@@ -92,10 +92,10 @@ Procedure.i Main()
   UartAuxMirror(0)
   UartAuxMirror(1)
   For n = 0 To #P3C_AUX_BYTES - 2
-    uart_AuxPut(65)
+    UartWrite(65)
   Next
   If uart_auxHead <> #P3C_AUX_BYTES - 1 Or uart_auxTail <> 0 : ProcedureReturn 12 : EndIf
-  uart_AuxPut(66)
+  UartWrite(66)
   If UartAuxLost() <> 1 Or UartAuxFillHigh() <> 1 : ProcedureReturn 13 : EndIf
   For n = 0 To #P3C_AUX_BYTES - 2
     If UartAuxGet() <> 65 : ProcedureReturn 14 : EndIf
@@ -104,7 +104,7 @@ Procedure.i Main()
 
   UartAuxMirror(0)
   If UartWrite(67) <> 1 : ProcedureReturn 16 : EndIf
-  If gate_screen_count <> 4 Or gate_screen_last <> 67 Or UartAuxGet() <> -1 : ProcedureReturn 17 : EndIf
+  If gate_screen_count <> #P3C_AUX_BYTES + 4 Or gate_screen_last <> 67 Or UartAuxGet() <> -1 : ProcedureReturn 17 : EndIf
 
   ; Admission only moves bytes from PL011 to a private bounded ring. It does
   ; not call InputFeedByte or re-enter ReadLine/command dispatch.

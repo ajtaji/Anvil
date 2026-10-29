@@ -1,3 +1,5 @@
+XIncludeFile "Anvil/Hal/aarch64_counter.pbi"
+
 ; Build 144 only: bounded timing of recovery poll, watchdog pet, and WFE.
 ; Procedure offsets from build/rockpi4c/anvil-flat.img.sym are rebased by
 ; the $41000 image load address. Payload command arms the physical deadman.
@@ -16,19 +18,12 @@ ProcedureNaked.i LoopProbeEl()
   ENDASM
 EndProcedure
 
-ProcedureNaked.i LoopProbeHz()
-  ASM
-    mrs x0, cntfrq_el0
-    ret
-  ENDASM
+Procedure.i LoopProbeHz()
+  ProcedureReturn A64CounterFrequency()
 EndProcedure
 
-ProcedureNaked.i LoopProbeTicks()
-  ASM
-    isb
-    mrs x0, cntpct_el0
-    ret
-  ENDASM
+Procedure.i LoopProbeTicks()
+  ProcedureReturn A64CounterReadOrdered()
 EndProcedure
 
 ProcedureNaked LoopProbeCall()

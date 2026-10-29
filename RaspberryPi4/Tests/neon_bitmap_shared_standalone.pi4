@@ -1,0 +1,70 @@
+; Returning proof links only the shared font module, without the native
+; renderer or Vulkan. The monitor remains the USB/upload/runtime owner.
+XIncludeFile "Anvil/Graphics/neon_bitmap_font.pbi"
+
+Global Dim bitmapInput.a[4]
+Global bitmapChecks.i
+Global bitmapFailures.i
+
+Procedure bitmapCheck(value.i,expected.i)
+  PokeI($E1C00020+bitmapChecks*16,value)
+  PokeI($E1C00028+bitmapChecks*16,expected)
+  bitmapChecks=bitmapChecks+1
+  If value<>expected : bitmapFailures=bitmapFailures+1 : EndIf
+EndProcedure
+
+Procedure.i Main(services.i)
+ Define i.i,rev.i
+ For i=0 To 4095 : PokeA($E1C00000+i,0) : Next
+ bitmapInput[0]=$80 : bitmapInput[1]=$41 : bitmapInput[2]=$24 : bitmapInput[3]=$FF
+ bitmapCheck(NeonBitmapFontBind(@bitmapInput[0],8,2,65,66),1)
+ bitmapCheck(neon_fontRevision,1)
+ NeonFontDefaults()
+ bitmapCheck(Neon_FontUI(),0) : bitmapCheck(Neon_FontSmall(),1)
+ bitmapCheck(Neon_FontMono(),2) : bitmapCheck(Neon_FontBold(),3)
+ For i=0 To 3
+  bitmapCheck(NeonBitmapFontScale(i),1)
+  bitmapCheck(Neon_CharWidth(i),8)
+  bitmapCheck(NeonBitmapLineHeight(i),2)
+  If i=3 : bitmapCheck(NeonBitmapFontBold(i),1)
+  Else : bitmapCheck(NeonBitmapFontBold(i),0) : EndIf
+ Next
+ NeonFontSetup(0,0,0) : NeonFontSetup(1,-4,-1)
+ NeonFontSetup(2,3,0) : NeonFontSetup(3,2,1)
+ NeonFontSetup(-1,99,1) : NeonFontSetup(4,99,1)
+ For i=0 To 3
+  If i<2 : bitmapCheck(NeonBitmapFontScale(i),1)
+  ElseIf i=2 : bitmapCheck(NeonBitmapFontScale(i),3)
+  Else : bitmapCheck(NeonBitmapFontScale(i),2) : EndIf
+ Next
+ bitmapCheck(NeonBitmapFontScale(-1),1) : bitmapCheck(NeonBitmapFontScale(4),1)
+ bitmapCheck(NeonBitmapFontBold(-1),0) : bitmapCheck(NeonBitmapFontBold(4),0)
+ bitmapCheck(NeonBitmapFontBold(1),1) : bitmapCheck(NeonBitmapFontBold(3),1)
+ bitmapCheck(Neon_CharWidth(2),24) : bitmapCheck(NeonBitmapLineHeight(3),4)
+ bitmapCheck(NeonBitmapGlyphRow(65,0,0),$80)
+ bitmapCheck(NeonBitmapGlyphRow(65,0,1),$C0)
+ bitmapCheck(NeonBitmapGlyphRow(65,1,-1),$61)
+ bitmapCheck(NeonBitmapGlyphRow(66,0,0),$24)
+ bitmapCheck(NeonBitmapGlyphRow(66,1,1),$FF)
+ rev=neon_fontRevision
+ bitmapCheck(NeonBitmapFontBind(0,8,2,65,66),0)
+ bitmapCheck(NeonBitmapFontBind(@bitmapInput[0],0,2,65,66),0)
+ bitmapCheck(NeonBitmapFontBind(@bitmapInput[0],8,0,65,66),0)
+ bitmapCheck(NeonBitmapFontBind(@bitmapInput[0],8,2,66,65),0)
+ bitmapCheck(neon_fontRevision,rev)
+ bitmapCheck(neon_fbits,@bitmapInput[0]) : bitmapCheck(neon_fw,8)
+ bitmapCheck(neon_fh,2) : bitmapCheck(neon_frb,1)
+ bitmapCheck(neon_ffirst,65) : bitmapCheck(neon_flast,66)
+ bitmapCheck(NeonBitmapFontBind(@bitmapInput[0],8,2,65,66),1)
+ bitmapCheck(neon_fontRevision,rev+1)
+ bitmapCheck(Neon_PointsForPixelHeight(-20),5)
+ bitmapCheck(Neon_PointsForPixelHeight(0),5)
+ bitmapCheck(Neon_PointsForPixelHeight(7),5)
+ bitmapCheck(Neon_PointsForPixelHeight(8),6)
+ bitmapCheck(Neon_PointsForPixelHeight(18),14)
+ bitmapCheck(Neon_PointsForPixelHeight(21),16)
+ bitmapCheck(Neon_PointsForPixelHeight(100),75)
+ PokeI($E1C00000,$4E424D46) : PokeI($E1C00008,bitmapChecks)
+ PokeI($E1C00010,bitmapFailures) : PokeI($E1C00FF8,$464D424E)
+ ProcedureReturn bitmapFailures
+EndProcedure

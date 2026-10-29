@@ -1,3 +1,4 @@
+XIncludeFile "Anvil/Core/token_parse.pbi"
 ; Explicit diagnostic operations for wiring into recovery after the read path
 ; is compiled and reviewed. This file does not alter the recovery grammar.
 ; The write routine enables the driver's writer only for its single known
@@ -40,65 +41,8 @@ Global rock_storage_trust_parts.i
 Global Dim rock_storage_hex.a[8]
 Global rock_recovery_skip_lf.i
 
-Procedure.i rock_storage_nextToken(*line, lineLength.i, *position, *dst, capacity.i)
-  Protected pos.i = PeekI(*position)
-  Protected count.i
-  While pos < lineLength And (PeekA(*line + pos) = 32 Or PeekA(*line + pos) = 9)
-    pos = pos + 1
-  Wend
-  count = 0
-  While pos < lineLength
-    If PeekA(*line + pos) = 32 Or PeekA(*line + pos) = 9 : Break : EndIf
-    If count >= capacity - 1 : ProcedureReturn -1 : EndIf
-    PokeA(*dst + count, PeekA(*line + pos))
-    count = count + 1
-    pos = pos + 1
-  Wend
-  PokeA(*dst + count, 0)
-  PokeI(*position, pos)
-  ProcedureReturn count
-EndProcedure
 
-Procedure.i rock_storage_parseHexToken(*line, lineLength.i, *position, *outValue)
-  Protected count.i
-  Protected digit.i
-  Protected accum.i
-  Protected c.i
-  Protected pos.i = PeekI(*position)
-  While pos < lineLength And (PeekA(*line + pos) = 32 Or PeekA(*line + pos) = 9)
-    pos = pos + 1
-  Wend
-  count = 0 : accum = 0
-  While pos < lineLength
-    c = PeekA(*line + pos) & 255
-    If c = 32 Or c = 9 : Break : EndIf
-    If c >= 48 And c <= 57
-      digit = c - 48
-    ElseIf c >= 65 And c <= 70
-      digit = c - 55
-    ElseIf c >= 97 And c <= 102
-      digit = c - 87
-    Else
-      ProcedureReturn 0
-    EndIf
-    If count >= 8 : ProcedureReturn 0 : EndIf
-    accum = ((accum << 4) | digit) & $FFFFFFFF
-    count = count + 1
-    pos = pos + 1
-  Wend
-  If count = 0 : ProcedureReturn 0 : EndIf
-  PokeI(*outValue, accum)
-  PokeI(*position, pos)
-  ProcedureReturn 1
-EndProcedure
 
-Procedure.i rock_storage_tokenIs(*token, text.i, length.i)
-  Protected index.i
-  For index = 0 To length - 1
-    If PeekA(*token + index) <> PeekA(text + index) : ProcedureReturn 0 : EndIf
-  Next
-  ProcedureReturn Bool(PeekA(*token + length) = 0)
-EndProcedure
 
 Procedure RockStorageHex8(value.i)
   Protected index.i
@@ -564,6 +508,7 @@ Procedure.i RockStorageTrustUpdate(expectedCrc.i)
   Define partition.i
   Define bothVerified.i
   Define partitionStart.i
+  Define partitionBlocks.i
   Define mounted.i
   bothVerified = 0
   If RockStorageIsEmmc()<>0
@@ -582,21 +527,18 @@ Procedure.i RockStorageTrustUpdate(expectedCrc.i)
       ProcedureReturn 0
     EndIf
     rock_storage_blocks = RockSdBlockCount()
-    exfat_partBlocks = 0
-    If exfat_FindPartition(1) = 0
+    If ExFatProbePartition(1,@partitionStart,@partitionBlocks) = 0
       RockUartLine("TRUST UPDATE REFUSED; GPT BOUNDARY NOT VERIFIED")
       RockStorageDiagnostics()
       ProcedureReturn 0
     EndIf
-    partitionStart = exfat_partLba
     partition = 0
     mounted = 0
   Else
     mounted = 1
     partition = rock_storage_partition
     If FsType() = #FS_EXFAT
-      partitionStart = exfat_partLba
-    ElseIf FsType() = #FS_FAT
+      ElseIf FsType() = #FS_FAT
       partitionStart = FatPartitionLba()
     Else
       RockUartLine("TRUST UPDATE REFUSED; NO ACTIVE PARTITION BOUNDARY")
@@ -815,13 +757,6 @@ rock_storage_proof_data:
   Data.s "RK3399 STORAGE PROOF 1"
 EndDataSection
 
-Procedure.i rock_storage_onlySpace(*line, lineLength.i, pos.i)
-  While pos < lineLength
-    If PeekA(*line + pos) <> 32 And PeekA(*line + pos) <> 9 : ProcedureReturn 0 : EndIf
-    pos = pos + 1
-  Wend
-  ProcedureReturn 1
-EndProcedure
 
 ; The recovery parser calls this only outside the fatal-exception path. It
 ; accepts exact words and simple space-delimited paths; every binary operation
@@ -835,11 +770,11 @@ Procedure.i RockStorageCommand(*line, lineLength.i)
   Protected index.i
 
   position = 0
-  wordLength = rock_storage_nextToken(*line, lineLength, @position, @rock_storage_token[0], 256)
+  wordLength = TokenNextBounded(*line, lineLength, @position, @rock_storage_token[0], 256)
   If wordLength <= 0 : ProcedureReturn 0 : EndIf
 
-  If rock_storage_tokenIs(@rock_storage_token[0], ?rock_storage_cmd_storage, 7) <> 0
-    If rock_storage_onlySpace(*line, lineLength, position) = 0 : ProcedureReturn 0 : EndIf
+  If TokenEquals(@rock_storage_token[0], ?rock_storage_cmd_storage, 7) <> 0
+    If TokenOnlySpace(*line, lineLength, position) = 0 : ProcedureReturn 0 : EndIf
     If HwStorageUp() = 0
       RockUartLine("STORAGE MOUNT FAILED")
       RockUartLine(RockStorageErrorText())
@@ -853,18 +788,18 @@ Procedure.i RockStorageCommand(*line, lineLength.i)
     RockUartLine("")
     ProcedureReturn 1
   EndIf
-  If rock_storage_tokenIs(@rock_storage_token[0], ?rock_storage_cmd_sdmeta, 6) <> 0
-    If rock_storage_onlySpace(*line, lineLength, position) = 0 : ProcedureReturn 0 : EndIf
+  If TokenEquals(@rock_storage_token[0], ?rock_storage_cmd_sdmeta, 6) <> 0
+    If TokenOnlySpace(*line, lineLength, position) = 0 : ProcedureReturn 0 : EndIf
     RockStorageMetadataProbe()
     ProcedureReturn 1
   EndIf
-  If rock_storage_tokenIs(@rock_storage_token[0], ?rock_storage_cmd_ls, 2) <> 0
-    If rock_storage_onlySpace(*line, lineLength, position) = 0 : ProcedureReturn 0 : EndIf
+  If TokenEquals(@rock_storage_token[0], ?rock_storage_cmd_ls, 2) <> 0
+    If TokenOnlySpace(*line, lineLength, position) = 0 : ProcedureReturn 0 : EndIf
     RockStorageProofList()
     ProcedureReturn 1
   EndIf
-  If rock_storage_tokenIs(@rock_storage_token[0], ?rock_storage_cmd_map, 3) <> 0
-    If rock_storage_onlySpace(*line, lineLength, position) = 0 : ProcedureReturn 0 : EndIf
+  If TokenEquals(@rock_storage_token[0], ?rock_storage_cmd_map, 3) <> 0
+    If TokenOnlySpace(*line, lineLength, position) = 0 : ProcedureReturn 0 : EndIf
     RockUartText("STAGE ")
     RockStorageHex8(@rock_storage_stage[0])
     RockUartText(" BYTES ")
@@ -872,15 +807,15 @@ Procedure.i RockStorageCommand(*line, lineLength.i)
     RockUartLine("")
     ProcedureReturn 1
   EndIf
-  If rock_storage_tokenIs(@rock_storage_token[0], ?rock_storage_cmd_proof, 10) <> 0
-    If rock_storage_onlySpace(*line, lineLength, position) = 0 : ProcedureReturn 0 : EndIf
+  If TokenEquals(@rock_storage_token[0], ?rock_storage_cmd_proof, 10) <> 0
+    If TokenOnlySpace(*line, lineLength, position) = 0 : ProcedureReturn 0 : EndIf
     RockStorageProofWriteRead()
     ProcedureReturn 1
   EndIf
 
-  If rock_storage_tokenIs(@rock_storage_token[0], ?rock_storage_cmd_get, 3) <> 0 Or rock_storage_tokenIs(@rock_storage_token[0], ?rock_storage_cmd_read, 4) <> 0
-    pathLength = rock_storage_nextToken(*line, lineLength, @position, @rock_storage_path[0], 256)
-    If pathLength <= 0 Or rock_storage_onlySpace(*line, lineLength, position) = 0
+  If TokenEquals(@rock_storage_token[0], ?rock_storage_cmd_get, 3) <> 0 Or TokenEquals(@rock_storage_token[0], ?rock_storage_cmd_read, 4) <> 0
+    pathLength = TokenNextBounded(*line, lineLength, @position, @rock_storage_path[0], 256)
+    If pathLength <= 0 Or TokenOnlySpace(*line, lineLength, position) = 0
       RockUartLine("USAGE: get <path>")
       ProcedureReturn 1
     EndIf
@@ -888,9 +823,9 @@ Procedure.i RockStorageCommand(*line, lineLength.i)
     ProcedureReturn 1
   EndIf
 
-  If rock_storage_tokenIs(@rock_storage_token[0], ?rock_storage_cmd_put, 3) <> 0 Or rock_storage_tokenIs(@rock_storage_token[0], ?rock_storage_cmd_write, 5) <> 0
-    pathLength = rock_storage_nextToken(*line, lineLength, @position, @rock_storage_path[0], 256)
-    If pathLength <= 0 Or rock_storage_parseHexToken(*line, lineLength, @position, @length) = 0 Or rock_storage_parseHexToken(*line, lineLength, @position, @checksum) = 0 Or rock_storage_onlySpace(*line, lineLength, position) = 0
+  If TokenEquals(@rock_storage_token[0], ?rock_storage_cmd_put, 3) <> 0 Or TokenEquals(@rock_storage_token[0], ?rock_storage_cmd_write, 5) <> 0
+    pathLength = TokenNextBounded(*line, lineLength, @position, @rock_storage_path[0], 256)
+    If pathLength <= 0 Or TokenHex32Bounded(*line, lineLength, @position, @length) = 0 Or TokenHex32Bounded(*line, lineLength, @position, @checksum) = 0 Or TokenOnlySpace(*line, lineLength, position) = 0
       RockUartLine("USAGE: put <path> <length-hex> <crc32-hex>")
       ProcedureReturn 1
     EndIf
@@ -898,8 +833,8 @@ Procedure.i RockStorageCommand(*line, lineLength.i)
     ProcedureReturn 1
   EndIf
 
-  If rock_storage_tokenIs(@rock_storage_token[0], ?rock_storage_cmd_trust, 11) <> 0
-    If rock_storage_parseHexToken(*line, lineLength, @position, @checksum) = 0 Or rock_storage_onlySpace(*line, lineLength, position) = 0
+  If TokenEquals(@rock_storage_token[0], ?rock_storage_cmd_trust, 11) <> 0
+    If TokenHex32Bounded(*line, lineLength, @position, @checksum) = 0 Or TokenOnlySpace(*line, lineLength, position) = 0
       RockUartLine("USAGE: trustupdate <crc32-hex>  (fixed 4 MiB BL3X image)")
       ProcedureReturn 1
     EndIf

@@ -992,6 +992,21 @@ Procedure.i exfat_FindPartition(partition.i)
   ProcedureReturn 1
 EndProcedure
 
+; Read-only partition geometry probe for recovery before a volume is mounted.
+; Uses the configured reader and the existing checked GPT/MBR parser. It does
+; not mount a volume, write media, or expose mutable parser globals to callers.
+Procedure.i ExFatProbePartition(partition.i,*firstBlock,*blockCount)
+  Define oldFirst.i,oldCount.i,rc.i
+  If *firstBlock=0 Or *blockCount=0 : ProcedureReturn exfat_Fail(#EXFAT_E_NULL) : EndIf
+  If exfat_mounted<>0 : ProcedureReturn exfat_Fail(#EXFAT_E_BUSY) : EndIf
+  PokeI(*firstBlock,0) : PokeI(*blockCount,0)
+  oldFirst=exfat_partLba : oldCount=exfat_partBlocks
+  rc=exfat_FindPartition(partition)
+  If rc<>0 : PokeI(*firstBlock,exfat_partLba) : PokeI(*blockCount,exfat_partBlocks) : EndIf
+  exfat_partLba=oldFirst : exfat_partBlocks=oldCount
+  ProcedureReturn rc
+EndProcedure
+
 Procedure.i exfat_ReadBoot()
   Define volume.i
   Define heapEnd.i

@@ -49,9 +49,9 @@ StackAddress $1F00000
 ;  other two Pi 3 board files, so three programs on one board keep three
 ;  numbers and none of them moves when another is built.
 ; ----------------------------------------------------------------------
-#ANVIL_BUILD = 45 ; pmf:build
-#ANVIL_BUILD_DATE = 20260920 ; pmf:builddate
-#ANVIL_BUILD_TIME = 205259 ; pmf:buildtime
+#ANVIL_BUILD = 53 ; pmf:build
+#ANVIL_BUILD_DATE = 20261029 ; pmf:builddate
+#ANVIL_BUILD_TIME = 112844 ; pmf:buildtime
 
 ; ======================================================================
 ;  1. THIS BOARD'S LOW-LEVEL LIBRARIES.
@@ -354,53 +354,20 @@ XIncludeFile "RaspberryPi3/Board/hw_link_wifi.pi3"
 Global pi3_wifi_join_abort.i
 Declare NetAddressBound(kind.i, ip.i, mask.i, gw.i, src.i)
 Declare NetAddressLost(kind.i)
-; The Pi 3 build serves as a Wi-Fi client only. The common console still
-; distinguishes UDP/67, but there is intentionally no DHCP-server policy
-; or command on this target, so DHCP server input is left unhandled.
-Procedure.i DhcpdInput(kind.i, *packet, n.i, fromIp.i)
-  ProcedureReturn 0
-EndProcedure
-Procedure.i DhcpdOn()
-  ProcedureReturn 0
-EndProcedure
-Procedure.i DhcpdKind()
-  ProcedureReturn #HW_LINK_NONE
-EndProcedure
-Procedure DhcpdStop()
-EndProcedure
-; Pi 3 has one IP-capable interface and no link-pin command; let the shared
-; per-interface policy choose its only usable Wi-Fi address.
-Procedure.i LinkPin()
-  ProcedureReturn #HW_LINK_NONE
-EndProcedure
+; The shared DHCP server remains inactive: this Wi-Fi-only composition has
+; no start command, and the shared service refuses the radio server role.
+XIncludeFile "Anvil/Core/dhcpd.pbi"
+; Shared policy owns link selection, frame ceilings and staged sends.
+; The Pi 3 hardware provider still exposes only its Wi-Fi interface.
+XIncludeFile "Anvil/Network/link.pbi"
 XIncludeFile "Anvil/Core/netconsole.pbi"
 ; Pi 3 serves the shared UDP network console only; it has no TCP/HTTP
-; listener. The shared scheduler hook remains an explicit no-op.
-Procedure HttpServerPoll()
-EndProcedure
+; listener. The shared polling boundary remains unregistered and inactive.
+XIncludeFile "Anvil/Services/Http/poll.pbi"
 XIncludeFile "RaspberryPi3/Lib/wifi_network.pi3"
 
-; NetCfg is intentionally not imported: that module owns the Pi 4 wired
-; compatibility globals and configuration commands. The common DHCP worker
-; needs only this per-interface lease tail on Pi 3.
-Procedure NetAddressBound(kind.i, ip.i, mask.i, gw.i, src.i)
-  NetIfSet(kind, ip, mask, gw, src)
-  If src = #NET_ADDR_LEASE
-    NetIfSetLease(kind, DhcpClientLeaseLeft(kind), millis())
-    NetIfSetDns(kind, DhcpClientDns(kind))
-  Else
-    NetIfSetLease(kind, 0, 0)
-    NetIfSetDns(kind, 0)
-  EndIf
-  HwLinkAddressBound(kind, ip, mask, gw)
-  NetConsoleRearm()
-EndProcedure
-
-Procedure NetAddressLost(kind.i)
-  NetIfClear(kind)
-  HwLinkAddressBound(kind, 0, 0, 0)
-  NetConsoleRearm()
-EndProcedure
+; Shared address policy excludes configuration commands and board hardware.
+XIncludeFile "Anvil/Core/net_address.pbi"
 
 ; Deferred workspace for post-prompt automatic bring-up and explicit `wifi
 ; start`. Long radio blobs live in RAM only after prompt servicing begins;

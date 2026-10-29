@@ -1,3 +1,4 @@
+XIncludeFile "Anvil/Graphics/truetype_controls.pbi"
 ; T2 Unicode character mapping. Supports cmap format 4 (BMP) and format 12.
 ; Caller owns UTF-8 input and glyph-ID output storage.
 
@@ -191,10 +192,11 @@ EndProcedure
 ; Decode strict UTF-8 bytes to native-width glyph IDs. Returns the number of
 ; emitted glyph IDs (0 is a valid empty string); returns -1 on invalid input
 ; or insufficient capacity. Output is untouched when capacity is inadequate.
-Procedure.i AnvilTrueTypeDecodeUtf8(text.i, byteCount.i, glyphOut.i, capacity.i)
+Procedure.i anvil_ttc_DecodeUtf8(text.i, byteCount.i, glyphOut.i, capacity.i,controlMode.i)
   Protected pos.i=0, count.i=0, b0.i, b1.i, b2.i, b3.i, cp.i, need.i
   Protected glyph.i, metricsCount.i
   If anvil_ttc_Ready()=0 : ProcedureReturn -1 : EndIf
+  If controlMode<0 Or controlMode>2 : anvil_ttc_InputFail(#ANVIL_TTC_E_CODEPOINT,0) : ProcedureReturn -1 : EndIf
   If (byteCount>0 And text=0) Or byteCount<0 Or capacity<0 Or (byteCount>0 And glyphOut=0)
     anvil_ttc_InputFail(#ANVIL_TTC_E_CODEPOINT,0) : ProcedureReturn -1
   EndIf
@@ -228,7 +230,8 @@ Procedure.i AnvilTrueTypeDecodeUtf8(text.i, byteCount.i, glyphOut.i, capacity.i)
       If (b3&$C0)<>$80 : anvil_ttc_InputFail(#ANVIL_TTC_E_CODEPOINT,pos+3) : ProcedureReturn -1 : EndIf
       cp=(cp<<6)|(b3&$3F)
     EndIf
-    count+1 : pos+need
+    If controlMode<>#ANVIL_TTC_CONTROLS_HIDE Or AnvilTrueTypeIsControl(cp)=0 : count+1 : EndIf
+    pos+need
   Wend
   If count>capacity : anvil_ttc_InputFail(#ANVIL_TTC_E_CAPACITY,byteCount) : ProcedureReturn -1 : EndIf
   metricsCount=AnvilTrueTypeGlyphCount()
@@ -243,13 +246,31 @@ Procedure.i AnvilTrueTypeDecodeUtf8(text.i, byteCount.i, glyphOut.i, capacity.i)
     If need>=2 : cp=(cp<<6)|(anvil_ttc_U8(text+pos+1)&$3F) : EndIf
     If need>=3 : cp=(cp<<6)|(anvil_ttc_U8(text+pos+2)&$3F) : EndIf
     If need=4 : cp=(cp<<6)|(anvil_ttc_U8(text+pos+3)&$3F) : EndIf
-    glyph=AnvilTrueTypeGlyphForCodepoint(cp)
+    If AnvilTrueTypeIsControl(cp)<>0
+      If controlMode=#ANVIL_TTC_CONTROLS_HIDE : pos+need : Continue : EndIf
+      If controlMode=#ANVIL_TTC_CONTROLS_SHOW
+        glyph=#ANVIL_TTC_CONTROL_GLYPH
+      Else
+        glyph=AnvilTrueTypeGlyphForCodepoint(cp)
+      EndIf
+    Else
+      glyph=AnvilTrueTypeGlyphForCodepoint(cp)
+    EndIf
     If AnvilTrueTypeCmapError()<>#ANVIL_TTC_E_NONE : ProcedureReturn -1 : EndIf
     If glyph>=metricsCount : anvil_ttc_InputFail(#ANVIL_TTC_E_FORMAT,pos) : ProcedureReturn -1 : EndIf
     PokeI(glyphOut+count*SizeOf(.i),glyph)
     count+1 : pos+need
   Wend
   ProcedureReturn count
+EndProcedure
+; The legacy decoder retains its original strict UTF8/capacity behavior.
+Procedure.i AnvilTrueTypeDecodeUtf8(text.i,byteCount.i,glyphOut.i,capacity.i)
+  ProcedureReturn anvil_ttc_DecodeUtf8(text,byteCount,glyphOut,capacity,0)
+EndProcedure
+; Show emits virtual-1 for C0/DEL. Hide counts only emitted glyphs, including
+; the valid all-hidden empty result. Whole-input UTF8 validation precedes writes.
+Procedure.i AnvilTrueTypeDecodeUtf8Controls(text.i,byteCount.i,glyphOut.i,capacity.i,controlMode.i)
+  ProcedureReturn anvil_ttc_DecodeUtf8(text,byteCount,glyphOut,capacity,controlMode)
 EndProcedure
 Procedure.i AnvilTrueTypeCmapError()
   anvil_ttc_Ready() : ProcedureReturn anvil_ttc_error

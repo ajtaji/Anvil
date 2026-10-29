@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import os
+import re
 from pathlib import Path
 import shutil
 import subprocess
@@ -17,6 +18,8 @@ from pmf_compiler import resolve_compiler
 ROOT = Path(__file__).resolve().parents[1]
 GATE = ROOT / "RaspberryPi4/Tests/neon_atlas_contract_emitted_gate.pi4"
 NEON = ROOT / "RaspberryPi4/Lib/neon.pi4"
+ATLAS = ROOT / "Anvil/Graphics/neon_atlas_raster.pbi"
+FRONTEND = ROOT / "Anvil/Graphics/neon_frontend.pbi"
 LIBS = (
     "uart.pi4", "timer.pi4", "safety.pi4", "mailbox.pi4", "display.pi4",
     "v3dqpu.pi4", "v3d.pi4", "neon.pi4",
@@ -126,7 +129,7 @@ def source_gate(text: str) -> int:
     return len(checks) + 3
 
 
-def build(compiler: Path, work: Path, name: str, neon_text: str) -> Path:
+def build(compiler: Path, work: Path, name: str, neon_text: str, atlas_text: str) -> Path:
     root = work / name
     libdir = root / "RaspberryPi4/Lib"
     testdir = root / "RaspberryPi4/Tests"
@@ -136,13 +139,31 @@ def build(compiler: Path, work: Path, name: str, neon_text: str) -> Path:
     testdir.mkdir(parents=True)
     intrinsics.mkdir(parents=True)
     coredir.mkdir(parents=True)
-    for item in LIBS:
-        src = ROOT / "RaspberryPi4/Lib" / item
-        (libdir / item).write_text(
-            neon_text if item == "neon.pi4" else src.read_text(encoding="utf-8-sig"),
-            encoding="utf-8",
-        )
-    shutil.copy2(GATE, testdir / GATE.name)
+    # Follow only exact source include references, never enumerate a directory.
+    # The private composition must contain the shared owners too, so a mutation
+    # cannot accidentally link the unchanged public owner through another edge.
+    overrides = {NEON: neon_text, ATLAS: atlas_text}
+    pending, seen = [GATE], set()
+    while pending:
+        src = pending.pop().resolve()
+        if src in seen:
+            continue
+        seen.add(src)
+        rel = src.relative_to(ROOT)
+        text = overrides.get(src)
+        if text is None:
+            text = src.read_text(encoding="utf-8-sig")
+        dst = root / rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_text(text, encoding="utf-8")
+        for spelling in re.findall(r'^\s*(?:XIncludeFile|IncludeFile)\s+"([^"]+)"', text, re.M | re.I):
+            target = (ROOT / spelling).resolve()
+            if not target.is_file():
+                target = (src.parent / spelling).resolve()
+            target.relative_to(ROOT)
+            if not target.is_file():
+                raise AssertionError("missing exact include: " + spelling)
+            pending.append(target)
     shutil.copy2(
         ROOT / "RaspberryPi4/Intrinsics/bcm2711_hardware.def",
         intrinsics / "bcm2711_hardware.def",
@@ -227,18 +248,19 @@ def main() -> int:
     interp = required_path(args.interp, "PMF_A64_INTERP")
     a64 = load_interpreter(interp)
     source = NEON.read_text(encoding="utf-8-sig")
-    source_checks = source_gate(source)
+    atlas = ATLAS.read_text(encoding="utf-8-sig")
+    source_checks = source_gate(source + "\n" + atlas + "\n" + FRONTEND.read_text(encoding="utf-8-sig"))
 
     with tempfile.TemporaryDirectory(prefix="anvil-neon-atlas-") as tmp:
-        image = build(compiler, Path(tmp), "baseline", source)
+        image = build(compiler, Path(tmp), "baseline", source, atlas)
         result, steps = execute(a64, image)
         if result:
             raise AssertionError(f"baseline failed assertion {result} after {steps:,} instructions")
 
         mutant_steps = 0
         for number, (label, old, new, expected) in enumerate(MUTANTS, 1):
-            mutant = replace_once(source, old, new)
-            image = build(compiler, Path(tmp), f"mutant{number}", mutant)
+            mutant = replace_once(atlas, old, new)
+            image = build(compiler, Path(tmp), f"mutant{number}", source, mutant)
             result, used = execute(a64, image)
             mutant_steps += used
             if result != expected:

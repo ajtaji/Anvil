@@ -14,7 +14,7 @@ import pathlib as _pmfpath
 from pmf_compiler import resolve_compiler
 
 ROOT = Path(__file__).resolve().parents[1]
-SOURCE = ROOT / "Anvil" / "Graphics" / "Tests" / "edid_parse_gate.pi3"
+SOURCE = ROOT / "Anvil" / "Graphics" / "Tests" / "edid_parse_gate.pbi"
 INTERPRETER = ROOT / "tools" / "a64" / "a64_interp.py"
 LOAD = 0x400000
 STACK = 0x3000000
@@ -35,7 +35,12 @@ def load_interpreter():
 
 def build(compiler: Path, out: Path):
     image = out / "edid-parse.img"
-    cmd = [str(compiler), "--compile", str(SOURCE), "-t", "pi3",
+    composition = out / "edid-parse.pbi"
+    composition.write_text('XIncludeFile "Anvil/Graphics/edid.pbi"\n'
+                           'XIncludeFile "Anvil/Graphics/Tests/edid_parse_gate.pbi"\n'
+                           f'Procedure.i Main()\n ProcedureReturn EdidParseGateDispatch({CONTROL},{EDID})\nEndProcedure\n',
+                           encoding="utf8", newline="\n")
+    cmd = [str(compiler), "--compile", str(composition), "-t", "pi3",
            "--entry-returns", "--load-addr", hex(LOAD),
            "--stack-addr", hex(STACK), "-s", "-o", str(image)]
     result = subprocess.run(cmd, cwd=ROOT,

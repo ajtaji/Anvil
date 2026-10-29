@@ -1,0 +1,87 @@
+; Real GNSS framer/decoder, deterministic USB stream provider; no receiver I/O.
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "Anvil/Hal/hal.pbi"
+#TCP_CLOSED=0
+#TCP_ESTABLISHED=4
+#NET_TCP_OK=0
+#NET_TCP_E_ARP=-303
+Global testNetworkCalls.i,testSourceCalls.i,testPosition.i,testMode.i,testLength.i
+Global *testSentence=0
+Procedure.i HwMicros() : ProcedureReturn 10000000 : EndProcedure
+Procedure.i SettingsGet(*name) : testNetworkCalls+1 : ProcedureReturn 0 : EndProcedure
+Procedure.i ParseDotted(*text) : testNetworkCalls+1 : ProcedureReturn 0 : EndProcedure
+Procedure TcpUse(slot.i) : testNetworkCalls+1 : EndProcedure
+Procedure.i TcpState() : testNetworkCalls+1 : ProcedureReturn #TCP_CLOSED : EndProcedure
+Procedure TcpClose() : testNetworkCalls+1 : EndProcedure
+Procedure TcpPoll(ms.i) : testNetworkCalls+1 : EndProcedure
+Procedure.i TcpSend(*src,n.i) : testNetworkCalls+1 : ProcedureReturn -1 : EndProcedure
+Procedure.i TcpRead(*dst,n.i) : testNetworkCalls+1 : ProcedureReturn -1 : EndProcedure
+Procedure.i TcpError() : testNetworkCalls+1 : ProcedureReturn -1 : EndProcedure
+Procedure.i NetIfForDest(ip.i) : testNetworkCalls+1 : ProcedureReturn #HW_LINK_NONE : EndProcedure
+Procedure.i TcpAlloc() : testNetworkCalls+1 : ProcedureReturn -1 : EndProcedure
+Procedure.i TcpConnect(kind.i,ip.i,port.i) : testNetworkCalls+1 : ProcedureReturn -1 : EndProcedure
+XIncludeFile "Anvil/Services/gnss.pbi"
+Global testCount.i,testFailures.i
+Global Dim testBuffer.a[32]
+Global Dim testFix.a[64]
+Procedure GCheck(actual.i,expected.i)
+ PokeI($E1C00040+testCount*16,actual) : PokeI($E1C00048+testCount*16,expected)
+ testCount+1
+ If actual<>expected : testFailures+1 : EndIf
+EndProcedure
+Procedure.i TestGnssUsb(op.i,arg.i,count.i)
+ Protected n.i,i.i
+ If op=#USB_SERIAL_KIND : ProcedureReturn 1 : EndIf
+ If op=#USB_SERIAL_NEEDS_BAUD : ProcedureReturn 0 : EndIf
+ If op<>#USB_SERIAL_READ : ProcedureReturn -1 : EndIf
+ testSourceCalls+1
+ If testMode=1 : ProcedureReturn -1 : EndIf
+ If testMode=2 : ProcedureReturn count+1 : EndIf
+ n=testLength-testPosition
+ If n>7 : n=7 : EndIf
+ If n>count : n=count : EndIf
+ For i=0 To n-1 : PokeA(arg+i,PeekA(*testSentence+testPosition+i)) : Next
+ testPosition=testPosition+n
+ ProcedureReturn n
+EndProcedure
+Procedure.i Main(services.i)
+ Protected i.i,mode.i,n.i,total.i,fixes.i,before.i,loops.i
+ For i=0 To 2047 : PokeA($E1C00000+i,0) : Next
+ ; Labels may include linker alignment; the wire sentence has 67 bytes.
+ *testSentence=?testGga : testLength=67
+ GCheck(GnssRead(@testBuffer[0],32),-1)
+ GCheck(GnssPump(),-1)
+ UsbSerialBind(@TestGnssUsb)
+ GCheck(GnssRead(0,32),-1)
+ GCheck(GnssRead(@testBuffer[0],0),-1)
+ GCheck(GnssRead(@testBuffer[0],-1),-1)
+ GCheck(testSourceCalls,0)
+ For mode=0 To 1
+   testPosition=0 : testMode=0 : total=0 : fixes=0 : loops=0
+   GCheck(GnssOpen(#GNSS_SRC_USB),1)
+   While testPosition<testLength And loops<100
+     If mode=0
+       n=GnssRead(@testBuffer[0],32) : total=total+n
+     Else
+       n=GnssPump() : fixes=fixes+n
+     EndIf
+     loops=loops+1
+   Wend
+   GCheck(testPosition,testLength)
+   GCheck(GnssBytes(),testLength)
+   GCheck(GnssGood(),1) : GCheck(GnssBad(),0)
+   If mode=0 : GCheck(total,testLength) : Else : GCheck(fixes,1) : EndIf
+   GCheck(GnssFix(@testFix[0]),#HW_GNSS_3D)
+   For i=0 To 63 : PokeA($E1C00400+mode*64+i,testFix[i]) : Next
+   GCheck(GnssRead(@testBuffer[0],32),0)
+   GCheck(GnssGood(),1)
+   testMode=1 : GCheck(GnssRead(@testBuffer[0],32),-1)
+   testMode=2 : GCheck(GnssRead(@testBuffer[0],32),-1)
+   GCheck(GnssBytes(),testLength) : GCheck(GnssGood(),1)
+ Next
+ GCheck(testNetworkCalls,0)
+ PokeI($E1C00000,$474E5231) : PokeI($E1C00008,testCount) : PokeI($E1C00010,testFailures)
+ PokeI($E1C00018,testLength) : PokeI($E1C00020,$454E4421)
+ ProcedureReturn testFailures
+EndProcedure
+; Test sentence data is appended by the builder, with its checked checksum.

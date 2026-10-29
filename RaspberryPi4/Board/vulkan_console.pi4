@@ -6,6 +6,17 @@
 ; a second text engine: NeonVkChrome's callback family backs the same Neon
 ; widget/text calls used by the V3D renderer.
 
+XIncludeFile "Anvil/Graphics/Vulkan/neon_vk_present_target.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/neon_vk_service_targets.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/neon_vk_service_caret.pbi"
+Global avcWsiMain.NeonVkPresentTarget, avcWsiBanner.NeonVkPresentTarget
+Global avcWsiPresentN.i
+Global avcSurfaceQueryN.i
+Global avcBanImage.i, avcBanMemory.i, avcBanView.i, avcBanFramebuffer.i
+Global avcBanBase.i, avcBanPitch.i, avcBanW.i, avcBanH.i, avcBanReady.i
+Global avcBanLastClock.i = -1, avcBanLastGlint.i = -2, avcBanShown.i
+
+
 #AVC_OK                 = 0
 #AVC_ERR_DISPLAY        = -22101
 #AVC_ERR_V3D            = -22102
@@ -28,8 +39,11 @@ Global avcReady.i
 Global avcActive.i
 Global avcQuarantined.i
 Global avcDeviceUnsafe.i
+Global avcDisplayCopyPending.i    ; a failed copy may still reference its source
 Global avcNeonAllowed.i = 1
 Global avcError.i
+; Failure stage and original Chrome error survive checked resource teardown.
+Global avcPresentStage.i, avcLastFailStage.i, avcLastFailReason.i, avcLastFailChrome.i
 Global avcInstance.i
 Global avcPhysical.i
 Global avcDevice.i
@@ -54,6 +68,23 @@ Global avcFallbackPaint.i
 Global avcBannerFrameReady.i
 Global avcFramePresented.i
 Global avcPayloadWasActive.i
+; A resident application borrows this owner's target, never a second driver.
+Global avsContext.i, avsEpoch.i, avsReady.i, avsFrame.i, avsFontCount.i, avsError.i
+Global Dim avsFont.NeonVkPortFontRef[32]
+Global Dim avsSprite.NeonVkPortSpriteRef[#NEON_SERVICE_MAX_SPRITES]
+Global Dim avsSpriteHandle.i[#NEON_SERVICE_MAX_SPRITES]
+Global avsSpriteClock.i,avsBatch.i
+Global Dim avsOwnedFont.i[#NEON_SERVICE_MAX_FONT_ASSETS]
+Global avsPreviousFont.i=-1,avsPreviousFontGeneration.i
+Global avsParticleReady.i,avsParticleCount.i
+Global avsParticleCameraX.f,avsParticleCameraY.f,avsParticleCameraZoom.f
+; Diagnostic ticks for the latest resident application. No payload ABI change.
+; End stages: GPU completion/publication, DMA, cache clean, display flip, other,
+; and total. Totals and the worst complete End survive Close for vkstat.
+Global avcCopyDmaTicks.i,avcCopyCleanTicks.i,avcCopyPublishTicks.i
+Global avsEndFrames.i,avsEndFailed.i,avsEndWorstFrame.i,avsEndWorstRc.i
+Global Dim avsEndTotal.i[6]
+Global Dim avsEndWorst.i[6]
 Global Dim avcClear.l[4]
 Global Dim avcGlyph.a[2]
 Global Dim avcGridGlyphs.l[#NEON_VK_CHROME_TT_CACHE_MAX]
@@ -99,10 +130,38 @@ Procedure.i VulkanConsoleError()
   ProcedureReturn avcError
 EndProcedure
 
+; Validate public surface metadata against this real provider-owned source.
+Procedure.i avcCheckPublicSurface(*target.NeonVkPresentTarget, width.i, height.i)
+  Define caps.VkSurfaceCapabilitiesKHR, format.VkSurfaceFormatKHR
+  Define count.i, supported.i, mode.i, rc.i
+  supported = 0
+  rc = vkGetPhysicalDeviceSurfaceSupportKHR(avcPhysical, 0, *target\surface, @supported)
+  If rc <> #VK_SUCCESS : ProcedureReturn rc : EndIf
+  If supported <> 1 : ProcedureReturn #AVC_ERR_PRESENT : EndIf
+  rc = vkGetPhysicalDeviceSurfaceCapabilitiesKHR(avcPhysical, *target\surface, @caps)
+  If rc <> #VK_SUCCESS : ProcedureReturn rc : EndIf
+  If caps\currentExtent\width <> width Or caps\currentExtent\height <> height
+    ProcedureReturn #AVC_ERR_PRESENT
+  EndIf
+  count = 1
+  rc = vkGetPhysicalDeviceSurfaceFormatsKHR(avcPhysical, *target\surface, @count, @format)
+  If rc <> #VK_SUCCESS : ProcedureReturn rc : EndIf
+  If count <> 1 Or format\format <> #VK_FORMAT_B8G8R8A8_UNORM Or format\colorSpace <> 0
+    ProcedureReturn #AVC_ERR_PRESENT
+  EndIf
+  count = 1 : mode = 0
+  rc = vkGetPhysicalDeviceSurfacePresentModesKHR(avcPhysical, *target\surface, @count, @mode)
+  If rc <> #VK_SUCCESS : ProcedureReturn rc : EndIf
+  If count <> 1 Or mode <> #VK_PRESENT_MODE_FIFO_KHR : ProcedureReturn #AVC_ERR_PRESENT : EndIf
+  avcSurfaceQueryN = avcSurfaceQueryN + 1
+  ProcedureReturn #VK_SUCCESS
+EndProcedure
+
 Procedure.i avcCreateTarget()
   Define rc.i
   Define count.i
   Define priority.l
+  Define surfaceName.i
   Define ici.VkInstanceCreateInfo
   Define qci.VkDeviceQueueCreateInfo
   Define dci.VkDeviceCreateInfo
@@ -127,6 +186,10 @@ Procedure.i avcCreateTarget()
     ProcedureReturn #AVC_ERR_WINDOW
   EndIf
   ici\sType = #VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO
+  If gScrSrc = #SCR_SRC_DSI
+    surfaceName = avkSurfaceExtensionName()
+    ici\enabledExtensionCount = 1 : ici\ppEnabledExtensionNames = @surfaceName
+  EndIf
   rc = vkCreateInstance(@ici, 0, @avcInstance)
   If rc <> #VK_SUCCESS : ProcedureReturn #AVC_ERR_VK : EndIf
   count = 1
@@ -227,6 +290,20 @@ EndProcedure
 
 Procedure.i VulkanConsoleDestroy()
   Define idleRc.i
+  ; GPU idle says nothing about the display DMA channel. A pending copy was
+  ; entered only while DMA was ready, so its selected registers are valid.
+  If avcDisplayCopyPending <> 0
+    If DmaQuarantined() <> 0
+      avcDeviceUnsafe = 1 : ProcedureReturn 0
+    EndIf
+    If DmaQuiescent() = 0
+      avcDeviceUnsafe = 1 : ProcedureReturn 0
+    EndIf
+    avcDisplayCopyPending = 0
+  EndIf
+  If ScrFrameRestore() = 0
+    avcDeviceUnsafe = 1 : ProcedureReturn 0
+  EndIf
   idleRc = #VK_SUCCESS
   If avcDevice <> 0
     idleRc = vkDeviceWaitIdle(avcDevice)
@@ -235,7 +312,23 @@ Procedure.i VulkanConsoleDestroy()
     avcDeviceUnsafe = 1
     ProcedureReturn 0
   EndIf
-  If NeonVkChromeReady() <> 0 : NeonVkChromeDestroy() : EndIf
+  ; Partial/failed Chrome teardown can retain a device while Ready is false.
+  ; Do not destroy the caller's target or lend its hardware to a fallback
+  ; renderer unless the adapter confirms its own resources were released.
+  If avcDevice <> 0
+    If NeonVkChromeDestroyChecked() <> #VK_SUCCESS
+      avcDeviceUnsafe = 1
+      ProcedureReturn 0
+    EndIf
+  EndIf
+  ; Checked Chrome teardown has rolled back any acquired/pending source.
+  ; Provider refusal must retain the physical image and every parent handle.
+  If NeonVkPresentTargetDestroy(avcInstance, avcDevice, @avcWsiBanner) <> #VK_SUCCESS
+    avcDeviceUnsafe = 1 : ProcedureReturn 0
+  EndIf
+  If NeonVkPresentTargetDestroy(avcInstance, avcDevice, @avcWsiMain) <> #VK_SUCCESS
+    avcDeviceUnsafe = 1 : ProcedureReturn 0
+  EndIf
   NeonVkChromeLogoSource(0, 0, 0)
   If avcDevice <> 0
     avcDestroyBannerTarget()
@@ -271,6 +364,9 @@ EndProcedure
 
 Procedure.i avcFailover(reason.i)
   Define idleSafe.i, v3dSafe.i, hadCursor.i
+  avcLastFailStage = avcPresentStage
+  avcLastFailReason = reason
+  avcLastFailChrome = NeonVkChromeError()
   hadCursor = gCurShown
   If avcError = 0 : avcError = reason : EndIf
   AnvilTrueTypeRasterAlphaHandlerSet(0)
@@ -425,6 +521,18 @@ Procedure.i VulkanConsoleStart()
   rc = avcCreateTarget()
   If rc = #AVC_OK
     avcCreateBannerTarget()                       ; optional: without it the banner uses the whole target
+    If gScrSrc = #SCR_SRC_DSI
+      If ScrFrameFront() = 0
+        rc = #AVC_ERR_PRESENT
+      Else
+        rc = NeonVkPresentTargetCreate(avcInstance, avcDevice, avcImage, avcFramebuffer, avcWidth, avcHeight, @avcWsiMain)
+        If rc = #VK_SUCCESS : rc = avcCheckPublicSurface(@avcWsiMain, avcWidth, avcHeight) : EndIf
+        If rc = #VK_SUCCESS And avcBanReady <> 0
+          rc = NeonVkPresentTargetCreate(avcInstance, avcDevice, avcBanImage, avcBanFramebuffer, avcBanW, avcBanH, @avcWsiBanner)
+          If rc = #VK_SUCCESS : rc = avcCheckPublicSurface(@avcWsiBanner, avcBanW, avcBanH) : EndIf
+        EndIf
+      EndIf
+    EndIf
   EndIf
   If rc <> #AVC_OK
     avcError = rc
@@ -710,31 +818,44 @@ EndProcedure
 ; The source already has the physical orientation selected by Chrome's rebind.
 ; Leave the existing banner rectangle untouched, then use the display layer's
 ; ordinary present path (including DSI rotation/HVS ownership) to publish it.
+Procedure.i avcCopyFullToDisplay()
+  Define dst.i, pitch.i, width.i, height.i,t0.i,t1.i,t2.i,rc.i
+  avcCopyDmaTicks=0 : avcCopyCleanTicks=0 : avcCopyPublishTicks=0
+  If DisplayMemorySafe() = 0 Or gDma = 0 Or DmaReady() = 0 : ProcedureReturn 0 : EndIf
+  dst = ScrGpuBase()
+  If gScrSrc = #SCR_SRC_DSI : dst = ScrFrameBack() : EndIf
+  pitch = ScrGpuPitch() : width = ScrGpuPhysicalW() : height = ScrGpuPhysicalH()
+  If dst = 0 Or pitch < width * 4 Or width <> avcWidth Or height <> avcHeight : ProcedureReturn 0 : EndIf
+  t0=Ticks()
+  rc=avcDmaCopyRect(dst,pitch,avcImageBase,avcImagePitch,0,0,width,height)
+  t1=Ticks() : avcCopyDmaTicks=t1-t0
+  If rc=0 : ProcedureReturn 0 : EndIf
+  ; The completed DMA helper already invalidated/cleaned the destination
+  ; rectangle and issued its visibility barrier. No CPU pixel writes follow
+  ; it here, so a second full-frame clean would repeat that ownership handoff.
+  t2=Ticks() : avcCopyCleanTicks=t2-t1
+  If gScrSrc = #SCR_SRC_DSI
+    rc=ScrFramePublish(dst) : avcCopyPublishTicks=Ticks()-t2
+    ProcedureReturn rc
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
 Procedure.i avcCopyToDisplay()
   Define dst.i, dstPitch.i, width.i, height.i, bx.i, by.i, bw.i, bh.i, rotation.i
   Define keepKeyboard.i, keyboardY0.i, keyboardY1.i
   Define topEnd.i, bottomStart.i
-  Define keyboardX.i, keyboardY.i, keyboardW.i, keyboardH.i, bytes.i
+  Define keyboardX.i, keyboardY.i, keyboardW.i, keyboardH.i
   If DisplayMemorySafe() = 0 : ProcedureReturn 0 : EndIf
-  dst = ScrGpuBase() : dstPitch = ScrGpuPitch()
+  dst = ScrGpuBase()
+  If gScrSrc = #SCR_SRC_DSI : dst = ScrFrameBack() : EndIf
+  dstPitch = ScrGpuPitch()
   width = ScrGpuPhysicalW() : height = ScrGpuPhysicalH()
   If dst = 0 Or dstPitch < width * 4 Or width <> avcWidth Or height <> avcHeight
     ProcedureReturn 0
   EndIf
   If avcBannerFrameReady <> 0
-    If gDma = 0 Or DmaReady() = 0 : ProcedureReturn 0 : EndIf
-    If avcDmaCopyRect(dst, dstPitch, avcImageBase, avcImagePitch, 0, 0, width, height) = 0
-      ProcedureReturn 0
-    EndIf
-    bytes = ScrGpuBytes()
-    MmuCleanRange(dst, bytes)
-    If gScrSrc = #SCR_SRC_DSI
-      ScrDsiWaitFrameStart()
-      DmaCacheRange(#MON_FB_SCAN, bytes)
-      If DmaCopy(#MON_FB_SCAN, dst, bytes) = 0 : ProcedureReturn 0 : EndIf
-      DmaCacheRange(#MON_FB_SCAN, bytes)
-    EndIf
-    ProcedureReturn 1
+    ProcedureReturn avcCopyFullToDisplay()
   EndIf
   bx = 0 : by = 0 : bw = width : bh = LogoHeight()
   rotation = ScrGpuRotation()
@@ -785,7 +906,7 @@ Procedure.i avcCopyToDisplay()
   ; DSI's front contains the correctly transformed CPU banner and keyboard.
   ; Restore their physical rectangles with DMA before the full-frame present.
   If gScrSrc = #SCR_SRC_DSI
-    If avcDmaCopyRect(dst, dstPitch, #MON_FB_SCAN, dstPitch, bx, by, bw, bh) = 0
+    If avcDmaCopyRect(dst, dstPitch, ScrFrameFront(), dstPitch, bx, by, bw, bh) = 0
       ProcedureReturn 0
     EndIf
     If keepKeyboard <> 0
@@ -801,19 +922,15 @@ Procedure.i avcCopyToDisplay()
       If keyboardX < 0 Or keyboardY < 0 Or keyboardW < 1 Or keyboardH < 1 Or keyboardX + keyboardW > width Or keyboardY + keyboardH > height
         ProcedureReturn 0
       EndIf
-      If avcDmaCopyRect(dst, dstPitch, #MON_FB_SCAN, dstPitch, keyboardX, keyboardY, keyboardW, keyboardH) = 0
+      If avcDmaCopyRect(dst, dstPitch, ScrFrameFront(), dstPitch, keyboardX, keyboardY, keyboardW, keyboardH) = 0
         ProcedureReturn 0
       EndIf
     EndIf
   EndIf
-  bytes = ScrGpuBytes()
-  MmuCleanRange(dst, bytes)
-  If gScrSrc = #SCR_SRC_DSI
-    ScrDsiWaitFrameStart()
-    DmaCacheRange(#MON_FB_SCAN, bytes)
-    If DmaCopy(#MON_FB_SCAN, dst, bytes) = 0 : ProcedureReturn 0 : EndIf
-    DmaCacheRange(#MON_FB_SCAN, bytes)
-  EndIf
+  ; Every destination write above was completed through avcDmaCopyRect.
+  ; Its post-DMA cache maintenance/barrier already made those pixels visible;
+  ; there are no CPU pixel stores requiring an additional whole-frame clean.
+  If gScrSrc = #SCR_SRC_DSI : ProcedureReturn ScrFramePublish(dst) : EndIf
   ProcedureReturn 1
 EndProcedure
 
@@ -834,9 +951,6 @@ EndProcedure
 ;  first frame, a geometry change). Copying the whole 614 KB strip twice was
 ;  the other 5.7 ms.
 ; ----------------------------------------------------------------------
-Global avcBanImage.i, avcBanMemory.i, avcBanView.i, avcBanFramebuffer.i
-Global avcBanBase.i, avcBanPitch.i, avcBanW.i, avcBanH.i, avcBanReady.i
-Global avcBanLastClock.i = -1, avcBanLastGlint.i = -2, avcBanShown.i
 
 Procedure avcDestroyBannerTarget()
   If avcDevice <> 0
@@ -934,7 +1048,9 @@ Procedure.i avcCopyBandRect(lx.i, ly.i, lw.i, lh.i, src.i, srcPitch.i, bandInSou
   If lx + lw > avcLogicalW : lw = avcLogicalW - lx : EndIf
   If ly + lh > band : lh = band - ly : EndIf
   If lw < 1 Or lh < 1 : ProcedureReturn 1 : EndIf
-  dst = ScrGpuBase() : dstPitch = ScrGpuPitch()
+  dst = ScrGpuBase()
+  If gScrSrc = #SCR_SRC_DSI : dst = ScrFrameBack() : EndIf
+  dstPitch = ScrGpuPitch()
   width = ScrGpuPhysicalW() : height = ScrGpuPhysicalH()
   If dst = 0 Or dstPitch < width * 4 Or width <> avcWidth Or height <> avcHeight : ProcedureReturn 0 : EndIf
   ; the rectangle in the band's physical coordinates, and where the band sits on the display
@@ -951,9 +1067,7 @@ Procedure.i avcCopyBandRect(lx.i, ly.i, lw.i, lh.i, src.i, srcPitch.i, bandInSou
   sx = px : sy = py
   If bandInSource = 0 : sx = px + ox : sy = py + oy : EndIf
   If avcDmaCopyRectAt(dst, dstPitch, px + ox, py + oy, src, srcPitch, sx, sy, pw, ph) = 0 : ProcedureReturn 0 : EndIf
-  If gScrSrc = #SCR_SRC_DSI
-    If avcDmaCopyRectAt(#MON_FB_SCAN, dstPitch, px + ox, py + oy, src, srcPitch, sx, sy, pw, ph) = 0 : ProcedureReturn 0 : EndIf
-  EndIf
+
   ProcedureReturn 1
 EndProcedure
 
@@ -974,6 +1088,9 @@ Procedure.i avcCopyBannerToDisplay(src.i, srcPitch.i, bandInSource.i)
   Define clock.i, glint.i, any.i, logoX.i
   If DisplayMemorySafe() = 0 : ProcedureReturn 0 : EndIf
   If gDma = 0 Or DmaReady() = 0 : ProcedureReturn 0 : EndIf
+  If gScrSrc = #SCR_SRC_DSI
+    If ScrFrameCloneBack() = 0 : ProcedureReturn 0 : EndIf
+  EndIf
   clock = avcClockSum() : glint = gBannerAnimPhase
   If avcBanShown = 0
     any = avcCopyBandRect(0, 0, avcLogicalW, LogoHeight(), src, srcPitch, bandInSource)
@@ -988,6 +1105,9 @@ Procedure.i avcCopyBannerToDisplay(src.i, srcPitch.i, bandInSource.i)
     EndIf
   EndIf
   If any = 0 : ProcedureReturn 0 : EndIf
+  If gScrSrc = #SCR_SRC_DSI
+    If ScrFramePublish(ScrFrameBack()) = 0 : ProcedureReturn 0 : EndIf
+  EndIf
   avcBanLastClock = clock : avcBanLastGlint = glint : avcBanShown = 1
   ProcedureReturn 1
 EndProcedure
@@ -1018,71 +1138,114 @@ Procedure avcGpuWaitIdle()
   EndIf
 EndProcedure
 
+; The completed render remains owned during the synchronous display transfer.
+; A failed transfer leaves the record and possible DMA ownership for checked
+; teardown; it must not be reported as a successful presentation.
+Procedure.i avcPresentRenderedFrame(bannerOnly.i, bandTarget.i)
+  Define ok.i
+  avcPresentStage = 10
+  If NeonVkChromePresentPending() <> 1 : ProcedureReturn 0 : EndIf
+  If NeonVkChromePresentValidate() <> 1 : ProcedureReturn 0 : EndIf
+  avcPresentStage = 11
+  avcDisplayCopyPending = DmaReady()
+  If bannerOnly <> 0
+    If bandTarget <> 0
+      ok = avcCopyBannerToDisplay(avcBanBase, avcBanPitch, 1)
+    Else
+      ok = avcCopyBannerToDisplay(avcImageBase, avcImagePitch, 0)
+    EndIf
+  Else
+    ok = avcCopyToDisplay()
+  EndIf
+  If ok = 0 : ProcedureReturn 0 : EndIf
+  avcDisplayCopyPending = 0
+  avcPresentStage = 12
+  If NeonVkChromePresentConsume() <> 1 : ProcedureReturn 0 : EndIf
+  If gScrSrc = #SCR_SRC_DSI : avcWsiPresentN = avcWsiPresentN + 1 : EndIf
+  ProcedureReturn 1
+EndProcedure
+
 ; A frame that holds the banner and nothing else, for a change of the clock or
 ; the glint while the text is unchanged. Returns 1 when it was presented.
 Procedure.i avcPumpBannerOnly()
-  Define rc.i, endRc.i, t0.i, t1.i, t2.i, ok.i, own.i, tBegin0.i
+  Define rc.i, endRc.i, t0.i, t1.i, t2.i, own.i, tBegin0.i
   t0 = Ticks()
+  ; Clock/status text changes independently of the grid. Admit new glyphs
+  ; before Begin; drawing inside the pass must never mutate the atlas.
+  avcPresentStage = 19
+  If AnvilTrueTypeSlotSelected() >= 0
+    rc = NeonVkChromeWarmTrueTypeText(16, @gBannerClockText[0])
+    If rc < 0 : ProcedureReturn 0 : EndIf
+  EndIf
+  avcPresentStage = 20
   own = 0
   If avcBanReady <> 0
     If NeonVkChromeRebind(avcBanFramebuffer, avcLogicalW, LogoHeight(), avcBanW, avcBanH, avcBanPitch, avcRotation) = #VK_SUCCESS
       own = 1
     Else
       NeonVkChromeRebind(avcFramebuffer, avcLogicalW, avcLogicalH, avcWidth, avcHeight, avcPitch, avcRotation)
+      If NeonVkPresentTargetDestroy(avcInstance, avcDevice, @avcWsiBanner) <> #VK_SUCCESS : ProcedureReturn 0 : EndIf
       avcDestroyBannerTarget()                      ; never again this session: the whole-target frame is used
     EndIf
   EndIf
   avcClear[0] = 0 : avcClear[1] = 0 : avcClear[2] = 0 : avcClear[3] = $3F800000
+  If gScrSrc = #SCR_SRC_DSI
+    If own <> 0
+      rc = NeonVkPresentTargetAcquire(avcDevice, avcBanImage, @avcWsiBanner)
+    Else
+      rc = NeonVkPresentTargetAcquire(avcDevice, avcImage, @avcWsiMain)
+    EndIf
+    If rc <> #VK_SUCCESS : ProcedureReturn 0 : EndIf
+  EndIf
   tBegin0 = Ticks()
+  avcPresentStage = 21
   If NeonVkChromeBegin(@avcClear[0]) <> #VK_SUCCESS
-    If own <> 0 : NeonVkChromeRebind(avcFramebuffer, avcLogicalW, avcLogicalH, avcWidth, avcHeight, avcPitch, avcRotation) : EndIf
     ProcedureReturn 0
   EndIf
   avcStatBeginTicks = avcStatBeginTicks + (Ticks() - tBegin0)
   avcBannerFrameReady = 0
+  avcPresentStage = 22
   rc = avcRenderBanner()
   t1 = Ticks()
   *gV3dWaitIdle = @avcGpuWaitIdle
+  avcPresentStage = 23
   endRc = NeonVkChromeEnd()
   *gV3dWaitIdle = 0
   t2 = Ticks()
-  ok = 1
   If rc <> #NEON_VK_CHROME_OK Or NeonVkChromeError() <> 0 Or endRc <> #VK_SUCCESS
-    If NeonVkChromePresentPending() <> 0 : NeonVkChromePresentConsume() : EndIf
-    ok = 0
-  ElseIf NeonVkChromePresentPending() <> 1
-    ok = 0
-  ElseIf NeonVkChromePresentConsume() <> 1
-    ok = 0
+    ProcedureReturn 0
   EndIf
-  ; back to the console's own target before anything else can draw
+  ; Use only the prompt-qualified idle provider, and never retain it after
+  ; presentation returns (including refusal). Other display owners still poll.
+  *gScrFrameWaitIdle = @avcGpuWaitIdle
+  rc = avcPresentRenderedFrame(1, own)
+  *gScrFrameWaitIdle = 0
+  If rc = 0 : ProcedureReturn 0 : EndIf
+  ; Retarget only after the banner copy and ownership consumption complete.
+  avcPresentStage = 25
   If own <> 0
     If NeonVkChromeRebind(avcFramebuffer, avcLogicalW, avcLogicalH, avcWidth, avcHeight, avcPitch, avcRotation) <> #VK_SUCCESS
       ProcedureReturn 0
     EndIf
   EndIf
-  If ok = 0 : ProcedureReturn 0 : EndIf
-  If own <> 0
-    ok = avcCopyBannerToDisplay(avcBanBase, avcBanPitch, 1)
-  Else
-    ok = avcCopyBannerToDisplay(avcImageBase, avcImagePitch, 0)
-  EndIf
   avcStatBanner[0] = avcStatBanner[0] + (t1 - t0)
   avcStatBanner[1] = avcStatBanner[1] + (t2 - t1)
   avcStatBanner[2] = avcStatBanner[2] + (Ticks() - t2)
   avcStatBannerN = avcStatBannerN + 1
-  ProcedureReturn ok
+  ProcedureReturn 1
 EndProcedure
 
 Procedure VulkanConsolePump()
   Define r.i, c.i, n.i, y.i, ch.i, cw.i, colour.i, rc.i, endRc.i, pass.i
   Define st0.i, st1.i, st2.i
   Define layoutCount.i, layoutLines.i, layoutWidth.i, baseline.i, visible.i
-  If avcReady = 0 Or avcActive = 0 Or gScreen = 0
+  If avsContext <> 0 : ProcedureReturn : EndIf
+  If avcReady = 0 Or avcActive = 0 Or gScreen = 0 Or avcDisplayCopyPending <> 0
     ProcedureReturn
   EndIf
   ; Only the banner changed, and a whole frame is already on the glass: draw
-  ; the banner alone. If that cannot be done the full frame below still is.
+  ; the banner alone. Failure may retain a frame or DMA source, so enter the
+  ; checked failure path rather than starting another frame on that owner.
   If avcBannerDirty <> 0 And avcFramePresented <> 0 And gConOverlayDirty = 0
     If avcGridNeedsPaint() = 0
       If avcPumpBannerOnly() <> 0
@@ -1091,6 +1254,8 @@ Procedure VulkanConsolePump()
         avcError = 0
         ProcedureReturn
       EndIf
+      avcFailover(#AVC_ERR_PRESENT)
+      ProcedureReturn
     EndIf
   EndIf
   avcBannerDirty = 0
@@ -1101,6 +1266,11 @@ Procedure VulkanConsolePump()
     ProcedureReturn
   EndIf
   avcClear[0] = 0 : avcClear[1] = 0 : avcClear[2] = 0 : avcClear[3] = $3F800000
+  If gScrSrc = #SCR_SRC_DSI
+    If NeonVkPresentTargetAcquire(avcDevice, avcImage, @avcWsiMain) <> #VK_SUCCESS
+      avcFailover(#AVC_ERR_PRESENT) : ProcedureReturn
+    EndIf
+  EndIf
   If NeonVkChromeBegin(@avcClear[0]) <> #VK_SUCCESS
     avcFailover(#AVC_ERR_CHROME)
     ProcedureReturn
@@ -1190,19 +1360,10 @@ Procedure VulkanConsolePump()
   endRc = NeonVkChromeEnd()
   st2 = Ticks()
   If rc <> 0 Or endRc <> #VK_SUCCESS
-    If NeonVkChromePresentPending() <> 0 : NeonVkChromePresentConsume() : EndIf
     avcFailover(#AVC_ERR_CHROME)
     ProcedureReturn
   EndIf
-  If NeonVkChromePresentPending() <> 1
-    avcFailover(#AVC_ERR_PRESENT)
-    ProcedureReturn
-  EndIf
-  If NeonVkChromePresentConsume() <> 1
-    avcFailover(#AVC_ERR_PRESENT)
-    ProcedureReturn
-  EndIf
-  If avcCopyToDisplay() = 0
+  If avcPresentRenderedFrame(0, 0) = 0
     avcFailover(#AVC_ERR_PRESENT)
     ProcedureReturn
   EndIf
@@ -1235,9 +1396,635 @@ Procedure avcStatLine(*label, n.i, sum0.i, sum1.i, sum2.i, hz.i)
 EndProcedure
 
 ; vkstat - what the Vulkan console's frames cost since the last vkstat.
+; The application service shares the console's checked Vulkan/display owner.
+; Context and font IDs are epochs, never caller-provided kernel pointers.
+Procedure.i avsRestoreFont()
+  If avsPreviousFont<0
+    If AnvilTrueTypeSlotDeselect()=0 : ProcedureReturn #NEON_SERVICE_ERR_PROVIDER : EndIf
+    ProcedureReturn 0
+  EndIf
+  If AnvilTrueTypeSlotBytes(avsPreviousFont)<1 Or AnvilTrueTypeSlotGeneration(avsPreviousFont)<>avsPreviousFontGeneration
+    ProcedureReturn #NEON_SERVICE_ERR_STALE
+  EndIf
+  If AnvilTrueTypeSlotSelect(avsPreviousFont)=0 : ProcedureReturn #NEON_SERVICE_ERR_PROVIDER : EndIf
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i avsClose()
+  Define i.i
+  Define rc.i
+  avsReady = 0
+  If avsContext = 0 : ProcedureReturn 0 : EndIf
+  rc=NeonVkTargetsClose(avsContext)
+  If rc<>0 : avsError=rc : ProcedureReturn rc : EndIf
+  If VulkanConsoleStop() = 0
+    avsError = #AVC_ERR_PRESENT : ProcedureReturn avsError
+  EndIf
+  ; GPU/device retirement precedes font-byte retirement. A failed restore or
+  ; release retains the context and all not-yet-released generation tokens.
+  rc=avsRestoreFont()
+  If rc<>0 : avsError=rc : ProcedureReturn rc : EndIf
+  For i=0 To #NEON_SERVICE_MAX_FONT_ASSETS-1
+    If avsOwnedFont[i]<>0
+      If AnvilFontReleaseMemory(i,avsOwnedFont[i])=0 : avsError=#NEON_SERVICE_ERR_STALE : ProcedureReturn avsError : EndIf
+      avsOwnedFont[i]=0
+    EndIf
+  Next
+  NeonVkPortSpriteFrameRetired()
+  For i=0 To #NEON_SERVICE_MAX_SPRITES-1 : avsSpriteHandle[i]=0 : Next
+  avsBatch=0
+  avsParticleReady=0 : avsParticleCount=0
+  avsContext = 0 : avsFrame = 0 : avsFontCount = 0 : avsError = 0
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i VulkanNeonServiceReset()
+  ProcedureReturn avsClose()
+EndProcedure
+
+Procedure.i avsRecord(request.i, bytes.i, expected.i)
+  If bytes <> expected : ProcedureReturn 0 : EndIf
+  If expected = 0 : ProcedureReturn Bool(request = 0) : EndIf
+  ProcedureReturn Bool(request <> 0 And (request & 7) = 0)
+EndProcedure
+
+; Reject NaN/infinity before conversion to coordinates or packed channels.
+Procedure.i avsFloats(request.i,count.i)
+  ProcedureReturn NeonServiceFloatsValid(request,count)
+EndProcedure
+
+Procedure.i avsFontIndex(font.i)
+  Define index.i
+  If font >= 0 And font <= 3 : ProcedureReturn 0 : EndIf
+  If (font >> 16) <> avsContext : ProcedureReturn -1 : EndIf
+  index = font & $FFFF
+  If index < 1 Or index > avsFontCount : ProcedureReturn -1 : EndIf
+  ProcedureReturn index
+EndProcedure
+
+Procedure.i avsFontBytesRequest(op.i,request.i,bytes.i)
+  Define *load.NeonServiceFontLoadRequest,*unload.NeonServiceFontUnloadRequest
+  Define slot.i,index.i,generation.i,rc.i
+  If avsFrame<>0 : ProcedureReturn #NEON_SERVICE_ERR_STATE : EndIf
+  If op=#NEON_SERVICE_FONT_LOAD
+    If avsRecord(request,bytes,SizeOf(NeonServiceFontLoadRequest))=0 : ProcedureReturn #NEON_SERVICE_ERR_ARGS : EndIf
+    *load=request
+    If *load\data<1 Or *load\bytes<1 Or *load\bytes>#NEON_SERVICE_MAX_FONT_BYTES Or *load\role<0 Or *load\role>3 Or *load\pixels<1 Or *load\pixels>512
+      ProcedureReturn #NEON_SERVICE_ERR_ARGS
+    EndIf
+    If *load\data+*load\bytes-1<*load\data : ProcedureReturn #NEON_SERVICE_ERR_ARGS : EndIf
+    If InPayload(*load\data,*load\data+*load\bytes-1)=0 : ProcedureReturn #NEON_SERVICE_ERR_ARGS : EndIf
+    If avsFontCount>=32 : ProcedureReturn #NEON_SERVICE_ERR_CAPACITY : EndIf
+    slot=0
+    While slot<#NEON_SERVICE_MAX_FONT_ASSETS
+      If avsOwnedFont[slot]=0 And AnvilTrueTypeSlotBytes(slot)=0 : Break : EndIf
+      slot=slot+1
+    Wend
+    If slot>=#NEON_SERVICE_MAX_FONT_ASSETS : ProcedureReturn #NEON_SERVICE_ERR_CAPACITY : EndIf
+    generation=AnvilFontLoadMemory(slot,*load\data,*load\bytes)
+    If generation<1 : ProcedureReturn #NEON_SERVICE_ERR_FORMAT : EndIf
+    avsOwnedFont[slot]=generation
+    rc=NeonVkPortFontBind(@avsFont[avsFontCount],slot,*load\role,*load\pixels)
+    If rc<>0
+      If AnvilFontReleaseMemory(slot,generation)<>0 : avsOwnedFont[slot]=0 : EndIf
+      ProcedureReturn rc
+    EndIf
+    avsFontCount=avsFontCount+1
+    ProcedureReturn (avsContext << 16) | avsFontCount
+  EndIf
+  If op=#NEON_SERVICE_FONT_UNLOAD
+    If avsRecord(request,bytes,SizeOf(NeonServiceFontUnloadRequest))=0 : ProcedureReturn #NEON_SERVICE_ERR_ARGS : EndIf
+    *unload=request : index=avsFontIndex(*unload\font)
+    If index<1 : ProcedureReturn #NEON_SERVICE_ERR_STALE : EndIf
+    slot=avsFont[index-1]\slot : generation=avsFont[index-1]\generation
+    If slot<0 Or slot>=#NEON_SERVICE_MAX_FONT_ASSETS : ProcedureReturn #NEON_SERVICE_ERR_STATE : EndIf
+    If avsOwnedFont[slot]=0 Or avsOwnedFont[slot]<>generation : ProcedureReturn #NEON_SERVICE_ERR_STALE : EndIf
+    If AnvilTrueTypeSlotSelected()=slot
+      rc=avsRestoreFont() : If rc<>0 : ProcedureReturn rc : EndIf
+    EndIf
+    If AnvilFontReleaseMemory(slot,generation)=0 : ProcedureReturn #NEON_SERVICE_ERR_STALE : EndIf
+    avsOwnedFont[slot]=0 : ProcedureReturn 0
+  EndIf
+  ProcedureReturn #NEON_SERVICE_ERR_ARGS
+EndProcedure
+
+Procedure.i avsMeasure(font.i, text.i, height.i)
+  Define index.i, measured.i
+  Define width.f
+  index = avsFontIndex(font)
+  If index < 0 : ProcedureReturn #NEON_SERVICE_ERR_ARGS : EndIf
+  If height <> 0
+    If index = 0
+      measured = NeonVkChromeMeasureLineHeight(font)
+    Else
+      measured = NeonVkPortFontLineHeight(@avsFont[index - 1])
+    EndIf
+    If measured < 0 : ProcedureReturn measured : EndIf
+    ProcedureReturn measured * 65536
+  EndIf
+  If text = 0 : ProcedureReturn #NEON_SERVICE_ERR_ARGS : EndIf
+  If index = 0
+    width = NeonVkPortTextWidth(font, text, 1)
+  Else
+    width = NeonVkPortFontTextWidth(@avsFont[index - 1], text, 1)
+  EndIf
+  If width < 0.0 Or width > 1000000.0 : ProcedureReturn #NEON_SERVICE_ERR_PROVIDER : EndIf
+  ProcedureReturn MathFToInt(width * 65536.0)
+EndProcedure
+
+Procedure.i avsSpriteIndex(handle.i)
+  Define i.i
+  If handle<1 : ProcedureReturn -1 : EndIf
+  For i=0 To #NEON_SERVICE_MAX_SPRITES-1
+    If avsSpriteHandle[i]=handle : ProcedureReturn i : EndIf
+  Next
+  ProcedureReturn -1
+EndProcedure
+
+Procedure.i avsSpriteRequest(op.i,request.i,bytes.i)
+  Define *limits.NeonServiceSpriteLimits,*upload.NeonServiceSpriteUploadRequest
+  Define *handle.NeonServiceSpriteHandleRequest,*draw.NeonServiceSpriteDrawRequest
+  Define *camera.NeonServiceCameraRequest,*batch.NeonServiceSpriteBatchRequest
+  Define candidate.NeonVkPortSpriteRef,index.i,rc.i,needed.i
+  Select op
+    Case #NEON_SERVICE_SPRITE_LIMITS
+      If avsRecord(request,bytes,SizeOf(NeonServiceSpriteLimits))=0 : ProcedureReturn #NEON_SERVICE_ERR_ARGS : EndIf
+      *limits=request : *limits\slots=#NEON_SERVICE_MAX_SPRITES
+      *limits\maxDimension=#NEON_SERVICE_MAX_SPRITE_DIM : *limits\maxUploadBytes=#NEON_SERVICE_MAX_SPRITE_BYTES
+      *limits\maxBatch=#NEON_SERVICE_MAX_SPRITE_BATCH
+      ProcedureReturn 0
+    Case #NEON_SERVICE_SPRITE_UPLOAD
+      If avsFrame<>0 Or avsBatch<>0 : ProcedureReturn #NEON_SERVICE_ERR_STATE : EndIf
+      If avsRecord(request,bytes,SizeOf(NeonServiceSpriteUploadRequest))=0 : ProcedureReturn #NEON_SERVICE_ERR_ARGS : EndIf
+      *upload=request
+      If *upload\slot<1 Or *upload\slot>#NEON_SERVICE_MAX_SPRITES Or *upload\pixels<1 Or *upload\width<1 Or *upload\height<1 Or *upload\width>#NEON_SERVICE_MAX_SPRITE_DIM Or *upload\height>#NEON_SERVICE_MAX_SPRITE_DIM Or (*upload\bgra<>0 And *upload\bgra<>1)
+        ProcedureReturn #NEON_SERVICE_ERR_ARGS
+      EndIf
+      If NeonVkTargetsOwnsSprite(*upload\slot)<>0 : ProcedureReturn #NEON_SERVICE_ERR_BUSY : EndIf
+      needed=*upload\width * *upload\height * 4
+      If *upload\sourceBytes<needed Or *upload\pixels+needed-1<*upload\pixels : ProcedureReturn #NEON_SERVICE_ERR_ARGS : EndIf
+      If InPayload(*upload\pixels,*upload\pixels+needed-1)=0 : ProcedureReturn #NEON_SERVICE_ERR_ARGS : EndIf
+      If avsSpriteClock=$7FFFFFFFFFFFFFFF : ProcedureReturn #NEON_SERVICE_ERR_STATE : EndIf
+      rc=NeonVkPortSpriteUpload(@candidate,*upload\slot,*upload\pixels,*upload\width,*upload\height,*upload\bgra)
+      If rc<>0 : ProcedureReturn rc : EndIf
+      index=*upload\slot-1
+      avsSprite[index]\id=candidate\id : avsSprite[index]\width=candidate\width
+      avsSprite[index]\height=candidate\height : avsSprite[index]\generation=candidate\generation
+      avsSpriteClock=avsSpriteClock+1 : avsSpriteHandle[index]=avsSpriteClock
+      ProcedureReturn avsSpriteClock
+    Case #NEON_SERVICE_SPRITE_CLEAR
+      If avsFrame<>0 Or avsBatch<>0 : ProcedureReturn #NEON_SERVICE_ERR_STATE : EndIf
+      If avsRecord(request,bytes,SizeOf(NeonServiceSpriteHandleRequest))=0 : ProcedureReturn #NEON_SERVICE_ERR_ARGS : EndIf
+      *handle=request : index=avsSpriteIndex(*handle\handle)
+      If index<0 : ProcedureReturn #NEON_SERVICE_ERR_STALE : EndIf
+      rc=NeonVkPortSpriteClear(@avsSprite[index])
+      If rc=0 : avsSpriteHandle[index]=0 : EndIf
+      ProcedureReturn rc
+    Case #NEON_SERVICE_SPRITE_DRAW
+      If avsFrame<>1 : ProcedureReturn #NEON_SERVICE_ERR_STATE : EndIf
+      If avsRecord(request,bytes,SizeOf(NeonServiceSpriteDrawRequest))=0 : ProcedureReturn #NEON_SERVICE_ERR_ARGS : EndIf
+      *draw=request
+      If avsFloats(request+8,8)=0 Or avsFloats(request+48,4)=0 : ProcedureReturn #NEON_SERVICE_ERR_ARGS : EndIf
+      If (*draw\scaled<>0 And *draw\scaled<>1) Or (*draw\ignoreCamera<>0 And *draw\ignoreCamera<>1) : ProcedureReturn #NEON_SERVICE_ERR_ARGS : EndIf
+      index=avsSpriteIndex(*draw\handle)
+      If index<0 : ProcedureReturn #NEON_SERVICE_ERR_STALE : EndIf
+      ProcedureReturn NeonVkPortSprite(@avsSprite[index],*draw\x,*draw\y,*draw\angle,*draw\scale,*draw\r,*draw\g,*draw\b,*draw\a,*draw\scaled,*draw\srcX,*draw\srcY,*draw\srcW,*draw\srcH,*draw\ignoreCamera)
+    Case #NEON_SERVICE_CAMERA
+      If avsFrame=2 : ProcedureReturn #NEON_SERVICE_ERR_STATE : EndIf
+      If avsRecord(request,bytes,SizeOf(NeonServiceCameraRequest))=0 Or avsFloats(request,3)=0 : ProcedureReturn #NEON_SERVICE_ERR_ARGS : EndIf
+      *camera=request
+      If *camera\reserved<>0 Or *camera\zoom<=0.0 Or *camera\zoom>16.0 : ProcedureReturn #NEON_SERVICE_ERR_ARGS : EndIf
+      ProcedureReturn NeonVkPortCamera(*camera\x,*camera\y,*camera\zoom)
+    Case #NEON_SERVICE_SPRITE_BATCH_BEGIN
+      If avsFrame<>1 Or avsBatch<>0 : ProcedureReturn #NEON_SERVICE_ERR_STATE : EndIf
+      If avsRecord(request,bytes,SizeOf(NeonServiceSpriteHandleRequest))=0 : ProcedureReturn #NEON_SERVICE_ERR_ARGS : EndIf
+      *handle=request : index=avsSpriteIndex(*handle\handle)
+      If index<0 : ProcedureReturn #NEON_SERVICE_ERR_STALE : EndIf
+      rc=NeonVkPortSpriteBatchBegin(@avsSprite[index])
+      If rc=0 : avsBatch=1 : EndIf
+      ProcedureReturn rc
+    Case #NEON_SERVICE_SPRITE_BATCH_ADD
+      If avsFrame<>1 Or avsBatch<>1 : ProcedureReturn #NEON_SERVICE_ERR_STATE : EndIf
+      If avsRecord(request,bytes,SizeOf(NeonServiceSpriteBatchRequest))=0 Or avsFloats(request,9)=0 : ProcedureReturn #NEON_SERVICE_ERR_ARGS : EndIf
+      *batch=request
+      If *batch\reserved<>0 Or (*batch\ignoreCamera<>0 And *batch\ignoreCamera<>1) : ProcedureReturn #NEON_SERVICE_ERR_ARGS : EndIf
+      ProcedureReturn NeonVkPortSpriteBatchAdd(*batch\x,*batch\y,*batch\w,*batch\h,*batch\angle,*batch\r,*batch\g,*batch\b,*batch\a,*batch\ignoreCamera)
+    Case #NEON_SERVICE_SPRITE_BATCH_END
+      If avsFrame<>1 Or avsBatch<>1 : ProcedureReturn #NEON_SERVICE_ERR_STATE : EndIf
+      If avsRecord(request,bytes,0)=0 : ProcedureReturn #NEON_SERVICE_ERR_ARGS : EndIf
+      rc=NeonVkPortSpriteBatchEnd()
+      If rc=0 : avsBatch=0 : Else : avsFrame=2 : EndIf
+      ProcedureReturn rc
+  EndSelect
+  ProcedureReturn #NEON_SERVICE_ERR_ARGS
+EndProcedure
+
+; Optional mapped drawing reuses the resident port and its single GPU owner.
+Procedure.i avsMappingRequest(op.i,request.i,bytes.i)
+  Define *canvas.NeonServiceCanvasRequest,*clip.NeonServiceScissorRequest
+  Define *box.NeonServiceMappedBoxRequest,*poly.NeonServiceMappedPolygonRequest
+  Define *text.NeonServiceMappedTextRequest,*lines.NeonServiceStaticLinesRequest
+  Define index.i,rc.i,count.i,needed.i
+  If op=#NEON_SERVICE_CANVAS
+    If avsFrame<>0 : ProcedureReturn #NEON_SERVICE_ERR_STATE : EndIf
+    If avsRecord(request,bytes,16)=0 : ProcedureReturn #NEON_SERVICE_ERR_ARGS : EndIf
+    *canvas=request
+    If *canvas\width<1 Or *canvas\height<1 Or *canvas\width>8192 Or *canvas\height>8192 : ProcedureReturn #NEON_SERVICE_ERR_ARGS : EndIf
+    rc=NeonVkTargetsBoundWidth() : count=NeonVkTargetsBoundHeight()
+    If rc=0 : rc=avcLogicalW : count=avcLogicalH : EndIf
+    rc=NeonVkPortCanvas(*canvas\width,*canvas\height,rc,count)
+    If rc=0 : avsParticleReady=0 : EndIf
+    ProcedureReturn rc
+  EndIf
+  If avsFrame<>1 Or avsBatch<>0 : ProcedureReturn #NEON_SERVICE_ERR_STATE : EndIf
+  Select op
+    Case #NEON_SERVICE_SCISSOR_SET
+      If avsRecord(request,bytes,16)=0 Or avsFloats(request,4)=0 : ProcedureReturn #NEON_SERVICE_ERR_ARGS : EndIf
+      *clip=request
+      rc=NeonVkPortScissorSet(*clip\x,*clip\y,*clip\w,*clip\h)
+      If rc=0 : rc=NeonVkChromeError() : EndIf
+    Case #NEON_SERVICE_SCISSOR_CLEAR
+      If avsRecord(request,bytes,0)=0 : ProcedureReturn #NEON_SERVICE_ERR_ARGS : EndIf
+      rc=NeonVkPortScissorClear()
+      If rc=0 : rc=NeonVkChromeError() : EndIf
+    Case #NEON_SERVICE_BOX_MAPPED
+      If avsRecord(request,bytes,48)=0 Or avsFloats(request,8)=0 : ProcedureReturn #NEON_SERVICE_ERR_ARGS : EndIf
+      *box=request
+      If (*box\scaled<>0 And *box\scaled<>1) Or (*box\ignoreCamera<>0 And *box\ignoreCamera<>1) : ProcedureReturn #NEON_SERVICE_ERR_ARGS : EndIf
+      rc=NeonVkPortBox(*box\x,*box\y,*box\w,*box\h,*box\r,*box\g,*box\b,*box\a,*box\scaled,*box\ignoreCamera)
+    Case #NEON_SERVICE_POLYGON_MAPPED
+      If avsRecord(request,bytes,64)=0 : ProcedureReturn #NEON_SERVICE_ERR_ARGS : EndIf
+      If avsFloats(request,4)=0 Or avsFloats(request+24,4)=0 : ProcedureReturn #NEON_SERVICE_ERR_ARGS : EndIf
+      *poly=request
+      If (*poly\scaled<>0 And *poly\scaled<>1) Or (*poly\ignoreCamera<>0 And *poly\ignoreCamera<>1) Or (*poly\solid<>0 And *poly\solid<>1) : ProcedureReturn #NEON_SERVICE_ERR_ARGS : EndIf
+      rc=NeonVkPortPolygon(*poly\x,*poly\y,*poly\rx,*poly\ry,*poly\sides,*poly\r,*poly\g,*poly\b,*poly\a,*poly\solid,*poly\scaled,*poly\ignoreCamera)
+    Case #NEON_SERVICE_TEXT_MAPPED
+      If avsRecord(request,bytes,56)=0 : ProcedureReturn #NEON_SERVICE_ERR_ARGS : EndIf
+      If avsFloats(request+8,2)=0 Or avsFloats(request+24,4)=0 : ProcedureReturn #NEON_SERVICE_ERR_ARGS : EndIf
+      *text=request : index=avsFontIndex(*text\font)
+      If index<0 Or *text\text=0 : ProcedureReturn #NEON_SERVICE_ERR_ARGS : EndIf
+      If (*text\scaled<>0 And *text\scaled<>1) Or (*text\ignoreCamera<>0 And *text\ignoreCamera<>1) : ProcedureReturn #NEON_SERVICE_ERR_ARGS : EndIf
+      If index=0
+        rc=NeonVkPortText(*text\font,*text\x,*text\y,*text\text,*text\r,*text\g,*text\b,*text\a,*text\scaled,*text\ignoreCamera)
+      Else
+        rc=NeonVkPortFontText(@avsFont[index-1],*text\x,*text\y,*text\text,*text\r,*text\g,*text\b,*text\a,*text\scaled,*text\ignoreCamera)
+      EndIf
+    Case #NEON_SERVICE_STATIC_LINES
+      If avsRecord(request,bytes,48)=0 Or avsFloats(request+24,4)=0 : ProcedureReturn #NEON_SERVICE_ERR_ARGS : EndIf
+      *lines=request
+      If *lines\vertexCount<0 Or *lines\vertexCount>#NEON_SERVICE_MAX_STATIC_LINE_VERTICES Or *lines\limitVertices<0 : ProcedureReturn #NEON_SERVICE_ERR_ARGS : EndIf
+      needed=*lines\vertexCount*8
+      If *lines\sourceBytes<needed : ProcedureReturn #NEON_SERVICE_ERR_ARGS : EndIf
+      If needed>0
+        If *lines\data<1 Or (*lines\data & 3)<>0 Or *lines\data+needed-1<*lines\data : ProcedureReturn #NEON_SERVICE_ERR_ARGS : EndIf
+        If InPayload(*lines\data,*lines\data+needed-1)=0 : ProcedureReturn #NEON_SERVICE_ERR_ARGS : EndIf
+        If avsFloats(*lines\data,*lines\vertexCount*2)=0 : ProcedureReturn #NEON_SERVICE_ERR_ARGS : EndIf
+      EndIf
+      rc=NeonVkPortStaticLines(*lines\data,*lines\vertexCount,*lines\r,*lines\g,*lines\b,*lines\a,*lines\limitVertices)
+    Default
+      ProcedureReturn #NEON_SERVICE_ERR_ARGS
+  EndSelect
+  ProcedureReturn rc
+EndProcedure
+
+Procedure avsEndProfile(start.i,afterGpu.i,result.i)
+  Define finish.i,total.i,gpu.i,other.i
+  finish=Ticks() : total=finish-start : gpu=afterGpu-start
+  other=total-gpu-avcCopyDmaTicks-avcCopyCleanTicks-avcCopyPublishTicks
+  avsEndFrames=avsEndFrames+1
+  If result<>0 : avsEndFailed=avsEndFailed+1 : EndIf
+  avsEndTotal[0]=avsEndTotal[0]+gpu
+  avsEndTotal[1]=avsEndTotal[1]+avcCopyDmaTicks
+  avsEndTotal[2]=avsEndTotal[2]+avcCopyCleanTicks
+  avsEndTotal[3]=avsEndTotal[3]+avcCopyPublishTicks
+  avsEndTotal[4]=avsEndTotal[4]+other
+  avsEndTotal[5]=avsEndTotal[5]+total
+  If avsEndFrames=1 Or total>avsEndWorst[5]
+    avsEndWorstFrame=avsEndFrames : avsEndWorstRc=result
+    avsEndWorst[0]=gpu : avsEndWorst[1]=avcCopyDmaTicks
+    avsEndWorst[2]=avcCopyCleanTicks : avsEndWorst[3]=avcCopyPublishTicks
+    avsEndWorst[4]=other : avsEndWorst[5]=total
+  EndIf
+EndProcedure
+
+Procedure.i VulkanNeonServiceDispatch(op.i, context.i, request.i, bytes.i)
+  Define *api.NeonServiceApi, *surface.NeonServiceSurface
+  Define *box.NeonServiceBoxRequest, *text.NeonServiceTextRequest
+  Define *measure.NeonServiceMeasureRequest, *polygon.NeonServicePolygonRequest
+  Define *font.NeonServiceFontRequest, index.i, rc.i, pixels.i
+  Define *spacing.NeonServiceFontAdvanceRequest
+  Define *snap.NeonServiceFontSnapRequest
+  Define *controls.NeonServiceFontControlsRequest
+  Define *derive.NeonServiceFontDeriveRequest
+  Define *caret.NeonServiceFontCaretRequest
+  Define endStart.i,endAfterGpu.i,profileIndex.i,parentFrame.i
+  Define *particleLimits.NeonServiceParticleLimits,*particlePrepare.NeonServiceParticlePrepareRequest,needed.i
+  If op = #NEON_SERVICE_QUERY
+    If context <> 0 Or avsRecord(request, bytes, SizeOf(NeonServiceApi)) = 0 : ProcedureReturn #NEON_SERVICE_ERR_ARGS : EndIf
+    *api = request
+    *api\magic = #NEON_SERVICE_MAGIC : *api\major = #NEON_SERVICE_MAJOR : *api\minor = #NEON_SERVICE_ROLE_CARETS_MINOR
+    *api\bytes = SizeOf(NeonServiceApi) : *api\flags = #NEON_SERVICE_VULKAN | #NEON_SERVICE_FONT_REFS | #NEON_SERVICE_SPRITES | #NEON_SERVICE_FONT_BYTES | #NEON_SERVICE_PARTICLES | #NEON_SERVICE_MAPPING | #NEON_SERVICE_FONT_SPACING | #NEON_SERVICE_FONT_SNAP | #NEON_SERVICE_FONT_CONTROLS | #NEON_SERVICE_FONT_DERIVE | #NEON_SERVICE_TARGETS | #NEON_SERVICE_TARGET_CONTINUATION | #NEON_SERVICE_TARGET_LOAD | #NEON_SERVICE_TARGET_RETRO | #NEON_SERVICE_FONT_CARETS | #NEON_SERVICE_ROLE_CARETS
+    *api\maxFonts = 32 : *api\dispatch = @GraphicsServiceCall
+    ProcedureReturn 0
+  EndIf
+  If op = #NEON_SERVICE_OPEN
+    If context <> 0 Or avsRecord(request, bytes, SizeOf(NeonServiceSurface)) = 0 : ProcedureReturn #NEON_SERVICE_ERR_ARGS : EndIf
+    If avsContext <> 0 : ProcedureReturn #NEON_SERVICE_ERR_BUSY : EndIf
+    If avsEpoch >= $7FFFFFFF : ProcedureReturn #NEON_SERVICE_ERR_STATE : EndIf
+    avsEpoch = avsEpoch + 1 : avsContext = avsEpoch
+    avsReady = 0 : avsFrame = 0 : avsFontCount = 0
+    avsEndFrames=0 : avsEndFailed=0 : avsEndWorstFrame=0 : avsEndWorstRc=0
+    For profileIndex=0 To 5 : avsEndTotal[profileIndex]=0 : avsEndWorst[profileIndex]=0 : Next
+    avsParticleReady=0 : avsParticleCount=0
+    avsPreviousFont=AnvilTrueTypeSlotSelected()
+    avsPreviousFontGeneration=AnvilTrueTypeSlotGeneration(avsPreviousFont)
+    *surface = request
+    *surface\bytes = SizeOf(NeonServiceSurface) : *surface\logicalW = 0 : *surface\logicalH = 0
+    *surface\flags = 0 : *surface\maxFonts = 0
+    rc=NeonVkTargetsOpen(avsContext)
+    If rc=0 : rc=VulkanConsoleStart() : EndIf
+    ConNoRenderer() : *gBannerGpuInvalidate = 0
+    If rc = 0 : rc = NeonVkPortCanvas(avcLogicalW, avcLogicalH, avcLogicalW, avcLogicalH) : EndIf
+    If rc = 0
+      avsReady = 1 : avsError = 0
+      *surface\logicalW = avcLogicalW : *surface\logicalH = avcLogicalH
+      *surface\flags = #NEON_SERVICE_VULKAN | #NEON_SERVICE_FONT_REFS | #NEON_SERVICE_SPRITES | #NEON_SERVICE_FONT_BYTES | #NEON_SERVICE_PARTICLES | #NEON_SERVICE_MAPPING | #NEON_SERVICE_FONT_SPACING | #NEON_SERVICE_FONT_SNAP | #NEON_SERVICE_FONT_CONTROLS | #NEON_SERVICE_FONT_DERIVE | #NEON_SERVICE_TARGETS | #NEON_SERVICE_TARGET_CONTINUATION | #NEON_SERVICE_TARGET_LOAD | #NEON_SERVICE_TARGET_RETRO | #NEON_SERVICE_FONT_CARETS | #NEON_SERVICE_ROLE_CARETS : *surface\maxFonts = 32
+    Else
+      avsError = rc
+    EndIf
+    ; Even failed startup returns ownership: invalid surface forces checked
+    ; Close in the client. A refused Close must retain this context.
+    ProcedureReturn avsContext
+  EndIf
+  If context = 0 Or context <> avsContext : ProcedureReturn #NEON_SERVICE_ERR_STATE : EndIf
+  If op = #NEON_SERVICE_CLOSE
+    If avsRecord(request, bytes, 0) = 0 : ProcedureReturn #NEON_SERVICE_ERR_ARGS : EndIf
+    ProcedureReturn avsClose()
+  EndIf
+  If op = #NEON_SERVICE_ERROR
+    If avsRecord(request, bytes, 0) = 0 : ProcedureReturn #NEON_SERVICE_ERR_ARGS : EndIf
+    ProcedureReturn avsError
+  EndIf
+  If avsReady = 0 : ProcedureReturn #NEON_SERVICE_ERR_STATE : EndIf
+  If (op>=#NEON_SERVICE_TARGET_CREATE And op<=#NEON_SERVICE_TARGET_LIMITS) Or op=#NEON_SERVICE_TARGET_RETRO_PREPARE Or op=#NEON_SERVICE_TARGET_RETRO_DRAW
+    If (op=#NEON_SERVICE_TARGET_BIND Or op=#NEON_SERVICE_TARGET_UNBIND) And avsBatch<>0 : ProcedureReturn #NEON_SERVICE_ERR_STATE : EndIf
+    parentFrame=NeonVkTargetsParentFrame()
+    rc=NeonVkTargetsDispatch(op,context,request,bytes,avsFrame)
+    If rc=0 And op=#NEON_SERVICE_TARGET_BIND : avsFrame=0 : EndIf
+    If rc=0 And op=#NEON_SERVICE_TARGET_UNBIND : avsFrame=parentFrame : EndIf
+    If op=#NEON_SERVICE_TARGET_BIND Or op=#NEON_SERVICE_TARGET_UNBIND : avsParticleReady=0 : EndIf
+    If rc<0 And NeonVkTargetsFailed()<>0 : avsReady=0 : EndIf
+    If op=#NEON_SERVICE_TARGET_CREATE And rc>0 : avsError=0 : ProcedureReturn rc : EndIf
+    If rc>0 : rc=#NEON_SERVICE_ERR_PROVIDER : EndIf
+    avsError=rc : ProcedureReturn rc
+  EndIf
+  If op>=#NEON_SERVICE_FONT_CARET_POINT And op<=#NEON_SERVICE_FONT_TEXT_COLUMN
+    If avsFrame=2 : ProcedureReturn #NEON_SERVICE_ERR_STATE : EndIf
+    If avsRecord(request,bytes,SizeOf(NeonServiceFontCaretRequest))=0 Or NeonByteSpan(request,bytes)=0 : ProcedureReturn #NEON_SERVICE_ERR_ARGS : EndIf
+    If InPayload(request,request+bytes-1)=0 : ProcedureReturn #NEON_SERVICE_ERR_ARGS : EndIf
+    *caret=request : index=avsFontIndex(*caret\font)
+    If index<0 : ProcedureReturn #NEON_SERVICE_ERR_STALE : EndIf
+    If *caret\textBytes<1 Or *caret\textBytes>4096 Or NeonByteSpan(*caret\text,*caret\textBytes)=0 : ProcedureReturn #NEON_SERVICE_ERR_ARGS : EndIf
+    If InPayload(*caret\text,*caret\text+*caret\textBytes-1)=0 : ProcedureReturn #NEON_SERVICE_ERR_ARGS : EndIf
+    If index=0
+      rc=NeonVkServiceCaret(op,0,*caret,bytes)
+    Else
+      rc=NeonVkServiceCaret(op,@avsFont[index-1],*caret,bytes)
+    EndIf
+    If rc>0 : rc=#NEON_SERVICE_ERR_PROVIDER : EndIf
+    avsError=rc : ProcedureReturn rc
+  EndIf
+  If op=#NEON_SERVICE_FONT_DERIVE_CREATE
+    If avsFrame<>0 : ProcedureReturn #NEON_SERVICE_ERR_STATE : EndIf
+    If avsRecord(request,bytes,SizeOf(NeonServiceFontDeriveRequest))=0 : ProcedureReturn #NEON_SERVICE_ERR_ARGS : EndIf
+    *derive=request : index=avsFontIndex(*derive\font)
+    If index<1 Or *derive\role<0 Or *derive\role>3 Or *derive\pixels<1 Or *derive\pixels>512 : ProcedureReturn #NEON_SERVICE_ERR_ARGS : EndIf
+    If avsFontCount>=32 : ProcedureReturn #NEON_SERVICE_ERR_CAPACITY : EndIf
+    rc=NeonVkPortFontDerive(@avsFont[avsFontCount],@avsFont[index-1],*derive\role,*derive\pixels)
+    If rc<>0 : avsError=rc : ProcedureReturn rc : EndIf
+    avsFontCount=avsFontCount+1 : avsError=0
+    ProcedureReturn (avsContext << 16) | avsFontCount
+  EndIf
+  If op=#NEON_SERVICE_FONT_CONTROLS_SET
+    If avsFrame<>0 : ProcedureReturn #NEON_SERVICE_ERR_STATE : EndIf
+    If avsRecord(request,bytes,SizeOf(NeonServiceFontControlsRequest))=0 : ProcedureReturn #NEON_SERVICE_ERR_ARGS : EndIf
+    *controls=request : index=avsFontIndex(*controls\font)
+    If index<1 Or *controls\mode<0 Or *controls\mode>2 : ProcedureReturn #NEON_SERVICE_ERR_ARGS : EndIf
+    rc=NeonVkPortFontSetControlMode(@avsFont[index-1],*controls\mode)
+    If rc>0 : rc=#NEON_SERVICE_ERR_PROVIDER : EndIf
+    avsError=rc : ProcedureReturn rc
+  EndIf
+  If op=#NEON_SERVICE_FONT_SNAP_SET
+    If avsFrame<>0 : ProcedureReturn #NEON_SERVICE_ERR_STATE : EndIf
+    If avsRecord(request,bytes,SizeOf(NeonServiceFontSnapRequest))=0 : ProcedureReturn #NEON_SERVICE_ERR_ARGS : EndIf
+    *snap=request : index=avsFontIndex(*snap\font)
+    If index<1 Or *snap\enabled<0 Or *snap\enabled>1 : ProcedureReturn #NEON_SERVICE_ERR_ARGS : EndIf
+    rc=NeonVkPortFontSetSnapToPixel(@avsFont[index-1],*snap\enabled)
+    If rc>0 : rc=#NEON_SERVICE_ERR_PROVIDER : EndIf
+    avsError=rc : ProcedureReturn rc
+  EndIf
+  If op=#NEON_SERVICE_FONT_ADVANCE
+    If avsFrame<>0 : ProcedureReturn #NEON_SERVICE_ERR_STATE : EndIf
+    If avsRecord(request,bytes,SizeOf(NeonServiceFontAdvanceRequest))=0 : ProcedureReturn #NEON_SERVICE_ERR_ARGS : EndIf
+    *spacing=request : index=avsFontIndex(*spacing\font)
+    If index<1 Or *spacing\advanceQ16<0 Or *spacing\advanceQ16>536870912 : ProcedureReturn #NEON_SERVICE_ERR_ARGS : EndIf
+    rc=NeonVkPortFontSetFixedAdvanceQ16(@avsFont[index-1],*spacing\advanceQ16)
+    If rc>0 : rc=#NEON_SERVICE_ERR_PROVIDER : EndIf
+    avsError=rc : ProcedureReturn rc
+  EndIf
+  If op>=#NEON_SERVICE_CANVAS And op<=#NEON_SERVICE_STATIC_LINES
+    rc=avsMappingRequest(op,request,bytes)
+    If rc>0 : rc=#NEON_SERVICE_ERR_PROVIDER : EndIf
+    avsError=rc : ProcedureReturn rc
+  EndIf
+  If op=#NEON_SERVICE_PARTICLE_LIMITS
+    If avsRecord(request,bytes,SizeOf(NeonServiceParticleLimits))=0 : ProcedureReturn #NEON_SERVICE_ERR_ARGS : EndIf
+    *particleLimits=request : *particleLimits\maxCount=#NEON_SERVICE_MAX_PARTICLES
+    *particleLimits\recordBytes=#NEON_SERVICE_PARTICLE_RECORD_BYTES : *particleLimits\coordinateFractionBits=8
+    avsError=0 : ProcedureReturn 0
+  EndIf
+  If op=#NEON_SERVICE_PARTICLE_PREPARE
+    If avsFrame<>0 : ProcedureReturn #NEON_SERVICE_ERR_STATE : EndIf
+    avsParticleReady=0
+    If avsRecord(request,bytes,SizeOf(NeonServiceParticlePrepareRequest))=0 : ProcedureReturn #NEON_SERVICE_ERR_ARGS : EndIf
+    *particlePrepare=request
+    If *particlePrepare\count<0 Or *particlePrepare\count>#NEON_SERVICE_MAX_PARTICLES Or *particlePrepare\sourceBytes<0 : ProcedureReturn #NEON_SERVICE_ERR_ARGS : EndIf
+    needed=*particlePrepare\count*#NEON_SERVICE_PARTICLE_RECORD_BYTES
+    If *particlePrepare\sourceBytes<needed : ProcedureReturn #NEON_SERVICE_ERR_ARGS : EndIf
+    If needed>0
+      If *particlePrepare\data<1 Or (*particlePrepare\data & 3)<>0 Or *particlePrepare\data+needed-1<*particlePrepare\data : ProcedureReturn #NEON_SERVICE_ERR_ARGS : EndIf
+      If InPayload(*particlePrepare\data,*particlePrepare\data+needed-1)=0 : ProcedureReturn #NEON_SERVICE_ERR_ARGS : EndIf
+    EndIf
+    avsParticleCameraX=NeonVkPortCameraX() : avsParticleCameraY=NeonVkPortCameraY() : avsParticleCameraZoom=NeonVkPortCameraZoom()
+    rc=NeonVkChromeParticlesPrepareFloat32(*particlePrepare\data,*particlePrepare\count,avsParticleCameraX,avsParticleCameraY,avsParticleCameraZoom)
+    If rc=0 : avsParticleReady=1 : avsParticleCount=*particlePrepare\count : EndIf
+    avsError=rc : ProcedureReturn rc
+  EndIf
+  If op=#NEON_SERVICE_PARTICLE_DRAW
+    If avsFrame<>1 Or avsBatch<>0 Or avsParticleReady=0 : ProcedureReturn #NEON_SERVICE_ERR_STATE : EndIf
+    If avsRecord(request,bytes,0)=0 : ProcedureReturn #NEON_SERVICE_ERR_ARGS : EndIf
+    If NeonVkPortCameraX()<>avsParticleCameraX Or NeonVkPortCameraY()<>avsParticleCameraY Or NeonVkPortCameraZoom()<>avsParticleCameraZoom : ProcedureReturn #NEON_SERVICE_ERR_STATE : EndIf
+    rc=0
+    If avsParticleCount>0 : rc=NeonVkChromeParticlesDrawPrepared() : EndIf
+    avsError=rc : ProcedureReturn rc
+  EndIf
+  If op=#NEON_SERVICE_FONT_LOAD Or op=#NEON_SERVICE_FONT_UNLOAD
+    rc=avsFontBytesRequest(op,request,bytes)
+    If op=#NEON_SERVICE_FONT_LOAD And rc>0 : avsError=0 : ProcedureReturn rc : EndIf
+    If rc>0 : rc=#NEON_SERVICE_ERR_PROVIDER : EndIf
+    avsError=rc : ProcedureReturn rc
+  EndIf
+  If op>=#NEON_SERVICE_SPRITE_LIMITS And op<=#NEON_SERVICE_SPRITE_BATCH_END
+    rc=avsSpriteRequest(op,request,bytes)
+    If op=#NEON_SERVICE_SPRITE_UPLOAD And rc>0 : avsError=0 : ProcedureReturn rc : EndIf
+    If rc>0 : rc=#NEON_SERVICE_ERR_PROVIDER : EndIf
+    avsError=rc : ProcedureReturn rc
+  EndIf
+  If op = #NEON_SERVICE_WIDTH Or op = #NEON_SERVICE_HEIGHT Or op = #NEON_SERVICE_PREPARE
+    If avsFrame = 2 : ProcedureReturn #NEON_SERVICE_ERR_STATE : EndIf
+    If avsRecord(request, bytes, 16) = 0 : ProcedureReturn #NEON_SERVICE_ERR_ARGS : EndIf
+    *measure = request
+    index = avsFontIndex(*measure\font)
+    If index < 0 : ProcedureReturn #NEON_SERVICE_ERR_ARGS : EndIf
+    If op <> #NEON_SERVICE_PREPARE : ProcedureReturn avsMeasure(*measure\font, *measure\text, Bool(op = #NEON_SERVICE_HEIGHT)) : EndIf
+    If avsFrame <> 0 Or *measure\text = 0 : ProcedureReturn #NEON_SERVICE_ERR_STATE : EndIf
+    If index = 0
+      ; Raster cache keys use the face's pixel size, not its line-box spacing.
+      pixels = NeonVkChromeFontPixelHeight(*measure\font)
+      If pixels < 1 Or NeonVkChromeMeasureLineHeight(*measure\font) < 1 : ProcedureReturn #NEON_SERVICE_ERR_PROVIDER : EndIf
+      rc = NeonVkChromeWarmTrueTypeText(pixels, *measure\text)
+      If rc >= 0 : rc = 0 : EndIf
+    Else
+      rc = NeonVkPortFontWarm(@avsFont[index - 1], *measure\text)
+    EndIf
+    If rc > 0 : rc = #NEON_SERVICE_ERR_PROVIDER : EndIf
+    avsError = rc : ProcedureReturn rc
+  EndIf
+  Select op
+    Case #NEON_SERVICE_TARGET_BEGIN_LOAD
+      If avsFrame<>0 Or NeonVkTargetsBound()=0 : ProcedureReturn #NEON_SERVICE_ERR_STATE : EndIf
+      If avsRecord(request,bytes,0)=0 : ProcedureReturn #NEON_SERVICE_ERR_ARGS : EndIf
+      rc=NeonVkTargetsFrameBeginLoad()
+      If rc=0 : avsFrame=1 : EndIf
+    Case #NEON_SERVICE_BEGIN
+      If avsFrame <> 0 : ProcedureReturn #NEON_SERVICE_ERR_STATE : EndIf
+      If avsRecord(request, bytes, 16) = 0 Or avsFloats(request, 4) = 0 : ProcedureReturn #NEON_SERVICE_ERR_ARGS : EndIf
+      If NeonVkTargetsBound()<>0 : rc=NeonVkTargetsFrameBegin(request)
+      Else : rc=NeonVkChromeBegin(request) : EndIf
+      If rc = 0 : avsFrame = 1 : EndIf
+    Case #NEON_SERVICE_END
+      If avsFrame <> 1 : ProcedureReturn #NEON_SERVICE_ERR_STATE : EndIf
+      If avsBatch<>0 : ProcedureReturn #NEON_SERVICE_ERR_STATE : EndIf
+      If avsRecord(request, bytes, 0) = 0 : ProcedureReturn #NEON_SERVICE_ERR_ARGS : EndIf
+      If NeonVkTargetsBound()<>0
+        endStart=Ticks()
+        rc=NeonVkTargetsFrameEnd()
+        avcCopyDmaTicks=0 : avcCopyCleanTicks=0 : avcCopyPublishTicks=0
+        If rc=0 : avsFrame=0 : Else : avsFrame=2 : EndIf
+        avsEndProfile(endStart,Ticks(),rc)
+        avsError=rc : ProcedureReturn rc
+      EndIf
+      avsFrame = 2
+      avcCopyDmaTicks=0 : avcCopyCleanTicks=0 : avcCopyPublishTicks=0
+      endStart=Ticks()
+      rc = NeonVkChromeEnd()
+      endAfterGpu=Ticks()
+      If rc = 0
+        rc = #AVC_ERR_PRESENT
+        If NeonVkChromePresentValidate() = 1
+          avcDisplayCopyPending = DmaReady()
+          If avcCopyFullToDisplay() <> 0
+            avcDisplayCopyPending = 0
+            If NeonVkChromePresentConsume() = 1
+              rc = 0 : avsFrame = 0
+              If gScrSrc = #SCR_SRC_DSI : avcWsiPresentN = avcWsiPresentN + 1 : EndIf
+            EndIf
+          EndIf
+        EndIf
+      EndIf
+      avsEndProfile(endStart,endAfterGpu,rc)
+    Case #NEON_SERVICE_ABORT
+      If avsFrame = 0 : ProcedureReturn #NEON_SERVICE_ERR_STATE : EndIf
+      If avsRecord(request, bytes, 0) = 0 : ProcedureReturn #NEON_SERVICE_ERR_ARGS : EndIf
+      If NeonVkTargetsBound()<>0 : rc=NeonVkTargetsFrameAbort()
+      Else : rc=NeonVkChromeAbort() : EndIf
+      If rc = 0
+        NeonVkPortSpriteFrameRetired() : avsBatch=0 : avsFrame=0
+      Else
+        avsFrame=2
+      EndIf
+    Case #NEON_SERVICE_FONT_REGISTER
+      If avsFrame <> 0 : ProcedureReturn #NEON_SERVICE_ERR_STATE : EndIf
+      If avsRecord(request, bytes, 24) = 0 Or avsFontCount >= 32 : ProcedureReturn #NEON_SERVICE_ERR_ARGS : EndIf
+      *font = request
+      rc = NeonVkPortFontBind(@avsFont[avsFontCount], *font\slot, *font\role, *font\pixels)
+      If rc <> 0 : ProcedureReturn rc : EndIf
+      avsFontCount = avsFontCount + 1
+      ProcedureReturn (avsContext << 16) | avsFontCount
+    Case #NEON_SERVICE_BOX
+      If avsFrame <> 1 : ProcedureReturn #NEON_SERVICE_ERR_STATE : EndIf
+      If avsRecord(request, bytes, 32) = 0 Or avsFloats(request, 8) = 0 : ProcedureReturn #NEON_SERVICE_ERR_ARGS : EndIf
+      *box = request
+      rc = NeonVkPortBox(*box\x, *box\y, *box\w, *box\h, *box\r, *box\g, *box\b, *box\a, 1, 1)
+    Case #NEON_SERVICE_TEXT
+      If avsFrame <> 1 : ProcedureReturn #NEON_SERVICE_ERR_STATE : EndIf
+      If avsRecord(request, bytes, 40) = 0 : ProcedureReturn #NEON_SERVICE_ERR_ARGS : EndIf
+      If avsFloats(request + 8, 2) = 0 Or avsFloats(request + 24, 4) = 0 : ProcedureReturn #NEON_SERVICE_ERR_ARGS : EndIf
+      *text = request : index = avsFontIndex(*text\font)
+      If index < 0 Or *text\text = 0 : ProcedureReturn #NEON_SERVICE_ERR_ARGS : EndIf
+      If index = 0
+        rc = NeonVkPortText(*text\font, *text\x, *text\y, *text\text, *text\r, *text\g, *text\b, *text\a, 1, 1)
+      Else
+        rc = NeonVkPortFontText(@avsFont[index - 1], *text\x, *text\y, *text\text, *text\r, *text\g, *text\b, *text\a, 1, 1)
+      EndIf
+    Case #NEON_SERVICE_POLYGON
+      If avsFrame <> 1 : ProcedureReturn #NEON_SERVICE_ERR_STATE : EndIf
+      If avsRecord(request, bytes, 48) = 0 : ProcedureReturn #NEON_SERVICE_ERR_ARGS : EndIf
+      If avsFloats(request, 4) = 0 Or avsFloats(request + 24, 4) = 0 : ProcedureReturn #NEON_SERVICE_ERR_ARGS : EndIf
+      *polygon = request
+      rc = NeonVkPortPolygon(*polygon\x, *polygon\y, *polygon\rx, *polygon\ry, *polygon\sides, *polygon\r, *polygon\g, *polygon\b, *polygon\a, *polygon\solid, 1, 1)
+    Default
+      ProcedureReturn #NEON_SERVICE_ERR_ARGS
+  EndSelect
+  If rc > 0 : rc = #NEON_SERVICE_ERR_PROVIDER : EndIf
+  avsError = rc
+  ProcedureReturn rc
+EndProcedure
+
+; Registration installs callbacks only; it does not acquire a GPU or display.
+GraphicsServiceBind(@VulkanNeonServiceDispatch, @VulkanNeonServiceReset)
+
+Procedure avsEndProfileLine(worst.i,values.i)
+  If worst=0 : Print("  total ticks: ") : Else : Print("  worst ticks: ") : EndIf
+  Print("gpu ") : PrintDec(PeekI(values))
+  Print(", dma ") : PrintDec(PeekI(values+8))
+  Print(", clean ") : PrintDec(PeekI(values+16))
+  Print(", publish ") : PrintDec(PeekI(values+24))
+  Print(", other ") : PrintDec(PeekI(values+32))
+  Print(", end ") : PrintDec(PeekI(values+40)) : PrintNl()
+EndProcedure
+
 Procedure CmdVkStat()
   Define hz.i, span.i, busy.i, share.i
+  Print("  last Vulkan failure: stage ") : PrintDec(avcLastFailStage)
+  Print(", console ") : PrintDec(avcLastFailReason)
+  Print(", Chrome ") : PrintDec(avcLastFailChrome) : PrintNl()
+  If gScrSrc = #SCR_SRC_DSI
+    Print("  DSI frame-boundary presents since boot ") : PrintDec(gScrFramePresentN)
+    Print(", restores ") : PrintDec(gScrFrameRestoreN)
+    Print(", timeouts ") : PrintDec(gScrFrameTimeoutN) : PrintNl()
+  EndIf
+  Print("  completed private WSI source transactions since boot ") : PrintDec(avcWsiPresentN) : PrintNl()
+  Print("  public surface targets checked since boot ") : PrintDec(avcSurfaceQueryN) : PrintNl()
   hz = TickHz()
+  Print("Resident Neon End timings: frames ") : PrintDec(avsEndFrames)
+  Print(", failed ") : PrintDec(avsEndFailed) : Print(", tick Hz ") : PrintDec(hz) : PrintNl()
+  If avsEndFrames>0
+    avsEndProfileLine(0,@avsEndTotal[0])
+    Print("  worst End frame ") : PrintDec(avsEndWorstFrame)
+    Print(", result ") : PrintDec(avsEndWorstRc) : PrintNl()
+    avsEndProfileLine(1,@avsEndWorst[0])
+  EndIf
   span = Ticks() - avcStatSince
   If avcActive = 0
     PrintN("The Vulkan console is not the active renderer now (type screen vulkan).")

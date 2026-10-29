@@ -178,6 +178,10 @@ XIncludeFile "Anvil/Graphics/Vulkan/vk_foundation.pbi"
 #SpvOpFAdd = 129
 #SpvOpISub = 130
 #SpvOpFSub = 131
+#SpvOpFOrdLessThan = 184
+#SpvOpFOrdGreaterThan = 186
+#SpvOpLogicalOr = 166
+#SpvOpSelect = 169
 #SpvOpIMul = 132
 #SpvOpFMul = 133
 #SpvOpFDiv = 136
@@ -286,6 +290,7 @@ XIncludeFile "Anvil/Graphics/Vulkan/vk_foundation.pbi"
 #ANVIL_SPV_T_FUNCTION = 7
 #ANVIL_SPV_T_IMAGE = 8
 #ANVIL_SPV_T_SAMPLED_IMAGE = 9
+#ANVIL_SPV_T_BOOL = 10
 
 ; What an id is.
 #ANVIL_SPV_K_NONE = 0
@@ -312,6 +317,13 @@ XIncludeFile "Anvil/Graphics/Vulkan/vk_foundation.pbi"
 #ANVIL_SPV_V_IMAGE_SAMPLE = 9 ; OpImageSampleImplicitLod(sampled, input vec2)
 #ANVIL_SPV_V_FADD = 10
 #ANVIL_SPV_V_FMUL = 11
+#ANVIL_SPV_V_FSUB = 12
+#ANVIL_SPV_V_DOT = 13
+#ANVIL_SPV_V_SCALE = 14
+#ANVIL_SPV_V_SIN = 15
+#ANVIL_SPV_V_DISTANCE = 16
+#ANVIL_SPV_V_SMOOTHSTEP = 17
+#ANVIL_SPV_V_LOGICAL = 18
 
 ; A normalized record is produced by the validating declaration engine, not
 ; by a downstream re-parser. IDs and literals are kept in their semantic
@@ -534,6 +546,7 @@ Procedure.i avkSpvComponents(typeId.i)
   If avkSpvIdOk(typeId) = 0 : ProcedureReturn 0 : EndIf
   If spvTypeClass[typeId] = #ANVIL_SPV_T_FLOAT : ProcedureReturn 1 : EndIf
   If spvTypeClass[typeId] = #ANVIL_SPV_T_INT : ProcedureReturn 1 : EndIf
+  If spvTypeClass[typeId] = #ANVIL_SPV_T_BOOL : ProcedureReturn 1 : EndIf
   If spvTypeClass[typeId] = #ANVIL_SPV_T_VECTOR : ProcedureReturn spvTypeCount[typeId] : EndIf
   ProcedureReturn 0
 EndProcedure
@@ -591,7 +604,7 @@ Procedure.i avkSpvRefuseOpcode(op.i)
     ProcedureReturn avkSpvRefuse(op, "the SPIR-V front end refused OpTypeArray or OpTypeRuntimeArray (Anvil code -20005, unsupported instruction); there are no arrays in this slice, so gl_ClipDistance, an array of varyings and a storage-buffer array all fall outside it.")
   EndIf
   If op = #SpvOpTypeBool Or op = #SpvOpConstantTrue Or op = #SpvOpConstantFalse
-    ProcedureReturn avkSpvRefuse(op, "the SPIR-V front end refused a boolean opcode - OpTypeBool, OpConstantTrue or OpConstantFalse (Anvil code -20005, unsupported instruction); there are no conditions in an accepted shader, so a boolean has nothing to be used for.")
+    ProcedureReturn avkSpvRefuse(op, "the SPIR-V front end refused a boolean opcode - OpTypeBool, OpConstantTrue or OpConstantFalse (Anvil code -20005, unsupported instruction); the legacy plan path has no Boolean representation; use the typed IR path.")
   EndIf
   If op = #SpvOpUndef Or op = #SpvOpConstantNull
     ProcedureReturn avkSpvRefuse(op, "the SPIR-V front end refused OpUndef or OpConstantNull (Anvil code -20005, unsupported instruction); a value with no defined bits cannot be lowered into a shader whose whole contract is that the bytes it writes are the bytes the caller asked for.")
@@ -641,6 +654,82 @@ EndProcedure
 ;  `at` is the word index of the instruction's first word and `count` its
 ;  word count, both already validated by the caller.
 ; ----------------------------------------------------------------------
+Procedure.i avkSpvBoolLanes(typeId.i)
+  Protected lanes.i=1
+  If avkSpvIdOk(typeId)=0 : ProcedureReturn 0 : EndIf
+  If spvTypeClass[typeId]=#ANVIL_SPV_T_VECTOR
+    lanes=spvTypeCount[typeId] : typeId=spvTypeComp[typeId]
+    If lanes<2 Or lanes>4 Or avkSpvIdOk(typeId)=0 : ProcedureReturn 0 : EndIf
+  EndIf
+  If spvKind[typeId]<>#ANVIL_SPV_K_TYPE Or spvTypeClass[typeId]<>#ANVIL_SPV_T_BOOL : ProcedureReturn 0 : EndIf
+  ProcedureReturn lanes
+EndProcedure
+
+Procedure.i avkSpvLogicalOp(op.i)
+  ProcedureReturn Bool(op=#SpvOpFOrdLessThan Or op=#SpvOpFOrdGreaterThan Or op=#SpvOpLogicalOr Or op=#SpvOpSelect)
+EndProcedure
+
+; Validate before retaining: no out-of-instruction reads, no undeclared types,
+; and no use of a future value. Boolean storage representation belongs below IR.
+Procedure.i avkSpvLogicalDecl(*words,at.i,count.i,op.i)
+  Protected id.i,t.i,a.i,b.i,c.i,k.i,arity.i=2,lanes.i,conditionLanes.i,component.i
+  If op=#SpvOpTypeBool
+    If count<>2 : ProcedureReturn avkSpvMalformed("OpTypeBool requires exactly two words (Anvil code -20001); no width operand is permitted.") : EndIf
+    id=avkSpvWord(*words,at+1)
+    If avkSpvIdOk(id)=0 : ProcedureReturn avkSpvMalformed("OpTypeBool result id is out of bounds (Anvil code -20001).") : EndIf
+    If spvKind[id]<>#ANVIL_SPV_K_NONE : ProcedureReturn avkSpvMalformed("OpTypeBool redefines an id (Anvil code -20001).") : EndIf
+    spvKind[id]=#ANVIL_SPV_K_TYPE : spvTypeClass[id]=#ANVIL_SPV_T_BOOL
+    ProcedureReturn #ANVIL_VK_OK
+  EndIf
+  If op=#SpvOpConstantTrue Or op=#SpvOpConstantFalse
+    If count<>3 : ProcedureReturn avkSpvMalformed("A Boolean constant requires exactly three words (Anvil code -20001); it has no literal payload.") : EndIf
+    t=avkSpvWord(*words,at+1) : id=avkSpvWord(*words,at+2)
+    If avkSpvIdOk(t)=0 Or avkSpvIdOk(id)=0 : ProcedureReturn avkSpvMalformed("A Boolean constant names an out-of-bounds id (Anvil code -20001).") : EndIf
+    If spvKind[id]<>#ANVIL_SPV_K_NONE : ProcedureReturn avkSpvMalformed("A Boolean constant redefines an id (Anvil code -20001).") : EndIf
+    If avkSpvBoolLanes(t)<>1 : ProcedureReturn avkSpvRefuse(op,"A Boolean constant requires a declared scalar Boolean type (Anvil code -20005).") : EndIf
+    spvKind[id]=#ANVIL_SPV_K_CONST : spvValueType[id]=t : spvValueSrc[id]=#ANVIL_SPV_V_CONST
+    spvConstWord[id]=Bool(op=#SpvOpConstantTrue)
+    ProcedureReturn #ANVIL_VK_OK
+  EndIf
+  If op=#SpvOpSelect : arity=3 : EndIf
+  If count<>3+arity : ProcedureReturn avkSpvMalformed("A logical instruction has the wrong operand count (Anvil code -20001); binary operations take two values and selection takes three.") : EndIf
+  t=avkSpvWord(*words,at+1) : id=avkSpvWord(*words,at+2)
+  If avkSpvIdOk(t)=0 Or avkSpvIdOk(id)=0 : ProcedureReturn avkSpvMalformed("A logical result or type id is out of bounds (Anvil code -20001).") : EndIf
+  If spvKind[t]<>#ANVIL_SPV_K_TYPE Or spvKind[id]<>#ANVIL_SPV_K_NONE : ProcedureReturn avkSpvMalformed("A logical instruction redefines an id or names an undeclared type (Anvil code -20001).") : EndIf
+  For k=0 To arity-1
+    a=avkSpvWord(*words,at+3+k)
+    If avkSpvIdOk(a)=0 : ProcedureReturn avkSpvMalformed("A logical operand id is out of bounds (Anvil code -20001).") : EndIf
+    If spvKind[a]<>#ANVIL_SPV_K_CONST And spvKind[a]<>#ANVIL_SPV_K_VALUE
+      ProcedureReturn avkSpvMalformed("A logical operand is not a value defined before its use (Anvil code -20001).")
+    EndIf
+  Next
+  a=avkSpvWord(*words,at+3) : b=avkSpvWord(*words,at+4)
+  If op=#SpvOpSelect
+    c=avkSpvWord(*words,at+5) : lanes=avkSpvComponents(t)
+    conditionLanes=avkSpvBoolLanes(spvValueType[a])
+    component=t
+    If spvTypeClass[t]=#ANVIL_SPV_T_VECTOR : component=spvTypeComp[t] : EndIf
+    If avkSpvIdOk(component)=0 : ProcedureReturn avkSpvRefuseOpcode(op) : EndIf
+    If spvTypeClass[component]<>#ANVIL_SPV_T_FLOAT And spvTypeClass[component]<>#ANVIL_SPV_T_INT And spvTypeClass[component]<>#ANVIL_SPV_T_BOOL
+      ProcedureReturn avkSpvRefuse(op,"Selection currently represents scalar and vector numeric or Boolean values (Anvil code -20005); pointers and aggregates need additional IR support.")
+    EndIf
+    If lanes<1 Or lanes>4 Or conditionLanes<1 Or spvValueType[b]<>t Or spvValueType[c]<>t : ProcedureReturn avkSpvRefuseOpcode(op) : EndIf
+    If conditionLanes<>lanes
+      If conditionLanes<>1 Or spvVersion<$00010400 : ProcedureReturn avkSpvRefuse(op,"Selection condition width does not match its result (Anvil code -20005); scalar selection of a whole vector requires SPIR-V 1.4.") : EndIf
+    EndIf
+  ElseIf op=#SpvOpLogicalOr
+    If avkSpvBoolLanes(t)<1 Or spvValueType[a]<>t Or spvValueType[b]<>t : ProcedureReturn avkSpvRefuse(op,"Logical OR requires matching Boolean operand and result types (Anvil code -20005).") : EndIf
+  Else
+    lanes=avkSpvBoolLanes(t)
+    If lanes<1 Or avkSpvIsFloatish(spvValueType[a])=0 Or spvValueType[a]<>spvValueType[b] Or avkSpvComponents(spvValueType[a])<>lanes
+      ProcedureReturn avkSpvRefuse(op,"Ordered comparison requires matching binary32 operands and a Boolean result of the same shape (Anvil code -20005).")
+    EndIf
+  EndIf
+  spvKind[id]=#ANVIL_SPV_K_VALUE : spvValueType[id]=t
+  spvValueSrc[id]=#ANVIL_SPV_V_LOGICAL : spvValueA[id]=a : spvValueB[id]=b
+  ProcedureReturn #ANVIL_VK_OK
+EndProcedure
+
 Procedure.i avkSpvDecl(*words, at.i, count.i, op.i, irMode.i)
   Define id.i
   Define a.i
@@ -649,6 +738,10 @@ Procedure.i avkSpvDecl(*words, at.i, count.i, op.i, irMode.i)
   Define n.i
   Define base.i
 
+  If op=#SpvOpTypeBool Or op=#SpvOpConstantTrue Or op=#SpvOpConstantFalse Or avkSpvLogicalOp(op)
+    If irMode=0 : ProcedureReturn avkSpvRefuseOpcode(op) : EndIf
+    ProcedureReturn avkSpvLogicalDecl(*words,at,count,op)
+  EndIf
   Select op
     ; --- modes, and the debug instructions that carry no meaning here ---
     Case #SpvOpNop
@@ -688,6 +781,13 @@ Procedure.i avkSpvDecl(*words, at.i, count.i, op.i, irMode.i)
       id = avkSpvWord(*words, at + 1)
       If avkSpvIdOk(id) = 0
         ProcedureReturn avkSpvMalformed("a SPIR-V OpExtInstImport declared a result id outside the module's own bound (Anvil code -20001, malformed module); every result id must be at least one and less than the bound in the header.")
+      EndIf
+      spvValueA[id] = 0
+      ; Exact terminated GLSL.std.450 spelling, including zero padding.
+      If count = 6
+        If avkSpvWord(*words,at+2)=$4C534C47 And avkSpvWord(*words,at+3)=$6474732E And avkSpvWord(*words,at+4)=$3035342E And avkSpvWord(*words,at+5)=0
+          spvValueA[id] = 450
+        EndIf
       EndIf
       spvKind[id] = #ANVIL_SPV_K_EXTSET
       ProcedureReturn #ANVIL_VK_OK
@@ -1190,8 +1290,11 @@ Procedure.i avkSpvDecl(*words, at.i, count.i, op.i, irMode.i)
       If spvValueSrc[b] <> #ANVIL_SPV_V_SAMPLED Or spvValueA[b] <> spvSampleVar
         ProcedureReturn avkSpvRefuse(op, "the SPIR-V front end refused OpImageSampleImplicitLod whose sampled-image operand is not a load of the declared combined sampler (Anvil code -20005, unsupported sampled value); separate image/sampler composition is not implemented.")
       EndIf
-      If spvValueSrc[k] <> #ANVIL_SPV_V_INPUT Or avkSpvIsFloatish(spvValueType[k]) = 0 Or avkSpvComponents(spvValueType[k]) <> 2
-        ProcedureReturn avkSpvRefuse(op, "the SPIR-V front end refused OpImageSampleImplicitLod whose coordinate is not a whole load of one vec2 input (Anvil code -20005, unsupported texture coordinate); computed, projected and non-two-dimensional coordinates need arithmetic this tranche does not lower.")
+      If avkSpvIsFloatish(spvValueType[k]) = 0 Or avkSpvComponents(spvValueType[k]) <> 2
+        ProcedureReturn avkSpvRefuse(op, "the SPIR-V front end refused a sample coordinate that is not binary32 vec2 (Anvil code -20005, unsupported texture coordinate); projected and non-two-dimensional coordinates are not represented.")
+      EndIf
+      If irMode = 0 And spvValueSrc[k] <> #ANVIL_SPV_V_INPUT
+        ProcedureReturn avkSpvRefuse(op, "the legacy SPIR-V plan requires a directly loaded vec2 coordinate (Anvil code -20005); computed coordinates require the retained typed-IR path.")
       EndIf
       spvKind[id] = #ANVIL_SPV_K_VALUE
       spvValueType[id] = a
@@ -1218,6 +1321,130 @@ Procedure.i avkSpvDecl(*words, at.i, count.i, op.i, irMode.i)
       spvKind[id]=#ANVIL_SPV_K_VALUE
       spvValueType[id]=a
       spvValueSrc[id]=#ANVIL_SPV_V_FADD
+      spvValueA[id]=b
+      spvValueB[id]=k
+      ProcedureReturn #ANVIL_VK_OK
+
+    Case #SpvOpFSub
+      If irMode = 0 : ProcedureReturn avkSpvRefuseOpcode(op) : EndIf
+      a = avkSpvWord(*words, at + 1)
+      id = avkSpvWord(*words, at + 2)
+      b = avkSpvWord(*words, at + 3)
+      k = avkSpvWord(*words, at + 4)
+      If count <> 5 Or avkSpvIdOk(id) = 0 Or avkSpvIdOk(a) = 0 Or avkSpvIdOk(b) = 0 Or avkSpvIdOk(k) = 0
+        ProcedureReturn avkSpvMalformed("a SPIR-V OpFSub named an invalid result type, result id or operand id (Anvil code -20001, malformed arithmetic); all five words and every id are required.")
+      EndIf
+      If spvKind[id] <> #ANVIL_SPV_K_NONE Or (spvKind[b] <> #ANVIL_SPV_K_VALUE And spvKind[b] <> #ANVIL_SPV_K_CONST) Or (spvKind[k] <> #ANVIL_SPV_K_VALUE And spvKind[k] <> #ANVIL_SPV_K_CONST)
+        ProcedureReturn avkSpvMalformed("a SPIR-V OpFSub redefined an id or used an operand not defined earlier in its block (Anvil code -20001, malformed arithmetic); SSA definitions must dominate every use.")
+      EndIf
+      If avkSpvIsFloatish(a) = 0 Or avkSpvComponents(a) < 1 Or avkSpvComponents(a) > 4 Or spvValueType[b] <> a Or spvValueType[k] <> a
+        ProcedureReturn avkSpvRefuse(op, "the SPIR-V IR walk refused OpFSub whose result and operands are not the same binary32 scalar or vec2, vec3 or vec4 type (Anvil code -20005, unsupported arithmetic type); mixed widths and conversions are not implicit.")
+      EndIf
+      spvKind[id]=#ANVIL_SPV_K_VALUE
+      spvValueType[id]=a
+      spvValueSrc[id]=#ANVIL_SPV_V_FSUB
+      spvValueA[id]=b
+      spvValueB[id]=k
+      ProcedureReturn #ANVIL_VK_OK
+
+    Case #SpvOpExtInst
+      If irMode=0 : ProcedureReturn avkSpvRefuseOpcode(op) : EndIf
+      If count<6 Or count>8
+        ProcedureReturn avkSpvMalformed("a SPIR-V extended call has the wrong word count (Anvil code -20001); check the arity of Sin, Distance or SmoothStep.")
+      EndIf
+      a=avkSpvWord(*words,at+1) : id=avkSpvWord(*words,at+2)
+      k=avkSpvWord(*words,at+3) : b=avkSpvWord(*words,at+5)
+      If avkSpvIdOk(a)=0 Or avkSpvIdOk(id)=0 Or avkSpvIdOk(k)=0 Or avkSpvIdOk(b)=0
+        ProcedureReturn avkSpvMalformed("a SPIR-V extended call names an invalid id (Anvil code -20001); check the result type, result, import and operand ids against the module bound.")
+      EndIf
+      If spvKind[k]<>#ANVIL_SPV_K_EXTSET Or spvValueA[k]<>450
+        ProcedureReturn avkSpvRefuse(op,"the extended instruction set is unsupported (Anvil code -20005); this path requires the exact GLSL.std.450 import.")
+      EndIf
+      If spvKind[id]<>#ANVIL_SPV_K_NONE Or (spvKind[b]<>#ANVIL_SPV_K_VALUE And spvKind[b]<>#ANVIL_SPV_K_CONST)
+        ProcedureReturn avkSpvMalformed("an extended call redefines an id or reads an undefined value (Anvil code -20001); its operands must be defined before the call.")
+      EndIf
+      If avkSpvWord(*words,at+4)=13
+        If count<>6 : ProcedureReturn avkSpvMalformed("GLSL Sin has invalid arity (Anvil code -20001); supply one argument.") : EndIf
+        If avkSpvIsFloatish(a)=0 Or spvValueType[b]<>a
+          ProcedureReturn avkSpvRefuse(op,"GLSL Sin has mismatched types (Anvil code -20005); the result and argument must have the same binary32 scalar or vector type.")
+        EndIf
+        spvValueSrc[id]=#ANVIL_SPV_V_SIN
+      ElseIf avkSpvWord(*words,at+4)=49
+        If count<>8 : ProcedureReturn avkSpvMalformed("GLSL SmoothStep has invalid arity (Anvil code -20001); supply edge0, edge1 and x.") : EndIf
+        If avkSpvIsFloatish(a)=0 Or spvValueType[b]<>a
+          ProcedureReturn avkSpvRefuse(op,"GLSL SmoothStep has incompatible types (Anvil code -20005); all three operands and the result must share a binary32 scalar or vector type.")
+        EndIf
+        For n=6 To 7
+          k=avkSpvWord(*words,at+n)
+          If avkSpvIdOk(k)=0 : ProcedureReturn avkSpvMalformed("GLSL SmoothStep names an invalid argument (Anvil code -20001); check its id against the module bound.") : EndIf
+          If spvKind[k]<>#ANVIL_SPV_K_VALUE And spvKind[k]<>#ANVIL_SPV_K_CONST
+            ProcedureReturn avkSpvMalformed("GLSL SmoothStep reads an undefined argument (Anvil code -20001); define it before the call.")
+          EndIf
+          If spvValueType[k]<>a : ProcedureReturn avkSpvRefuseOpcode(op) : EndIf
+        Next
+        spvValueSrc[id]=#ANVIL_SPV_V_SMOOTHSTEP
+      ElseIf avkSpvWord(*words,at+4)=67
+        If count<>7 : ProcedureReturn avkSpvMalformed("GLSL Distance has invalid arity (Anvil code -20001); supply two arguments.") : EndIf
+        k=avkSpvWord(*words,at+6)
+        If avkSpvIdOk(k)=0 : ProcedureReturn avkSpvMalformed("GLSL Distance names an invalid second argument (Anvil code -20001); check its id against the module bound.") : EndIf
+        If spvKind[k]<>#ANVIL_SPV_K_VALUE And spvKind[k]<>#ANVIL_SPV_K_CONST
+          ProcedureReturn avkSpvMalformed("GLSL Distance reads an undefined second argument (Anvil code -20001); define it before the call.")
+        EndIf
+        If avkSpvIsFloatish(spvValueType[b])=0 Or spvValueType[b]<>spvValueType[k] Or avkSpvIsFloatish(a)=0 Or avkSpvComponents(a)<>1
+          ProcedureReturn avkSpvRefuse(op,"GLSL Distance has incompatible types (Anvil code -20005); use matching binary32 operands and a scalar component result.")
+        EndIf
+        If avkSpvComponents(spvValueType[b])=1
+          If spvValueType[b]<>a : ProcedureReturn avkSpvRefuseOpcode(op) : EndIf
+        Else
+          If spvTypeComp[spvValueType[b]]<>a : ProcedureReturn avkSpvRefuseOpcode(op) : EndIf
+        EndIf
+        spvValueSrc[id]=#ANVIL_SPV_V_DISTANCE : spvValueB[id]=k
+      Else
+        ProcedureReturn avkSpvRefuse(op,"the GLSL extended opcode is unsupported (Anvil code -20005); this path implements Sin, Distance and SmoothStep.")
+      EndIf
+      spvKind[id]=#ANVIL_SPV_K_VALUE : spvValueType[id]=a : spvValueA[id]=b
+      ProcedureReturn #ANVIL_VK_OK
+
+    Case #SpvOpDot
+      If irMode = 0 : ProcedureReturn avkSpvRefuseOpcode(op) : EndIf
+      a = avkSpvWord(*words, at + 1)
+      id = avkSpvWord(*words, at + 2)
+      b = avkSpvWord(*words, at + 3)
+      k = avkSpvWord(*words, at + 4)
+      If count <> 5 Or avkSpvIdOk(id) = 0 Or avkSpvIdOk(a) = 0 Or avkSpvIdOk(b) = 0 Or avkSpvIdOk(k) = 0
+        ProcedureReturn avkSpvMalformed("a SPIR-V OpDot named an invalid result type, result id or operand id (Anvil code -20001, malformed arithmetic); all five words and every id are required.")
+      EndIf
+      If spvKind[id] <> #ANVIL_SPV_K_NONE Or (spvKind[b] <> #ANVIL_SPV_K_VALUE And spvKind[b] <> #ANVIL_SPV_K_CONST) Or (spvKind[k] <> #ANVIL_SPV_K_VALUE And spvKind[k] <> #ANVIL_SPV_K_CONST)
+        ProcedureReturn avkSpvMalformed("a SPIR-V OpDot redefined an id or used an operand not defined earlier in its block (Anvil code -20001, malformed arithmetic); SSA definitions must dominate every use.")
+      EndIf
+      If avkSpvIsFloatish(a) = 0 Or avkSpvComponents(a) <> 1 Or avkSpvIsFloatish(spvValueType[b]) = 0 Or avkSpvComponents(spvValueType[b]) < 2 Or avkSpvComponents(spvValueType[b]) > 4 Or spvValueType[b] <> spvValueType[k] Or spvTypeComp[spvValueType[b]] <> a
+        ProcedureReturn avkSpvRefuse(op, "the SPIR-V IR walk refused OpDot whose operands are not matching binary32 vec2, vec3 or vec4 values with their scalar component result type (Anvil code -20005, unsupported arithmetic type); mixed widths and conversions are not implicit.")
+      EndIf
+      spvKind[id]=#ANVIL_SPV_K_VALUE
+      spvValueType[id]=a
+      spvValueSrc[id]=#ANVIL_SPV_V_DOT
+      spvValueA[id]=b
+      spvValueB[id]=k
+      ProcedureReturn #ANVIL_VK_OK
+
+    Case #SpvOpVectorTimesScalar
+      If irMode = 0 : ProcedureReturn avkSpvRefuseOpcode(op) : EndIf
+      a = avkSpvWord(*words, at + 1)
+      id = avkSpvWord(*words, at + 2)
+      b = avkSpvWord(*words, at + 3)
+      k = avkSpvWord(*words, at + 4)
+      If count <> 5 Or avkSpvIdOk(id) = 0 Or avkSpvIdOk(a) = 0 Or avkSpvIdOk(b) = 0 Or avkSpvIdOk(k) = 0
+        ProcedureReturn avkSpvMalformed("a SPIR-V OpVectorTimesScalar named an invalid result type, result id or operand id (Anvil code -20001, malformed arithmetic); all five words and every id are required.")
+      EndIf
+      If spvKind[id] <> #ANVIL_SPV_K_NONE Or (spvKind[b] <> #ANVIL_SPV_K_VALUE And spvKind[b] <> #ANVIL_SPV_K_CONST) Or (spvKind[k] <> #ANVIL_SPV_K_VALUE And spvKind[k] <> #ANVIL_SPV_K_CONST)
+        ProcedureReturn avkSpvMalformed("a SPIR-V OpVectorTimesScalar redefined an id or used an operand not defined earlier in its block (Anvil code -20001, malformed arithmetic); SSA definitions must dominate every use.")
+      EndIf
+      If avkSpvIsFloatish(a) = 0 Or avkSpvComponents(a) < 2 Or avkSpvComponents(a) > 4 Or spvValueType[b] <> a Or spvValueType[k] <> spvTypeComp[a]
+        ProcedureReturn avkSpvRefuse(op, "the SPIR-V IR walk refused OpVectorTimesScalar whose vector operand and result are not the same binary32 vec2, vec3 or vec4 type with a matching scalar multiplier (Anvil code -20005, unsupported arithmetic type); mixed widths and conversions are not implicit.")
+      EndIf
+      spvKind[id]=#ANVIL_SPV_K_VALUE
+      spvValueType[id]=a
+      spvValueSrc[id]=#ANVIL_SPV_V_SCALE
       spvValueA[id]=b
       spvValueB[id]=k
       ProcedureReturn #ANVIL_VK_OK
@@ -1425,6 +1652,11 @@ Procedure.i avkSpvVertexScalarGraph(x.i, y.i)
         EndIf
         If firstAttr < 0 : firstAttr = attr : EndIf
       Case #ANVIL_SPV_V_FADD
+        sawArithmetic = 1
+        If sp > 509 : ProcedureReturn -1 : EndIf
+        pending[sp] = spvValueA[id] : sp = sp + 1
+        pending[sp] = spvValueB[id] : sp = sp + 1
+      Case #ANVIL_SPV_V_FSUB
         sawArithmetic = 1
         If sp > 509 : ProcedureReturn -1 : EndIf
         pending[sp] = spvValueA[id] : sp = sp + 1
@@ -1743,7 +1975,7 @@ Procedure.i avkSpvWalk(*code, bytes.i, irMode.i)
       If op = #SpvOpLabel And (inFunction = 0 Or inBlock <> 0)
         ProcedureReturn avkSpvRefuse(op, "the SPIR-V IR walk refused a label outside the entry function or after its sole block began (Anvil code -20005, unsupported block order); exactly one entry block is representable.")
       EndIf
-      If (op = #SpvOpLoad Or op = #SpvOpStore Or op = #SpvOpAccessChain Or op = #SpvOpCompositeExtract Or op = #SpvOpCompositeConstruct Or op = #SpvOpImageSampleImplicitLod Or op = #SpvOpFAdd Or op = #SpvOpFMul Or op = #SpvOpReturn) And (inBlock = 0 Or blockReturned <> 0)
+      If (op = #SpvOpLoad Or op = #SpvOpStore Or op = #SpvOpAccessChain Or op = #SpvOpCompositeExtract Or op = #SpvOpCompositeConstruct Or op = #SpvOpImageSampleImplicitLod Or op = #SpvOpFAdd Or op = #SpvOpFSub Or op = #SpvOpFMul Or op = #SpvOpDot Or op = #SpvOpVectorTimesScalar Or op = #SpvOpExtInst Or avkSpvLogicalOp(op) Or op = #SpvOpReturn) And (inBlock = 0 Or blockReturned <> 0)
         ProcedureReturn avkSpvRefuse(op, "the SPIR-V IR walk refused an SSA operation outside the sole entry block or after its terminator (Anvil code -20005, unsupported instruction order); ordered operands must be defined in the block before use and OpReturn must end it.")
       EndIf
       If op = #SpvOpFunctionEnd And (inFunction = 0 Or inBlock = 0 Or blockReturned = 0)
@@ -2033,22 +2265,39 @@ Procedure.i avkSpvRetain(*words, at.i, count.i, op.i)
   If op = #SpvOpEntryPoint : section = #ANVIL_SPV_REC_ENTRY : EndIf
   If op = #SpvOpTypeVoid Or op = #SpvOpTypeInt Or op = #SpvOpTypeFloat Or op = #SpvOpTypeVector Or op = #SpvOpTypeImage Or op = #SpvOpTypeSampledImage Or op = #SpvOpTypeStruct Or op = #SpvOpTypePointer Or op = #SpvOpTypeFunction : section = #ANVIL_SPV_REC_TYPE : EndIf
   If op = #SpvOpConstant Or op = #SpvOpConstantComposite : section = #ANVIL_SPV_REC_CONSTANT : EndIf
+  If op=#SpvOpTypeBool : section=#ANVIL_SPV_REC_TYPE : EndIf
+  If op=#SpvOpConstantTrue Or op=#SpvOpConstantFalse : section=#ANVIL_SPV_REC_CONSTANT : EndIf
   If op = #SpvOpVariable : section = #ANVIL_SPV_REC_VARIABLE : EndIf
   If op = #SpvOpDecorate Or op = #SpvOpMemberDecorate : section = #ANVIL_SPV_REC_DECORATION : EndIf
   If op = #SpvOpFunction : section = #ANVIL_SPV_REC_FUNCTION : EndIf
   If op = #SpvOpLabel : section = #ANVIL_SPV_REC_BLOCK : EndIf
-  If op = #SpvOpLoad Or op = #SpvOpStore Or op = #SpvOpAccessChain Or op = #SpvOpCompositeExtract Or op = #SpvOpCompositeConstruct Or op = #SpvOpImageSampleImplicitLod Or op = #SpvOpFAdd Or op = #SpvOpFMul Or op = #SpvOpReturn : section = #ANVIL_SPV_REC_NODE : EndIf
+  If op = #SpvOpLoad Or op = #SpvOpStore Or op = #SpvOpAccessChain Or op = #SpvOpCompositeExtract Or op = #SpvOpCompositeConstruct Or op = #SpvOpImageSampleImplicitLod Or op = #SpvOpFAdd Or op = #SpvOpFSub Or op = #SpvOpFMul Or op = #SpvOpDot Or op = #SpvOpVectorTimesScalar Or op = #SpvOpExtInst Or avkSpvLogicalOp(op) Or op = #SpvOpReturn : section = #ANVIL_SPV_REC_NODE : EndIf
   If op = #SpvOpFunctionEnd : section = #ANVIL_SPV_REC_END : EndIf
   *r = avkSpvRecordStart(at, count, op, section)
   If *r = 0
     ProcedureReturn avkSpvMalformed("the accepted SPIR-V semantic record stream exceeded the module's own bounded word count (Anvil code -20001, internal bounds); no record was truncated or published.")
   EndIf
 
+  If op=#SpvOpTypeBool
+    *r\sourceId=avkSpvWord(*words,at+1)
+    ProcedureReturn #ANVIL_VK_OK
+  EndIf
+  If op=#SpvOpConstantTrue Or op=#SpvOpConstantFalse
+    *r\resultType=avkSpvWord(*words,at+1) : *r\sourceId=avkSpvWord(*words,at+2)
+    ProcedureReturn #ANVIL_VK_OK
+  EndIf
+  If avkSpvLogicalOp(op)
+    *r\resultType=avkSpvWord(*words,at+1) : *r\sourceId=avkSpvWord(*words,at+2)
+    *r\idCount=count-3 : *r\id0=avkSpvWord(*words,at+3) : *r\id1=avkSpvWord(*words,at+4)
+    If count=6 : *r\id2=avkSpvWord(*words,at+5) : EndIf
+    ProcedureReturn #ANVIL_VK_OK
+  EndIf
   Select op
     Case #SpvOpCapability
       *r\literalCount=1:*r\literal0=avkSpvWord(*words,at+1)
     Case #SpvOpExtInstImport
       *r\sourceId=avkSpvWord(*words,at+1)
+      *r\literalCount=1:*r\literal0=spvValueA[*r\sourceId]
     Case #SpvOpSource
       If count>1:*r\literalCount=1:*r\literal0=avkSpvWord(*words,at+1):EndIf
       If count>2:*r\literalCount=2:*r\literal1=avkSpvWord(*words,at+2):EndIf
@@ -2151,7 +2400,19 @@ Procedure.i avkSpvRetain(*words, at.i, count.i, op.i)
       *r\resultType=avkSpvWord(*words,at+1):*r\sourceId=avkSpvWord(*words,at+2):*r\idCount=2:*r\id0=avkSpvWord(*words,at+3):*r\id1=avkSpvWord(*words,at+4)
     Case #SpvOpFAdd
       *r\resultType=avkSpvWord(*words,at+1):*r\sourceId=avkSpvWord(*words,at+2):*r\idCount=2:*r\id0=avkSpvWord(*words,at+3):*r\id1=avkSpvWord(*words,at+4)
+    Case #SpvOpFSub
+      *r\resultType=avkSpvWord(*words,at+1):*r\sourceId=avkSpvWord(*words,at+2):*r\idCount=2:*r\id0=avkSpvWord(*words,at+3):*r\id1=avkSpvWord(*words,at+4)
     Case #SpvOpFMul
+      *r\resultType=avkSpvWord(*words,at+1):*r\sourceId=avkSpvWord(*words,at+2):*r\idCount=2:*r\id0=avkSpvWord(*words,at+3):*r\id1=avkSpvWord(*words,at+4)
+    Case #SpvOpExtInst
+      *r\resultType=avkSpvWord(*words,at+1):*r\sourceId=avkSpvWord(*words,at+2)
+      *r\idCount=count-4:*r\id0=avkSpvWord(*words,at+3):*r\id1=avkSpvWord(*words,at+5)
+      If count>=7 : *r\id2=avkSpvWord(*words,at+6) : EndIf
+      If count=8 : *r\id3=avkSpvWord(*words,at+7) : EndIf
+      *r\literalCount=1:*r\literal0=avkSpvWord(*words,at+4)
+    Case #SpvOpDot
+      *r\resultType=avkSpvWord(*words,at+1):*r\sourceId=avkSpvWord(*words,at+2):*r\idCount=2:*r\id0=avkSpvWord(*words,at+3):*r\id1=avkSpvWord(*words,at+4)
+    Case #SpvOpVectorTimesScalar
       *r\resultType=avkSpvWord(*words,at+1):*r\sourceId=avkSpvWord(*words,at+2):*r\idCount=2:*r\id0=avkSpvWord(*words,at+3):*r\id1=avkSpvWord(*words,at+4)
   EndSelect
   ProcedureReturn #ANVIL_VK_OK

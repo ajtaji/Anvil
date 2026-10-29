@@ -510,7 +510,8 @@ smaller. Every tool that reads through it gets the fix.
 | `tools/board_core_status_check.py` | Negative secondary-core errors are parsed, and a latched fault or malformed status refuses further model work before asset writes and rejects a nominal primary return after a worker failure. Host only; no board commands. |
 | `tools/anvil_readback_burst_check.py` | a whole `readback` reply sent before a byte of it is read, over real loopback sockets: 1 MiB into the default receive buffer must be lost, and 2,382,400 bytes through `read_range` as shipped must arrive complete with no retry. |
 | `tools/board_run_parse_check.py` | `board_run.py`'s decoders against recorded `p` and `shot` streams, including four that must be refused. The live and kept streams must decode to the same pixels. |
-| `tools/board_run_exception_check.py` | the control flow around a processor exception and a trace readback: that nothing is transmitted after a fatal marker, that an incomplete record is still terminal, and that a bad argument does no console or output work at all. |
+| `tools/board_run_exception_check.py` | the control flow around a processor exception and a trace readback: a prompt-ended exception sends no further commands, an incomplete record is still terminal, and a bad argument does no console or output work at all. |
+| `tools/board_run_exception_boot_check.py` | a watchdog exception allows its expiry margin plus 90 seconds for boot before one fresh read-only version query; an observed prompt may finish earlier. Late prompts, absent watchdogs, failed queries and malformed identities never become passing payload results. |
 | `tools/board_run_outcome_check.py` | the long-silence fixes, against a scripted monitor behind a scripted stateful firewall and no board: with the keepalive the return line arrives and nothing is typed at the running payload; without it the line is lost and the board is asked; still running, returned with the line lost, reset by the deadman, stopped at an exception, never entered, and an old monitor with and without a moved capture each reported as itself; no output anywhere says "never returned". Five mutants must fail it, one per decision. |
 | `tools/runrecord_emitted_check.py` | the run record's own logic in `runrecord.pi4`, compiled and executed over seven scenarios, reading back every character `last run` prints; three mutants. A small fixture - the monitor's behaviour on silicon is a board run. |
 | `tools/board_run_refusal_check.py` | the three defects of 2026-09-16, each against a scripted monitor and no board: a refused `boot mem` ends in the round trip rather than in `--timeout` and is reported in the board's own words; a run killed mid-step has already written a record naming that stage; a console with nobody listening is a sentence naming the address and the port, not a traceback. Plus the anchoring itself - a prompt with a command echoed after it is not a finished command. |
@@ -592,3 +593,35 @@ The shared transfer protocol now permits one full RAM resend after a proven dige
 A TCP send error now enters the same read-only destination verification as a missing UDP completion reply. A full matching image may continue; a proven mismatch permits one resend after a confirmed prompt, while unknown state stops. The report preserves send interruptions. Four additional host cases cover complete/partial RAM, a second interruption and unknown state. A live injected interruption after a real4096-byte transfer rejected the partial70,748-byte image and verified exactly one correct resend without executing either upload.
 
 Images larger than1MiB now use chunks no larger than1MiB, each checked independently, with at most one proven-mismatch resend per chunk. After all chunks are present, the complete contiguous RAM image MUST match the original SHA256 before this function returns. Boot/deadman/reset commands are never retried. Two host cases check offset addressing and mandatory whole-image refusal. A real2,601,120-byte model image transferred as three verified chunks (about0.54/0.52/0.27s), passed its full SHA, then ran successfully and returned with healthy cores. Earlier monolithic and paced trials reset or failed prompt confirmation safely; this change avoids the observed large-transfer failure without claiming its underlying network cause proven.
+
+
+## Bounded recovery of read-only preflight queries
+
+Only exact `version`, `map` and `shot status` commands are eligible for one retry
+after CommandTimeout. A fresh socket must first obtain the prompt; a failed prompt
+or second incomplete query is terminal. The journal records the first partial
+response and replacement transcript, including capture-baseline recovery before
+upload. No boot, upload, arm/disarm, reset or renderer-changing command is retried
+by this mechanism. Safe-query recovery is not evidence that a payload returned.
+
+The older-monitor capture fallback retains its caller's console object, merges
+the temporary socket's evidence and closes that temporary socket after status.
+That preservation is covered by mocked I/O checks; it is not a claim of physical
+qualification on legacy firmware. The physical Anvil361 injected-loss test
+recovers the baseline before upload and confirms exactly one boot. The injection
+deliberately classifies a received real read-only reply as incomplete, and is
+recorded separately from an actual network drop. This does not detect every form
+of UDP truncation. Run `tools/board_read_only_recovery_check.py` for seven bounded
+fault cases without a board or emulator.
+
+## Processor-exception boot interval
+
+A complete exception report is preserved before any recovery check. With a
+watchdog armed, the runner allows its duration plus five seconds for expiry,
+then 90 seconds for startup. An actual prompt can end that passive wait early.
+If no prompt was observed, one fresh console sends only `version`, bounded to
+ten seconds. A complete build identity records readiness; it does not prove
+all services healthy. No payload, upload, reset, trace or screenshot is retried.
+Without an armed watchdog, the runner records the parked exception and stops.
+The exception remains a failed run even when the monitor subsequently answers.
+The JSON exception record includes the boot allowance and any readiness result.

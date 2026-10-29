@@ -8,6 +8,7 @@
 ; The backend owns a fixed host-visible heap, and never advertises GPU work.
 
 XIncludeFile "Anvil/Graphics/Vulkan/vk_foundation.pbi"
+#ANVIL_VULKAN_BACKEND_PRESENT = 2
 
 #AVK_SW_HEAP_BYTES = 67108864
 #AVK_SW_MAX_DIMENSION = 4096
@@ -48,7 +49,7 @@ EndProcedure
 
 Procedure.i avkBackendCaps()
   If avkSwEnsureHeap() = 0 : ProcedureReturn 0 : EndIf
-  ProcedureReturn #ANVIL_VK_CAP_DEVICE | #ANVIL_VK_CAP_CLEAR_COLOR | #ANVIL_VK_CAP_DRAW | #ANVIL_VK_CAP_BLEND_SRC_OVER | #ANVIL_VK_CAP_DRAW_LIST | #ANVIL_VK_CAP_BUFFER_TRANSFER | #ANVIL_VK_CAP_LINEAR_TRANSFER | #ANVIL_VK_CAP_CLEAR_ATTACHMENT_RECT | #ANVIL_VK_CAP_TILED_RECT_COPY | #ANVIL_VK_CAP_TILED_EDGE_TAIL_COPY | #ANVIL_VK_CAP_TILED_MICRO_COPY | #ANVIL_VK_CAP_TILED_MICRO_READBACK | #ANVIL_VK_CAP_TILED_TO_LINEAR_MICRO_COPY | #ANVIL_VK_CAP_LINEAR_TO_TILED_RECT_COPY | #ANVIL_VK_CAP_LINEAR_TO_TILED_MICRO_COPY | #ANVIL_VK_CAP_BUFFER_TO_TILED_RECT_COPY | #ANVIL_VK_CAP_BUFFER_TO_TILED_TAIL_COPY | #ANVIL_VK_CAP_BUFFER_TO_TILED_MICRO_COPY | #ANVIL_VK_CAP_BUFFER_TO_TILED_GRID_COPY | #ANVIL_VK_CAP_BUFFER_TO_TILED_GRID_4X4_COPY
+  ProcedureReturn #ANVIL_VK_CAP_DEVICE | #ANVIL_VK_CAP_CLEAR_COLOR | #ANVIL_VK_CAP_ATTACHMENT_LOAD | #ANVIL_VK_CAP_DRAW | #ANVIL_VK_CAP_BLEND_SRC_OVER | #ANVIL_VK_CAP_DRAW_LIST | #ANVIL_VK_CAP_BUFFER_TRANSFER | #ANVIL_VK_CAP_LINEAR_TRANSFER | #ANVIL_VK_CAP_CLEAR_ATTACHMENT_RECT | #ANVIL_VK_CAP_TILED_RECT_COPY | #ANVIL_VK_CAP_TILED_EDGE_TAIL_COPY | #ANVIL_VK_CAP_TILED_MICRO_COPY | #ANVIL_VK_CAP_TILED_MICRO_READBACK | #ANVIL_VK_CAP_TILED_TO_LINEAR_MICRO_COPY | #ANVIL_VK_CAP_LINEAR_TO_TILED_RECT_COPY | #ANVIL_VK_CAP_LINEAR_TO_TILED_MICRO_COPY | #ANVIL_VK_CAP_BUFFER_TO_TILED_RECT_COPY | #ANVIL_VK_CAP_BUFFER_TO_TILED_TAIL_COPY | #ANVIL_VK_CAP_BUFFER_TO_TILED_MICRO_COPY | #ANVIL_VK_CAP_BUFFER_TO_TILED_GRID_COPY | #ANVIL_VK_CAP_BUFFER_TO_TILED_GRID_4X4_COPY
 EndProcedure
 
 Procedure.i avkBackendName()
@@ -357,14 +358,17 @@ Procedure.i avkBackendClearSupported(base.i, bytes.i, w.i, h.i, pitch.i)
   ProcedureReturn #VK_SUCCESS
 EndProcedure
 
-Procedure.i avkBackendSubmitClear(base.i, bytes.i, w.i, h.i, pitch.i, bgra.i)
+Procedure.i avkBackendSubmitClear(base.i, bytes.i, w.i, h.i, pitch.i, bgra.i, loadColor.i)
   Define x.i, y.i
+  If loadColor <> 0 And loadColor <> 1 : ProcedureReturn -1 : EndIf
   If avkBackendClearSupported(base, bytes, w, h, pitch) <> #VK_SUCCESS : ProcedureReturn -1 : EndIf
-  For y = 0 To h - 1
-    For x = 0 To w - 1
-      PokeL(base + y * pitch + x * 4, bgra)
+  If loadColor = 0
+    For y = 0 To h - 1
+      For x = 0 To w - 1
+        PokeL(base + y * pitch + x * 4, bgra)
+      Next
     Next
-  Next
+  EndIf
   avkSwJobs = avkSwJobs + 1
   ProcedureReturn #ANVIL_VK_JOB_DONE
 EndProcedure
@@ -682,7 +686,7 @@ Procedure.i avkBackendSubmitDraw(*payload)
   ; Complete transaction preflight precedes the first target write.
   For n = 0 To *list\drawCount - 1
     *d = *list\draws + n * SizeOf(AnvilVkBackendDraw)
-    If *d\targetBase <> *first\targetBase Or *d\targetBytes <> *first\targetBytes Or *d\width <> *first\width Or *d\height <> *first\height Or *d\pitch <> *first\pitch
+    If *d\targetBase <> *first\targetBase Or *d\targetBytes <> *first\targetBytes Or *d\width <> *first\width Or *d\height <> *first\height Or *d\pitch <> *first\pitch Or *d\loadColor <> *first\loadColor Or (*d\loadColor <> 0 And *d\loadColor <> 1)
       ProcedureReturn -1
     EndIf
     If *d\kind = #ANVIL_VK_RENDER_OP_DRAW
@@ -718,7 +722,7 @@ Procedure.i avkBackendSubmitDraw(*payload)
       ProcedureReturn -1
     EndIf
   Next
-  If avkBackendSubmitClear(*first\targetBase, *first\targetBytes, *first\width, *first\height, *first\pitch, *first\clearBgra) <> #ANVIL_VK_JOB_DONE : ProcedureReturn -1 : EndIf
+  If avkBackendSubmitClear(*first\targetBase, *first\targetBytes, *first\width, *first\height, *first\pitch, *first\clearBgra, *first\loadColor) <> #ANVIL_VK_JOB_DONE : ProcedureReturn -1 : EndIf
   For n = 0 To *list\drawCount - 1
     *d = *list\draws + n * SizeOf(AnvilVkBackendDraw)
     If *d\kind = #ANVIL_VK_RENDER_OP_CLEAR_RECT

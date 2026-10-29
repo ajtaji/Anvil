@@ -226,7 +226,7 @@ Procedure.i avkBackendClearSupported(base.i, bytes.i, w.i, h.i, pitch.i)
   ProcedureReturn #VK_ERROR_FEATURE_NOT_PRESENT
 EndProcedure
 
-Procedure.i avkBackendSubmitClear(base.i, bytes.i, w.i, h.i, pitch.i, bgra.i)
+Procedure.i avkBackendSubmitClear(base.i, bytes.i, w.i, h.i, pitch.i, bgra.i, loadColor.i)
   ProcedureReturn #VK_ERROR_DEVICE_LOST
 EndProcedure
 

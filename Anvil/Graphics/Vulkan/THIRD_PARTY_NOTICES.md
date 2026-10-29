@@ -8,13 +8,19 @@ relationships and ordering from the Khronos Vulkan API Registry:
 - Copyright (c) 2015-2023 The Khronos Group Inc.
 - SPDX-License-Identifier: Apache-2.0 OR MIT
 - Source: `https://github.com/KhronosGroup/Vulkan-Headers/tree/v1.4.350/registry`
-- Pinned commit: `a33416ed2ce6bf8ef48b4eda821825f66d1850d3`
+- Pinned commit: `8864cdc896bbc2a9b6eb36b3218fc9ef57908d77`
 
 The registry file itself is not vendored in this source closure. The generator
 accepts the pinned `vk.xml` and verifies its byte-exact SHA-256 before emitting
 anything. This distribution selects the MIT option. The complete, unmodified
 Khronos MIT text is retained in
 `licenses/Khronos-Vulkan-Registry-MIT.txt`.
+
+`vk_surface.pbi` independently implements the surface contract from the official
+Vulkan specification. Its command names, revision and C structure member order
+and widths use the same registry interface facts and MIT election above. The
+existing Khronos notice and complete license text are retained; no driver or
+other implementation code was consulted or copied.
 
 ## Khronos SPIR-V specification
 

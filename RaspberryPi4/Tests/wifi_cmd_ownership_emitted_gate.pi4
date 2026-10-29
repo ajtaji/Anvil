@@ -1,4 +1,5 @@
 #WIFI_KA_MS = 60000
+#CYW43_IO_OK = 0
 #WIFI_EAPOL_FAIL_NONE = 0
 Global gPos.i : Global gWordAt.i : Global gWordLen.i
 Global Dim gLine.a[160]
@@ -14,6 +15,14 @@ Global gate_hasCalls.i
 Global gate_mutations.i : Global gate_hooks.i : Global gate_cancels.i
 Global gate_reconciles.i : Global gate_joinFails.i : Global gate_heal.i
 Global gate_rxArm.i : Global gate_rxDisable.i
+Global gParseOk.i,gWifiUp.i,cyw43_chHw.i,cyw43_chTarget.i,cyw43_chScan.i,cyw43_chLen.i
+Procedure.i Cyw43RpiConfigRc(index.i) : ProcedureReturn 0 : EndProcedure
+Procedure.i Cyw43ReadChannelInfo(timeout.i) : ProcedureReturn 0 : EndProcedure
+Procedure delay(ms.i) : EndProcedure
+Procedure.i Cyw43GetIovarData(name.i,length.i,capacity.i,timeout.i) : ProcedureReturn -1 : EndProcedure
+Procedure.i Cyw43ReplyI32(out.i) : ProcedureReturn 0 : EndProcedure
+Procedure.i Cyw43IoctlStatus() : ProcedureReturn -1 : EndProcedure
+Procedure str_print_at(text.i) : EndProcedure
 
 Procedure SkipSpace() : EndProcedure : Procedure SkipWord() : gPos = gWordAt + 1 : EndProcedure
 Procedure.i ArgWord() : ProcedureReturn gate_word : EndProcedure
@@ -65,6 +74,9 @@ Procedure WifiRxReadyStatus() : EndProcedure
 Procedure WifiRecShow() : EndProcedure
 Procedure.i WifiRekeyAsk(pairwise.i) : ProcedureReturn 0 : EndProcedure
 Procedure WifiDeaf(seconds.i, ask.i) : EndProcedure
+Procedure WifiEpManualBegin(which.i) : EndProcedure
+Procedure WifiEpManualFailed(which.i,stage.i) : EndProcedure
+Procedure WifiEpisodeRecovered() : EndProcedure
 Procedure.i ParseDec() : ProcedureReturn 0 : EndProcedure
 Procedure.i WifiRejoin(a.i) : ProcedureReturn 0 : EndProcedure : Procedure.i WifiLinkActive() : ProcedureReturn 1 : EndProcedure
 Procedure.i WifiRejoinCount() : ProcedureReturn 0 : EndProcedure : Procedure WifiLinkSet(on.i) : EndProcedure
@@ -74,6 +86,7 @@ Procedure.i Cyw43EventName(t.i) : ProcedureReturn "none" : EndProcedure
 ; @@PRODUCTION_CMD_WIFI@@
 
 Procedure GateReset(cmd.i,word.i,rest.i,rc.i)
+  WifiControlBind(@HwWifiControlDispatch)
   gate_cmd=cmd : gate_word=word : gate_rest=rest : gate_settingRc=rc
   gate_hasNet=0 : gate_hasPw=0 : gate_hasCalls=0 : gate_mutations=0 : gate_hooks=0
   gate_cancels=0 : gate_reconciles=0 : gate_joinFails=0 : gate_heal=0

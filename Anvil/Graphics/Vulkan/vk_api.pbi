@@ -14,7 +14,8 @@
 ; gets a compile-time refusal naming it, which is the loudest possible
 ; answer and far better than a stub that returns VK_SUCCESS.
 ;
-; There is no platform loader, layer interface or extension negotiation.
+; There is no platform loader or layer interface. VK_KHR_surface is the only
+; supported instance extension; device extensions remain unavailable.
 ; Direct calls and the separately included vk_dispatch.pbi expose only
 ; the implemented subset recorded in the capability table.
 ;
@@ -39,12 +40,13 @@ Procedure.i avkNoPNext(*pNext)
   ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "a Vulkan create-info carried a pNext chain (Anvil code -20005, no pNext extension is implemented); nothing was created. Every structure this implementation accepts must have pNext set to null, because an ignored extension structure is a silently different request.")
 EndProcedure
 
+XIncludeFile "Anvil/Graphics/Vulkan/vk_surface.pbi"
+
 ; ----------------------------------------------------------------------
 ;  INSTANCE, PHYSICAL DEVICE, DEVICE, QUEUE
 ; ----------------------------------------------------------------------
-; No layers or extensions are implemented. Enumeration still has the Vulkan
-; two-call shape: a null output array is a count query, and any capacity is
-; enough for an empty list. A named layer cannot supply extensions.
+; No layers are implemented. Instance extension enumeration uses the Vulkan
+; two-call/count-capacity contract. A named layer cannot supply extensions.
 Procedure.i vkEnumerateInstanceLayerProperties(*pPropertyCount, *pProperties)
   If *pPropertyCount = 0
     ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkEnumerateInstanceLayerProperties needs pPropertyCount (Anvil code -20001, null output count); pass a writable count pointer.")
@@ -60,12 +62,11 @@ Procedure.i vkEnumerateInstanceExtensionProperties(*pLayerName, *pPropertyCount,
   If *pLayerName <> 0
     ProcedureReturn avkFault(#VK_ERROR_LAYER_NOT_PRESENT, "vkEnumerateInstanceExtensionProperties was given a layer name (VkResult -6, VK_ERROR_LAYER_NOT_PRESENT); Anvil has no layers. Pass a null pLayerName to enumerate implementation extensions.")
   EndIf
-  PokeL(*pPropertyCount, 0)
-  ProcedureReturn #VK_SUCCESS
+  ProcedureReturn avkSurfaceEnumerateExtensions(*pPropertyCount, *pProperties)
 EndProcedure
 
 Procedure.i vkCreateInstance(*pCreateInfo.VkInstanceCreateInfo, *pAllocator, *pInstance)
-  Define rc.i
+  Define rc.i, enabled.i, name.i
   If *pCreateInfo = 0 Or *pInstance = 0 : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf
   rc = avkNoAllocator(*pAllocator, 1)
   If rc <> #VK_SUCCESS : ProcedureReturn rc : EndIf
@@ -78,10 +79,21 @@ Procedure.i vkCreateInstance(*pCreateInfo.VkInstanceCreateInfo, *pAllocator, *pI
   If *pCreateInfo\enabledLayerCount <> 0
     ProcedureReturn avkFault(#VK_ERROR_LAYER_NOT_PRESENT, "vkCreateInstance was asked to enable an instance layer (VkResult -6, VK_ERROR_LAYER_NOT_PRESENT); no instance was created. Anvil has no layer interface, so vkEnumerateInstanceLayerProperties would report none.")
   EndIf
+  enabled = 0
   If *pCreateInfo\enabledExtensionCount <> 0
-    ProcedureReturn avkFault(#VK_ERROR_EXTENSION_NOT_PRESENT, "vkCreateInstance was asked to enable an instance extension (VkResult -7, VK_ERROR_EXTENSION_NOT_PRESENT); no instance was created. Anvil implements no instance extensions, including the surface extensions, so there is no presentation path through this API yet.")
+    If *pCreateInfo\enabledExtensionCount <> 1
+      ProcedureReturn avkFault(#VK_ERROR_EXTENSION_NOT_PRESENT, "vkCreateInstance supports only VK_KHR_surface; no instance was created.")
+    EndIf
+    If *pCreateInfo\ppEnabledExtensionNames = 0 : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf
+    name = PeekI(*pCreateInfo\ppEnabledExtensionNames)
+    If avkApiNameEquals(name, avkSurfaceExtensionName(), #VK_MAX_EXTENSION_NAME_SIZE) = 0
+      ProcedureReturn avkFault(#VK_ERROR_EXTENSION_NOT_PRESENT, "vkCreateInstance was given an unsupported extension name; only VK_KHR_surface is available.")
+    EndIf
+    enabled = 1
   EndIf
-  ProcedureReturn AnvilVkInstanceCreate(*pInstance)
+  rc = AnvilVkInstanceCreate(*pInstance)
+  If rc = #VK_SUCCESS : avkInstSurfaceEnabled[avkInstSlot(PeekI(*pInstance))] = enabled : EndIf
+  ProcedureReturn rc
 EndProcedure
 
 Procedure vkDestroyInstance(instance.i, *pAllocator)
@@ -91,9 +103,9 @@ Procedure vkDestroyInstance(instance.i, *pAllocator)
   If instance = #VK_NULL_HANDLE
     ProcedureReturn
   EndIf
-  If AnvilVkInstanceDestroy(instance) <> #VK_SUCCESS
-    avkFault(#ANVIL_VK_ERR_HANDLE, "vkDestroyInstance was given a VkInstance handle that is not live (Anvil code -20002, stale or foreign handle); nothing was destroyed. Check for a double destroy.")
-  EndIf
+  ; The status-bearing owner records the original refusal; do not turn a
+  ; child-ownership refusal into a misleading stale-handle diagnostic.
+  AnvilVkInstanceDestroy(instance)
 EndProcedure
 
 Procedure.i vkEnumeratePhysicalDevices(instance.i, *pPhysicalDeviceCount, *pPhysicalDevices)

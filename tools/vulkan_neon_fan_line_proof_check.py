@@ -51,7 +51,7 @@ def check_source() -> int:
     source = PAYLOAD.read_text(encoding="utf-8")
     required = (
         "#NW_PROOF_MODE        = 2",
-        'XIncludeFile "Anvil/Graphics/Vulkan/neon_vk_chrome.pi4"',
+        'XIncludeFile "Anvil/Graphics/Vulkan/neon_vk_chrome.pbi"',
         "nwPairClear[0] = $3D888889 : nwPairClear[1] = $3E048485",
         "nwPairClear[2] = $3E5CDCDD : nwPairClear[3] = $3F800000",
         "rc = nwPairFanFrame(imageBase, imagePitch)",

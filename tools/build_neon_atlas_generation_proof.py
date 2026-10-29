@@ -21,14 +21,14 @@ r=Path(__file__).resolve().parents[1];w=r
 d=args.out.resolve();d.mkdir(parents=True,exist_ok=True)
 variant='old' if args.reference_adapter else ('uncertain' if args.inject_uncertain else 'candidate')
 source=(r/'RaspberryPi4/Examples/Diagnostics/vulkanNeonWidgetAll15Proof.pi4').read_text(encoding='utf8')
-if variant=='old':source=source.replace('Anvil/Graphics/Vulkan/neon_vk_chrome.pi4',args.reference_adapter.resolve().as_posix())
+if variant=='old':source=source.replace('Anvil/Graphics/Vulkan/neon_vk_chrome.pbi',args.reference_adapter.resolve().as_posix())
 source=source.replace('#NW_PROOF_MODE        = 0','#NW_PROOF_MODE        = 1',1)
-helper=(r/'Anvil/Graphics/Vulkan/Tests/neon_atlas_generation_proof.pbi').read_text(encoding='utf8');at=source.index('Procedure.i Main()');source=source[:at]+helper+'\n'+source[at:]
+helper=(r/'RaspberryPi4/Tests/Vulkan/neon_atlas_generation_proof.pbi').read_text(encoding='utf8');at=source.index('Procedure.i Main()');source=source[:at]+helper+'\n'+source[at:]
 if variant=='uncertain':
- adapter=(r/'Anvil/Graphics/Vulkan/neon_vk_chrome.pi4').read_text(encoding='utf8');a=adapter.index('Procedure.i nvcAtlasReplaceGeneration()');b=adapter.index('\nEndProcedure',a);part=adapter[a:b]
+ adapter=(r/'Anvil/Graphics/Vulkan/neon_vk_chrome.pbi').read_text(encoding='utf8');a=adapter.index('Procedure.i nvcAtlasReplaceGeneration()');b=adapter.index('\nEndProcedure',a);part=adapter[a:b]
  needle='  If rc = #VK_SUCCESS : rc = nvcAtlasUploadImage(image, #VK_IMAGE_LAYOUT_UNDEFINED, 0, 0) : EndIf';assert needle in part
  part=part.replace(needle,needle+'\n  If rc = #VK_SUCCESS And AtlasProofInject <> 0 : rc = #VK_ERROR_DEVICE_LOST : EndIf',1).replace('If vkDeviceWaitIdle(nvcDevice) <> #VK_SUCCESS','If AtlasProofWaitIdle(nvcDevice) <> #VK_SUCCESS',1)
- adapter=adapter[:a]+part+adapter[b:];private=d/'atlas-injected.pi4';private.write_text(adapter,encoding='utf8');source=source.replace('Anvil/Graphics/Vulkan/neon_vk_chrome.pi4',private.resolve().as_posix(),1)
+ adapter=adapter[:a]+part+adapter[b:];private=d/'atlas-injected.pi4';private.write_text(adapter,encoding='utf8');source=source.replace('Anvil/Graphics/Vulkan/neon_vk_chrome.pbi',private.resolve().as_posix(),1)
  needle='  rc = NeonFontUse(oldFont, oldW, oldH, oldFirst, oldLast)\n  PokeI($E1C01018, swaps)';assert needle in source
  injected='''  If failure = 0
     oldImage = nvcAtlasImage : oldMemory = nvcAtlasMemory : oldView = nvcAtlasView : oldSet = nvcDescriptorSet

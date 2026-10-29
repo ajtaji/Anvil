@@ -191,6 +191,9 @@ CompilerElse
 CompilerEndIf
 
 Global gCacheOn.i = 0     ; 1 while the cached MMU is live. 0 at every boot.
+; C clear alone does not certify the firmware's old cache lines were retired.
+; Only our completed flush grants the V3D owner's stronger cold-state promise.
+Global gCacheRetired.i = 0
 
 ; 12 KiB of page tables (an L1 table and TWO L2 tables - the top-gigabyte
 ; split and the low-gigabyte split that carries the framebuffer's Non-
@@ -266,6 +269,7 @@ Procedure CacheDmaPolicy()
   DmaClearUncached()
   CompilerIf #PMF_CHIP <> 2712 And #ANVIL_V3D_CONSOLE = 1
   V3dClearUncached()
+  V3dSetCacheOff(Bool(gCacheOn = 0 And gCacheRetired <> 0))
   If gCacheOn <> 0                                 ; mapped Non-Cacheable by CacheMapNc: no line to clean
     V3dDeclareUncached($0C000000, $0D000000)
     V3dDeclareUncached($0A000000, $0B000000)
@@ -306,6 +310,11 @@ Procedure.i CacheEnable()
   If rc <> 0
     ProcedureReturn 0
   EndIf
+  ; Revoke the cold-state promise before making cached accesses possible.
+  gCacheRetired = 0
+  CompilerIf #PMF_CHIP <> 2712 And #ANVIL_V3D_CONSOLE = 1
+  V3dSetCacheOff(0)
+  CompilerEndIf
   MmuEnableCached()
   gCacheOn = 1
   CacheDmaPolicy()
@@ -325,6 +334,7 @@ Procedure CacheDisable()
   EndIf
   MmuDisableCachedFlushed()
   gCacheOn = 0
+  gCacheRetired = 1
   CacheDmaPolicy()
   CompilerEndIf
 EndProcedure
@@ -476,6 +486,9 @@ Declare.i V3dConPayloadSuspend()
 Declare.i V3dConPayloadResume(state.i)
 Declare.i V3dConFailed()
 CompilerEndIf
+
+XIncludeFile "Anvil/Hal/neon_service_api.pbi"
+XIncludeFile "Anvil/Hal/graphics_service.pbi"
 
 Procedure RunAt(a.i)
   Define wasCached.i
@@ -730,6 +743,24 @@ Procedure RunAt(a.i)
   ; ------------------------------------------------------------------
   If ShotTakeArm() <> 0
     ScrShotNow(#MON_SHOT_WHO_RETURN, gGoRc)
+  EndIf
+
+  ; Retire input before restoring the console. A failed input cleanup retains
+  ; its scope and blocks the next service payload; it does not own a bus master.
+  If InputServiceLeave()<>0
+    PrintN("!! the resident input owner is still quarantined; new service payloads remain blocked.")
+  EndIf
+
+  ; Retire service-owned graphics BEFORE cache/DMA/native console recovery.
+  ; A failed cleanup retains its resources; reusing their page tables or
+  ; buffers would put the restored console beside an untrusted bus master.
+  If GraphicsServiceLeave()<>0
+    UartMirror(0) : ConNoRenderer()
+    PrintN("!! the payload returned, but its resident graphics owner could not retire safely.")
+    PrintN("   Cache, DMA and renderer recovery were not attempted; Anvil is resetting to firmware.")
+    UartDrain()
+    SafetyToFirmware()
+    ProcedureReturn 0
   EndIf
 
   ; RECLAIM GENET BEFORE TOUCHING CACHES, DISPLAY DMA OR NETWORK SOFTWARE.

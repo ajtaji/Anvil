@@ -1,3 +1,4 @@
+XIncludeFile "Anvil/Network/byte_order.pbi"
 ; ======================================================================
 ;  net.pbi - target-neutral Ethernet II, ARP, IPv4, ICMP echo and UDP.
 ; ======================================================================
@@ -1078,28 +1079,19 @@ EndProcedure
 ; and an all-ones netmask octet is another.
 ; ----------------------------------------------------------------------
 Procedure.i net_GetBE16(*p)
-  ProcedureReturn ((PeekA(*p) << 8) | PeekA(*p + 1)) & $FFFF
+  ProcedureReturn NetReadBE16(*p)
 EndProcedure
 
 Procedure.i net_GetBE32(*p)
-  Protected v.i
-  v = PeekA(*p)
-  v = (v << 8) | PeekA(*p + 1)
-  v = (v << 8) | PeekA(*p + 2)
-  v = (v << 8) | PeekA(*p + 3)
-  ProcedureReturn v & $FFFFFFFF
+  ProcedureReturn NetReadBE32(*p)
 EndProcedure
 
 Procedure net_PutBE16(*p, v.i)
-  PokeB(*p + 0, (v >> 8) & $FF)
-  PokeB(*p + 1, v & $FF)
+  NetWriteBE16(*p,v)
 EndProcedure
 
 Procedure net_PutBE32(*p, v.i)
-  PokeB(*p + 0, (v >> 24) & $FF)
-  PokeB(*p + 1, (v >> 16) & $FF)
-  PokeB(*p + 2, (v >> 8) & $FF)
-  PokeB(*p + 3, v & $FF)
+  NetWriteBE32(*p,v)
 EndProcedure
 
 

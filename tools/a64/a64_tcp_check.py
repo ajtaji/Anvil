@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Executable gate for RaspberryPi4/Lib/tcp.pi4 - the TCP state machine.
+"""Executable gate for Anvil/Network/tcp.pbi - the TCP state machine.
 
 There is no Pi 4 here, no network and no link driver.  None of the three
 is needed, and that is a property of the library rather than a shortcut
@@ -253,15 +253,15 @@ import a64_mutate_pool as pool                      # noqa: E402
 PMFC = os.environ.get("PMF_COMPILER") or "PureMetalForge.exe"  # rebound from --compiler
 # Every compile resolves includes from THIS tree only.
 BUILD_ENV = dict(os.environ, PMF_ROOT=str(ROOT))
-LIB = ROOT / "RaspberryPi4" / "Lib" / "tcp.pi4"
+LIB = ROOT / "Anvil" / "Network" / "tcp.pbi"
 NETLIB = ROOT / "Anvil" / "Network" / "net.pbi"
 # THE SECOND FILE UNDER TEST, since 2026-09-05: the upload receiver.  It
 # is here rather than in a gate of its own because it has no meaning
 # without a TCP connection under it, and this is the only harness in the
 # tree that can produce one from byte-exact frames.
 RECVLIB = ROOT / "Anvil" / "Core" / "netrecv.pbi"
-LINKLIB = ROOT / "RaspberryPi4" / "Lib" / "link.pi4"
-LIB_DEFAULT = "RaspberryPi4/Lib/tcp.pi4"
+LINKLIB = ROOT / "Anvil" / "Network" / "link.pbi"
+LIB_DEFAULT = "Anvil/Network/tcp.pbi"
 RECV_DEFAULT = "Anvil/Core/netrecv.pbi"
 WORK = ROOT / "_work"
 

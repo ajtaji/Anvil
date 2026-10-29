@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-r"""Executable gate for RaspberryPi4/Lib/link.pi4 - THE NET PUMP, driven
+r"""Executable gate for Anvil/Network/link.pbi - THE NET PUMP, driven
 through a FIXTURE LINK.
 
       python tools/a64/a64_netpump_check.py
@@ -166,7 +166,7 @@ from a64_target import TARGETS, apply_target, patch_harness      # noqa: E402
 PMFC = os.environ.get("PMF_COMPILER") or "PureMetalForge.exe"  # rebound from --compiler
 # Every compile resolves includes from THIS tree only.
 BUILD_ENV = dict(os.environ, PMF_ROOT=str(ROOT))
-LIB = ROOT / "RaspberryPi4" / "Lib" / "link.pi4"
+LIB = ROOT / "Anvil" / "Network" / "link.pbi"
 WORK = ROOT / "_work" / "netpump"
 
 # ---- the image contract. apply_target() rebinds every one of these as
@@ -449,7 +449,7 @@ Procedure.i HwLinkReady(kind.i)
   ProcedureReturn HwLinkHas(kind)
 EndProcedure
 
-; netif.pi4 also reads LinkPin(), and RaspberryPi4/Lib/link.pi4 - the
+; netif.pi4 also reads LinkPin(), and Anvil/Network/link.pbi - the
 ; library UNDER TEST - defines it, so nothing is supplied for it here:
 ; the call is resolved forward to the real one, which is what should be
 ; graded anyway.
@@ -2236,14 +2236,14 @@ def main() -> int:
 
     print("[gate] tree under test: %s" % ROOT, file=sys.stderr)
     print("a64_netpump_check: grading %s" % row["what"])
-    print("                   RaspberryPi4/Lib/link.pi4 over a FIXTURE link,")
+    print("                   Anvil/Network/link.pbi over a FIXTURE link,")
     print("                   with no MAC, no PHY and no radio in the image")
 
     work = WORK / args.target
     work.mkdir(parents=True, exist_ok=True)
     harness = work / "netpumpharness.pi4"
     img = work / "netpumpcheck.img"
-    write_harness("RaspberryPi4/Lib/link.pi4", harness)
+    write_harness("Anvil/Network/link.pbi", harness)
     build(harness, img)
 
     s, at = build_script()

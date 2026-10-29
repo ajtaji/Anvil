@@ -14,7 +14,7 @@ ap.add_argument('--compiler')
 args=ap.parse_args()
 r=Path(__file__).resolve().parents[1]
 d=args.out.resolve();d.mkdir(parents=True,exist_ok=True)
-helper=(r/'Anvil/Graphics/Vulkan/Tests/neon_combined_draws_proof.pbi').read_text(encoding='utf8')
+helper=(r/'RaspberryPi4/Tests/Vulkan/neon_combined_draws_proof.pbi').read_text(encoding='utf8')
 s=(r/'RaspberryPi4/Examples/Diagnostics/vulkanNeonWidgetAll15Proof.pi4').read_text(encoding='utf8').replace('#NW_PROOF_MODE        = 0','#NW_PROOF_MODE        = 1',1).replace('#NW_WINDOW_BYTES      = $00C00000','#NW_WINDOW_BYTES      = $01000000',1).replace('#NW_MAP_SPAN          = $00FE8000','#NW_MAP_SPAN          = $013E8000',1)
 s=s.replace('adapterDraws = #NVWA_EXPECT_DRAWS : adapterQuads = #NVWA_EXPECT_QUADS','adapterDraws = 6144 : adapterQuads = 6145',1)
 at=s.index('Procedure.i Main()');s=s[:at]+helper+'\n'+s[at:];s=s.replace('Procedure.i Main()','Procedure.i CombinedDiagnosticMain()',1)

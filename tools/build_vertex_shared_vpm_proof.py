@@ -14,8 +14,20 @@ ap.add_argument('--compiler')
 args=ap.parse_args()
 r=Path(__file__).resolve().parents[1]
 d=args.out.resolve();d.mkdir(parents=True,exist_ok=True)
-helper=(r/'Anvil/Graphics/Vulkan/Tests/vertex_shared_vpm_proof.pbi').read_text(encoding='utf8')
+helper=(r/'RaspberryPi4/Tests/Vulkan/vertex_shared_vpm_proof.pbi').read_text(encoding='utf8')
 s=(r/'RaspberryPi4/Examples/Diagnostics/vulkanNeonWidgetAll15Proof.pi4').read_text(encoding='utf8').replace('#NW_PROOF_MODE        = 0','#NW_PROOF_MODE        = 1',1)
+
+# The standalone example's native arena is outside Anvil's payload windows.
+# Returning proofs own ordinary payload RAM instead; keep all modes' banner,
+# image/window and GPU regions disjoint from the compiler stack and each other.
+import re
+for name,value in [('NW_ARENA',0x05000000),('NW_SURFACE',0x03000000),
+                   ('NW_WINDOW',0x033E8000),('NW_BANNER0',0x04000000),
+                   ('NW_BANNER90',0x04060000),('NW_BANNER270',0x04100000),
+                   ('NW_BANNER_CHANGED',0x041A0000)]:
+    s,count=re.subn(r'(?m)^(#'+name+r'\s*=\s*)\$[0-9A-Fa-f]+',
+                    lambda m:m.group(1)+f'${value:08X}',s)
+    assert count==1,'Missing unique returning-proof placement: '+name
 
 at=s.index('Procedure.i Main()');s=s[:at]+helper+'\n'+s[at:];s=s.replace('Procedure.i Main()','Procedure.i LineDiagnosticMain()',1)
 s=s.replace('  ; Destroy the production adapter first:','  PokeI($E1C01000,lineContractProof(imageBase,imagePitch,framebuffer))\n  ; Destroy the production adapter first:',1)

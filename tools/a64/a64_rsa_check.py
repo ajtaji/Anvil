@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Executable gate for RaspberryPi4/Lib/rsa.pi4 - RSA signature VERIFY
+"""Executable gate for Anvil/Crypto/rsa.pbi - RSA signature VERIFY
 (PKCS#1 v1.5 and PSS) on AArch64.
 
 WHY THIS FILE IS WRITTEN THE WAY IT IS
@@ -121,7 +121,7 @@ PMFC = os.environ.get("PMF_COMPILER") or "PureMetalForge.exe"  # rebound from --
 BUILD_ENV = dict(os.environ, PMF_ROOT=str(ROOT))
 # --jobs, remembered for the pools that are not handed it directly.
 JOBS_CAP = None
-RSA = ROOT / "RaspberryPi4" / "Lib" / "rsa.pi4"
+RSA = ROOT / "Anvil" / "Crypto" / "rsa.pbi"
 WORK = ROOT / "_work"
 
 LOAD = 0x00400000
@@ -174,7 +174,7 @@ HARNESS = r'''
 ; ======================================================================
 XIncludeFile "RaspberryPi4/Lib/uart.pi4"
 XIncludeFile "Anvil/Core/sha256.pbi"
-XIncludeFile "RaspberryPi4/Lib/bignum.pi4"
+XIncludeFile "Anvil/Crypto/bignum.pbi"
 XIncludeFile "__RSA__"
 
 #H_SCRIPT = $06000000
@@ -1106,7 +1106,7 @@ def main(argv=None):
 
     s = build_script(g, level="quick" if args.quick else "full")
     img = WORK / "rsaharness.img"
-    size = build("RaspberryPi4/Lib/rsa.pi4", WORK / "rsaharness.pi4", img)
+    size = build("Anvil/Crypto/rsa.pbi", WORK / "rsaharness.pi4", img)
     print("[gate] image %d bytes, %d jobs (%d imported records, %d derived)"
           % (size, len(s), len(g.RECORDS) if not args.quick else
              sum(1 for r in g.RECORDS if len(r[2]) == 256),

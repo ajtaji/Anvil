@@ -40,7 +40,7 @@
 #PI3_V3D_IDENT1 = 4
 #PI3_V3D_IDENT2 = 8
 #PI3_V3D_IDENT0_EXPECTED = $02443356
-#PI3_V3D_FDT_MAGIC = $D00DFEED
+XIncludeFile "Anvil/Core/fdt.pbi"
 #PI3_V3D_FDT_MAX_BYTES = $100000
 #PI3_V3D_FDT_MAX_DEPTH = 32
 
@@ -152,7 +152,8 @@ Procedure.i Pi3V3dDtbValid(*dtb, *dtbEnd)
   Protected Dim nodeSize.i[#PI3_V3D_FDT_MAX_DEPTH]
   pi3_v3d_dtb_stage = 1
   If *dtb = 0 Or *dtbEnd <= *dtb Or *dtbEnd - *dtb < 40 : ProcedureReturn 0 : EndIf
-  If p3vBe32(*dtb) <> #PI3_V3D_FDT_MAGIC : ProcedureReturn 0 : EndIf
+  ; Shared format validation precedes board-specific topology policy.
+  If FdtCheck(*dtb,*dtbEnd-*dtb)<>#FDT_OK : ProcedureReturn 0 : EndIf
   total = p3vBe32(*dtb + 4)
   If total < 40 Or total > #PI3_V3D_FDT_MAX_BYTES Or total > *dtbEnd - *dtb : ProcedureReturn 0 : EndIf
   If p3vBe32(*dtb + 20) < 17 Or p3vBe32(*dtb + 24) > 17 : ProcedureReturn 0 : EndIf

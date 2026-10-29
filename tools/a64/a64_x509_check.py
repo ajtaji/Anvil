@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Executable gate for RaspberryPi4/Lib/x509.pi4 and
-RaspberryPi4/Lib/x509_blob.pi4 - X.509 certificate-chain validation on
+"""Executable gate for Anvil/Crypto/x509.pbi and
+Anvil/Crypto/x509_blob.pbi - X.509 certificate-chain validation on
 AArch64.
 
 WHY THIS FILE IS WRITTEN THE WAY IT IS
@@ -130,8 +130,8 @@ sys.path.insert(0, str(HERE))
 PMFC = os.environ.get("PMF_COMPILER") or "PureMetalForge.exe"  # rebound from --compiler
 # Every compile resolves includes from THIS tree only.
 BUILD_ENV = dict(os.environ, PMF_ROOT=str(ROOT))
-X509 = ROOT / "RaspberryPi4" / "Lib" / "x509.pi4"
-BLOB_A64 = ROOT / "RaspberryPi4" / "Lib" / "x509_blob.pi4"
+X509 = ROOT / "Anvil" / "Crypto" / "x509.pbi"
+BLOB_A64 = ROOT / "Anvil" / "Crypto" / "x509_blob.pbi"
 # BearSSL's sources are not part of this tree. Set BEARSSL_SRC to the root
 # of a BearSSL checkout to regenerate the blob in process and compare.
 BEARSSL_SRC = os.environ.get("BEARSSL_SRC")
@@ -253,7 +253,7 @@ HARNESS = r'''
 EnableExplicit
 #X509_SIG_LINKED = __LINKED__
 XIncludeFile "RaspberryPi4/Lib/uart.pi4"
-XIncludeFile "RaspberryPi4/Lib/t0vm.pi4"
+XIncludeFile "Anvil/Crypto/t0vm.pbi"
 XIncludeFile "Anvil/Core/sha256.pbi"
 XIncludeFile "Anvil/Crypto/sha512.pbi"
 __SIGINC__
@@ -382,10 +382,10 @@ EndProcedure
 # arguments because the A64 backend passes eight and the seam declares
 # nine.  This is what ecdsaX509Proof.pico2 does too, and it is why every
 # RSA chain in mode B still reports #X509ERR_SEAM (200).
-SIGINC_LINKED = '''XIncludeFile "RaspberryPi4/Lib/bignum.pi4"
-XIncludeFile "RaspberryPi4/Lib/ec256.pi4"
-XIncludeFile "RaspberryPi4/Lib/ecp.pi4"
-XIncludeFile "RaspberryPi4/Lib/ecdsa.pi4"
+SIGINC_LINKED = '''XIncludeFile "Anvil/Crypto/bignum.pbi"
+XIncludeFile "Anvil/Crypto/ec256.pbi"
+XIncludeFile "Anvil/Crypto/ecp.pbi"
+XIncludeFile "Anvil/Crypto/ecdsa.pbi"
 
 ; The RSA half of the seam, unlinked in this image. -1 is exactly what
 ; x509.pi4's compiled-out stub returns and it becomes the loud
@@ -409,11 +409,11 @@ EndProcedure
 # entry point and rsa.pi4 exports RsaSetPubKey, so the split x509.pi4
 # had to make for the eight-argument backend is exactly the shape this
 # module already speaks.  Nothing is stubbed here.
-SIGINC_FULL = '''XIncludeFile "RaspberryPi4/Lib/bignum.pi4"
-XIncludeFile "RaspberryPi4/Lib/ec256.pi4"
-XIncludeFile "RaspberryPi4/Lib/ecp.pi4"
-XIncludeFile "RaspberryPi4/Lib/ecdsa.pi4"
-XIncludeFile "RaspberryPi4/Lib/rsa.pi4"
+SIGINC_FULL = '''XIncludeFile "Anvil/Crypto/bignum.pbi"
+XIncludeFile "Anvil/Crypto/ec256.pbi"
+XIncludeFile "Anvil/Crypto/ecp.pbi"
+XIncludeFile "Anvil/Crypto/ecdsa.pbi"
+XIncludeFile "Anvil/Crypto/rsa.pbi"
 '''
 
 
@@ -1323,7 +1323,7 @@ def mutate_source(idx, which, find, replace, harness_text):
         if harness_text.count(find) != 1:
             raise SystemExit("mutation anchor not unique in the harness:\n%r"
                              % find)
-        return "RaspberryPi4/Lib/x509.pi4", harness_text.replace(
+        return "Anvil/Crypto/x509.pbi", harness_text.replace(
             find, replace, 1)
     text = X509.read_text(encoding="utf-8").replace("\r\n", "\n")
     if text.count(find) != 1:
@@ -1344,7 +1344,7 @@ def run_one_mutation(i, jobs):
             img = WORK / ("x509_mut%02d_%s.img" % (i, mode))
             hp = WORK / ("xharness_mut%02d_%s.pi4" % (i, mode))
             try:
-                build(mode, inc, "RaspberryPi4/Lib/x509_blob.pi4", hp, img)
+                build(mode, inc, "Anvil/Crypto/x509_blob.pbi", hp, img)
             except SystemExit as e:
                 print("NOBUILD  %s\n         %s"
                       % (label, str(e).splitlines()[0]))
@@ -1481,8 +1481,8 @@ def main(argv=None):
         print("\n== MODE %s: %s" % (mode, title))
         s = build_script(mode)
         img = WORK / ("xharness_%s.img" % mode)
-        size = build(mode, "RaspberryPi4/Lib/x509.pi4",
-                     "RaspberryPi4/Lib/x509_blob.pi4",
+        size = build(mode, "Anvil/Crypto/x509.pbi",
+                     "Anvil/Crypto/x509_blob.pbi",
                      WORK / ("xharness_%s.pi4" % mode), img)
         print("[gate] image %d bytes, %d jobs, %d bytes of certificate data"
               % (size, len(s), len(s.data)))

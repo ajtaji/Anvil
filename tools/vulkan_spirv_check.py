@@ -34,7 +34,7 @@ HERE = pathlib.Path(__file__).resolve().parent
 ROOT = HERE.parent
 sys.path.insert(0, str(HERE))
 from pmf_compiler import resolve_compiler as _pmf_resolve_compiler  # noqa: E402
-GATE = ROOT / "Anvil" / "Graphics" / "Vulkan" / "Tests" / "vulkan_spirv_gate.pi4"
+GATE = ROOT / 'RaspberryPi4/Tests/Vulkan/vulkan_spirv_gate.pi4'
 FRONTEND = ROOT / "Anvil" / "Graphics" / "Vulkan" / "vk_spirv.pbi"
 
 LOAD = 0x00400000

@@ -1,3 +1,4 @@
+XIncludeFile "Anvil/Core/token_parse.pbi"
 ; Rock Pi 4C serial adapter for Anvil's shared HwFile/Fs command operations.
 ; Keep the block format and file semantics in Anvil/Storage; this layer only
 ; parses bounded recovery lines and reports their result over UART.
@@ -408,39 +409,39 @@ Procedure.i RockFsCommand(*line,lineLength.i)
   Protected command.i
   Protected length.i
   Protected checksum.i
-  n=rock_storage_nextToken(*line,lineLength,@pos,@rock_fs_word[0],32)
+  n=TokenNextBounded(*line,lineLength,@pos,@rock_fs_word[0],32)
   If n<=0 : ProcedureReturn 0 : EndIf
-  If rock_storage_tokenIs(@rock_fs_word[0],?rock_fs_ls,2)<>0 Or rock_storage_tokenIs(@rock_fs_word[0],?rock_fs_dir,3)<>0 Or rock_storage_tokenIs(@rock_fs_word[0],?rock_fs_fatls,5)<>0
+  If TokenEquals(@rock_fs_word[0],?rock_fs_ls,2)<>0 Or TokenEquals(@rock_fs_word[0],?rock_fs_dir,3)<>0 Or TokenEquals(@rock_fs_word[0],?rock_fs_fatls,5)<>0
     command=1
-  ElseIf rock_storage_tokenIs(@rock_fs_word[0],?rock_fs_stat,4)<>0
+  ElseIf TokenEquals(@rock_fs_word[0],?rock_fs_stat,4)<>0
     command=2
-  ElseIf rock_storage_tokenIs(@rock_fs_word[0],?rock_fs_cat,3)<>0
+  ElseIf TokenEquals(@rock_fs_word[0],?rock_fs_cat,3)<>0
     command=3
-  ElseIf rock_storage_tokenIs(@rock_fs_word[0],?rock_fs_load,4)<>0 Or rock_storage_tokenIs(@rock_fs_word[0],?rock_fs_fatload,7)<>0
+  ElseIf TokenEquals(@rock_fs_word[0],?rock_fs_load,4)<>0 Or TokenEquals(@rock_fs_word[0],?rock_fs_fatload,7)<>0
     command=8
-  ElseIf rock_storage_tokenIs(@rock_fs_word[0],?rock_fs_save,4)<>0
+  ElseIf TokenEquals(@rock_fs_word[0],?rock_fs_save,4)<>0
     command=9
-  ElseIf rock_storage_tokenIs(@rock_fs_word[0],?rock_fs_receive,7)<>0
+  ElseIf TokenEquals(@rock_fs_word[0],?rock_fs_receive,7)<>0
     command=10
-  ElseIf rock_storage_tokenIs(@rock_fs_word[0],?rock_fs_f,1)<>0 Or rock_storage_tokenIs(@rock_fs_word[0],?rock_fs_fs,2)<>0
+  ElseIf TokenEquals(@rock_fs_word[0],?rock_fs_f,1)<>0 Or TokenEquals(@rock_fs_word[0],?rock_fs_fs,2)<>0
     command=11
-  ElseIf rock_storage_tokenIs(@rock_fs_word[0],?rock_fs_emmc,4)<>0
+  ElseIf TokenEquals(@rock_fs_word[0],?rock_fs_emmc,4)<>0
     command=12
-  ElseIf rock_storage_tokenIs(@rock_fs_word[0],?rock_fs_sd,2)<>0
+  ElseIf TokenEquals(@rock_fs_word[0],?rock_fs_sd,2)<>0
     command=13
-  ElseIf rock_storage_tokenIs(@rock_fs_word[0],?rock_fs_mkdir,5)<>0
+  ElseIf TokenEquals(@rock_fs_word[0],?rock_fs_mkdir,5)<>0
     command=4
-  ElseIf rock_storage_tokenIs(@rock_fs_word[0],?rock_fs_rm,2)<>0 Or rock_storage_tokenIs(@rock_fs_word[0],?rock_fs_del,3)<>0
+  ElseIf TokenEquals(@rock_fs_word[0],?rock_fs_rm,2)<>0 Or TokenEquals(@rock_fs_word[0],?rock_fs_del,3)<>0
     command=5
-  ElseIf rock_storage_tokenIs(@rock_fs_word[0],?rock_fs_rmdir,5)<>0
+  ElseIf TokenEquals(@rock_fs_word[0],?rock_fs_rmdir,5)<>0
     command=6
-  ElseIf rock_storage_tokenIs(@rock_fs_word[0],?rock_fs_mv,2)<>0 Or rock_storage_tokenIs(@rock_fs_word[0],?rock_fs_rename,6)<>0
+  ElseIf TokenEquals(@rock_fs_word[0],?rock_fs_mv,2)<>0 Or TokenEquals(@rock_fs_word[0],?rock_fs_rename,6)<>0
     command=7
   Else
     ProcedureReturn 0
   EndIf
   If command=11 Or command=12 Or command=13
-    If rock_storage_onlySpace(*line,lineLength,pos)=0
+    If TokenOnlySpace(*line,lineLength,pos)=0
       RockUartLine("USAGE: fs | emmc | sd")
     ElseIf command=12
       RockFsSelectMedium(1)
@@ -452,7 +453,7 @@ Procedure.i RockFsCommand(*line,lineLength.i)
     ProcedureReturn 1
   EndIf
   If command=10
-    If rock_storage_parseHexToken(*line,lineLength,@pos,@length)=0 Or rock_storage_parseHexToken(*line,lineLength,@pos,@checksum)=0 Or rock_storage_onlySpace(*line,lineLength,pos)=0
+    If TokenHex32Bounded(*line,lineLength,@pos,@length)=0 Or TokenHex32Bounded(*line,lineLength,@pos,@checksum)=0 Or TokenOnlySpace(*line,lineLength,pos)=0
       RockUartLine("USAGE: receive <length-hex> <crc32-hex>")
     Else
       RockFsReceive(length,checksum)
@@ -475,7 +476,7 @@ Procedure.i RockFsCommand(*line,lineLength.i)
       ProcedureReturn 1
     EndIf
   EndIf
-  If rock_storage_onlySpace(*line,lineLength,pos)=0
+  If TokenOnlySpace(*line,lineLength,pos)=0
     RockUartLine("FILESYSTEM COMMAND HAS EXTRA ARGUMENTS")
     ProcedureReturn 1
   EndIf

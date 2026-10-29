@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Executable gate for RaspberryPi4/Lib/ec256.pi4 and
-RaspberryPi4/Lib/x25519.pi4 - the M8 elliptic-curve primitives on AArch64.
+"""Executable gate for Anvil/Crypto/ec256.pbi and
+Anvil/Crypto/x25519.pbi - the M8 elliptic-curve primitives on AArch64.
 
 WHY THIS FILE IS WRITTEN THE WAY IT IS
 
@@ -76,8 +76,8 @@ PMFC = os.environ.get("PMF_COMPILER") or "PureMetalForge.exe"  # rebound from --
 BUILD_ENV = dict(os.environ, PMF_ROOT=str(ROOT))
 # --jobs, remembered for the pools that are not handed it directly.
 JOBS_CAP = None
-EC256 = ROOT / "RaspberryPi4" / "Lib" / "ec256.pi4"
-X25519 = ROOT / "RaspberryPi4" / "Lib" / "x25519.pi4"
+EC256 = ROOT / "Anvil" / "Crypto" / "ec256.pbi"
+X25519 = ROOT / "Anvil" / "Crypto" / "x25519.pbi"
 WORK = ROOT / "_work"
 
 LOAD = 0x00400000
@@ -120,7 +120,7 @@ HARNESS = r'''
 ;  NOT A SOURCE FILE. DO NOT EDIT.
 ; ======================================================================
 XIncludeFile "RaspberryPi4/Lib/uart.pi4"
-XIncludeFile "RaspberryPi4/Lib/bignum.pi4"
+XIncludeFile "Anvil/Crypto/bignum.pbi"
 XIncludeFile "__EC256__"
 XIncludeFile "__X25519__"
 
@@ -835,8 +835,8 @@ MUTATIONS = [
 
 def mutate_source(idx, which, find, replace, harness_text):
     WORK.mkdir(exist_ok=True)
-    inc_ec = "RaspberryPi4/Lib/ec256.pi4"
-    inc_x = "RaspberryPi4/Lib/x25519.pi4"
+    inc_ec = "Anvil/Crypto/ec256.pbi"
+    inc_x = "Anvil/Crypto/x25519.pbi"
     if which == "harness":
         if harness_text.count(find) != 1:
             raise SystemExit("mutation anchor not unique in the harness:\n%r"
@@ -985,7 +985,7 @@ def main(argv=None):
 
     s = build_script(g, iter1000=args.iter1000)
     img = WORK / "echarness.img"
-    size = build("RaspberryPi4/Lib/ec256.pi4", "RaspberryPi4/Lib/x25519.pi4",
+    size = build("Anvil/Crypto/ec256.pbi", "Anvil/Crypto/x25519.pbi",
                  WORK / "echarness.pi4", img)
     print("[gate] image %d bytes, %d jobs" % (size, len(s)))
     t0 = time.time()

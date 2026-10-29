@@ -70,6 +70,19 @@
 ; reference to that backend. When set, the cursor is part of the next GPU
 ; frame and save-under must not touch the renderer's physical back buffer.
 Global gCursorGpuOwned.i = 0
+Global gKeyboardUiReturnFence.i,gMouseUiReturnMask.i
+Global gTouchUiReturnFence.i,gTouchUiReturnFrame.i
+Procedure KeyboardInputReturnFence()
+  gKeyboardUiReturnFence=1
+EndProcedure
+Procedure MouseInputReturnFence()
+  gMouseUiReturnMask=HidMouseButtons() & 7
+  gPtrBtnMouse=0
+EndProcedure
+Procedure TouchInputReturnFence()
+  gTouchUiReturnFence=1 : gTouchUiReturnFrame=HwTouchFrameSequence()
+  HwTouchFlush()
+EndProcedure
 
 Procedure CursorShape()
   gCurMask[0]  = $80
@@ -736,6 +749,10 @@ Procedure.i KeyboardChar()
     ProcedureReturn -1
   EndIf
   n = HidKeyboardPoll(gKbdH)
+  If gKeyboardUiReturnFence<>0
+    If n>=0 And HidKeysHeld(gKbdH)=0 And HidModifiers(gKbdH)=0 : gKeyboardUiReturnFence=0 : EndIf
+    ProcedureReturn -1
+  EndIf
   If n <= 0
     ProcedureReturn -1
   EndIf
@@ -775,6 +792,14 @@ EndProcedure
 ; PointerPlace - put the arrow at an absolute pixel and redraw it.
 ; The one writer of gCurX and gCurY.
 Procedure PointerPlace(nx.i, ny.i)
+  If InputFocus()=#AIF_PAYLOAD
+    If nx<0 : nx=0 : EndIf
+    If ny<0 : ny=0 : EndIf
+    If nx>=DisplayWidth() : nx=DisplayWidth()-1 : EndIf
+    If ny>=DisplayHeight() : ny=DisplayHeight()-1 : EndIf
+    gCurX=nx : gCurY=ny : gPtrPlaced=1
+    ProcedureReturn
+  EndIf
   If nx < 0
     nx = 0
   EndIf
@@ -836,6 +861,7 @@ EndProcedure
 ; PointerShow - draw it where it already is. Used so the arrow appears
 ; the moment a device is found rather than on the first movement.
 Procedure PointerShow()
+  If InputFocus()=#AIF_PAYLOAD : ProcedureReturn : EndIf
   If gCurShown <> 0
     ProcedureReturn
   EndIf
@@ -849,6 +875,7 @@ Procedure PointerShow()
 EndProcedure
 
 Procedure PointerHide()
+  If InputFocus()=#AIF_PAYLOAD : gCurShown=0 : ProcedureReturn : EndIf
   If gCurShown = 0
     ProcedureReturn
   EndIf
@@ -895,6 +922,7 @@ Procedure.i PointerButtons()
 EndProcedure
 
 
+Global gPtrWheel.i
 Procedure MouseTick()
   Define n.i
   ; No screen, no cursor - and no point paying for the poll.
@@ -913,6 +941,7 @@ Procedure MouseTick()
   EndIf
   gCurTick = Ticks()
 
+  If InputFocus()<>#AIF_PAYLOAD : gPtrWheel=0 : EndIf
   n = HidMousePoll(gMouseH)
   ; A negative return is an error, not an idle mouse. Three in a row and
   ; the device is gone (unplugged, or the bus was reset underneath us);
@@ -935,6 +964,10 @@ Procedure MouseTick()
   gMouseMiss = 0
   ; Button state is absolute and may change without any movement.
   gPtrBtnMouse = HidMouseButtons()
+  If InputFocus()<>#AIF_PAYLOAD
+    gMouseUiReturnMask=gMouseUiReturnMask & gPtrBtnMouse
+    gPtrBtnMouse=gPtrBtnMouse & (7-gMouseUiReturnMask)
+  EndIf
   If n <= 0
     ; Draw it once even if the mouse has not moved, so it appears the
     ; moment the screen comes on rather than on the first movement.
@@ -957,6 +990,7 @@ Procedure MouseTick()
   ; applied - a constant hand speed now gives a constant cursor speed.
   Define rawDx.i
   Define rawDy.i
+  gPtrWheel=gPtrWheel+HidMouseWheel()
   rawDx = HidMouseDx()
   rawDy = HidMouseDy()
   HidMouseTake()
@@ -1040,6 +1074,7 @@ EndProcedure
 ;  the events.
 ; ======================================================================
 Procedure TouchTick()
+  If InputUiActive()<>0 : ProcedureReturn : EndIf
   Define n.i
   Define pollSeq.i
   Define contacts.i
@@ -1162,6 +1197,14 @@ Procedure TouchTick()
   ;
   ; Multitouch programs own this queue while they run; this tick executes
   ; only in the interactive console's input wait.
+  If gTouchUiReturnFence<>0
+    gPtrBtnTouch=0 : gTouchPrimaryId=-1
+    If HwTouchFrameSequence()<>gTouchUiReturnFrame And n=0 : gTouchUiReturnFence=0 : EndIf
+    gTouchUiReturnFrame=HwTouchFrameSequence()
+    HwTouchFlush()
+    ProcedureReturn
+  EndIf
+
   While HwTouchPoll(@ev) = 1
     InputTouchDispatch(PeekL(@ev + #HW_TOUCH_EV_X), PeekL(@ev + #HW_TOUCH_EV_Y), PeekL(@ev + #HW_TOUCH_EV_ID), PeekL(@ev + #HW_TOUCH_EV_ST), PeekI(@ev + #HW_TOUCH_EV_TICK), PeekL(@ev + #HW_TOUCH_EV_PRES))
   Wend

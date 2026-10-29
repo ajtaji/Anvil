@@ -62,6 +62,15 @@ BOARD_EXTS = (".pi4", ".pi3", ".unoq", ".rockpi4c")
 SHARED_ROOT = "Anvil/"
 BOARD_ROOTS = ("RaspberryPi3/", "RaspberryPi4/", "RockPi4C/", "ArduinoQ/")
 
+# Compiler-selected registries, not a list of exempt symbol spellings. These
+# identify builtins for board callers only; shared code still owes a HAL seam.
+INTRINSIC_REGISTRIES = {
+    "RaspberryPi3/": ("Intrinsics/bcm2837_hardware.def", "BCM2837"),
+    "RaspberryPi4/": ("Intrinsics/bcm2711_hardware.def", "BCM2711"),
+    "RockPi4C/": ("Intrinsics/rk3399_hardware.def", "RK3399"),
+    "ArduinoQ/": ("Intrinsics/qcm2290_hardware.def", "QCM2290"),
+}
+
 # Where the seams are declared. They are declared in prose, in comments,
 # beside their contracts - which is the only place a board implementor
 # actually reads - so this file reads the comments.
@@ -107,6 +116,10 @@ PROGRAM_ENTRY = {"main"}
 #  are blanked first - because a protocol named in a sentence is a
 #  reference and a protocol written in an expression is an implementation.
 # ----------------------------------------------------------------------
+# FIPS 180-4 sections 4.2.3/5.3.5: SHA-512 stores these 64-bit words as
+# Data.l high/low pairs. Their high halves alone are SHA-256 fingerprints.
+# Recognize the complete words, not a file-name exemption for arbitrary code.
+SHA512_SPLIT_WORD = r"\$(?:6A09E667\s*,\s*\$F3BCC908|BB67AE85\s*,\s*\$84CAA73B|428A2F98\s*,\s*\$D728AE22|71374491\s*,\s*\$23EF65CD)\b"
 FINGERPRINTS = (
     {
         "id": "crc32-polynomial",
@@ -123,6 +136,13 @@ FINGERPRINTS = (
         "what": "the SHA-256 initial hash or round constants",
         "owners": ("Anvil/Core/sha256.pbi",),
         "pattern": r"\$(?:6A09E667|BB67AE85|428A2F98|71374491)\b",
+        "embedded_data_words": SHA512_SPLIT_WORD,
+    },
+    {
+        "id": "sha512-constants",
+        "what": "the SHA-512 initial hash or round constants as split words",
+        "owners": ("Anvil/Crypto/sha512.pbi",),
+        "pattern": SHA512_SPLIT_WORD,
     },
     {
         "id": "videocore-mailbox-registers",
@@ -161,7 +181,7 @@ FINGERPRINTS = (
     {
         "id": "generic-timer-read",
         "what": "a private read of the AArch64 generic timer",
-        "owners": ("RaspberryPi4/Lib/timer.pi4",),
+        "owners": ("Anvil/Hal/aarch64_counter.pbi",),
         "pattern": r"(?i)\bmrs[ \t]+[a-z0-9]+[ \t]*,[ \t]*cnt(?:pct|vct|frq)_el0\b",
     },
     {
@@ -299,9 +319,12 @@ def layer_of(path):
 
 
 class Tree(object):
-    def __init__(self, root, use_git=True):
+    def __init__(self, root, use_git=True, source_paths=None):
         self.root = Path(root)
-        self.files = tracked_sources(self.root, use_git)
+        # Tests already have a literal fixture inventory; do not enumerate it.
+        # Normal publication checks retain their authoritative Git inventory.
+        self.files = (tracked_sources(self.root, use_git) if source_paths is None
+                      else sorted(source_paths))
         self.code = {}
         self.comments = {}
         self.uncommented = {}
@@ -332,6 +355,45 @@ class Tree(object):
                         self.conditional.add((path, lineno))
 
         self.seams = self.read_seams()
+        self.intrinsics = self.read_intrinsics()
+
+    def read_intrinsics(self):
+        """Read complete declarations from the exact target registries.
+
+        Missing or mismatched registries grant no exception. Fixture trees need
+        only create the literal registry they are testing; there is no traversal.
+        """
+        result = {}
+        for board, (relative, target) in INTRINSIC_REGISTRIES.items():
+            path = self.root / board / relative
+            if not path.is_file():
+                continue
+            text = path.read_text(encoding="utf-8-sig")
+            targets = re.findall(r"(?mi)^@TARGET[ \t]+([A-Za-z0-9_]+)[ \t]*$", text)
+            if targets != [target]:
+                continue
+            names = re.findall(
+                r"(?ms)^@INTRINSIC[ \t]+(" + IDENT + r")[ \t]*\r?$"
+                r"(?:(?!^@INTRINSIC\b|^@END\b).)*^@ASM[ \t]*\r?$"
+                r"(?:(?!^@INTRINSIC\b|^@END\b).)*^@END[ \t]*\r?$", text)
+            result[board] = {name.lower() for name in names}
+        return result
+
+    def is_intrinsic_with_test_doubles(self, caller, name):
+        """A test recorder cannot claim production ownership of a builtin.
+
+        Keep ordinary private definitions, test callers and shared callers in
+        the normal rules. No namespace or test-directory exemption is applied.
+        """
+        for board in BOARD_ROOTS:
+            if not caller.startswith(board) or caller.startswith(board + "Tests/"):
+                continue
+            if name not in self.intrinsics.get(board, set()):
+                return False
+            sites = self.def_sites.get(name, ())
+            return bool(sites) and all(path.startswith(board + "Tests/")
+                                       for path, _, _ in sites)
+        return False
 
     def read_seams(self):
         """The names the seam files DECLARE, read out of their comments.
@@ -478,7 +540,10 @@ def rule_protocol(tree):
             for lineno, line in enumerate(tree.code[path], 1):
                 if exempt is not None and exempt.match(line):
                     continue
-                found = len(pat.findall(line))
+                candidate = line
+                if fp.get("embedded_data_words") and re.match(r"^\s*Data\.l\s",line,re.I):
+                    candidate = re.sub(fp["embedded_data_words"], "", line)
+                found = len(pat.findall(candidate))
                 if found:
                     hits += found
                     details.append((fp["id"], path, lineno, line.strip()[:90]))
@@ -523,6 +588,12 @@ def rule_private_namespace(tree):
                 key = raw.lower()
                 prefix = member.get(key)
                 if prefix is None:
+                    continue
+                # Explicitly published seams are public even when a compiler
+                # ABI fixes an underscore spelling. Do not exempt the prefix.
+                if tree.is_seam(raw):
+                    continue
+                if tree.is_intrinsic_with_test_doubles(path, key):
                     continue
                 if path in owners[prefix]:
                     continue
@@ -886,15 +957,47 @@ SELF_TEST_TREE = {
 }
 
 
+
+# A compiler/runtime hook can retain a legacy underscore name while being an
+# explicitly published seam. The exemption is the declared NAME, not its prefix.
+SELF_TEST_TREE["Anvil/Hal/hal.pbi"] += (
+    ";                 str_print_at(p)   published runtime string output\n"
+    "; The prose merely mentions str_Hidden(p); that is not a declaration.\n"
+)
+SELF_TEST_TREE["RaspberryPi4/Lib/board_lib.pi4"] += (
+    "Procedure str_print_at(p.i)\nEndProcedure\n"
+    "Procedure str_Hidden()\nEndProcedure\n"
+)
+SELF_TEST_TREE["Anvil/Core/runtime_client.pbi"] = (
+    "Global runtimePublished.i=@str_print_at\n"
+    "Procedure RuntimeClient(p.i)\n  str_print_at(p)\nEndProcedure\n"
+)
+SELF_TEST_TREE["Anvil/Core/runtime_hidden.pbi"] = (
+    "Global runtimeHidden.i=@str_Hidden\n"
+    "Procedure RuntimeHidden()\n  str_Hidden()\nEndProcedure\n"
+)
+
 def self_test():
     failures = []
+    sha_pairs = "Data.l $428A2F98, $D728AE22, $71374491, $23EF65CD, $6A09E667, $F3BCC908, $BB67AE85, $84CAA73B\n"
+    sha_tree = dict(SELF_TEST_TREE)
+    sha_tree.update({
+        "Anvil/Hal/aarch64_counter.pbi": "ProcedureNaked.i A64CounterRead()\nASM\nmrs x0, cntpct_el0\nret\nENDASM\nEndProcedure\n",
+        "RaspberryPi4/Lib/timer.pi4": "Procedure.i DuplicatedTicks()\nASM\nmrs x0, cntpct_el0\nENDASM\nEndProcedure\n",
+        "RockPi4C/Lib/duplicate_counter.pbi": "Procedure.i DuplicatedFrequency()\nASM\nmrs x0, cntfrq_el0\nENDASM\nEndProcedure\n",
+        "Anvil/Crypto/sha512.pbi": sha_pairs + "Global rogue.i=$428A2F98\n",
+        "Anvil/Core/sha256.pbi": "Global initial.i=$6A09E667\n",
+        "Anvil/Core/second_sha512.pbi": sha_pairs,
+        "Anvil/Core/second_sha256.pbi": "Data.l $428A2F98, $71374491, $6A09E667, $BB67AE85\n",
+        "Anvil/Core/not_sha512.pbi": "Data.l $428A2F98, $D728AE23\n",
+    })
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
-        for rel, text in sorted(SELF_TEST_TREE.items()):
+        for rel, text in sorted(sha_tree.items()):
             p = root / rel
             p.parent.mkdir(parents=True, exist_ok=True)
             p.write_text(text, encoding="utf-8")
-        tree = Tree(root, use_git=False)
+        tree = Tree(root, use_git=False, source_paths=sha_tree)
         (dcall, dincl, bext, proto, priv, onedef), _ = run(tree)
 
         def want(ok, label):
@@ -916,14 +1019,37 @@ def self_test():
         want(bext == ["Anvil/Graphics/planted_backend.pi4"],
              "rule 2b red on the planted board-extension file under Anvil/")
         crc = proto.get("crc32-polynomial", {})
+        counters = proto.get("generic-timer-read", {})
+        want("Anvil/Hal/aarch64_counter.pbi" not in counters
+             and counters.get("RaspberryPi4/Lib/timer.pi4") == 1
+             and counters.get("RockPi4C/Lib/duplicate_counter.pbi") == 1,
+             "counter owner is shared; duplicate reads in either board facade still refuse")
         want(crc.get("Anvil/Core/second_crc.pbi") == 1,
              "rule 3 red on the planted second CRC-32")
         want("Anvil/Core/comment_only.pbi" not in crc,
              "rule 3 quiet on the same constant in a comment and a string")
+        sha256 = proto.get("sha256-constants", {})
+        sha512 = proto.get("sha512-constants", {})
+        want(sha256.get("Anvil/Crypto/sha512.pbi") == 1,
+             "SHA-512 data pairs are distinct; standalone SHA-256 code in that file still refuses")
+        want(sha512 == {"Anvil/Core/second_sha512.pbi": 4},
+             "duplicate SHA-512 data refuses outside its owner")
+        want(sha256.get("Anvil/Core/second_sha256.pbi") == 4,
+             "duplicate SHA-256 data still refuses")
+        want(sha256.get("Anvil/Core/not_sha512.pbi") == 1,
+             "wrong low half does not hide a SHA-256 fingerprint")
+        want("Anvil/Core/sha256.pbi" not in sha256 and "Anvil/Core/second_sha512.pbi" not in sha256,
+             "SHA-256 owner and complete SHA-512 pairs are not false duplicates")
         want(priv.get("RaspberryPi4/Lib/crosses.pi4", {}).get("zz_Helper") == 1,
              "rule 4 red on the planted private-namespace crossing")
         want("RaspberryPi4/Lib/board_lib.pi4" not in priv,
              "rule 4 quiet inside the namespace's own file")
+        want("Anvil/Core/runtime_client.pbi" not in priv,
+             "rule 4 allows calls and addresses of an explicitly declared seam")
+        want(priv.get("Anvil/Core/runtime_hidden.pbi", {}).get("str_Hidden") == 2,
+             "rule 4 still rejects undeclared helpers in that same prefix")
+        want(tree.is_seam("str_print_at") and not tree.is_seam("str_Hidden"),
+             "only declaration syntax grants a seam, not a prose mention")
         want("TwiceDefined" in onedef and len(onedef["TwiceDefined"]) == 2,
              "rule 5 red on the planted duplicate definition")
         want("UartWriteStr" not in onedef,

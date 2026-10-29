@@ -34,7 +34,10 @@ Procedure.i lineContractProof(imageBase.i, imagePitch.i, framebuffer.i)
     rc=NeonVkChromeLinesDraw(first,8,Neon_RGBA(255,255,255,255))
    EndIf
    If rc<>0 : NeonVkChromeAbort() : ProcedureReturn 204 : EndIf
-   If NeonVkChromeDrawCount()<>1 Or NeonVkChromeVertexCount()<>48 : NeonVkChromeAbort() : ProcedureReturn 205 : EndIf
+   If NeonVkChromeDrawCount()<>1 : NeonVkChromeAbort() : ProcedureReturn 205 : EndIf
+   ; Compact instances occupy eleven 24-byte slots; bulk quads occupy 48.
+   If (path=0 And NeonVkChromeVertexCount()<>11) Or (path=1 And NeonVkChromeVertexCount()<>48) : NeonVkChromeAbort() : ProcedureReturn 205 : EndIf
+   If Neon_Draws()<>1 Or Neon_Verts()<>(16+32*path) : NeonVkChromeAbort() : ProcedureReturn 210 : EndIf
    rc=NeonVkChromeEnd()
    If rc<>0 : ProcedureReturn 206 : EndIf
    If NeonVkChromePresentConsume()<>1 : ProcedureReturn 207 : EndIf

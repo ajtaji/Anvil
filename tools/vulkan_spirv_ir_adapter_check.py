@@ -25,7 +25,7 @@ from pmf_compiler import resolve_compiler
 HERE = pathlib.Path(__file__).resolve().parent
 ROOT = HERE.parent
 VULKAN = ROOT / "Anvil" / "Graphics" / "Vulkan"
-GATE = VULKAN / "Tests" / "vulkan_spirv_ir_adapter_gate.pi4"
+GATE = ROOT / 'RaspberryPi4/Tests/Vulkan/vulkan_spirv_ir_adapter_gate.pi4'
 FRONTEND = VULKAN / "vk_spirv.pbi"
 ADAPTER = VULKAN / "vk_spirv_ir_adapter.pbi"
 IR = VULKAN / "vk_ir.pbi"

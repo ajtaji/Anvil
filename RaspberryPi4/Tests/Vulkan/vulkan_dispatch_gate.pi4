@@ -1,0 +1,307 @@
+; ======================================================================
+;  Emitted gate: Vulkan core-1.0 procedure-address dispatch
+; ======================================================================
+; State-only returning test. The test backend supplies object handles
+; without touching hardware; this gate checks exact function addresses,
+; lookup domains, spelling, missing names, and stale owner rejection.
+
+XIncludeFile "Anvil/Graphics/Vulkan/vk_api.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_backend_test.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_dispatch.pbi"
+
+#VKD_OUT = $06000000
+#VKD_ROWS = $06000100
+#VKD_MAGIC = $564B4450
+
+Global vkdChecks.i = 0
+Global vkdFails.i = 0
+Global Dim vkdSparseSentinel.a[128]
+Global Dim vkdCacheBytes.a[32]
+
+Procedure Vkd(ok.i)
+  PokeI(#VKD_ROWS + vkdChecks * 8, ok)
+  vkdChecks = vkdChecks + 1
+  If ok = 0 : vkdFails = vkdFails + 1 : EndIf
+EndProcedure
+
+Procedure.i Main()
+  Define instance.i
+  Define physical.i
+  Define device.i
+  Define queue.i
+  Define image.i
+  Define memory.i
+  Define mappedPointer.i
+  Define i.i
+  Define count.l
+  Define extensionProperty.VkExtensionProperties
+  Define propertySentinel.l
+  Define subresource.VkImageSubresource
+  Define layout.VkSubresourceLayout
+  Define mappedRange.VkMappedMemoryRange
+  Define properties.VkPhysicalDeviceProperties
+  Define cacheInfo.VkPipelineCacheCreateInfo
+  Define cache.i
+  Define cache2.i
+  Define cacheSize.i
+  Define cacheSource.i
+  Define pipelineInfo.VkGraphicsPipelineCreateInfo
+  Define pipelineOut.i
+
+  AnvilVkTestBackendHeap($07000000, $00100000)
+  Vkd(AnvilVkInstanceCreate(@instance) = #VK_SUCCESS)
+  count = 1
+  Vkd(AnvilVkPhysicalEnumerate(instance, @count, @physical) = #VK_SUCCESS)
+  Vkd(AnvilVkDeviceCreate(physical, @device) = #VK_SUCCESS)
+  Vkd(AnvilVkDeviceQueue(device, @queue) = #VK_SUCCESS)
+
+  ; Vulkan 1.0 null-instance lookup exposes the three audited global entries.
+  Vkd(vkGetInstanceProcAddr(0, "vkCreateInstance") = @vkCreateInstance)
+  Vkd(vkGetInstanceProcAddr(0, "vkEnumerateInstanceLayerProperties") = @vkEnumerateInstanceLayerProperties)
+  Vkd(vkGetInstanceProcAddr(0, "vkEnumerateInstanceExtensionProperties") = @vkEnumerateInstanceExtensionProperties)
+  Vkd(vkGetInstanceProcAddr(0, "vkGetInstanceProcAddr") = 0)
+  Vkd(vkGetInstanceProcAddr(0, "vkEnumeratePhysicalDevices") = 0)
+  Vkd(vkGetInstanceProcAddr(0, "vkDeviceWaitIdle") = 0)
+
+  ; Both resolver addresses have their exact non-null domains.
+  Vkd(vkGetInstanceProcAddr(instance, "vkGetInstanceProcAddr") = @vkGetInstanceProcAddr)
+  Vkd(vkGetInstanceProcAddr(instance, "vkGetDeviceProcAddr") = @vkGetDeviceProcAddr)
+  Vkd(vkGetDeviceProcAddr(device, "vkGetDeviceProcAddr") = @vkGetDeviceProcAddr)
+  Vkd(vkGetDeviceProcAddr(device, "vkCreateEvent") = @vkCreateEvent)
+  Vkd(vkGetDeviceProcAddr(device, "vkCreatePipelineCache") = @vkCreatePipelineCache)
+  Vkd(vkGetDeviceProcAddr(device, "vkDestroyPipelineCache") = @vkDestroyPipelineCache)
+  Vkd(vkGetDeviceProcAddr(device, "vkGetPipelineCacheData") = @vkGetPipelineCacheData)
+  Vkd(vkGetDeviceProcAddr(device, "vkMergePipelineCaches") = @vkMergePipelineCaches)
+  Vkd(vkGetDeviceProcAddr(device, "vkDestroyEvent") = @vkDestroyEvent)
+  Vkd(vkGetDeviceProcAddr(device, "vkGetEventStatus") = @vkGetEventStatus)
+  Vkd(vkGetDeviceProcAddr(device, "vkSetEvent") = @vkSetEvent)
+  Vkd(vkGetDeviceProcAddr(device, "vkResetEvent") = @vkResetEvent)
+  Vkd(vkGetInstanceProcAddr(0, "vkCreateEvent") = 0)
+  Vkd(vkGetDeviceProcAddr(device, "vkGetInstanceProcAddr") = 0)
+
+  ; Representative instance commands: exact address through GIPA and never GDPA.
+  Vkd(vkGetInstanceProcAddr(instance, "vkDestroyInstance") = @vkDestroyInstance)
+  Vkd(vkGetInstanceProcAddr(instance, "vkEnumeratePhysicalDevices") = @vkEnumeratePhysicalDevices)
+  Vkd(vkGetInstanceProcAddr(instance, "vkGetPhysicalDeviceFeatures") = @vkGetPhysicalDeviceFeatures)
+  Vkd(vkGetInstanceProcAddr(instance, "vkGetPhysicalDeviceFormatProperties") = @vkGetPhysicalDeviceFormatProperties)
+  Vkd(vkGetInstanceProcAddr(instance, "vkGetPhysicalDeviceImageFormatProperties") = @vkGetPhysicalDeviceImageFormatProperties)
+  Vkd(vkGetInstanceProcAddr(instance, "vkGetPhysicalDeviceMemoryProperties") = @vkGetPhysicalDeviceMemoryProperties)
+  Vkd(vkGetInstanceProcAddr(instance, "vkGetPhysicalDeviceProperties") = @vkGetPhysicalDeviceProperties)
+  Vkd(vkGetDeviceProcAddr(device, "vkGetPhysicalDeviceProperties") = 0)
+  i = 0
+  While i < SizeOf(VkPhysicalDeviceProperties)
+    PokeA(@properties + i, $A5)
+    i = i + 1
+  Wend
+  vkGetPhysicalDeviceProperties(physical, @properties)
+  Vkd(properties\apiVersion = #VK_API_VERSION_1_0)
+  Vkd(properties\deviceType = #VK_PHYSICAL_DEVICE_TYPE_OTHER)
+  Vkd(properties\limits\maxImageDimension2D = avkBackendMaxImageDimension2D())
+  Vkd(properties\limits\maxUniformBufferRange = #ANVIL_VK_UNIFORM_BYTES)
+  Vkd(properties\limits\minUniformBufferOffsetAlignment = #ANVIL_VK_UNIFORM_ALIGN)
+  Vkd(properties\limits\optimalBufferCopyOffsetAlignment = avkBackendImageCopySourceAlignment())
+  Vkd(properties\limits\maxBoundDescriptorSets = 1 And properties\limits\maxColorAttachments = 1)
+  Vkd(properties\limits\maxImageDimension3D = 0 And properties\limits\maxComputeWorkGroupInvocations = 0)
+  Vkd(PeekA(@properties + OffsetOf(VkPhysicalDeviceProperties\deviceName)) = 116)
+  Vkd(PeekA(@properties + OffsetOf(VkPhysicalDeviceProperties\pipelineCacheUUID)) = 0)
+  properties\driverVersion = 77
+  vkGetPhysicalDeviceProperties($12345678, @properties)
+  Vkd(properties\driverVersion = 77)
+  Vkd(vkGetInstanceProcAddr(instance, "vkGetPhysicalDeviceQueueFamilyProperties") = @vkGetPhysicalDeviceQueueFamilyProperties)
+  Vkd(vkGetInstanceProcAddr(instance, "vkGetPhysicalDeviceSparseImageFormatProperties") = @vkGetPhysicalDeviceSparseImageFormatProperties)
+  Vkd(vkGetDeviceProcAddr(device, "vkGetPhysicalDeviceSparseImageFormatProperties") = 0)
+  Vkd(vkGetInstanceProcAddr(instance, "vkCreateDevice") = @vkCreateDevice)
+  Vkd(vkGetInstanceProcAddr(instance, "vkEnumerateDeviceExtensionProperties") = @vkEnumerateDeviceExtensionProperties)
+  Vkd(vkGetInstanceProcAddr(instance, "vkEnumerateDeviceLayerProperties") = @vkEnumerateDeviceLayerProperties)
+  Vkd(vkGetDeviceProcAddr(device, "vkCreateDevice") = 0)
+  Vkd(vkGetDeviceProcAddr(device, "vkEnumerateDeviceExtensionProperties") = 0)
+  Vkd(vkGetDeviceProcAddr(device, "vkEnumerateDeviceLayerProperties") = 0)
+  Vkd(vkGetDeviceProcAddr(device, "vkEnumeratePhysicalDevices") = 0)
+
+  Vkd(AnvilVkImageCreate(device, 3, 2, #VK_FORMAT_B8G8R8A8_UNORM, #VK_IMAGE_TILING_LINEAR, #VK_IMAGE_USAGE_TRANSFER_DST_BIT, #VK_IMAGE_LAYOUT_UNDEFINED, @image) = #VK_SUCCESS)
+  Vkd(vkGetInstanceProcAddr(instance, "vkGetImageSparseMemoryRequirements") = @vkGetImageSparseMemoryRequirements)
+  Vkd(vkGetDeviceProcAddr(device, "vkGetImageSparseMemoryRequirements") = @vkGetImageSparseMemoryRequirements)
+  count = 1 : vkdSparseSentinel[0] = 99
+  vkGetImageSparseMemoryRequirements(device, image, @count, @vkdSparseSentinel[0])
+  Vkd(count = 0 And vkdSparseSentinel[0] = 99)
+  count = 77
+  vkGetImageSparseMemoryRequirements(device, image, @count, 0)
+  Vkd(count = 0)
+  count = 77
+  vkGetImageSparseMemoryRequirements(device, $12345678, @count, @vkdSparseSentinel[0])
+  Vkd(count = 77 And vkdSparseSentinel[0] = 99)
+  count = 77
+  vkGetImageSparseMemoryRequirements(device, image, 0, @vkdSparseSentinel[0])
+  Vkd(count = 77 And vkdSparseSentinel[0] = 99)
+  Vkd(vkGetInstanceProcAddr(instance, "vkGetImageSubresourceLayout") = @vkGetImageSubresourceLayout)
+  Vkd(vkGetDeviceProcAddr(device, "vkGetImageSubresourceLayout") = @vkGetImageSubresourceLayout)
+  subresource\aspectMask = #VK_IMAGE_ASPECT_COLOR_BIT
+  subresource\mipLevel = 0 : subresource\arrayLayer = 0
+  layout\size = 77
+  vkGetImageSubresourceLayout(device, image, @subresource, @layout)
+  Vkd(layout\offset = 0 And layout\size = AnvilVkImageSize(image))
+  Vkd(layout\rowPitch = AnvilVkImageRowPitch(image) And layout\rowPitch >= 12)
+  Vkd(layout\arrayPitch = 0 And layout\depthPitch = 0)
+  layout\size = 77 : subresource\mipLevel = 1
+  vkGetImageSubresourceLayout(device, image, @subresource, @layout)
+  Vkd(layout\size = 77)
+  subresource\mipLevel = 0
+  vkGetImageSubresourceLayout($12345678, image, @subresource, @layout)
+  Vkd(layout\size = 77)
+  AnvilVkImageDestroy(device, image)
+
+  Vkd(AnvilVkMemoryAllocate(device, 128, 1, @memory) = #VK_SUCCESS)
+  Vkd(AnvilVkMemoryMap(device, memory, 16, 64, 0, @mappedPointer) = #VK_SUCCESS)
+  mappedRange\sType = #VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE
+  mappedRange\pNext = 0
+  mappedRange\memory = memory
+  mappedRange\offset = 16
+  mappedRange\size = 32
+  Vkd(vkGetDeviceProcAddr(device, "vkFlushMappedMemoryRanges") = @vkFlushMappedMemoryRanges)
+  Vkd(vkGetDeviceProcAddr(device, "vkInvalidateMappedMemoryRanges") = @vkInvalidateMappedMemoryRanges)
+  Vkd(vkFlushMappedMemoryRanges(device, 1, @mappedRange) = #VK_SUCCESS)
+  Vkd(vkInvalidateMappedMemoryRanges(device, 1, @mappedRange) = #VK_SUCCESS)
+  mappedRange\offset = 8
+  Vkd(vkFlushMappedMemoryRanges(device, 1, @mappedRange) = #ANVIL_VK_ERR_ARGS)
+  mappedRange\offset = 16
+  mappedRange\size = 65
+  Vkd(vkInvalidateMappedMemoryRanges(device, 1, @mappedRange) = #ANVIL_VK_ERR_ARGS)
+  mappedRange\size = #VK_WHOLE_SIZE
+  Vkd(vkFlushMappedMemoryRanges(device, 1, @mappedRange) = #VK_SUCCESS)
+  AnvilVkMemoryUnmap(device, memory)
+  Vkd(vkInvalidateMappedMemoryRanges(device, 1, @mappedRange) = #ANVIL_VK_ERR_STATE)
+  AnvilVkMemoryFree(device, memory)
+
+  ; Empty layer/device discovery is a real zero-count query; instance extension
+  ; discovery writes its complete C record into correctly sized supplied output
+  ; storage; invalid layer and physical-device requests preserve the outputs.
+  count = 77 : propertySentinel = 99
+  Vkd(vkEnumerateInstanceLayerProperties(@count, 0) = #VK_SUCCESS)
+  Vkd(count = 0)
+  count = 77
+  Vkd(vkEnumerateInstanceLayerProperties(@count, @propertySentinel) = #VK_SUCCESS)
+  Vkd(count = 0 And propertySentinel = 99)
+  count = 1
+  Vkd(vkEnumerateInstanceExtensionProperties(0, @count, @extensionProperty) = #VK_SUCCESS)
+  Vkd(count = 1 And propertySentinel = 99)
+  Vkd(avkApiNameEquals(@extensionProperty, avkSurfaceExtensionName(), 256) <> 0 And extensionProperty\specVersion = 25)
+  count = 77
+  Vkd(vkEnumerateInstanceExtensionProperties("missing", @count, @propertySentinel) = #VK_ERROR_LAYER_NOT_PRESENT)
+  Vkd(count = 77 And propertySentinel = 99)
+  count = 77
+  Vkd(vkEnumerateDeviceExtensionProperties(physical, 0, @count, @propertySentinel) = #VK_SUCCESS)
+  Vkd(count = 0 And propertySentinel = 99)
+  count = 77
+  Vkd(vkEnumerateDeviceExtensionProperties(physical, "missing", @count, @propertySentinel) = #VK_ERROR_LAYER_NOT_PRESENT)
+  Vkd(count = 77 And propertySentinel = 99)
+  Vkd(vkEnumerateDeviceExtensionProperties($12345678, 0, @count, @propertySentinel) = #ANVIL_VK_ERR_HANDLE)
+  Vkd(count = 77 And propertySentinel = 99)
+  Vkd(vkEnumerateDeviceLayerProperties(physical, @count, @propertySentinel) = #VK_SUCCESS)
+  Vkd(count = 0 And propertySentinel = 99)
+  count = 77
+  Vkd(vkEnumerateDeviceLayerProperties($12345678, @count, @propertySentinel) = #ANVIL_VK_ERR_HANDLE)
+  Vkd(count = 77 And propertySentinel = 99)
+  vkGetPhysicalDeviceSparseImageFormatProperties(physical, #VK_FORMAT_B8G8R8A8_UNORM, #VK_IMAGE_TYPE_2D, #VK_SAMPLE_COUNT_1_BIT, #VK_IMAGE_USAGE_SAMPLED_BIT, #VK_IMAGE_TILING_LINEAR, @count, @propertySentinel)
+  Vkd(count = 0 And propertySentinel = 99)
+  count = 77
+  vkGetPhysicalDeviceSparseImageFormatProperties($12345678, #VK_FORMAT_B8G8R8A8_UNORM, #VK_IMAGE_TYPE_2D, #VK_SAMPLE_COUNT_1_BIT, #VK_IMAGE_USAGE_SAMPLED_BIT, #VK_IMAGE_TILING_LINEAR, @count, @propertySentinel)
+  Vkd(count = 77 And propertySentinel = 99)
+
+  ; Representative device commands resolve identically through valid GIPA/GDPA.
+  Vkd(vkGetInstanceProcAddr(instance, "vkAllocateMemory") = @vkAllocateMemory)
+  Vkd(vkGetDeviceProcAddr(device, "vkAllocateMemory") = @vkAllocateMemory)
+  Vkd(vkGetInstanceProcAddr(instance, "vkCreateCommandPool") = @vkCreateCommandPool)
+  Vkd(vkGetDeviceProcAddr(device, "vkCreateCommandPool") = @vkCreateCommandPool)
+  Vkd(vkGetInstanceProcAddr(instance, "vkCmdPipelineBarrier") = @vkCmdPipelineBarrier)
+  Vkd(vkGetDeviceProcAddr(device, "vkCmdPipelineBarrier") = @vkCmdPipelineBarrier)
+  Vkd(vkGetInstanceProcAddr(instance, "vkCmdCopyBufferToImage") = @vkCmdCopyBufferToImage)
+  Vkd(vkGetDeviceProcAddr(device, "vkCmdCopyBufferToImage") = @vkCmdCopyBufferToImage)
+  Vkd(vkGetInstanceProcAddr(instance, "vkCmdCopyBuffer") = @vkCmdCopyBuffer)
+  Vkd(vkGetDeviceProcAddr(device, "vkCmdCopyBuffer") = @vkCmdCopyBuffer)
+  Vkd(vkGetInstanceProcAddr(instance, "vkCmdFillBuffer") = @vkCmdFillBuffer)
+  Vkd(vkGetDeviceProcAddr(device, "vkCmdFillBuffer") = @vkCmdFillBuffer)
+  Vkd(vkGetInstanceProcAddr(instance, "vkCmdUpdateBuffer") = @vkCmdUpdateBuffer)
+  Vkd(vkGetDeviceProcAddr(device, "vkCmdUpdateBuffer") = @vkCmdUpdateBuffer)
+  Vkd(vkGetInstanceProcAddr(instance, "vkQueueSubmit") = @vkQueueSubmit)
+  Vkd(vkGetDeviceProcAddr(device, "vkQueueSubmit") = @vkQueueSubmit)
+  Vkd(vkGetInstanceProcAddr(instance, "vkCreateGraphicsPipelines") = @vkCreateGraphicsPipelines)
+  Vkd(vkGetDeviceProcAddr(device, "vkCreateGraphicsPipelines") = @vkCreateGraphicsPipelines)
+  Vkd(vkGetInstanceProcAddr(instance, "vkCmdDraw") = @vkCmdDraw)
+  Vkd(vkGetDeviceProcAddr(device, "vkCmdDraw") = @vkCmdDraw)
+  Vkd(vkGetInstanceProcAddr(instance, "vkCmdBindIndexBuffer") = @vkCmdBindIndexBuffer)
+  Vkd(vkGetDeviceProcAddr(device, "vkCmdBindIndexBuffer") = @vkCmdBindIndexBuffer)
+  Vkd(vkGetInstanceProcAddr(instance, "vkCmdDrawIndexed") = @vkCmdDrawIndexed)
+  Vkd(vkGetDeviceProcAddr(device, "vkCmdDrawIndexed") = @vkCmdDrawIndexed)
+  Vkd(vkGetInstanceProcAddr(instance, "vkCmdSetScissor") = @vkCmdSetScissor)
+  Vkd(vkGetDeviceProcAddr(device, "vkCmdSetScissor") = @vkCmdSetScissor)
+  Vkd(vkGetInstanceProcAddr(instance, "vkCmdSetViewport") = @vkCmdSetViewport)
+  Vkd(vkGetDeviceProcAddr(device, "vkCmdSetViewport") = @vkCmdSetViewport)
+  Vkd(vkGetInstanceProcAddr(instance, "vkDeviceWaitIdle") = @vkDeviceWaitIdle)
+  Vkd(vkGetDeviceProcAddr(device, "vkDeviceWaitIdle") = @vkDeviceWaitIdle)
+  Vkd(vkGetInstanceProcAddr(instance, "vkQueueWaitIdle") = @vkQueueWaitIdle)
+  Vkd(vkGetDeviceProcAddr(device, "vkQueueWaitIdle") = @vkQueueWaitIdle)
+  Vkd(vkQueueWaitIdle(queue) = #VK_SUCCESS)
+  Vkd(vkQueueWaitIdle($12345678) = #ANVIL_VK_ERR_HANDLE)
+
+  ; Public binary semaphore entry points have exact device domains.
+  Vkd(vkGetInstanceProcAddr(instance, "vkCreateSemaphore") = @vkCreateSemaphore)
+  Vkd(vkGetDeviceProcAddr(device, "vkCreateSemaphore") = @vkCreateSemaphore)
+  Vkd(vkGetInstanceProcAddr(instance, "vkDestroySemaphore") = @vkDestroySemaphore)
+  Vkd(vkGetDeviceProcAddr(device, "vkDestroySemaphore") = @vkDestroySemaphore)
+
+  ; Individual set free is a device command; names remain domain-checked.
+  Vkd(vkGetInstanceProcAddr(instance, "vkFreeDescriptorSets") = @vkFreeDescriptorSets)
+  Vkd(vkGetDeviceProcAddr(device, "vkFreeDescriptorSets") = @vkFreeDescriptorSets)
+  Vkd(vkGetInstanceProcAddr(instance, "vkCreateEvent") = @vkCreateEvent)
+  Vkd(vkGetDeviceProcAddr(device, "vkCreateEvent") = @vkCreateEvent)
+
+  ; An empty cache has a stable 32-byte header and accepts a round trip.
+  cacheInfo\sType = #VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO
+  Vkd(vkCreatePipelineCache(device, @cacheInfo, 0, @cache) = #VK_SUCCESS)
+  Vkd(vkCreateGraphicsPipelines(device, cache, 0, @pipelineInfo, 0, @pipelineOut) = #ANVIL_VK_ERR_ARGS)
+  cacheSize = 0
+  Vkd(vkGetPipelineCacheData(device, cache, @cacheSize, 0) = #VK_SUCCESS And cacheSize = 32)
+  cacheSize = 12
+  Vkd(vkGetPipelineCacheData(device, cache, @cacheSize, @vkdCacheBytes[0]) = #VK_INCOMPLETE And cacheSize = 12)
+  cacheSize = 32
+  Vkd(vkGetPipelineCacheData(device, cache, @cacheSize, @vkdCacheBytes[0]) = #VK_SUCCESS And cacheSize = 32)
+  Vkd(PeekL(@vkdCacheBytes[0]) = 32 And PeekL(@vkdCacheBytes[4]) = 1)
+  cacheInfo\initialDataSize = 32
+  cacheInfo\pInitialData = @vkdCacheBytes[0]
+  Vkd(vkCreatePipelineCache(device, @cacheInfo, 0, @cache2) = #VK_SUCCESS)
+  cacheSource = cache2
+  Vkd(vkMergePipelineCaches(device, cache, 1, @cacheSource) = #VK_SUCCESS)
+  Vkd(vkMergePipelineCaches(device, cache, 1, @cache) = #ANVIL_VK_ERR_HANDLE)
+  Vkd(vkGetPipelineCacheData($12345678, cache, @cacheSize, 0) = #ANVIL_VK_ERR_HANDLE)
+  vkDestroyPipelineCache(device, cache2, 0)
+  Vkd(vkGetPipelineCacheData(device, cache2, @cacheSize, 0) = #ANVIL_VK_ERR_HANDLE)
+  vkDestroyPipelineCache(device, cache, 0)
+  Vkd(vkGetPipelineCacheData(device, cache, @cacheSize, 0) = #ANVIL_VK_ERR_HANDLE)
+  Vkd(vkCreateGraphicsPipelines(device, cache, 0, @pipelineInfo, 0, @pipelineOut) = #ANVIL_VK_ERR_HANDLE)
+
+  ; Names are byte exact: no case folding, prefix matching, suffix guessing,
+  ; alias invention, or unterminated overlong match.
+  Vkd(vkGetDeviceProcAddr(device, "vkdevicewaitidle") = 0)
+  Vkd(vkGetDeviceProcAddr(device, "vkDeviceWait") = 0)
+  Vkd(vkGetDeviceProcAddr(device, "vkDeviceWaitIdleKHR") = 0)
+  Vkd(vkGetDeviceProcAddr(device, "VKDeviceWaitIdle") = 0)
+  Vkd(vkGetDeviceProcAddr(device, 0) = 0)
+  Vkd(vkGetInstanceProcAddr(instance, 0) = 0)
+
+  ; Null, malformed, and stale generation-tagged owners disclose no address.
+  Vkd(vkGetDeviceProcAddr(0, "vkDeviceWaitIdle") = 0)
+  Vkd(vkGetInstanceProcAddr($12345678, "vkEnumeratePhysicalDevices") = 0)
+  Vkd(vkGetDeviceProcAddr($12345678, "vkDeviceWaitIdle") = 0)
+  Vkd(AnvilVkDeviceDestroy(device) = #VK_SUCCESS)
+  Vkd(vkGetDeviceProcAddr(device, "vkDeviceWaitIdle") = 0)
+  Vkd(vkQueueWaitIdle(queue) = #ANVIL_VK_ERR_HANDLE)
+  Vkd(AnvilVkInstanceDestroy(instance) = #VK_SUCCESS)
+  Vkd(vkGetInstanceProcAddr(instance, "vkEnumeratePhysicalDevices") = 0)
+
+  PokeI(#VKD_OUT + 0, #VKD_MAGIC)
+  PokeI(#VKD_OUT + 8, vkdChecks)
+  PokeI(#VKD_OUT + 16, vkdFails)
+  ProcedureReturn vkdFails
+EndProcedure
+
+Main()

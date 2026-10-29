@@ -16,7 +16,8 @@
 ;  slot) and every TLS slot call. The one stretch of pure computation is
 ;  the handshake's own arithmetic - an X25519 share at open and the chain
 ;  and CertificateVerify signatures when the server's flight lands - which
-;  is milliseconds on the A72 and is done in the call that has the bytes.
+;  is done in the call that has the bytes. Its cost depends on cache state
+;  and the certificate algorithms; it is not bounded to one display frame.
 ;
 ;  ONE CONNECTION AT A TIME. tls13_hs keeps its state in globals (it is
 ;  the Pico core's design), so there is one handle, 1; a second open while
@@ -35,8 +36,8 @@
 ;    #SVC_TLS_CONNECTING  TCP is being opened
 ;    #SVC_TLS_HANDSHAKE   TLS handshake in progress
 ;    #SVC_TLS_OPEN        verified and established; send and receive
-;    #SVC_TLS_PEER_CLOSED the server sent close_notify or closed TCP after
-;                         it; what it sent before is still readable
+;    #SVC_TLS_PEER_CLOSED authenticated close_notify was received;
+;                         prior plaintext is still readable
 ;    negative             failed - the code, and SvcErrDetail's fragment
 ; ======================================================================
 
@@ -203,14 +204,16 @@ Procedure tlsc_Begin()
 EndProcedure
 
 ; ----------------------------------------------------------------------
-;  TlsClientAdvance - move the connection on. Bounded; never waits.
+;  TlsClientAdvance - move the connection on without waiting for I/O.
+;  Signature/key-share arithmetic is synchronous; not a frame-time guarantee.
 ; ----------------------------------------------------------------------
 Procedure TlsClientAdvance()
   Define r.i
   Define st.i
   Define n.i
+  Define tcpEmpty.i
 
-  If tlsc_state = #TLSC_IDLE Or tlsc_state = #TLSC_FAILED
+  If tlsc_state = #TLSC_IDLE Or tlsc_state = #TLSC_FAILED Or tlsc_state = #TLSC_CLOSED
     ProcedureReturn
   EndIf
 
@@ -266,13 +269,11 @@ Procedure TlsClientAdvance()
   If tlsc_inLen = 0
     n = PayNetTcpRecv(tlsc_tcp, @tlsc_in[0], #TLSC_IN_BUF)
     If n < 0
-      If tlsc_state = #TLSC_OPEN
-        tlsc_state = #TLSC_CLOSED
-      Else
-        tlsc_Refuse(n, "the TCP connection under TLS failed")
-      EndIf
+      ; A reset/error is never authenticated end-of-stream, even after data.
+      tlsc_Refuse(n, "the TCP connection under TLS failed")
       ProcedureReturn
     EndIf
+    tcpEmpty = Bool(n = 0)
     tlsc_inLen = n
     tlsc_inOff = 0
   EndIf
@@ -305,12 +306,13 @@ Procedure TlsClientAdvance()
   EndIf
   If tlsc_state = #TLSC_OPEN Or tlsc_state = #TLSC_HS
     st = PayNetTcpState(tlsc_tcp)
-    If st = #SVC_TCP_PEER_CLOSED And tlsc_inLen = 0
-      If tlsc_state = #TLSC_OPEN
-        tlsc_state = #TLSC_CLOSED
-      Else
-        tlsc_Refuse(#SVC_EIO, "the server closed the connection during the TLS handshake")
-      EndIf
+    If st < 0
+      tlsc_Refuse(st, "the TCP connection under TLS failed")
+    ElseIf st = #SVC_TCP_PEER_CLOSED And tcpEmpty And tlsc_inLen = 0
+      ; FIN can coexist with unread TCP bytes. Drain them before deciding EOF.
+      ; RFC 8446 section 6.1: absent close_notify, truncation is not excluded.
+      ; The application must see failure, never successful close-delimited data.
+      tlsc_Refuse(#SVC_EIO, "TCP ended without authenticated TLS close_notify")
     EndIf
   EndIf
 EndProcedure

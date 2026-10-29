@@ -10,31 +10,121 @@
 Global Dim anvil_font_slot_data.a[#ANVIL_FONT_SLOT_COUNT * #ANVIL_FONT_MAX_BYTES]
 Global Dim anvil_font_slot_path.a[#ANVIL_FONT_SLOT_COUNT * #ANVIL_FONT_PATH_BYTES]
 Global anvil_font_bootChecked.i
-Global anvil_font_embeddedReady.i
 Global anvil_font_pixel_limit.i = 512
+; Memory-loaded faces use the same Core-owned backing as file-loaded faces.
+; A generation token prevents releasing a preexisting or subsequently replaced face.
+Global Dim anvil_font_memoryGeneration.i[#ANVIL_FONT_SLOT_COUNT]
+Global anvil_font_fileSerial.i
+Global Dim anvil_font_fileToken.i[#ANVIL_FONT_SLOT_COUNT]
+Global Dim anvil_font_fileGeneration.i[#ANVIL_FONT_SLOT_COUNT]
+Global Dim anvil_font_fileLimit.i[#ANVIL_FONT_SLOT_COUNT]
+Global Dim anvil_font_fileBytes.i[#ANVIL_FONT_SLOT_COUNT]
+Global Dim anvil_font_fileOffset.i[#ANVIL_FONT_SLOT_COUNT]
+Global Dim anvil_font_filePathBytes.i[#ANVIL_FONT_SLOT_COUNT]
+Global Dim anvil_font_filePath.a[#ANVIL_FONT_SLOT_COUNT * #ANVIL_FONT_PATH_BYTES]
 
-; The image carries one parser-ready face for the first screen frame. Its
-; private slot borrows immutable image bytes; the four command slots remain
-; available for files loaded after the storage medium mounts.
-Procedure.i AnvilFontBootEmbeddedInit()
-  If anvil_font_embeddedReady <> 0 : ProcedureReturn 1 : EndIf
-  AnvilTrueTypeSlotsInit()
-  If #ANVIL_BOOT_TTF_BYTES < 1 Or #ANVIL_BOOT_TTF_BYTES > #ANVIL_TTS_MAX_BYTES
-    PrintN("!! embedded TrueType font is outside the slot size limit")
-    ProcedureReturn 0
-  EndIf
-  If AnvilTrueTypeSlotLoad(#ANVIL_TTS_BOOT_SLOT, ?anvilBootTtf, #ANVIL_BOOT_TTF_BYTES) = 0
-    PrintN("!! embedded TrueType font failed validation")
-    ProcedureReturn 0
-  EndIf
-  If AnvilTrueTypeSlotSelect(#ANVIL_TTS_BOOT_SLOT) = 0
-    PrintN("!! embedded TrueType font could not be selected")
-    ProcedureReturn 0
-  EndIf
-  AnvilTrueTypeSetDefaultSlot(#ANVIL_TTS_BOOT_SLOT)
-  anvil_font_embeddedReady = 1
+; Begin an incremental file load into an empty, unselected slot. Copy the
+; caller-owned path now; later steps borrow no caller memory. A positive token
+; identifies this request, and is never reused. Zero refuses without starting.
+; maxBytes is a board policy limit, bounded by the shared slot capacity.
+Procedure.i AnvilFontFileBegin(slot.i,path.i,pathBytes.i,maxBytes.i)
+  Protected i.i,base.i
+  If slot<0 Or slot>=#ANVIL_FONT_SLOT_COUNT Or path<1 Or pathBytes<1 Or pathBytes>=#ANVIL_FONT_PATH_BYTES : ProcedureReturn 0 : EndIf
+  If path>$7FFFFFFFFFFFFFFF-pathBytes Or maxBytes<1 Or maxBytes>#ANVIL_FONT_MAX_BYTES : ProcedureReturn 0 : EndIf
+  If anvil_font_fileToken[slot]<>0 Or AnvilTrueTypeSlotBytes(slot)<>0 Or AnvilTrueTypeSlotSelected()=slot : ProcedureReturn 0 : EndIf
+  If anvil_font_fileSerial=$7FFFFFFFFFFFFFFF : ProcedureReturn 0 : EndIf
+  For i=0 To pathBytes-1
+    If PeekA(path+i)=0 : ProcedureReturn 0 : EndIf
+  Next
+  base=slot*#ANVIL_FONT_PATH_BYTES
+  For i=0 To pathBytes-1 : anvil_font_filePath[base+i]=PeekA(path+i) : Next
+  anvil_font_filePath[base+pathBytes]=0
+  anvil_font_fileGeneration[slot]=AnvilTrueTypeSlotGeneration(slot)
+  anvil_font_fileLimit[slot]=maxBytes
+  anvil_font_fileBytes[slot]=0 : anvil_font_fileOffset[slot]=0
+  anvil_font_filePathBytes[slot]=pathBytes
+  anvil_font_fileSerial=anvil_font_fileSerial+1
+  anvil_font_fileToken[slot]=anvil_font_fileSerial
+  ProcedureReturn anvil_font_fileToken[slot]
+EndProcedure
+
+; Cancel only the matching pending request. No committed slot is unloaded.
+Procedure.i AnvilFontFileCancel(slot.i,token.i)
+  If slot<0 Or slot>=#ANVIL_FONT_SLOT_COUNT Or token<1 : ProcedureReturn 0 : EndIf
+  If anvil_font_fileToken[slot]<>token : ProcedureReturn 0 : EndIf
+  anvil_font_fileToken[slot]=0
   ProcedureReturn 1
 EndProcedure
+
+; Perform at most one bounded file read, closing the file before returning.
+; 1 means pending, 2 means validated and committed, 0 means refused/failed.
+; A stale token or invalid chunk limit leaves an existing request untouched.
+; Storage/parser failures cancel this request. Slot generation is rechecked
+; before every write; the selected face and its backing are never overwritten.
+; The last step also validates the font, so it is not a hard time deadline.
+Procedure.i AnvilFontFileStep(slot.i,token.i,maxChunk.i)
+  Protected bytes.i,take.i,got.i,target.i,path.i
+  If slot<0 Or slot>=#ANVIL_FONT_SLOT_COUNT Or token<1 Or maxChunk<1 Or maxChunk>#ANVIL_FONT_READ_CHUNK : ProcedureReturn 0 : EndIf
+  If anvil_font_fileToken[slot]<>token : ProcedureReturn 0 : EndIf
+  If AnvilTrueTypeSlotBytes(slot)<>0 Or AnvilTrueTypeSlotSelected()=slot Or AnvilTrueTypeSlotGeneration(slot)<>anvil_font_fileGeneration[slot]
+    AnvilFontFileCancel(slot,token) : ProcedureReturn 0
+  EndIf
+  path=@anvil_font_filePath[slot*#ANVIL_FONT_PATH_BYTES]
+  If HwStorageUp()=0
+    AnvilFontFileCancel(slot,token) : ProcedureReturn 0
+  EndIf
+  If HwFileOpen(path)=0
+    AnvilFontFileCancel(slot,token) : ProcedureReturn 0
+  EndIf
+  bytes=HwFileSize()
+  If bytes<1 Or bytes>anvil_font_fileLimit[slot] Or (anvil_font_fileBytes[slot]<>0 And bytes<>anvil_font_fileBytes[slot])
+    HwFileClose() : AnvilFontFileCancel(slot,token) : ProcedureReturn 0
+  EndIf
+  anvil_font_fileBytes[slot]=bytes
+  take=bytes-anvil_font_fileOffset[slot]
+  If take>maxChunk : take=maxChunk : EndIf
+  target=anvil_font_SlotAddress(slot)
+  got=HwFileReadAt(anvil_font_fileOffset[slot],target+anvil_font_fileOffset[slot],take)
+  HwFileClose()
+  If got<>take : AnvilFontFileCancel(slot,token) : ProcedureReturn 0 : EndIf
+  anvil_font_fileOffset[slot]=anvil_font_fileOffset[slot]+got
+  If anvil_font_fileOffset[slot]<bytes : ProcedureReturn 1 : EndIf
+  If AnvilTrueTypeSlotLoad(slot,target,bytes)=0
+    AnvilFontFileCancel(slot,token) : ProcedureReturn 0
+  EndIf
+  anvil_font_CopySlotPath(slot,path,anvil_font_filePathBytes[slot])
+  anvil_font_memoryGeneration[slot]=0
+  AnvilFontFileCancel(slot,token)
+  ProcedureReturn 2
+EndProcedure
+
+Procedure.i AnvilFontLoadMemory(slot.i,data.i,bytes.i)
+  Protected target.i,i.i,generation.i
+  If slot<0 Or slot>=#ANVIL_FONT_SLOT_COUNT Or data<1 Or bytes<1 Or bytes>#ANVIL_FONT_MAX_BYTES : ProcedureReturn 0 : EndIf
+  If anvil_font_fileToken[slot]<>0 : ProcedureReturn 0 : EndIf
+  If data>$7FFFFFFFFFFFFFFF-bytes Or AnvilTrueTypeSlotBytes(slot)<>0 Or AnvilTrueTypeSlotSelected()=slot : ProcedureReturn 0 : EndIf
+  generation=AnvilTrueTypeSlotGeneration(slot)
+  ; Reserve one generation for the eventual successful unload.
+  If generation>=$7FFFFFFE : ProcedureReturn 0 : EndIf
+  target=anvil_font_SlotAddress(slot)
+  If data<>target And data<target+bytes And target<data+bytes : ProcedureReturn 0 : EndIf
+  For i=0 To bytes-1 : PokeA(target+i,PeekA(data+i)) : Next
+  If AnvilTrueTypeSlotLoad(slot,target,bytes)=0 : ProcedureReturn 0 : EndIf
+  anvil_font_memoryGeneration[slot]=AnvilTrueTypeSlotGeneration(slot)
+  anvil_font_ClearSlotPath(slot)
+  ProcedureReturn anvil_font_memoryGeneration[slot]
+EndProcedure
+
+Procedure.i AnvilFontReleaseMemory(slot.i,generation.i)
+  If slot<0 Or slot>=#ANVIL_FONT_SLOT_COUNT Or generation<1 : ProcedureReturn 0 : EndIf
+  If anvil_font_memoryGeneration[slot]<>generation Or AnvilTrueTypeSlotGeneration(slot)<>generation Or AnvilTrueTypeSlotBytes(slot)<1 : ProcedureReturn 0 : EndIf
+  If AnvilTrueTypeSlotUnload(slot)=0 : ProcedureReturn 0 : EndIf
+  anvil_font_memoryGeneration[slot]=0
+  anvil_font_ClearSlotPath(slot)
+  ProcedureReturn 1
+EndProcedure
+
+
 
 ; Boards with a fixed-cell display may narrow the shared command's size
 ; range without changing the parser or other boards' default behavior.
@@ -193,6 +283,7 @@ Procedure.i anvil_font_LoadFile(slot.i, *path, pathBytes.i)
   If slot < 0 Or slot >= #ANVIL_FONT_SLOT_COUNT Or *path = 0 Or pathBytes < 1 Or pathBytes >= #ANVIL_FONT_PATH_BYTES
     ProcedureReturn 0
   EndIf
+  If anvil_font_fileToken[slot]<>0 : ProcedureReturn 0 : EndIf
   If AnvilTrueTypeSlotBytes(slot) > 0 : ProcedureReturn 0 : EndIf
   If HwStorageUp() = 0 : ProcedureReturn 0 : EndIf
   If HwFileOpen(*path) = 0 : ProcedureReturn 0 : EndIf

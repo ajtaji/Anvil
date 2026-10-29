@@ -1,5 +1,8 @@
 ; Bounded read-only full-sector CRC repetition for eMMC partition preflight.
 ; pmf:target rockpi4c
+; Shared IEEE CRC owner; sector checksum includes the final inversion.
+#CRC_POLY = $EDB88320
+XIncludeFile "Anvil/Core/crc.pbi"
 XIncludeFile "RockPi4C/Lib/arch_timer.pbi"
 
 #EMMC_I_HOST = $FE330000
@@ -10,7 +13,7 @@ XIncludeFile "RockPi4C/Lib/arch_timer.pbi"
 
 Global emmc_i_lastInterrupt.i
 Global emmc_i_lastResponse.i
-Global Dim emmc_i_data.a[511]
+Global Dim emmc_i_data.a[512]
 
 Procedure.i EmmcITx(value.i)
   Protected attempt.i
@@ -47,21 +50,7 @@ Procedure EmmcINewline()
 EndProcedure
 
 Procedure.i EmmcICrc(*buffer)
-  Protected crc.i=$FFFFFFFF
-  Protected index.i
-  Protected bit.i
-  For index=0 To 511
-    crc=crc ! (PeekA(*buffer+index) & 255)
-    For bit=0 To 7
-      If (crc & 1)<>0
-        crc=(crc >> 1) ! $EDB88320
-      Else
-        crc=crc >> 1
-      EndIf
-    Next
-    crc=crc & $FFFFFFFF
-  Next
-  ProcedureReturn (crc ! $FFFFFFFF) & $FFFFFFFF
+  ProcedureReturn Crc32(*buffer,512)
 EndProcedure
 
 Procedure.i EmmcIWait8(offset.i,mask.i,wanted.i,timeoutUs.i)

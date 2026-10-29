@@ -1,3 +1,5 @@
+XIncludeFile "Anvil/Hal/aarch64_counter.pbi"
+
 ; Read-only EL3/GICv3 secure physical timer admission check for RK3399.
 ; Returns X0=$5746493000000000 | refusal bits. No MMIO/sysreg writes.
 ; pmf:target rockpi4c
@@ -23,11 +25,8 @@ ProcedureNaked.i WfiPreflightDaif()
   ENDASM
 EndProcedure
 
-ProcedureNaked.i WfiPreflightHz()
-  ASM
-    mrs x0, cntfrq_el0
-    ret
-  ENDASM
+Procedure.i WfiPreflightHz()
+  ProcedureReturn A64CounterFrequency()
 EndProcedure
 
 ProcedureNaked.i WfiPreflightMpidr()

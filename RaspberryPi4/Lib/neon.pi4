@@ -17,9 +17,9 @@
 ; never reaches DRAM at all.
 ;
 ; ======================================================================
-; USE - in the MAIN file, in this order. Libraries do not include
-; libraries (project ruling, 2026-07-30, house rule 10), so the main
-; file is what orders them:
+; USE - the MAIN file supplies the board peripherals in this order.
+; This native backend includes the shared Neon frontend, colour, bitmap
+; and numeric implementation modules; those modules own no peripheral.
 ;
 ;     XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
 ;     XIncludeFile "RaspberryPi4/Lib/timer.pi4"
@@ -155,26 +155,7 @@
 ;  return value still cannot get a clean-looking frame out of a broken
 ;  one.
 ; ======================================================================
-#NEON_OK            = 0
-#NEON_ERR_ARENA     = 1    ; the arena is missing, misaligned or too small
-#NEON_ERR_SURFACE   = 2    ; no surface bound, or not 32 bits per pixel
-#NEON_ERR_V3D       = 3    ; V3dInit() or the MMU refused - V3dError() says
-#NEON_ERR_GEOMETRY  = 4    ; V3dRenderBegin() refused the surface size
-#NEON_ERR_ONETILE   = 5    ; the surface is a single tile - see NeonInit()
-#NEON_ERR_SHADER    = 6    ; a QPU program would not encode
-#NEON_ERR_VERTS     = 7    ; the vertex arena is full
-#NEON_ERR_RECORDS   = 8    ; the shader-record arena is full
-#NEON_ERR_LIST      = 9    ; the bin list is full
-#NEON_ERR_NOFRAME   = 10   ; a primitive outside NeonFrameBegin/End
-#NEON_ERR_INFRAME   = 11   ; NeonFrameBegin() inside a frame
-#NEON_ERR_BIN       = 12   ; the binner did not finish
-#NEON_ERR_RENDER    = 13   ; the renderer did not finish
-#NEON_ERR_FONT      = 14   ; no font bound
-#NEON_ERR_ARGS      = 15   ; a parameter out of range
-#NEON_ERR_BACKEND   = 16   ; selected renderer lifecycle refused
-
-#NEON_BACKEND_NATIVE   = 0
-#NEON_BACKEND_EXTERNAL = 1
+XIncludeFile "Anvil/Graphics/neon_frontend.pbi"
 
 ; ======================================================================
 ;  LIMITS
@@ -189,8 +170,6 @@
 ;  glyphs (_GlDrawBench.pb:14-18). 4096 draws and 131072 vertices cover
 ;  it with the text decomposed into rectangles.
 ; ======================================================================
-#NEON_MAX_DRAWS   = 4096
-#NEON_MAX_VERTS   = 262144
 
 #NEON_VERT_BYTES  = 16     ; Xc Yc Xs Ys, four 32-bit values
 #NEON_ATTRS       = 4      ; and therefore four attribute records
@@ -247,8 +226,8 @@
 #NEON_TATTRS        = 10
 #NEON_TSHREC_STRIDE = 256   ; 36 record + 10 * 16 attrs = 196, rounded up
                             ; to a 32-byte-aligned 256
-#NEON_MAX_TDRAWS    = 2048  ; textured DRAW CALLS - one per Neon_TextTex
-#NEON_MAX_TVERTS    = 98304 ; 6 verts a glyph -> ~16k glyphs, a full screen
+
+XIncludeFile "Anvil/Graphics/neon_atlas_raster.pbi"
 
 ; The atlas is FIXED WIDTH 16. The TMU derives the UBLINEAR_2_COLUMN
 ; tiling from an image width of 16 (pi4V3dAtlas's whole M2 lesson), so
@@ -256,19 +235,10 @@
 ; padded to a power of two so V = vTexel / height is exact. The carved
 ; buffers are sized for the maximum; the TFU tiles only the height the
 ; current font actually needs.
-#NEON_ATLAS_W       = 16
-#NEON_ATLAS_MAXH    = 4096
-#NEON_ATLAS_MAXBYTES = 262144   ; 16 * 4096 * 4
 
 ; A caller may copy this value out through Neon_AtlasRasterGlyphUV().
 ; It never receives neon_glyphUV itself: the renderer keeps ownership of
 ; that table, just as it keeps ownership of the raster pixels.
-Structure NeonAtlasGlyphUV
-  left.i
-  right.i
-  top.i
-  bottom.i
-EndStructure
 
 ; How the textured fragment shader turns atlas coverage into colour.
 ;   1 (default) - MODULATE: out = (colour.rgb, texel.a * colour.a). One
@@ -289,75 +259,16 @@ EndStructure
 ;  No procedure here is re-entrant and none recurses: parameters and
 ;  locals are static .bss slots on this backend.
 ; ======================================================================
-Global neon_err.i      = #NEON_OK
-Global gNeonReady.i    = 0        ; NeonInit() completed
-Global neon_inFrame.i  = 0
 ; The Vulkan hardware backend may submit its own native V3D list while an
 ; external renderer owns a public Neon frame. Keep those two frame latches
 ; independent so neither path can consume the other's Begin/End pair.
 Global neon_hwInFrame.i = 0
 
-; ---- optional primitive backend -------------------------------------
-; The widget layer below is intentionally renderer-neutral.  Normally its
-; boxes, text, scissors, fans and lines fall through to Neon's native V3D
-; frame owner.
-; A resident renderer such as the Vulkan chrome adapter can install these
-; entry points and reuse every existing primitive unchanged without
-; entering NeonFrameBegin/NeonFrameEnd recursively.  The hook signatures
-; exactly match the public Neon primitive procedures.
-; Ownership stays with the installer; Neon only borrows the addresses.
-Global gNeonBackendBox.i          = 0
-Global gNeonBackendText.i         = 0
-Global gNeonBackendTextTex.i      = 0
-Global gNeonBackendScissorSet.i   = 0
-Global gNeonBackendScissorClear.i = 0
-Global gNeonBackendFanBegin.i     = 0
-Global gNeonBackendFanPoint.i     = 0
-Global gNeonBackendFanEnd.i       = 0
-Global gNeonBackendFanOutline.i   = 0
-Global gNeonBackendLinesBegin.i   = 0
-Global gNeonBackendLine.i         = 0
-Global gNeonBackendLinesEnd.i     = 0
-Global gNeonBackendActive.i       = 0
-; Optional renderer measurements pair with the draw backend. A negative
-; callback result selects the native bitmap measurement path.
-Global gNeonMeasureWidth.i        = 0
-Global gNeonMeasureLineHeight.i   = 0
-Global gNeonMeasureActive.i       = 0
-; Optional owner queries are scalar and side-effect free. Frontend error
-; validation uses a separate typed writer; native hardware work stays local.
-Global gNeonStateQuery.i = 0
-Global gNeonStateError.i = 0
-Global gNeonStateActive.i = 0
-#NEON_STATE_DRAWS = 1
-#NEON_STATE_BOXES = 2
-#NEON_STATE_GLYPHS = 3
-#NEON_STATE_RUNS = 4
-#NEON_STATE_VERTS = 5
-#NEON_STATE_TEX_DRAWS = 6
-#NEON_STATE_TEX_GLYPHS = 7
-#NEON_STATE_TEX_VERTS = 8
-#NEON_STATE_CLIPPED = 9
-#NEON_STATE_SCISSOR_ON = 10
-#NEON_STATE_ERROR = 11
-#NEON_STATE_READY = 12
-
-
 ; Renderer-neutral lifecycle seam. Native V3D remains the default. An
 ; external renderer installs all four callbacks atomically and then owns
 ; the public lifecycle without calling these public procedures recursively.
-Global gNeonLifecycleMode.i       = #NEON_BACKEND_NATIVE
-Global gNeonLifecyclePrepared.i   = 0
-Global gNeonPreparedOwnerPending.i = 0
-Declare.i neon_LifecycleInitUnbound()
-Declare.i neon_LifecycleBeginUnbound(colour.i)
-Declare.i neon_LifecycleEndUnbound()
-Declare.i neon_LifecycleShutdownUnbound()
-Global gNeonLifecycleInit.i       = @neon_LifecycleInitUnbound
-Global gNeonLifecycleBegin.i      = @neon_LifecycleBeginUnbound
-Global gNeonLifecycleEnd.i        = @neon_LifecycleEndUnbound
-Global gNeonLifecycleShutdown.i   = @neon_LifecycleShutdownUnbound
-Global gNeonLifecycleError.i      = 0
+
+XIncludeFile "Anvil/Graphics/neon_lifecycle.pbi"
 
 ; ---- the arena -------------------------------------------------------
 Global neon_arena.i    = 0
@@ -389,9 +300,9 @@ Global neon_outFmt.i    = #V3D_OFMT_RGBA8
 Global neon_cx.i       = 0        ; physical viewport centre, pixels
 Global neon_cy.i       = 0
 
-; One spare pair for the previous physical geometry. This stays outside the
-; arena, so a rebind never changes arena layout or V3D mappings. Geometries
-; larger than this bound use the original exact-ratio build path.
+; Two CPU-only coordinate banks: the carved arena pair and one bounded BSS
+; pair. Selection may exchange their addresses; the arena layout and V3D
+; mappings never change. Larger geometries always use the arena pair.
 #NEON_COORD_SPARE_DIM = 4096
 #NEON_COORD_SPARE_WORDS = #NEON_COORD_SPARE_DIM * 3
 Global Dim neon_coordSpareX.l[#NEON_COORD_SPARE_WORDS]
@@ -402,6 +313,10 @@ Global neon_coordSpareW.i = 0
 Global neon_coordSpareH.i = 0
 Global neon_coordReuseCount.i = 0
 Global neon_coordBuildCount.i = 0
+Global neon_coordArenaX.i = 0
+Global neon_coordArenaY.i = 0
+Global neon_coordSpareBaseX.i = 0
+Global neon_coordSpareBaseY.i = 0
 
 ; ---- the carved buffers ---------------------------------------------
 Global neon_pt.i       = 0        ; V3D page table
@@ -433,12 +348,6 @@ Global neon_guard.i    = 0        ; DELIBERATELY NOT MAPPED. See NeonInit().
 Global neon_top.i      = 0        ; one past everything above
 
 ; ---- per-frame cursors ----------------------------------------------
-Global neon_nDraws.i   = 0
-Global neon_nVerts.i   = 0
-Global neon_nBoxes.i   = 0        ; counted separately, for the report
-Global neon_nGlyphs.i  = 0
-Global neon_nRuns.i    = 0
-Global neon_nClipped.i = 0        ; primitives the clip rejected outright
 
 ; ---- where a frame's microseconds went -------------------------------
 ;  Four numbers, because "the frame took 265 ms" names nothing. The
@@ -454,29 +363,15 @@ Global gNeonUsRender.i = 0        ; submit and wait, the renderer
 ;  hardware and pixel-exact. The values are also kept here so the
 ;  CPU-side cull below can drop a primitive that cannot contribute
 ;  before it costs a shader record.
-Global neon_clipOn.i   = 0
 Global neon_clipX.i    = 0
 Global neon_clipY.i    = 0
 Global neon_clipW.i    = 0
 Global neon_clipH.i    = 0
 
 ; ---- the font --------------------------------------------------------
-Global neon_fbits.i    = 0        ; address of the 1bpp glyph blob
-Global neon_fw.i       = 0        ; cell width, pixels
-Global neon_fh.i       = 0        ; cell height
-Global neon_frb.i      = 0        ; bytes per glyph row
-Global neon_ffirst.i   = 0
-Global neon_flast.i    = 0
-
-; Four font slots, matching the engine's four faces (GlUIChrome.pbi:73-76).
-; The engine's are separate rasterised atlases at different point sizes;
-; here they are the same 1bpp cell at integer scales, which is what a
-; 1-bit font can honestly do. Index 0 UI, 1 small, 2 mono, 3 bold.
-Global Dim neon_fontScale.i[4]
-Global Dim neon_fontEmbolden.i[4]
+XIncludeFile "Anvil/Graphics/neon_bitmap_font.pbi"
 
 ; ---- the textured path's carved buffers (see the M3 header) ----------
-Global neon_texSrc.i    = 0       ; raster RGBA8 atlas, the TFU reads it
 Global neon_tex.i       = 0       ; UBLINEAR_2 atlas, TFU writes / TMU reads
 Global neon_texState.i  = 0       ; texture state +0, sampler state +256
 Global neon_unifTcs.i   = 0       ; textured coord shader's constant uniforms
@@ -487,12 +382,8 @@ Global neon_tunif.i     = 0       ; #NEON_MAX_TDRAWS textured FS uniform blocks
 Global neon_tunifBytes.i = 0
 Global neon_tverts.i    = 0
 Global neon_tvertsBytes.i = 0
-Global neon_glyphUV.i   = 0       ; per-glyph cell-edge UVs, CPU-only (unmapped)
 
 ; ---- the textured path's per-frame cursors ---------------------------
-Global neon_nTDraws.i   = 0
-Global neon_nTVerts.i   = 0
-Global neon_nTGlyphs.i  = 0
 ; What the bin list currently says the non-perspective flags are, so a
 ; run of textured draws costs one NON_PERSPECTIVE_FLAGS packet, not one
 ; per glyph string. The prologue zeros the flags, so 0 is the reset.
@@ -501,18 +392,9 @@ Global neon_emitNP.i    = 0
 ; ---- the atlas, once built (lazily, from the current font) ------------
 Global neon_texBuilt.i    = 0     ; the atlas has been filled and tiled
 Global neon_texFontBits.i = 0     ; the font it was built for; a change rebuilds
-Global neon_fontRevision.i = 0
 Global neon_texRevision.i = -1
-Global neon_rasterBuilt.i    = 0  ; CPU RGBA atlas and UV table are complete
-Global neon_rasterFontBits.i = 0  ; font which owns that immutable snapshot
-Global neon_rasterRevision.i = -1
-Global neon_rasterW.i        = 0  ; dimensions of the borrowed linear view
-Global neon_rasterH.i        = 0
-Global neon_rasterBytes.i    = 0  ; exact populated CPU raster extent
 Global gNeonAtlasW.i      = 0     ; always #NEON_ATLAS_W
 Global gNeonAtlasH.i      = 0     ; padded to a power of two
-Global neon_atlasCols.i   = 0     ; #NEON_ATLAS_W / cell width
-Global neon_atlasGlyphs.i = 0     ; last - first + 1
 
 ; ======================================================================
 ;  THREE LOOKUP TABLES, AND WHY THEY ARE NOT AN OPTIMISATION
@@ -542,288 +424,62 @@ Global neon_ycTab.i = 0           ; 3 * height entries, biased by height
 Global Dim neon_byteF32.i[256]
 
 ; ======================================================================
-;  ACCESSORS
+;  COMPATIBILITY ERROR ROUTING AND NATIVE HARDWARE ACCESSORS
 ; ======================================================================
-Procedure.i neon_StateQueryUnbound(selector.i)
-  ProcedureReturn #NEON_ERR_BACKEND
-EndProcedure
 
-Procedure neon_StateErrorUnbound(code.i)
-EndProcedure
 
 Procedure neon_FrontendError(code.i)
-  neon_err = code
-  If gNeonStateActive <> 0 : gNeonStateError(code) : EndIf
+  NeonFrontendError(code)
 EndProcedure
 
-Procedure NeonStateBackendClear()
-  gNeonStateActive = 0
-  gNeonStateQuery = @neon_StateQueryUnbound
-  gNeonStateError = @neon_StateErrorUnbound
-EndProcedure
 
-Procedure.i NeonStateBackendInstall(queryProc.i, errorProc.i)
-  If queryProc = 0 And errorProc = 0
-    NeonStateBackendClear() : ProcedureReturn #NEON_OK
-  EndIf
-  If gNeonBackendActive = 0 Or queryProc = 0 Or errorProc = 0
-    neon_FrontendError(#NEON_ERR_ARGS) : ProcedureReturn #NEON_ERR_ARGS
-  EndIf
-  gNeonStateQuery = queryProc : gNeonStateError = errorProc
-  gNeonStateActive = 1
-  ProcedureReturn #NEON_OK
-EndProcedure
 
-Procedure.i NeonStateBackendActive()
-  ProcedureReturn gNeonStateActive
-EndProcedure
 
 ; Internal GPU ownership must not depend on an external renderer's readiness.
+; Read-only native lifecycle state. The shared owner combines these with
+; its logical readiness/frame state; no ownership is acquired or released.
+Procedure.i NeonHardwareLifecycleFlags()
+  Protected flags.i
+  If v3d_owner <> 0 : flags = flags | #NEON_NATIVE_LIFECYCLE_OWNER : EndIf
+  If neon_hwInFrame <> 0 : flags = flags | #NEON_NATIVE_LIFECYCLE_FRAME : EndIf
+  ProcedureReturn flags
+EndProcedure
+
+Procedure NeonHardwareCoordinateReset()
+  neon_coordActiveW = 0 : neon_coordActiveH = 0
+  neon_coordSpareW = 0 : neon_coordSpareH = 0
+EndProcedure
+
 Procedure.i NeonHardwareReady()
   ProcedureReturn gNeonReady
 EndProcedure
 
-Procedure.i Neon_Error()
-  If gNeonStateActive <> 0 : ProcedureReturn gNeonStateQuery(#NEON_STATE_ERROR) : EndIf
-  ProcedureReturn neon_err
-EndProcedure
 
-Procedure.i Neon_Ready()
-  If gNeonStateActive <> 0 : ProcedureReturn gNeonStateQuery(#NEON_STATE_READY) : EndIf
-  ProcedureReturn gNeonReady
-EndProcedure
 
-; These private, never-selected targets give the compiler an exact
-; signature for each indirect-call slot even in programs which use only the
-; native renderer.  The active flag, not a magic null target, selects a
-; backend.  Real targets arrive through NeonDrawBackendInstall below.
-Procedure.i neon_BackendBoxUnbound(x.i, y.i, w.i, h.i, colour.i)
-  ProcedureReturn #NEON_ERR_NOFRAME
-EndProcedure
+; Native hardware lifecycle guards remain below.
 
-Procedure.i neon_BackendTextUnbound(font.i, x.i, y.i, *s, colour.i)
-  ProcedureReturn #NEON_ERR_NOFRAME
-EndProcedure
 
-Procedure.i neon_BackendTextTexUnbound(font.i, x.i, y.i, *s, colour.i)
-  ProcedureReturn #NEON_ERR_NOFRAME
-EndProcedure
 
-Procedure.i neon_MeasureWidthUnbound(font.i, *s)
-  ProcedureReturn -1
-EndProcedure
 
-Procedure.i neon_MeasureLineHeightUnbound(font.i)
-  ProcedureReturn -1
-EndProcedure
 
-Procedure neon_BackendScissorSetUnbound(x.i, y.i, w.i, h.i)
-EndProcedure
 
-Procedure neon_BackendScissorClearUnbound()
-EndProcedure
 
-Procedure.i neon_BackendFanBeginUnbound()
-  ProcedureReturn #NEON_ERR_NOFRAME
-EndProcedure
 
-Procedure neon_BackendFanPointUnbound(x.i, y.i)
-EndProcedure
 
-Procedure.i neon_BackendFanEndUnbound(colour.i)
-  ProcedureReturn #NEON_ERR_NOFRAME
-EndProcedure
 
-Procedure.i neon_BackendFanOutlineUnbound(colour.i)
-  ProcedureReturn #NEON_ERR_NOFRAME
-EndProcedure
-
-Procedure.i neon_BackendLinesBeginUnbound()
-  ProcedureReturn #NEON_ERR_NOFRAME
-EndProcedure
-
-Procedure neon_BackendLineUnbound(x0.i, y0.i, x1.i, y1.i)
-EndProcedure
-
-Procedure.i neon_BackendLinesEndUnbound(colour.i)
-  ProcedureReturn #NEON_ERR_NOFRAME
-EndProcedure
-
-; Renderer-neutral optional text measurements. The callbacks only answer
-; questions; they must not render, rasterize, or mutate renderer state.
-Procedure.i NeonMeasureBackendInstall(widthProc.i, lineHeightProc.i)
-  If widthProc = 0 And lineHeightProc = 0
-    NeonMeasureBackendClear()
-    ProcedureReturn #NEON_OK
-  EndIf
-  If gNeonBackendActive = 0 Or widthProc = 0 Or lineHeightProc = 0
-    neon_FrontendError(#NEON_ERR_ARGS)
-    ProcedureReturn #NEON_ERR_ARGS
-  EndIf
-  gNeonMeasureWidth = widthProc
-  gNeonMeasureLineHeight = lineHeightProc
-  gNeonMeasureActive = 1
-  ProcedureReturn #NEON_OK
-EndProcedure
-
-Procedure NeonMeasureBackendClear()
-  gNeonMeasureWidth = @neon_MeasureWidthUnbound
-  gNeonMeasureLineHeight = @neon_MeasureLineHeightUnbound
-  gNeonMeasureActive = 0
-EndProcedure
-
-Procedure.i NeonMeasureBackendActive()
-  ProcedureReturn gNeonMeasureActive
-EndProcedure
-
-; Install one complete primitive family or none.  A partial family would
-; split one widget frame between two frame owners, so it is refused rather
-; than guessed at.  Passing twelve zeroes restores the native Neon path.
-;
-; THE ADDRESSES ARE PARAMETERS, NOT FIELDS OF A STRUCTURE (forum 915). For a
-; while this took a NeonDrawBackend pointer and loaded each address out of
-; it. The compiler cannot follow a procedure address loaded from memory, so
-; it counts it as EVERY procedure whose address the program stores into
-; memory - the service table's slots among them - and the Pi 4 monitor
-; stopped building: the text hook closed a loop through the USB service
-; slots, whose enumeration prints boot steps, back into the console mirror
-; that paints text through the hook. On this backend parameters live in
-; globals, so the compiler is right to refuse a loop it cannot rule out.
-; An address passed as a parameter is followed exactly, to the procedure
-; the caller named.
-Procedure.i NeonDrawBackendInstall(boxProc.i, textProc.i, textTexProc.i, scissorSetProc.i, scissorClearProc.i, fanBeginProc.i, fanPointProc.i, fanEndProc.i, fanOutlineProc.i, linesBeginProc.i, lineProc.i, linesEndProc.i)
-  If boxProc = 0 And textProc = 0 And textTexProc = 0 And scissorSetProc = 0 And scissorClearProc = 0 And fanBeginProc = 0 And fanPointProc = 0 And fanEndProc = 0 And fanOutlineProc = 0 And linesBeginProc = 0 And lineProc = 0 And linesEndProc = 0
-    NeonDrawBackendClear()
-    ProcedureReturn #NEON_OK
-  EndIf
-  If boxProc = 0 Or textProc = 0 Or textTexProc = 0 Or scissorSetProc = 0 Or scissorClearProc = 0
-    neon_FrontendError(#NEON_ERR_ARGS)
-    ProcedureReturn #NEON_ERR_ARGS
-  EndIf
-  If fanBeginProc = 0 Or fanPointProc = 0 Or fanEndProc = 0 Or fanOutlineProc = 0
-    neon_FrontendError(#NEON_ERR_ARGS)
-    ProcedureReturn #NEON_ERR_ARGS
-  EndIf
-  If linesBeginProc = 0 Or lineProc = 0 Or linesEndProc = 0
-    neon_FrontendError(#NEON_ERR_ARGS)
-    ProcedureReturn #NEON_ERR_ARGS
-  EndIf
-  NeonMeasureBackendClear()
-  NeonStateBackendClear()
-  gNeonBackendBox          = boxProc
-  gNeonBackendText         = textProc
-  gNeonBackendTextTex      = textTexProc
-  gNeonBackendScissorSet   = scissorSetProc
-  gNeonBackendScissorClear = scissorClearProc
-  gNeonBackendFanBegin     = fanBeginProc
-  gNeonBackendFanPoint     = fanPointProc
-  gNeonBackendFanEnd       = fanEndProc
-  gNeonBackendFanOutline   = fanOutlineProc
-  gNeonBackendLinesBegin   = linesBeginProc
-  gNeonBackendLine         = lineProc
-  gNeonBackendLinesEnd     = linesEndProc
-  gNeonBackendActive       = 1
-  ProcedureReturn #NEON_OK
-EndProcedure
-
-Procedure NeonDrawBackendClear()
-  NeonMeasureBackendClear()
-  NeonStateBackendClear()
-  gNeonBackendBox          = @neon_BackendBoxUnbound
-  gNeonBackendText         = @neon_BackendTextUnbound
-  gNeonBackendTextTex      = @neon_BackendTextTexUnbound
-  gNeonBackendScissorSet   = @neon_BackendScissorSetUnbound
-  gNeonBackendScissorClear = @neon_BackendScissorClearUnbound
-  gNeonBackendFanBegin     = @neon_BackendFanBeginUnbound
-  gNeonBackendFanPoint     = @neon_BackendFanPointUnbound
-  gNeonBackendFanEnd       = @neon_BackendFanEndUnbound
-  gNeonBackendFanOutline   = @neon_BackendFanOutlineUnbound
-  gNeonBackendLinesBegin   = @neon_BackendLinesBeginUnbound
-  gNeonBackendLine         = @neon_BackendLineUnbound
-  gNeonBackendLinesEnd     = @neon_BackendLinesEndUnbound
-  gNeonBackendActive       = 0
-EndProcedure
-
-Procedure.i NeonDrawBackendActive()
-  If gNeonBackendActive <> 0
-    ProcedureReturn 1
-  EndIf
-  ProcedureReturn 0
-EndProcedure
-
-Procedure.i neon_LifecycleInitUnbound()
-  ProcedureReturn #NEON_ERR_BACKEND
-EndProcedure
-
-Procedure.i neon_LifecycleBeginUnbound(colour.i)
-  ProcedureReturn #NEON_ERR_BACKEND
-EndProcedure
-
-Procedure.i neon_LifecycleEndUnbound()
-  ProcedureReturn #NEON_ERR_BACKEND
-EndProcedure
-
-Procedure.i neon_LifecycleShutdownUnbound()
-  ProcedureReturn #NEON_ERR_BACKEND
-EndProcedure
-
-Procedure neon_LifecycleRestoreNative()
-  gNeonLifecycleInit = @neon_LifecycleInitUnbound
-  gNeonLifecycleBegin = @neon_LifecycleBeginUnbound
-  gNeonLifecycleEnd = @neon_LifecycleEndUnbound
-  gNeonLifecycleShutdown = @neon_LifecycleShutdownUnbound
-  gNeonLifecycleError = #NEON_OK
-  gNeonLifecycleMode = #NEON_BACKEND_NATIVE
-  gNeonLifecyclePrepared = 0
-EndProcedure
 
 ; A prepared external renderer borrows an already-live native V3D context.
 ; After it shuts down, the caller must destroy its Vulkan device/target and
 ; call NeonShutdown once more to release that returned native context.
-Procedure.i NeonLifecyclePreparedOwnerPending()
-  ProcedureReturn gNeonPreparedOwnerPending
-EndProcedure
 
-Procedure.i neon_PreparedInitRollback()
-  Protected r.i
-  If gNeonLifecyclePrepared = 0 Or gNeonLifecycleShutdown = 0
-    ProcedureReturn #NEON_ERR_BACKEND
-  EndIf
-  r = gNeonLifecycleShutdown()
-  If r <> #NEON_OK
-    gNeonLifecycleError = r
-    ProcedureReturn #NEON_ERR_BACKEND
-  EndIf
-  NeonDrawBackendClear()
-  neon_LifecycleRestoreNative()
-  neon_inFrame = 0
-  gNeonReady = 1
-  gNeonPreparedOwnerPending = 1
-  ProcedureReturn #NEON_OK
-EndProcedure
+
+
 
 ; Install one complete lifecycle family. The callback ABI is deliberately
 ; small: Init(), Begin(colour), End(), Shutdown(). The external owner may
 ; use its own prepared Vulkan/display resources; Neon only dispatches the
 ; established public calls and never claims native V3D ownership for it.
-Procedure.i NeonLifecycleInstall(initProc.i, beginProc.i, endProc.i, shutdownProc.i)
-  If gNeonReady <> 0 Or neon_inFrame <> 0 Or v3d_owner <> 0
-    neon_FrontendError(#NEON_ERR_BACKEND)
-    ProcedureReturn #NEON_ERR_BACKEND
-  EndIf
-  If initProc = 0 Or beginProc = 0 Or endProc = 0 Or shutdownProc = 0
-    neon_FrontendError(#NEON_ERR_ARGS)
-    ProcedureReturn #NEON_ERR_ARGS
-  EndIf
-  gNeonLifecycleInit = initProc
-  gNeonLifecycleBegin = beginProc
-  gNeonLifecycleEnd = endProc
-  gNeonLifecycleShutdown = shutdownProc
-  gNeonLifecycleError = #NEON_OK
-  gNeonLifecycleMode = #NEON_BACKEND_EXTERNAL
-  gNeonLifecyclePrepared = 0
-  ProcedureReturn #NEON_OK
-EndProcedure
+
 
 ; A caller that already owns a native V3D context and a complete external
 ; draw backend may transfer that prepared context to the public lifecycle.
@@ -831,86 +487,23 @@ EndProcedure
 ; Successful NeonShutdown retires the external renderer and returns the native
 ; context to its caller; a second native NeonShutdown releases that context after
 ; the caller destroys its Vulkan objects. A failed external Init does likewise.
-Procedure.i NeonLifecycleInstallPrepared(initProc.i, beginProc.i, endProc.i, shutdownProc.i)
-  If gNeonLifecycleMode <> #NEON_BACKEND_NATIVE Or gNeonReady = 0 Or v3d_owner = 0 Or neon_inFrame <> 0 Or neon_hwInFrame <> 0 Or NeonDrawBackendActive() = 0
-    neon_FrontendError(#NEON_ERR_BACKEND)
-    ProcedureReturn #NEON_ERR_BACKEND
-  EndIf
-  If initProc = 0 Or beginProc = 0 Or endProc = 0 Or shutdownProc = 0
-    neon_FrontendError(#NEON_ERR_ARGS)
-    ProcedureReturn #NEON_ERR_ARGS
-  EndIf
-  gNeonLifecycleInit = initProc
-  gNeonLifecycleBegin = beginProc
-  gNeonLifecycleEnd = endProc
-  gNeonLifecycleShutdown = shutdownProc
-  gNeonLifecycleError = #NEON_OK
-  gNeonLifecyclePrepared = 1
-  gNeonPreparedOwnerPending = 0
-  gNeonLifecycleMode = #NEON_BACKEND_EXTERNAL
-  ProcedureReturn #NEON_OK
-EndProcedure
 
-Procedure.i NeonLifecycleUseNative()
-  If gNeonReady <> 0 Or neon_inFrame <> 0 Or v3d_owner <> 0
-    neon_FrontendError(#NEON_ERR_BACKEND)
-    ProcedureReturn #NEON_ERR_BACKEND
-  EndIf
-  neon_LifecycleRestoreNative()
-  ProcedureReturn #NEON_OK
-EndProcedure
 
-Procedure.i NeonLifecycleBackend()
-  ProcedureReturn gNeonLifecycleMode
-EndProcedure
 
-Procedure.i Neon_Draws()
-  If gNeonStateActive <> 0 : ProcedureReturn gNeonStateQuery(#NEON_STATE_DRAWS) : EndIf
-  ProcedureReturn neon_nDraws
-EndProcedure
 
-Procedure.i Neon_Boxes()
-  If gNeonStateActive <> 0 : ProcedureReturn gNeonStateQuery(#NEON_STATE_BOXES) : EndIf
-  ProcedureReturn neon_nBoxes
-EndProcedure
 
-Procedure.i Neon_Glyphs()
-  If gNeonStateActive <> 0 : ProcedureReturn gNeonStateQuery(#NEON_STATE_GLYPHS) : EndIf
-  ProcedureReturn neon_nGlyphs
-EndProcedure
 
-Procedure.i Neon_Runs()
-  If gNeonStateActive <> 0 : ProcedureReturn gNeonStateQuery(#NEON_STATE_RUNS) : EndIf
-  ProcedureReturn neon_nRuns
-EndProcedure
 
-Procedure.i Neon_Verts()
-  If gNeonStateActive <> 0 : ProcedureReturn gNeonStateQuery(#NEON_STATE_VERTS) : EndIf
-  ProcedureReturn neon_nVerts
-EndProcedure
+
+
+
 
 ; The textured path's own counters, for the M3 benchmark. Kept apart
 ; from the flat ones so a mixed frame's report stays honest about which
 ; pipeline produced what.
-Procedure.i Neon_TexDraws()
-  If gNeonStateActive <> 0 : ProcedureReturn gNeonStateQuery(#NEON_STATE_TEX_DRAWS) : EndIf
-  ProcedureReturn neon_nTDraws
-EndProcedure
 
-Procedure.i Neon_TexGlyphs()
-  If gNeonStateActive <> 0 : ProcedureReturn gNeonStateQuery(#NEON_STATE_TEX_GLYPHS) : EndIf
-  ProcedureReturn neon_nTGlyphs
-EndProcedure
 
-Procedure.i Neon_TexVerts()
-  If gNeonStateActive <> 0 : ProcedureReturn gNeonStateQuery(#NEON_STATE_TEX_VERTS) : EndIf
-  ProcedureReturn neon_nTVerts
-EndProcedure
 
-Procedure.i Neon_Clipped()
-  If gNeonStateActive <> 0 : ProcedureReturn gNeonStateQuery(#NEON_STATE_CLIPPED) : EndIf
-  ProcedureReturn neon_nClipped
-EndProcedure
 
 Procedure.i Neon_UsBegin()
   ProcedureReturn gNeonUsBegin
@@ -1012,102 +605,7 @@ Procedure.i Neon_CapacityPhysicalH()
 EndProcedure
 
 
-; ======================================================================
-;  COLOUR
-;
-;  Packed 0xAARRGGBB, each channel 0..255. This is a LOGICAL colour and
-;  not the surface's word: the fragment shader is handed four separate
-;  f32 components and the tile buffer packs them, so nothing here
-;  depends on the framebuffer's channel order.
-; ======================================================================
-Procedure.i Neon_RGBA(r.i, g.i, b.i, a.i)
-  If r < 0 : r = 0 : EndIf
-  If r > 255 : r = 255 : EndIf
-  If g < 0 : g = 0 : EndIf
-  If g > 255 : g = 255 : EndIf
-  If b < 0 : b = 0 : EndIf
-  If b > 255 : b = 255 : EndIf
-  If a < 0 : a = 0 : EndIf
-  If a > 255 : a = 255 : EndIf
-  ProcedureReturn ((a & $FF) << 24) | ((r & $FF) << 16) | ((g & $FF) << 8) | (b & $FF)
-EndProcedure
-
-Procedure.i Neon_RGB(r.i, g.i, b.i)
-  ProcedureReturn Neon_RGBA(r, g, b, 255)
-EndProcedure
-
-Procedure.i Neon_R(c.i)
-  ProcedureReturn (c >> 16) & $FF
-EndProcedure
-
-Procedure.i Neon_G(c.i)
-  ProcedureReturn (c >> 8) & $FF
-EndProcedure
-
-Procedure.i Neon_B(c.i)
-  ProcedureReturn c & $FF
-EndProcedure
-
-Procedure.i Neon_A(c.i)
-  ProcedureReturn (c >> 24) & $FF
-EndProcedure
-
-; Replace the alpha, keeping the colour. `a` is 0..255.
-Procedure.i Neon_WithAlpha(c.i, a.i)
-  ProcedureReturn Neon_RGBA(Neon_R(c), Neon_G(c), Neon_B(c), a)
-EndProcedure
-
-; ----------------------------------------------------------------------
-;  Neon_Mul - the palette's derived products, as an integer ratio.
-;
-;  The widgets multiply the palette rather than naming new entries: an
-;  open menu tab is accent * 0.30/0.30/0.34 (GlUIChrome.pbi:725), a
-;  drop-down frame accent * 0.55 (:774), a hot scrollbar thumb
-;  accent * 0.8 (:485). Neon_Mul(cAcc, 55, 100) is that, and the
-;  rounding is round-to-nearest so 0.353 * 0.55 * 255 comes out the
-;  same integer the engine's float path would produce.
-;
-;  THE ALPHA IS NOT SCALED. Every one of those products in the engine
-;  multiplies the colour and leaves the alpha at 1.0.
-; ----------------------------------------------------------------------
-Procedure.i Neon_Mul(c.i, num.i, den.i)
-  Protected r.i
-  Protected g.i
-  Protected b.i
-  If den <= 0
-    ProcedureReturn c
-  EndIf
-  r = ((Neon_R(c) * num) + (den / 2)) / den
-  g = ((Neon_G(c) * num) + (den / 2)) / den
-  b = ((Neon_B(c) * num) + (den / 2)) / den
-  ProcedureReturn Neon_RGBA(r, g, b, Neon_A(c))
-EndProcedure
-
-; The three-channel form, for accent * 0.30/0.30/0.34 and
-; red * 0.5/0.35/0.35 which are not uniform.
-Procedure.i Neon_Mul3(c.i, numR.i, numG.i, numB.i)
-  Protected r.i
-  Protected g.i
-  Protected b.i
-  r = ((Neon_R(c) * numR) + 50) / 100
-  g = ((Neon_G(c) * numG) + 50) / 100
-  b = ((Neon_B(c) * numB) + 50) / 100
-  ProcedureReturn Neon_RGBA(r, g, b, Neon_A(c))
-EndProcedure
-
-; Add a constant to each channel, which is the button's hover lift:
-; br + 0.06*hover, bg + 0.07*hover, bb + 0.08*hover (GlUIChrome.pbi:365).
-; `hover` is 0..1000 here and the offsets are in 1/1000 of full scale.
-Procedure.i Neon_Lift(c.i, hover1000.i)
-  Protected r.i
-  Protected g.i
-  Protected b.i
-  r = Neon_R(c) + ((255 * 60 * hover1000) / 1000000)
-  g = Neon_G(c) + ((255 * 70 * hover1000) / 1000000)
-  b = Neon_B(c) + ((255 * 80 * hover1000) / 1000000)
-  ProcedureReturn Neon_RGBA(r, g, b, Neon_A(c))
-EndProcedure
-
+XIncludeFile "Anvil/Graphics/neon_colour.pbi"
 
 ; ======================================================================
 ;  IEEE 754 BINARY32 FROM INTEGERS
@@ -1135,157 +633,23 @@ EndProcedure
 ;  done properly instead and the pixel tests below choose colours whose
 ;  round trip is unambiguous for the same reason the tri probe did.
 ; ======================================================================
+; Compatibility entry points use the single shared numeric implementation.
+XIncludeFile "Anvil/Graphics/float_bits.pbi"
+
 Procedure.i neon_F32Ratio(num.i, den.i)
-  Protected neg.i
-  Protected bias.i
-  Protected m.i
-  Protected p.i
-  Protected e.i
-  Protected sh.i
-  Protected mant.i
-  Protected half.i
-
-  If den = 0
-    ProcedureReturn 0
-  EndIf
-  neg = 0
-  If num < 0
-    neg = 1
-    num = 0 - num
-  EndIf
-  If den < 0
-    If neg = 1
-      neg = 0
-    Else
-      neg = 1
-    EndIf
-    den = 0 - den
-  EndIf
-  If num = 0
-    ProcedureReturn 0
-  EndIf
-
-  ; m = num * 2^bias / den.
-  ;
-  ; THE BIAS IS 40 AND NOT 31, AND THE DIFFERENCE IS ONE ULP. With 31
-  ; the quotient can land with EXACTLY twenty-four significant bits -
-  ; that happens whenever num/den is in [2^-8, 2^-7) - and then there
-  ; is nothing left below the mantissa to round with, so the answer
-  ; comes out truncated. The clip coordinate 2/320 is in that band, and
-  ; a rectangle two pixels from the viewport centre got $BBCCCCCC where
-  ; IEEE 754 says $BBCCCCCD. FOUND BY tools/a64/a64_neon_check.py, not
-  ; by the board: the 2,073,600-pixel run in pi4NeonBox.pi4 has no
-  ; geometry and no colour in that band.
-  ;
-  ; With 40 the quotient carries at least seven bits below the mantissa
-  ; for every denominator this engine uses - 255 for a colour channel,
-  ; half the surface width or height for a coordinate - so the rounding
-  ; below always has something to round.
-  ;
-  ; THE SHIFT CANNOT OVERFLOW. .i is 64 bits and signed; 40 bits of
-  ; headroom leaves 23 for the numerator, so anything below 4194304 is
-  ; safe. A caller with a bigger one drops back to 31, which is the
-  ; behaviour that was correct to within one ulp anyway.
-  bias = 40
-  If num >= 4194304
-    bias = 31
-  EndIf
-  m = (num << bias) / den
-  If m = 0
-    ProcedureReturn 0
-  EndIf
-
-  ; p = index of the highest set bit of m, by halving rather than by
-  ; counting. THE LOOP THIS REPLACED WAS UP TO 62 ITERATIONS AND IT IS
-  ; ON THE PER-VERTEX PATH: with the ARM MMU off every instruction
-  ; fetch is Device memory, so sixty iterations is tens of
-  ; microseconds, and a text-heavy frame has a hundred thousand
-  ; vertices in it. Six shifts instead.
-  p = 0
-  If (m >> 32) <> 0
-    p = p + 32
-  EndIf
-  If (m >> (p + 16)) <> 0
-    p = p + 16
-  EndIf
-  If (m >> (p + 8)) <> 0
-    p = p + 8
-  EndIf
-  If (m >> (p + 4)) <> 0
-    p = p + 4
-  EndIf
-  If (m >> (p + 2)) <> 0
-    p = p + 2
-  EndIf
-  If (m >> (p + 1)) <> 0
-    p = p + 1
-  EndIf
-
-  ; The value is m * 2^-bias, so its exponent is p - bias.
-  e = p - bias
-
-  If p > 23
-    sh = p - 23
-    half = 1 << (sh - 1)
-    mant = (m + half) >> sh
-    ; A carry out of the mantissa's top bit means the value rounded up
-    ; to the next binade.
-    If (mant >> 24) <> 0
-      mant = mant >> 1
-      e = e + 1
-    EndIf
-  ElseIf p = 23
-    ; EXACTLY TWENTY-FOUR SIGNIFICANT BITS: nothing to round off and
-    ; nothing to shift.
-    ;
-    ; UNREACHABLE WITH A BIAS OF 40 and every denominator this engine
-    ; uses, and it is here anyway because the arm above CANNOT HANDLE
-    ; IT: at p = 23 the shift is zero and `1 << (sh - 1)` is a shift by
-    ; MINUS ONE. On AArch64 a variable shift is taken modulo the
-    ; register width, so that is a shift by 63 - the rounding constant
-    ; becomes $8000000000000000, the carry test fires, and the exponent
-    ; comes out one too big. A silently wrong float, from a shift the
-    ; compiler cannot warn about.
-    ;
-    ; A backstop that is labelled as unreachable is honest; one
-    ; described as doing work it does not do is the beginning of a
-    ; wrong belief about where the guard lives.
-    mant = m
-  Else
-    mant = m << (23 - p)
-  EndIf
-  mant = mant & $7FFFFF
-
-  e = e + 127
-  If e <= 0
-    ; Underflow to zero. Nothing this file computes can reach it - the
-    ; smallest ratio is 1/255 - and a denormal would be worse than a
-    ; zero because the vertex fetcher may flush it.
-    ProcedureReturn 0
-  EndIf
-  If e > 254
-    ; Overflow. Saturate to the largest finite value rather than
-    ; produce an infinity that would propagate silently.
-    e = 254
-    mant = $7FFFFF
-  EndIf
-
-  If neg = 1
-    ProcedureReturn ($80000000 | (e << 23) | mant) & $FFFFFFFF
-  EndIf
-  ProcedureReturn ((e << 23) | mant) & $FFFFFFFF
+  ProcedureReturn GraphicsF32RatioBits(num, den)
 EndProcedure
 
 ; A whole number as a binary32.
 Procedure.i neon_F32Int(n.i)
-  ProcedureReturn neon_F32Ratio(n, 1)
+  ProcedureReturn GraphicsF32IntBits(n)
 EndProcedure
 
 ; A 0..255 channel as a binary32 in 0..1. This is the conversion the
 ; engine's .f palette already is: GlUIChrome.pbi holds 0.129, and
 ; 0.129 * 255 = 32.9, so 33/255 is the same number back again.
 Procedure.i neon_F32Byte(n.i)
-  ProcedureReturn neon_F32Ratio(n, 255)
+  ProcedureReturn GraphicsF32ByteBits(n)
 EndProcedure
 
 
@@ -1336,7 +700,7 @@ Procedure.i NeonSurfaceOriented(base.i, w.i, h.i, pitch.i, rot.i)
     pw = h
     ph = w
   EndIf
-  If base <= 0 Or w < 8 Or h < 8 Or pitch < (pw * 4)
+  If base <= 0 Or w < 1 Or h < 1 Or pitch < (pw * 4)
     neon_FrontendError(#NEON_ERR_SURFACE)
     ProcedureReturn #NEON_ERR_SURFACE
   EndIf
@@ -1362,6 +726,11 @@ Procedure.i NeonSurfaceOriented(base.i, w.i, h.i, pitch.i, rot.i)
   If neon_capPhysH < maxDim : neon_capPhysH = maxDim : EndIf
   neon_cx        = pw / 2
   neon_cy        = ph / 2
+  ; A one-pixel axis uses an enclosing two-pixel viewport for the native
+  ; coordinate transform. Clipping/scissor and tile stores keep the true
+  ; extent. Matching nonzero centre/scale preserves x -> x without /0.
+  If neon_cx=0 : neon_cx=1 : EndIf
+  If neon_cy=0 : neon_cy=1 : EndIf
   gNeonReady     = 0
   neon_coordActiveW = 0 : neon_coordActiveH = 0
   neon_coordSpareW = 0 : neon_coordSpareH = 0
@@ -1377,7 +746,7 @@ Procedure.i NeonRenderCapacity(width.i, height.i)
     neon_FrontendError(#NEON_ERR_INFRAME)
     ProcedureReturn #NEON_ERR_INFRAME
   EndIf
-  If width < 8 Or height < 8 Or width > 65535 Or height > 65535
+  If width < 1 Or height < 1 Or width > 65535 Or height > 65535
     neon_FrontendError(#NEON_ERR_GEOMETRY)
     ProcedureReturn #NEON_ERR_GEOMETRY
   EndIf
@@ -1475,9 +844,9 @@ Procedure neon_BuildCoordinateTables(physW.i, physH.i, cx.i, cy.i)
 EndProcedure
 
 ; Select the exact table bits for a successful physical-geometry change.
-; The active pair lives in the arena; one bounded previous pair lives in BSS.
-; A hit exchanges the pairs, so alternating target and display geometries
-; avoid the binary32 division work. All misses use the original builder.
+; A bounded hit exchanges only the two CPU table addresses. A miss still
+; uses the exact-ratio builder. The bounded BSS pair is never selected for
+; dimensions above its capacity, including after a coordinate reset.
 Procedure neon_SelectCoordinateTables(physW.i, physH.i, cx.i, cy.i)
   Protected n.i, words.i, value.i
   Protected priorW.i, priorH.i
@@ -1489,34 +858,58 @@ Procedure neon_SelectCoordinateTables(physW.i, physH.i, cx.i, cy.i)
   priorW = neon_coordActiveW : priorH = neon_coordActiveH
   keepPrior = Bool(priorW > 0 And priorH > 0 And priorW <= #NEON_COORD_SPARE_DIM And priorH <= #NEON_COORD_SPARE_DIM)
 
+  If (physW > #NEON_COORD_SPARE_DIM Or physH > #NEON_COORD_SPARE_DIM) And neon_xcTab <> neon_coordArenaX
+    ; The current bounded geometry already lives in BSS: retain it there
+    ; and build the large request into the capacity-sized arena tables.
+    neon_coordSpareBaseX = neon_xcTab : neon_coordSpareBaseY = neon_ycTab
+    If keepPrior <> 0
+      neon_coordSpareW = priorW : neon_coordSpareH = priorH
+    Else
+      neon_coordSpareW = 0 : neon_coordSpareH = 0
+    EndIf
+    neon_xcTab = neon_coordArenaX : neon_ycTab = neon_coordArenaY
+    neon_BuildCoordinateTables(physW, physH, cx, cy)
+    neon_coordActiveW = physW : neon_coordActiveH = physH
+    neon_coordBuildCount = neon_coordBuildCount + 1
+    ProcedureReturn
+  EndIf
+
   If neon_coordSpareW = physW And neon_coordSpareH = physH
+    If keepPrior <> 0
+      value = neon_xcTab : neon_xcTab = neon_coordSpareBaseX : neon_coordSpareBaseX = value
+      value = neon_ycTab : neon_ycTab = neon_coordSpareBaseY : neon_coordSpareBaseY = value
+      neon_coordSpareW = priorW : neon_coordSpareH = priorH
+      neon_coordActiveW = physW : neon_coordActiveH = physH
+      neon_coordReuseCount = neon_coordReuseCount + 1
+      ProcedureReturn
+    EndIf
     ; A preceding geometry above the spare bound cannot be exchanged. The
     ; requested pair can still be recovered, then the spare is invalidated.
     words = physW * 3 : n = 0
     While n < words
       value = PeekN(neon_xcTab + n * 4)
-      PokeN(neon_xcTab + n * 4, neon_coordSpareX[n])
-      If keepPrior <> 0 : neon_coordSpareX[n] = value : EndIf
+      PokeN(neon_xcTab + n * 4, PeekN(neon_coordSpareBaseX + n * 4))
+      If keepPrior <> 0 : PokeN(neon_coordSpareBaseX + n * 4, value) : EndIf
       n = n + 1
     Wend
     If keepPrior <> 0 And priorW > physW
       n = words
       While n < priorW * 3
-        neon_coordSpareX[n] = PeekN(neon_xcTab + n * 4)
+        PokeN(neon_coordSpareBaseX + n * 4, PeekN(neon_xcTab + n * 4))
         n = n + 1
       Wend
     EndIf
     words = physH * 3 : n = 0
     While n < words
       value = PeekN(neon_ycTab + n * 4)
-      PokeN(neon_ycTab + n * 4, neon_coordSpareY[n])
-      If keepPrior <> 0 : neon_coordSpareY[n] = value : EndIf
+      PokeN(neon_ycTab + n * 4, PeekN(neon_coordSpareBaseY + n * 4))
+      If keepPrior <> 0 : PokeN(neon_coordSpareBaseY + n * 4, value) : EndIf
       n = n + 1
     Wend
     If keepPrior <> 0 And priorH > physH
       n = words
       While n < priorH * 3
-        neon_coordSpareY[n] = PeekN(neon_ycTab + n * 4)
+        PokeN(neon_coordSpareBaseY + n * 4, PeekN(neon_ycTab + n * 4))
         n = n + 1
       Wend
     EndIf
@@ -1533,12 +926,12 @@ Procedure neon_SelectCoordinateTables(physW.i, physH.i, cx.i, cy.i)
   If keepPrior <> 0
     n = 0
     While n < priorW * 3
-      neon_coordSpareX[n] = PeekN(neon_xcTab + n * 4)
+      PokeN(neon_coordSpareBaseX + n * 4, PeekN(neon_xcTab + n * 4))
       n = n + 1
     Wend
     n = 0
     While n < priorH * 3
-      neon_coordSpareY[n] = PeekN(neon_ycTab + n * 4)
+      PokeN(neon_coordSpareBaseY + n * 4, PeekN(neon_ycTab + n * 4))
       n = n + 1
     Wend
     neon_coordSpareW = priorW : neon_coordSpareH = priorH
@@ -1597,7 +990,7 @@ Procedure.i NeonHardwareRebindSurface(base.i, w.i, h.i, pitch.i, bytes.i, outFmt
     pw = h
     ph = w
   EndIf
-  If base <= 0 Or w < 8 Or h < 8 Or pitch < (pw * 4)
+  If base <= 0 Or w < 1 Or h < 1 Or pitch < (pw * 4)
     neon_err = #NEON_ERR_SURFACE
     ProcedureReturn #NEON_ERR_SURFACE
   EndIf
@@ -1668,6 +1061,8 @@ Procedure.i NeonHardwareRebindSurface(base.i, w.i, h.i, pitch.i, bytes.i, outFmt
 
   cx = pw / 2
   cy = ph / 2
+  If cx=0 : cx=1 : EndIf
+  If cy=0 : cy=1 : EndIf
   neon_SelectCoordinateTables(pw, ph, cx, cy)
   neon_fb = base
   neon_w = w
@@ -2421,52 +1816,9 @@ Procedure.i neon_InitFail(code.i)
   ProcedureReturn code
 EndProcedure
 
-Procedure.i NeonInit()
-  Protected r.i
-  Protected rollbackRc.i
-  Protected p.i
-  Protected n.i
-  Protected maxVa.i
-  Protected fbPage0.i
-  Protected fbMapEnd.i
-  Protected extraMapEnd.i
+Procedure.i NeonHardwareInit()
+  Protected r.i, p.i, n.i, maxVa.i, fbPage0.i, fbMapEnd.i, extraMapEnd.i
   Protected capPlan.V3dRenderPlan
-
-  gNeonReady = 0
-  neon_FrontendError(#NEON_OK)
-  neon_coordActiveW = 0 : neon_coordActiveH = 0
-  neon_coordSpareW = 0 : neon_coordSpareH = 0
-
-  If gNeonLifecycleMode = #NEON_BACKEND_EXTERNAL
-    If gNeonLifecycleInit = 0
-      neon_FrontendError(#NEON_ERR_BACKEND)
-      ProcedureReturn #NEON_ERR_BACKEND
-    EndIf
-    r = gNeonLifecycleInit()
-    gNeonLifecycleError = r
-    If r <> #NEON_OK
-      If gNeonLifecyclePrepared <> 0
-        rollbackRc = neon_PreparedInitRollback()
-        If rollbackRc = #NEON_OK : gNeonLifecycleError = r : EndIf
-      EndIf
-      neon_FrontendError(#NEON_ERR_BACKEND)
-      ProcedureReturn #NEON_ERR_BACKEND
-    EndIf
-    If NeonDrawBackendActive() = 0
-      gNeonLifecycleError = #NEON_ERR_BACKEND
-      If gNeonLifecyclePrepared <> 0
-        rollbackRc = neon_PreparedInitRollback()
-        If rollbackRc = #NEON_OK : gNeonLifecycleError = #NEON_ERR_BACKEND : EndIf
-      ElseIf gNeonLifecycleShutdown <> 0
-        gNeonLifecycleShutdown()
-      EndIf
-      neon_FrontendError(#NEON_ERR_BACKEND)
-      ProcedureReturn #NEON_ERR_BACKEND
-    EndIf
-    gNeonReady = 1
-    ProcedureReturn #NEON_OK
-  EndIf
-
   If neon_arena = 0
     neon_FrontendError(#NEON_ERR_ARENA)
     ProcedureReturn #NEON_ERR_ARENA
@@ -2580,12 +1932,12 @@ Procedure.i NeonInit()
   neon_overflow = p
   p = p + neon_overflowBytes
 
-  ; The bin list. Prologue and epilogue are about sixty bytes; each
-  ; draw costs a GL_SHADER_STATE (5) plus a VERTEX_ARRAY_PRIMS (10),
-  ; and each clip change a CLIP_WINDOW (9). Thirty-two bytes per draw
-  ; is twice the worst case and the readahead slack is inside it. The
-  ; textured draws share this list, so their maximum is budgeted too.
-  gNeonBclBytes = neon_RoundPage(((#NEON_MAX_DRAWS + #NEON_MAX_TDRAWS) * 32) + 8192)
+  ; The bin list is a physical command budget, independent of logical
+  ; draw counters. An indexed outline uses an open-chain draw and an
+  ; immutable closing-edge draw, each with index-buffer setup. Reserve
+  ; two raw draws per flat call plus one per textured call. The Vulkan
+  ; backend still checks its exact transitions before starting a frame.
+  gNeonBclBytes = neon_RoundPage(((#NEON_MAX_DRAWS * 2 + #NEON_MAX_TDRAWS) * 32) + 8192)
   neon_bcl = p
   p = p + gNeonBclBytes
 
@@ -2646,6 +1998,9 @@ Procedure.i NeonInit()
   p = p + neon_RoundPage(neon_capPhysW * 3 * 4)
   neon_ycTab = p
   p = p + neon_RoundPage(neon_capPhysH * 3 * 4)
+  neon_coordArenaX = neon_xcTab : neon_coordArenaY = neon_ycTab
+  neon_coordSpareBaseX = @neon_coordSpareX[0]
+  neon_coordSpareBaseY = @neon_coordSpareY[0]
 
   ; The per-glyph cell-edge UV table, also CPU-only and unmapped: one
   ; page holds four floats for each of up to 256 glyphs. Built once when
@@ -2896,38 +2251,8 @@ EndProcedure
 ;  arrived, and undoing that would be undoing something that was not
 ;  broken.
 ; ======================================================================
-Procedure.i NeonShutdown()
+Procedure.i NeonHardwareShutdown()
   Protected r.i
-  neon_coordActiveW = 0 : neon_coordActiveH = 0
-  neon_coordSpareW = 0 : neon_coordSpareH = 0
-  If gNeonReady = 0 And v3d_owner = 0
-    ProcedureReturn #NEON_OK
-  EndIf
-  If gNeonLifecycleMode = #NEON_BACKEND_EXTERNAL
-    If gNeonLifecycleShutdown = 0
-      neon_FrontendError(#NEON_ERR_BACKEND)
-      ProcedureReturn #NEON_ERR_BACKEND
-    EndIf
-    r = gNeonLifecycleShutdown()
-    gNeonLifecycleError = r
-    If r <> #NEON_OK
-      neon_FrontendError(#NEON_ERR_BACKEND)
-      ProcedureReturn #NEON_ERR_BACKEND
-    EndIf
-    NeonDrawBackendClear()
-    neon_inFrame = 0
-    If gNeonLifecyclePrepared <> 0
-      ; The caller still owns the Vulkan device/target and must destroy them
-      ; before releasing the native V3D context it lent to this adapter.
-      neon_LifecycleRestoreNative()
-      gNeonReady = 1
-      gNeonPreparedOwnerPending = 1
-    Else
-      gNeonReady = 0
-    EndIf
-    neon_FrontendError(#NEON_OK)
-    ProcedureReturn #NEON_OK
-  EndIf
   If v3d_owner = 0
     neon_FrontendError(#NEON_ERR_V3D)
     ProcedureReturn #NEON_ERR_V3D
@@ -3073,10 +2398,14 @@ EndProcedure
 ; Internal native entry. The Vulkan backend uses this after closing and
 ; validating its command list; it never dispatches back through the public
 ; external lifecycle that may have initiated the submission.
-Procedure.i NeonHardwareFrameBegin(colour.i)
+Procedure.i NeonHardwareFrameBeginLoad(colour.i,loadColor.i)
   Protected r.i
   Protected t0.i
   Protected hz.i
+
+  If loadColor<>0 And loadColor<>1
+    neon_err=#NEON_ERR_ARGS : ProcedureReturn #NEON_ERR_ARGS
+  EndIf
 
   ; THE GUARD IS NOT DECORATION. V3dCounterHz() reads CNTFRQ_EL0, which
   ; is 54,000,000 on this part and ZERO on a part where nothing set it.
@@ -3123,6 +2452,10 @@ Procedure.i NeonHardwareFrameBegin(colour.i)
   ; TILE_RENDERING_MODE_CFG carries the field whether or not anything
   ; reads it.
   V3dRenderClear(colour, #NEON_F_ONE, 0)
+  r=V3dRenderLoadColor(loadColor)
+  If r<>#V3D_OK
+    neon_err=#NEON_ERR_LIST : ProcedureReturn #NEON_ERR_LIST
+  EndIf
 
   r = V3dRclBuild(neon_tilelist, neon_tilelistBytes, neon_rcl, neon_rclBytes)
   If r <> #V3D_OK
@@ -3147,41 +2480,13 @@ Procedure.i NeonHardwareFrameBegin(colour.i)
   ProcedureReturn #NEON_OK
 EndProcedure
 
-Procedure.i NeonFrameBegin(colour.i)
-  Protected r.i
-
-  If gNeonLifecycleMode = #NEON_BACKEND_EXTERNAL
-    If gNeonReady = 0
-      neon_FrontendError(#NEON_ERR_ARENA)
-      ProcedureReturn #NEON_ERR_ARENA
-    EndIf
-    If neon_inFrame <> 0
-      neon_FrontendError(#NEON_ERR_INFRAME)
-      ProcedureReturn #NEON_ERR_INFRAME
-    EndIf
-    If gNeonLifecycleBegin = 0
-      neon_FrontendError(#NEON_ERR_BACKEND)
-      ProcedureReturn #NEON_ERR_BACKEND
-    EndIf
-    r = gNeonLifecycleBegin(colour)
-    gNeonLifecycleError = r
-    If r <> #NEON_OK
-      neon_FrontendError(#NEON_ERR_BACKEND)
-      ProcedureReturn #NEON_ERR_BACKEND
-    EndIf
-    neon_inFrame = 1
-    ProcedureReturn #NEON_OK
-  EndIf
-
-  If neon_inFrame <> 0
-    neon_FrontendError(#NEON_ERR_INFRAME)
-    ProcedureReturn #NEON_ERR_INFRAME
-  EndIf
-  r = NeonHardwareFrameBegin(colour)
-  If r <> #NEON_OK : neon_FrontendError(r) : EndIf
-  If r = #NEON_OK : neon_inFrame = 1 : EndIf
-  ProcedureReturn r
+; Existing callers retain clear-at-begin behavior. Attachment preservation
+; is explicit and must never leak from the preceding frame.
+Procedure.i NeonHardwareFrameBegin(colour.i)
+  ProcedureReturn NeonHardwareFrameBeginLoad(colour,0)
 EndProcedure
+
+
 
 ; ----------------------------------------------------------------------
 ;  NeonFrameEnd - cap the list, submit both jobs, wait for both.
@@ -3314,39 +2619,7 @@ Procedure.i NeonHardwareFrameJoin()
   ProcedureReturn #NEON_OK
 EndProcedure
 
-Procedure.i NeonFrameEnd()
-  Protected r.i
 
-  If gNeonLifecycleMode = #NEON_BACKEND_EXTERNAL
-    If neon_inFrame = 0
-      neon_FrontendError(#NEON_ERR_NOFRAME)
-      ProcedureReturn #NEON_ERR_NOFRAME
-    EndIf
-    If gNeonLifecycleEnd = 0
-      neon_inFrame = 0
-      neon_FrontendError(#NEON_ERR_BACKEND)
-      ProcedureReturn #NEON_ERR_BACKEND
-    EndIf
-    r = gNeonLifecycleEnd()
-    gNeonLifecycleError = r
-    neon_inFrame = 0
-    If r <> #NEON_OK
-      neon_FrontendError(#NEON_ERR_BACKEND)
-      ProcedureReturn #NEON_ERR_BACKEND
-    EndIf
-    neon_FrontendError(#NEON_OK)
-    ProcedureReturn #NEON_OK
-  EndIf
-
-  If neon_inFrame = 0
-    neon_FrontendError(#NEON_ERR_NOFRAME)
-    ProcedureReturn #NEON_ERR_NOFRAME
-  EndIf
-  r = NeonHardwareFrameEnd()
-  If r <> #NEON_OK : neon_FrontendError(r) : EndIf
-  neon_inFrame = 0
-  ProcedureReturn r
-EndProcedure
 
 
 ; ======================================================================
@@ -3668,12 +2941,9 @@ EndProcedure
 ;  shader record, a uniform block, six vertices and two packets - and
 ;  it is provably invisible, so it is dropped and counted.
 ; ======================================================================
-Procedure.i Neon_Box(x.i, y.i, w.i, h.i, colour.i)
+Procedure.i neon_NativeBox(x.i, y.i, w.i, h.i, colour.i)
   Protected first.i
 
-  If gNeonBackendActive <> 0
-    ProcedureReturn gNeonBackendBox(x, y, w, h, colour)
-  EndIf
 
   If neon_inFrame = 0
     neon_FrontendError(#NEON_ERR_NOFRAME)
@@ -3709,6 +2979,13 @@ Procedure.i Neon_Box(x.i, y.i, w.i, h.i, colour.i)
   If (neon_nVerts + 6) > #NEON_MAX_VERTS
     neon_FrontendError(#NEON_ERR_VERTS)
     ProcedureReturn #NEON_ERR_VERTS
+  EndIf
+
+  ; Record capacity must refuse before geometry or the box counter changes.
+  ; Empty and fully clipped boxes above do not need a record.
+  If neon_nDraws >= #NEON_MAX_DRAWS
+    neon_err = #NEON_ERR_RECORDS
+    ProcedureReturn #NEON_ERR_RECORDS
   EndIf
 
   first = neon_nVerts
@@ -3839,6 +3116,39 @@ Procedure neon_Rect(x.i, y.i, w.i, h.i)
 EndProcedure
 
 
+; Replacement clear over the hardware target, independent of an installed
+; renderer's blend, scissor, viewport and sample mask. The native owner alone
+; appends its private vertices, uniforms and shader record. Culling is off,
+; depth always passes, blending is disabled and all colour channels are written.
+Procedure.i NeonHardwareClearRect(x.i, y.i, w.i, h.i, colour.i)
+  Define first.i
+  If neon_hwInFrame = 0 : ProcedureReturn #NEON_ERR_NOFRAME : EndIf
+  If x < 0 Or y < 0 Or w < 1 Or h < 1 Or w > neon_w Or h > neon_h Or x > neon_w - w Or y > neon_h - h
+    ProcedureReturn #NEON_ERR_ARGS
+  EndIf
+  If neon_nDraws >= #NEON_MAX_DRAWS Or neon_nVerts > #NEON_MAX_VERTS - 6
+    ProcedureReturn #NEON_ERR_RECORDS
+  EndIf
+  first = neon_nVerts
+  neon_Rect(x, y, w, h)
+  If neon_nVerts <> first + 6 : ProcedureReturn #NEON_ERR_VERTS : EndIf
+  neon_Uniforms(neon_nDraws, colour)
+  If neon_Record(neon_nDraws) <> #V3D_OK : ProcedureReturn #NEON_ERR_RECORDS : EndIf
+  V3dClClipWindow(x, y, w, h)
+  V3dClClipperXyScaling(GraphicsF32IntBits(neon_cx * 256), GraphicsF32IntBits(neon_cy * 256))
+  V3dClViewportOffset(neon_cx * 256, 0, neon_cy * 256, 0)
+  V3dClCfgBits(V3dCfgBitsWord(1, 1, 0, 7))
+  V3dClBlendEnables(0)
+  V3dClColorWriteMasks(0)
+  V3dClSampleState($3F80, $F)
+  V3dClNonperspFlags(0)
+  V3dClGlShaderState(neon_shrec + (neon_nDraws * #NEON_SHREC_STRIDE), #NEON_ATTRS)
+  V3dClVertexArrayPrims(#NEON_PRIM_TRIS, 6, first)
+  If V3dClError() <> #V3D_OK : ProcedureReturn #NEON_ERR_LIST : EndIf
+  neon_nDraws = neon_nDraws + 1
+  ProcedureReturn #NEON_OK
+EndProcedure
+
 ; ======================================================================
 ;  PRIMITIVE 3 - THE CONVEX FAN, AND PRIMITIVE 4 - THE LINE LIST
 ;
@@ -3857,10 +3167,7 @@ EndProcedure
 ; ======================================================================
 Global neon_fanFirst.i = -1
 
-Procedure.i NeonFanBegin()
-  If gNeonBackendActive <> 0
-    ProcedureReturn gNeonBackendFanBegin()
-  EndIf
+Procedure.i neon_NativeFanBegin()
   If neon_inFrame = 0
     neon_FrontendError(#NEON_ERR_NOFRAME)
     ProcedureReturn #NEON_ERR_NOFRAME
@@ -3869,19 +3176,12 @@ Procedure.i NeonFanBegin()
   ProcedureReturn #NEON_OK
 EndProcedure
 
-Procedure NeonFanPoint(x.i, y.i)
-  If gNeonBackendActive <> 0
-    gNeonBackendFanPoint(x, y)
-    ProcedureReturn
-  EndIf
+Procedure neon_NativeFanPoint(x.i, y.i)
   neon_Vertex(x, y)
 EndProcedure
 
-Procedure.i NeonFanEnd(colour.i)
+Procedure.i neon_NativeFanEnd(colour.i)
   Protected n.i
-  If gNeonBackendActive <> 0
-    ProcedureReturn gNeonBackendFanEnd(colour)
-  EndIf
   If neon_fanFirst < 0
     neon_FrontendError(#NEON_ERR_ARGS)
     ProcedureReturn #NEON_ERR_ARGS
@@ -3914,11 +3214,8 @@ EndProcedure
 ;  finished. NeonFanOutline does not clear it, so the natural order is
 ;  outline then fill, or fill then nothing.
 ; ----------------------------------------------------------------------
-Procedure.i NeonFanOutline(colour.i)
+Procedure.i neon_NativeFanOutline(colour.i)
   Protected n.i
-  If gNeonBackendActive <> 0
-    ProcedureReturn gNeonBackendFanOutline(colour)
-  EndIf
   If neon_fanFirst < 0
     neon_FrontendError(#NEON_ERR_ARGS)
     ProcedureReturn #NEON_ERR_ARGS
@@ -3933,10 +3230,7 @@ EndProcedure
 ; A line list. Same shape: begin, two points per segment, end.
 Global neon_lineFirst.i = -1
 
-Procedure.i NeonLinesBegin()
-  If gNeonBackendActive <> 0
-    ProcedureReturn gNeonBackendLinesBegin()
-  EndIf
+Procedure.i neon_NativeLinesBegin()
   If neon_inFrame = 0
     neon_FrontendError(#NEON_ERR_NOFRAME)
     ProcedureReturn #NEON_ERR_NOFRAME
@@ -3945,20 +3239,13 @@ Procedure.i NeonLinesBegin()
   ProcedureReturn #NEON_OK
 EndProcedure
 
-Procedure NeonLine(x0.i, y0.i, x1.i, y1.i)
-  If gNeonBackendActive <> 0
-    gNeonBackendLine(x0, y0, x1, y1)
-    ProcedureReturn
-  EndIf
+Procedure neon_NativeLine(x0.i, y0.i, x1.i, y1.i)
   neon_Vertex(x0, y0)
   neon_Vertex(x1, y1)
 EndProcedure
 
-Procedure.i NeonLinesEnd(colour.i)
+Procedure.i neon_NativeLinesEnd(colour.i)
   Protected n.i
-  If gNeonBackendActive <> 0
-    ProcedureReturn gNeonBackendLinesEnd(colour)
-  EndIf
   If neon_lineFirst < 0
     neon_FrontendError(#NEON_ERR_ARGS)
     ProcedureReturn #NEON_ERR_ARGS
@@ -3988,28 +3275,18 @@ EndProcedure
 ;  on silicon - and one canvas unit is one pixel, so the rectangle
 ;  goes straight through.
 ; ======================================================================
-Procedure Neon_ScissorSet(x.i, y.i, w.i, h.i)
+Procedure neon_NativeScissorSet(x.i, y.i, w.i, h.i)
   neon_clipOn = 1
   neon_clipX  = x
   neon_clipY  = y
   neon_clipW  = w
   neon_clipH  = h
-  If gNeonBackendActive <> 0
-    gNeonBackendScissorSet(x, y, w, h)
-  EndIf
 EndProcedure
 
-Procedure Neon_ScissorClear()
+Procedure neon_NativeScissorClear()
   neon_clipOn = 0
-  If gNeonBackendActive <> 0
-    gNeonBackendScissorClear()
-  EndIf
 EndProcedure
 
-Procedure.i Neon_ScissorOn()
-  If gNeonStateActive <> 0 : ProcedureReturn gNeonStateQuery(#NEON_STATE_SCISSOR_ON) : EndIf
-  ProcedureReturn neon_clipOn
-EndProcedure
 
 
 ; ======================================================================
@@ -4080,22 +3357,7 @@ EndProcedure
 ;  and neon.pi4 does not name that label itself, because a library that
 ;  includes no library must not depend on one either.
 ; ----------------------------------------------------------------------
-Procedure.i NeonFontUse(bitsAddr.i, cellW.i, cellH.i, first.i, last.i)
-  If bitsAddr <= 0 Or cellW < 1 Or cellH < 1 Or last < first
-    neon_FrontendError(#NEON_ERR_FONT)
-    ProcedureReturn #NEON_ERR_FONT
-  EndIf
-  neon_fbits  = bitsAddr
-  neon_fw     = cellW
-  neon_fh     = cellH
-  neon_frb    = (cellW + 7) / 8
-  neon_ffirst = first
-  neon_flast  = last
-  ; An explicit font selection invalidates both atlas forms even if the caller
-  ; reused the same bitmap address with changed glyphs or cell metadata.
-  neon_fontRevision = neon_fontRevision + 1
-  ProcedureReturn #NEON_OK
-EndProcedure
+
 
 ; ----------------------------------------------------------------------
 ;  THE FOUR FACES.
@@ -4121,25 +3383,6 @@ EndProcedure
 ;  emboldening a bitmap face has always been. It is not a separate
 ;  face because there is not one.
 ; ----------------------------------------------------------------------
-#NEON_FONT_UI    = 0
-#NEON_FONT_SMALL = 1
-#NEON_FONT_MONO  = 2
-#NEON_FONT_BOLD  = 3
-
-Procedure NeonFontSetup(idx.i, scale.i, bold.i)
-  If idx < 0 Or idx > 3
-    ProcedureReturn
-  EndIf
-  If scale < 1
-    scale = 1
-  EndIf
-  neon_fontScale[idx] = scale
-  If bold <> 0
-    neon_fontEmbolden[idx] = 1
-  Else
-    neon_fontEmbolden[idx] = 0
-  EndIf
-EndProcedure
 
 ; ----------------------------------------------------------------------
 ;  THE FOUR FACES BY NAME, and the two font constructors.
@@ -4149,21 +3392,9 @@ EndProcedure
 ;  above, because there is one cell font and four scales of it, so
 ;  these return the index and the call sites read the same.
 ; ----------------------------------------------------------------------
-Procedure.i Neon_FontUI()
-  ProcedureReturn #NEON_FONT_UI
-EndProcedure
 
-Procedure.i Neon_FontSmall()
-  ProcedureReturn #NEON_FONT_SMALL
-EndProcedure
 
-Procedure.i Neon_FontMono()
-  ProcedureReturn #NEON_FONT_MONO
-EndProcedure
 
-Procedure.i Neon_FontBold()
-  ProcedureReturn #NEON_FONT_BOLD
-EndProcedure
 
 ; ----------------------------------------------------------------------
 ;  Neon_PointsForPixelHeight - GlUIChrome.pbi:93-116.
@@ -4184,14 +3415,6 @@ EndProcedure
 ;  compiles and gets a sane number rather than finding the procedure
 ;  missing. Neon_CreateFontPx is the one to use.
 ; ----------------------------------------------------------------------
-Procedure.i Neon_PointsForPixelHeight(pixels.i)
-  Protected pt.i
-  pt = ((pixels * 75) + 50) / 100
-  If pt < 5
-    pt = 5
-  EndIf
-  ProcedureReturn pt
-EndProcedure
 
 ; ----------------------------------------------------------------------
 ;  Neon_CreateFontPx - GlUIChrome.pbi:120-122.
@@ -4222,98 +3445,12 @@ Procedure.i Neon_CreateFontPx(slot.i, wantPixels.i, bold.i)
   ProcedureReturn neon_fh * sc
 EndProcedure
 
-Procedure NeonFontDefaults()
-  NeonFontSetup(#NEON_FONT_UI,    1, 0)
-  NeonFontSetup(#NEON_FONT_SMALL, 1, 0)
-  NeonFontSetup(#NEON_FONT_MONO,  1, 0)
-  NeonFontSetup(#NEON_FONT_BOLD,  1, 1)
-EndProcedure
 
 Procedure.i neon_FontScaleOf(font.i)
-  If font < 0 Or font > 3
-    ProcedureReturn 1
-  EndIf
-  If neon_fontScale[font] < 1
-    ProcedureReturn 1
-  EndIf
-  ProcedureReturn neon_fontScale[font]
+  ProcedureReturn NeonBitmapFontScale(font)
 EndProcedure
 
-; The advance in pixels for one character. Fixed width, so it does not
-; depend on the character - but it takes one anyway, because the moment
-; a proportional atlas exists this is where the per-glyph advance goes
-; and every caller is already passing what it needs.
-Procedure.i Neon_CharWidth(font.i)
-  ProcedureReturn neon_fw * neon_FontScaleOf(font)
-EndProcedure
-
-; The cell height. This is the engine's GLFont\LineHeight and it is the
-; number every vertical centring in the chrome kit divides by
-; (GlUIChrome.pbi:372, :727, :862, :948, :1130, :1249, :1347).
-Procedure.i Neon_LineHeight(font.i)
-  Protected measured.i
-  If gNeonMeasureActive <> 0
-    measured = gNeonMeasureLineHeight(font)
-    If measured > 0 : ProcedureReturn measured : EndIf
-  EndIf
-  ProcedureReturn neon_fh * neon_FontScaleOf(font)
-EndProcedure
-
-; Raw fixed-bitmap line height for renderer adapters whose own callbacks
-; need Neon's scale without recursively consulting the measurement backend.
-Procedure.i NeonBitmapLineHeight(font.i)
-  ProcedureReturn neon_fh * neon_FontScaleOf(font)
-EndProcedure
-
-; The selected bitmap face style is shared by the native rectangle path and
-; renderer adapters. A face index does not imply bold after NeonFontSetup().
-Procedure.i NeonBitmapFontBold(font.i)
-  If font < 0 Or font > 3
-    ProcedureReturn 0
-  EndIf
-  If neon_fontEmbolden[font] <> 0
-    ProcedureReturn 1
-  EndIf
-  ProcedureReturn 0
-EndProcedure
-
-; ----------------------------------------------------------------------
-;  Neon_TextWidth - GetGLTextWidth, GlUtilities.pbi:1672-1707.
-;
-;  The engine walks the string, skips control codes, and adds each
-;  glyph's advance. So does this; the advance is just constant.
-; ----------------------------------------------------------------------
-Procedure.i Neon_TextWidth(font.i, *s)
-  Protected i.i
-  Protected ch.i
-  Protected n.i
-  Protected measured.i
-  If *s = 0
-    ProcedureReturn 0
-  EndIf
-  If gNeonMeasureActive <> 0
-    measured = gNeonMeasureWidth(font, *s)
-    If measured >= 0 : ProcedureReturn measured : EndIf
-  EndIf
-  i = 0
-  n = 0
-  Repeat
-    ch = PeekA(*s + i)
-    If ch = 0
-      Break
-    EndIf
-    ; Control codes are skipped, exactly as GlUtilities.pbi:1690-1692
-    ; skips anything below 32 and DEL.
-    If ch >= 32 And ch <> 127
-      n = n + 1
-    EndIf
-    i = i + 1
-    If i > 4096
-      Break
-    EndIf
-  ForEver
-  ProcedureReturn n * Neon_CharWidth(font)
-EndProcedure
+; Public measured line height and width are owned by the shared frontend.
 
 ; ----------------------------------------------------------------------
 ;  neon_GlyphRow - the bits of one row of one glyph, MSB leftmost,
@@ -4331,12 +3468,7 @@ EndProcedure
 ;  none. An 8 x 16 cell is what this tree has.
 ; ----------------------------------------------------------------------
 Procedure.i neon_GlyphRow(ch.i, row.i, bold.i)
-  Protected b.i
-  b = PeekA(neon_fbits + (((ch - neon_ffirst) * neon_fh) + row) * neon_frb)
-  If bold <> 0
-    b = (b | (b >> 1)) & $FF
-  EndIf
-  ProcedureReturn b
+  ProcedureReturn NeonBitmapGlyphRow(ch, row, bold)
 EndProcedure
 
 ; ----------------------------------------------------------------------
@@ -4349,7 +3481,7 @@ EndProcedure
 ;  Returns the number of rectangles appended, which the caller adds up
 ;  so a run can report how much geometry a string actually cost.
 ; ----------------------------------------------------------------------
-Procedure.i neon_GlyphRects(ch.i, gx.i, gy.i, font.i)
+Procedure.i neon_GlyphRects(ch.i, gx.i, gy.i, font.i, emit.i)
   Protected sc.i
   Protected bold.i
   Protected row.i
@@ -4392,7 +3524,9 @@ Procedure.i neon_GlyphRects(ch.i, gx.i, gy.i, font.i)
           EndIf
         Else
           If runStart >= 0
+            If emit <> 0
             neon_Rect(gx + (runStart * sc), gy + (row * sc), (col - runStart) * sc, span * sc)
+            EndIf
             nRect = nRect + 1
             runStart = -1
           EndIf
@@ -4416,7 +3550,7 @@ EndProcedure
 ;  this engine, which is why every vertical centring in the chrome kit
 ;  is y + (rowHeight - LineHeight) / 2.
 ; ----------------------------------------------------------------------
-Procedure.i Neon_Text(font.i, x.i, y.i, *s, colour.i)
+Procedure.i neon_NativeText(font.i, x.i, y.i, *s, colour.i)
   Protected i.i
   Protected ch.i
   Protected cx.i
@@ -4424,10 +3558,8 @@ Procedure.i Neon_Text(font.i, x.i, y.i, *s, colour.i)
   Protected first.i
   Protected count.i
   Protected cellH.i
+  Protected pass.i, needed.i, glyphRuns.i
 
-  If gNeonBackendActive <> 0
-    ProcedureReturn gNeonBackendText(font, x, y, *s, colour)
-  EndIf
 
   If neon_inFrame = 0
     neon_FrontendError(#NEON_ERR_NOFRAME)
@@ -4462,6 +3594,10 @@ Procedure.i Neon_Text(font.i, x.i, y.i, *s, colour.i)
   EndIf
 
   first = neon_nVerts
+  ; Count and emit use the same clipping and glyph-run walk. The first
+  ; pass changes no geometry or counters, so capacity refusal is atomic.
+  needed = 0
+  For pass = 0 To 1
   cx = x
   i = 0
   Repeat
@@ -4474,11 +3610,21 @@ Procedure.i Neon_Text(font.i, x.i, y.i, *s, colour.i)
       ; only builds the glyphs that can show.
       If (cx + adv) > 0 And cx < neon_w
         If neon_clipOn = 0
-          neon_nRuns = neon_nRuns + neon_GlyphRects(ch, cx, y, font)
-          neon_nGlyphs = neon_nGlyphs + 1
+          glyphRuns = neon_GlyphRects(ch, cx, y, font, pass)
+          If pass = 0
+            needed = needed + glyphRuns * 6
+          Else
+            neon_nRuns = neon_nRuns + glyphRuns
+            neon_nGlyphs = neon_nGlyphs + 1
+          EndIf
         ElseIf (cx + adv) > neon_clipX And cx < (neon_clipX + neon_clipW)
-          neon_nRuns = neon_nRuns + neon_GlyphRects(ch, cx, y, font)
-          neon_nGlyphs = neon_nGlyphs + 1
+          glyphRuns = neon_GlyphRects(ch, cx, y, font, pass)
+          If pass = 0
+            needed = needed + glyphRuns * 6
+          Else
+            neon_nRuns = neon_nRuns + glyphRuns
+            neon_nGlyphs = neon_nGlyphs + 1
+          EndIf
         EndIf
       EndIf
       cx = cx + adv
@@ -4488,6 +3634,17 @@ Procedure.i Neon_Text(font.i, x.i, y.i, *s, colour.i)
       Break
     EndIf
   ForEver
+  If pass = 0 And needed > 0
+    If needed > (#NEON_MAX_VERTS - first)
+      neon_err = #NEON_ERR_VERTS
+      ProcedureReturn #NEON_ERR_VERTS
+    EndIf
+    If neon_nDraws >= #NEON_MAX_DRAWS
+      neon_err = #NEON_ERR_RECORDS
+      ProcedureReturn #NEON_ERR_RECORDS
+    EndIf
+  EndIf
+  Next
 
   count = neon_nVerts - first
   If count = 0
@@ -4523,134 +3680,6 @@ EndProcedure
 ;  tiling, the texture and sampler state, the per-glyph UVs - is built
 ;  once by neon_TexEnsure() from whatever font NeonFontUse() last set.
 ; ======================================================================
-
-; The smallest power of two that is >= v (>= 1). Used to pad the atlas
-; height so V = vTexel / height is exactly representable.
-Procedure.i neon_NextPow2(v.i)
-  Protected p.i
-  p = 1
-  While p < v
-    p = p << 1
-  Wend
-  ProcedureReturn p
-EndProcedure
-
-; ----------------------------------------------------------------------
-;  neon_RasterEnsure - build only the CPU-readable RGBA atlas and its
-;  copied-out glyph metadata.
-;
-;  This is the common owner for both texture paths. The direct V3D path
-;  still tiles this raster below; another renderer may copy these bytes
-;  into its own staging resource. Publication is last, so no query can
-;  observe a partly-filled raster or UV table.
-; ----------------------------------------------------------------------
-Procedure.i neon_RasterEnsure()
-  Protected cols.i
-  Protected nGlyph.i
-  Protected rows.i
-  Protected paddedH.i
-  Protected g.i
-  Protected ch.i
-  Protected cellX0.i
-  Protected cellY0.i
-  Protected tx.i
-  Protected ty.i
-  Protected bits.i
-  Protected off.i
-  Protected i.i
-  Protected n.i
-  Protected bytes.i
-
-  If neon_fbits = 0
-    neon_err = #NEON_ERR_FONT
-    ProcedureReturn #NEON_ERR_FONT
-  EndIf
-  If neon_rasterBuilt <> 0 And neon_rasterFontBits = neon_fbits And neon_rasterRevision = neon_fontRevision
-    ProcedureReturn #NEON_OK
-  EndIf
-  If neon_texSrc <= 0 Or neon_glyphUV <= 0
-    neon_err = #NEON_ERR_ARENA
-    ProcedureReturn #NEON_ERR_ARENA
-  EndIf
-  If neon_fw < 1 Or neon_fw > #NEON_ATLAS_W Or (#NEON_ATLAS_W % neon_fw) <> 0 Or neon_fh < 1
-    neon_err = #NEON_ERR_ARGS
-    ProcedureReturn #NEON_ERR_ARGS
-  EndIf
-
-  cols = #NEON_ATLAS_W / neon_fw
-  nGlyph = neon_flast - neon_ffirst + 1
-  If nGlyph < 1 Or nGlyph > 256
-    neon_err = #NEON_ERR_ARGS
-    ProcedureReturn #NEON_ERR_ARGS
-  EndIf
-  rows = (nGlyph + cols - 1) / cols
-  ; Keep one row outside every glyph cell.  Its first texel is an opaque
-  ; white sample used by renderers which put boxes and glyphs through one
-  ; sampled+tinted pipeline.  Adding the row before power-of-two padding is
-  ; important: a completely full atlas must not corrupt its final glyph.
-  paddedH = neon_NextPow2((rows * neon_fh) + 1)
-  If paddedH > #NEON_ATLAS_MAXH
-    neon_err = #NEON_ERR_ARGS
-    ProcedureReturn #NEON_ERR_ARGS
-  EndIf
-  bytes = #NEON_ATLAS_W * paddedH * 4
-  If bytes < 1 Or bytes > #NEON_ATLAS_MAXBYTES
-    neon_err = #NEON_ERR_ARGS
-    ProcedureReturn #NEON_ERR_ARGS
-  EndIf
-
-  n = #NEON_ATLAS_W * paddedH
-  i = 0
-  While i < n
-    PokeN(neon_texSrc + (i * 4), $00000000)
-    i = i + 1
-  Wend
-
-  g = 0
-  While g < nGlyph
-    ch = neon_ffirst + g
-    cellX0 = (g % cols) * neon_fw
-    cellY0 = (g / cols) * neon_fh
-    ty = 0
-    While ty < neon_fh
-      bits = neon_GlyphRow(ch, ty, 0)
-      tx = 0
-      While tx < neon_fw
-        If (bits & (128 >> tx)) <> 0
-          off = (((cellY0 + ty) * #NEON_ATLAS_W) + (cellX0 + tx)) * 4
-          PokeN(neon_texSrc + off, $FFFFFFFF)
-        EndIf
-        tx = tx + 1
-      Wend
-      ty = ty + 1
-    Wend
-    g = g + 1
-  Wend
-
-  ; The final row is reserved, so this can never overlap a glyph cell.
-  PokeN(neon_texSrc + (((paddedH - 1) * #NEON_ATLAS_W) * 4), $FFFFFFFF)
-
-  g = 0
-  While g < nGlyph
-    cellX0 = (g % cols) * neon_fw
-    cellY0 = (g / cols) * neon_fh
-    PokeN(neon_glyphUV + (g * 16) +  0, neon_F32Ratio(cellX0,            #NEON_ATLAS_W))
-    PokeN(neon_glyphUV + (g * 16) +  4, neon_F32Ratio(cellX0 + neon_fw,  #NEON_ATLAS_W))
-    PokeN(neon_glyphUV + (g * 16) +  8, neon_F32Ratio(cellY0,            paddedH))
-    PokeN(neon_glyphUV + (g * 16) + 12, neon_F32Ratio(cellY0 + neon_fh,  paddedH))
-    g = g + 1
-  Wend
-
-  neon_rasterW = #NEON_ATLAS_W
-  neon_rasterH = paddedH
-  neon_atlasCols = cols
-  neon_atlasGlyphs = nGlyph
-  neon_rasterBytes = bytes
-  neon_rasterFontBits = neon_fbits
-  neon_rasterRevision = neon_fontRevision
-  neon_rasterBuilt = 1
-  ProcedureReturn #NEON_OK
-EndProcedure
 
 ; ----------------------------------------------------------------------
 ;  neon_TexEnsure - build the atlas, if it is not already built for the
@@ -4744,106 +3773,6 @@ EndProcedure
 ; outside any frame. Neon_TextTex builds it lazily if this was skipped.
 Procedure.i Neon_TexAtlasBuild()
   ProcedureReturn neon_TexEnsure()
-EndProcedure
-
-; ----------------------------------------------------------------------
-;  READ-ONLY CPU ATLAS CONTRACT
-;
-;  Neon_AtlasRasterEnsure builds the linear RGBA8 source and UV metadata
-;  without submitting a TFU job. The returned base is a BORROWED view:
-;  Neon retains allocation and lifetime ownership, and the caller may only
-;  read/copy `Neon_AtlasRasterBytes()` bytes from it. There is deliberately
-;  no setter, detach or free operation. Glyph UVs are copied into caller-
-;  owned storage instead of exposing the renderer's metadata table.
-;
-;  A font change makes every query unavailable until Ensure succeeds for
-;  that font. This is independent from the private UBLINEAR image: the
-;  existing V3D path still owns and builds that image in neon_TexEnsure.
-; ----------------------------------------------------------------------
-Procedure.i Neon_AtlasRasterEnsure()
-  ProcedureReturn neon_RasterEnsure()
-EndProcedure
-
-Procedure.i Neon_AtlasRasterReady()
-  If neon_rasterBuilt = 0 Or neon_rasterFontBits <> neon_fbits Or neon_rasterRevision <> neon_fontRevision
-    ProcedureReturn 0
-  EndIf
-  If neon_texSrc <= 0 Or neon_rasterW < 1 Or neon_rasterH < 1 Or neon_rasterBytes < 1
-    ProcedureReturn 0
-  EndIf
-  ProcedureReturn 1
-EndProcedure
-
-Procedure.i Neon_AtlasRasterGeneration()
-  If Neon_AtlasRasterReady() = 0 : ProcedureReturn 0 : EndIf
-  ProcedureReturn neon_rasterRevision
-EndProcedure
-
-Procedure.i Neon_AtlasRasterBase()
-  If Neon_AtlasRasterReady() = 0 : ProcedureReturn 0 : EndIf
-  ProcedureReturn neon_texSrc
-EndProcedure
-
-Procedure.i Neon_AtlasRasterWidth()
-  If Neon_AtlasRasterReady() = 0 : ProcedureReturn 0 : EndIf
-  ProcedureReturn neon_rasterW
-EndProcedure
-
-Procedure.i Neon_AtlasRasterHeight()
-  If Neon_AtlasRasterReady() = 0 : ProcedureReturn 0 : EndIf
-  ProcedureReturn neon_rasterH
-EndProcedure
-
-Procedure.i Neon_AtlasRasterBytes()
-  If Neon_AtlasRasterReady() = 0 : ProcedureReturn 0 : EndIf
-  ProcedureReturn neon_rasterBytes
-EndProcedure
-
-Procedure.i Neon_AtlasRasterFirstGlyph()
-  If Neon_AtlasRasterReady() = 0 : ProcedureReturn 0 : EndIf
-  ProcedureReturn neon_ffirst
-EndProcedure
-
-Procedure.i Neon_AtlasRasterLastGlyph()
-  If Neon_AtlasRasterReady() = 0 : ProcedureReturn 0 : EndIf
-  ProcedureReturn neon_flast
-EndProcedure
-
-Procedure.i Neon_AtlasRasterGlyphUV(ch.i, *uv.NeonAtlasGlyphUV)
-  Protected g.i
-  Protected src.i
-  If Neon_AtlasRasterReady() = 0 Or *uv = 0
-    ProcedureReturn 0
-  EndIf
-  If ch < neon_ffirst Or ch > neon_flast
-    ProcedureReturn 0
-  EndIf
-  g = ch - neon_ffirst
-  If g < 0 Or g >= neon_atlasGlyphs
-    ProcedureReturn 0
-  EndIf
-  src = neon_glyphUV + (g * 16)
-  *uv\left   = PeekN(src + 0)
-  *uv\right  = PeekN(src + 4)
-  *uv\top    = PeekN(src + 8)
-  *uv\bottom = PeekN(src + 12)
-  ProcedureReturn 1
-EndProcedure
-
-; Copy the exact one-texel rectangle reserved for solid-colour geometry.
-; Keeping this beside the glyph query means another renderer never has to
-; know where the atlas builder placed the texel or assume that (0,0) is free.
-Procedure.i Neon_AtlasRasterWhiteUV(*uv.NeonAtlasGlyphUV)
-  Protected y.i
-  If Neon_AtlasRasterReady() = 0 Or *uv = 0
-    ProcedureReturn 0
-  EndIf
-  y = neon_rasterH - 1
-  *uv\left   = #NEON_F_ZERO
-  *uv\right  = neon_F32Ratio(1, neon_rasterW)
-  *uv\top    = neon_F32Ratio(y, neon_rasterH)
-  *uv\bottom = #NEON_F_ONE
-  ProcedureReturn 1
 EndProcedure
 
 ; The dimensions of the built atlas, for a diagnostic's report.
@@ -5064,7 +3993,7 @@ EndProcedure
 ;  difference is entirely in what each glyph becomes: six vertices of
 ;  one atlas-sampled quad instead of up to seven blended rectangles.
 ; ----------------------------------------------------------------------
-Procedure.i Neon_TextTex(font.i, x.i, y.i, *s, colour.i)
+Procedure.i neon_NativeTextTex(font.i, x.i, y.i, *s, colour.i)
   Protected i.i
   Protected ch.i
   Protected cx.i
@@ -5082,10 +4011,8 @@ Procedure.i Neon_TextTex(font.i, x.i, y.i, *s, colour.i)
   Protected uR.i
   Protected vT.i
   Protected vB.i
+  Protected pass.i, needed.i
 
-  If gNeonBackendActive <> 0
-    ProcedureReturn gNeonBackendTextTex(font, x, y, *s, colour)
-  EndIf
 
   If neon_inFrame = 0
     neon_FrontendError(#NEON_ERR_NOFRAME)
@@ -5100,12 +4027,6 @@ Procedure.i Neon_TextTex(font.i, x.i, y.i, *s, colour.i)
   EndIf
   If Neon_A(colour) = 0
     ProcedureReturn #NEON_OK
-  EndIf
-
-  ; The atlas, built lazily if a caller skipped Neon_TexAtlasBuild.
-  r = neon_TexEnsure()
-  If r <> #NEON_OK
-    ProcedureReturn r
   EndIf
 
   adv   = Neon_CharWidth(font)
@@ -5124,6 +4045,9 @@ Procedure.i Neon_TextTex(font.i, x.i, y.i, *s, colour.i)
   EndIf
 
   first = neon_nTVerts
+  ; Preflight the same visible glyph walk before atlas or vertex writes.
+  needed = 0
+  For pass = 0 To 1
   cx = x
   i = 0
   Repeat
@@ -5142,10 +4066,9 @@ Procedure.i Neon_TextTex(font.i, x.i, y.i, *s, colour.i)
             drawIt = 1
           EndIf
           If drawIt <> 0
-            If (neon_nTVerts + 6) > #NEON_MAX_TVERTS
-              neon_FrontendError(#NEON_ERR_VERTS)
-              Break
-            EndIf
+            If pass = 0
+              needed = needed + 6
+            Else
             g  = ch - neon_ffirst
             uL = PeekN(neon_glyphUV + (g * 16) +  0)
             uR = PeekN(neon_glyphUV + (g * 16) +  4)
@@ -5163,6 +4086,7 @@ Procedure.i Neon_TextTex(font.i, x.i, y.i, *s, colour.i)
             neon_TexVertex(base + 5, cx,  gy1, uL, vB)
             neon_nTVerts  = base + 6
             neon_nTGlyphs = neon_nTGlyphs + 1
+            EndIf
           EndIf
         EndIf
       EndIf
@@ -5173,6 +4097,24 @@ Procedure.i Neon_TextTex(font.i, x.i, y.i, *s, colour.i)
       Break
     EndIf
   ForEver
+  If pass = 0
+    If needed = 0
+      ProcedureReturn #NEON_OK
+    EndIf
+    If needed > (#NEON_MAX_TVERTS - first)
+      neon_err = #NEON_ERR_VERTS
+      ProcedureReturn #NEON_ERR_VERTS
+    EndIf
+    If neon_nTDraws >= #NEON_MAX_TDRAWS
+      neon_err = #NEON_ERR_RECORDS
+      ProcedureReturn #NEON_ERR_RECORDS
+    EndIf
+    r = neon_TexEnsure()
+    If r <> #NEON_OK
+      ProcedureReturn r
+    EndIf
+  EndIf
+  Next
 
   count = neon_nTVerts - first
   If count = 0
@@ -6200,20 +5142,8 @@ Procedure.i Neon_ScrollBarH(id.i, x.i, y.i, w.i, h.i, total.i, visible.i)
 
   ProcedureReturn changed
 EndProcedure
-; The key codes the field consumes. The engine uses the host
-; #PB_Shortcut_* values; these are the ASCII/keypad numbers a bare
-; metal HID layer produces, named here so the mapping is in one place.
-#NEON_KEY_BACK   = 8
-#NEON_KEY_TAB    = 9
-#NEON_KEY_RETURN = 13
-#NEON_KEY_ESCAPE = 27
-#NEON_KEY_DELETE = 127
-#NEON_KEY_LEFT   = 256
-#NEON_KEY_RIGHT  = 257
-#NEON_KEY_UP     = 258
-#NEON_KEY_DOWN   = 259
-#NEON_KEY_HOME   = 260
-#NEON_KEY_END    = 261
+; Shared legacy key domain; normalized native events require explicit conversion.
+XIncludeFile "Anvil/Graphics/neon_legacy_keys.pbi"
 
 
 ; ======================================================================
@@ -7597,3 +6527,7 @@ EndProcedure
 Procedure.i Neon_CaretPos(id.i)
   ProcedureReturn Neon_StateGet(#NEON_ST_CARET, id)
 EndProcedure
+
+; Bind the typed native family before Main, including pre-init clip calls.
+; A later Vulkan family install/clear leaves these addresses intact.
+NeonNativeDrawBackendInstall(@neon_NativeBox, @neon_NativeText, @neon_NativeTextTex, @neon_NativeScissorSet, @neon_NativeScissorClear, @neon_NativeFanBegin, @neon_NativeFanPoint, @neon_NativeFanEnd, @neon_NativeFanOutline, @neon_NativeLinesBegin, @neon_NativeLine, @neon_NativeLinesEnd)

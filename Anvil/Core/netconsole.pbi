@@ -1521,6 +1521,13 @@ Procedure netcon_PumpOne(kind.i)
   EndIf
 EndProcedure
 
+; Drain one caller-selected link under the same receive ownership/budget rules
+; as the monitor pump. Board maintenance uses this without entering the editor.
+Procedure NetConsolePumpInterface(kind.i)
+  If kind<=#HW_LINK_NONE Or kind>#HW_LINK_FILE : ProcedureReturn : EndIf
+  netcon_PumpOne(kind)
+EndProcedure
+
 Procedure NetConsolePump()
   Define k.i
   Define members.i

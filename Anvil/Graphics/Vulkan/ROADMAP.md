@@ -373,3 +373,25 @@ A separate Pi 4 right-edge-only `5×4` proof copied from source `(8,4)` to desti
 A separate Pi 4 bottom-edge-only `4×5` proof copied from source `(4,8)` to destination `(8,8)` in distinct 13×13 optimal images. Its full-image oracles matched 20 copied and 149 untouched destination texels, including five immediately right of the rectangle; all 169 source texels remained unchanged. The partial copy advanced guarded DMA 0→2 and backend jobs 2→3 while TFU stayed at 2. Both full-image readbacks then advanced DMA 2→18→34. Staging, readback padding and 160 guards passed; all status, MMU, OOM and native-error slots were zero. A nonedge source `(4,4)` request returned `-20005` during recording without another DMA operation. The measured report is `docs/evidence/vulkan-optimal-optimal-bottom-edge-pi4-20261001/report.bin` (SHA-256 `E52AAB7AD6905E56EDACBD98A89DF2EBA4EC51467D5C39EBCDDB6DE48511F77D`). This adds no capability claim for other boards.
 
 A direct public `vkCmdFillBuffer` request also passed on Pi 4 silicon on 2026-10-01: 16 words were filled, 48 remained unchanged, and the alignment-derived guard layout passed. The valid request added one guarded DMA operation and backend job without changing TFU, V3D bin/render or display counters. An offset-2 request returned `-20001` before additional DMA. See `docs/evidence/vulkan-buffer-fill-pi4-20261001/README.md`. This does not add a capability claim for other boards.
+
+
+## Current Anvil task scope and checkpoint - 27 October 2026
+
+The current task covers the Neon engine implementation within Anvil first, then
+broader Anvil Vulkan support and physical Pi4 validation. The older desktop
+integration item above is historical and outside this task's requested scope.
+The authoritative current implementation/qualification record is
+`docs/VULKAN_COMPATIBILITY_STATUS.md`; dated tranche statements above retain
+their original source-specific evidence rather than defining current coverage.
+
+Shared renderer/adapters now have .pbi owners, with optional prepared lifecycle
+integration linked explicitly. The ordinary lifecycle binder preserves its public
+provider contract. A full Pi4 composition and both GPU proof containers preserve
+exact bytes; an actual UnoQ core/file composition compiles the renderer with the
+absent backend. The controlled binder cleanup regression also passes on actual
+Pi4. Evidence: `docs/evidence/neon-shared-modules-20261027/`.
+
+This closes module ownership and the exposed optional-integration coupling;
+full Neon application/API behavior still needs explicit qualification before the
+remaining Vulkan API/object/platform/shader gaps can be called complete.
+No conformant Vulkan implementation, accepted publication or full port is claimed.

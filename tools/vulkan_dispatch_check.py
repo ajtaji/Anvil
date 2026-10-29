@@ -22,7 +22,7 @@ from vulkan_dispatch_inventory import (InventoryError, classify,
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 DISPATCH = ROOT / "Anvil" / "Graphics" / "Vulkan" / "vk_dispatch.pbi"
-GATE = ROOT / "Anvil" / "Graphics" / "Vulkan" / "Tests" / "vulkan_dispatch_gate.pi4"
+GATE = ROOT / 'RaspberryPi4/Tests/Vulkan/vulkan_dispatch_gate.pi4'
 RESOURCE_CHECK = ROOT / "tools" / "vulkan_resource_check.py"
 MAGIC = 0x564B4450
 OUT = 0x06000000
@@ -150,7 +150,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv); args.compiler = _pmfpath.Path(resolve_compiler(args.compiler)) if args.compiler else args.compiler
     try:
         data, transport = pinned_registry_bytes(args.registry)
-        commands = classify(registry_commands(data), public_procedures())
+        commands = classify(registry_commands(data), public_procedures(), registry_commands(data, "VK_KHR_surface"))
         source = DISPATCH.read_text(encoding="utf-8")
         rows = table(source)
         checks = validate(rows, commands)
@@ -158,7 +158,7 @@ def main(argv: list[str] | None = None) -> int:
         # Source contract: validation precedes lookup, names are byte-exact,
         # bounded, and Vulkan 1.0 null-instance behavior is explicit.
         required_source = (
-            "While n < 128", "If a <> b : ProcedureReturn 0", "If a = 0 : ProcedureReturn 1",
+            "ProcedureReturn avkApiNameEquals(*actual, expected, 128)",
             "If instance = #VK_NULL_HANDLE", "If avkInstSlot(instance) = 0 : ProcedureReturn 0",
             "If *pName = 0 Or avkDevSlot(device) = 0 : ProcedureReturn 0",
             "#AVK_QUERY_GIPA_NULL", "#AVK_QUERY_GIPA_INSTANCE", "#AVK_QUERY_GDPA_DEVICE",
@@ -166,6 +166,17 @@ def main(argv: list[str] | None = None) -> int:
         for token in required_source:
             if token not in source:
                 raise AssertionError("dispatch source lost contract token " + token)
+            checks += 1
+
+        # The bounded matcher has one shared owner; check its actual body,
+        # while the dispatch call above must still choose the 128-byte cap.
+        foundation = (ROOT / "Anvil/Graphics/Vulkan/vk_foundation.pbi").read_text(encoding="utf-8")
+        match = re.search(r"Procedure\.i avkApiNameEquals\([^\n]*\)(.*?)EndProcedure", foundation, re.S)
+        if match is None:
+            raise AssertionError("shared dispatch name owner missing")
+        for token in ("maxBytes < 1", "While n < maxBytes", "If a <> b : ProcedureReturn 0", "If a = 0 : ProcedureReturn 1"):
+            if token not in match.group(1):
+                raise AssertionError("shared name matcher lost contract token " + token)
             checks += 1
 
         # Hostile table models: unreviewed exposure, wrong pointer, wrong

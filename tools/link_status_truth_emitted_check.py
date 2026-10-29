@@ -2,7 +2,7 @@
 """Compile/execute the link/address status-truth gate.
 
 The gate extracts the #LINK_WHY_* codes, LinkSelect and LinkWhyText from
-RaspberryPi4/Lib/link.pi4 and NetAddrFromText from Anvil/Core/netcfg.pbi,
+Anvil/Network/link.pbi and NetAddrFromText from Anvil/Core/netcfg.pbi,
 compiles those exact procedures against explicit interface-row seams, and
 executes the emitted A64 through the shared interpreter.
 
@@ -34,7 +34,7 @@ from pmf_compiler import resolve_compiler
 
 
 ROOT = Path(__file__).resolve().parents[1]
-LINK = ROOT / "RaspberryPi4" / "Lib" / "link.pi4"
+LINK = ROOT / "Anvil" / "Network" / "link.pbi"
 NETCFG = ROOT / "Anvil" / "Core" / "netcfg.pbi"
 FIXTURE = ROOT / "RaspberryPi4" / "Tests" / "link_status_truth_emitted_gate.pi4"
 

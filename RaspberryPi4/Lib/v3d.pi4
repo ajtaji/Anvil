@@ -1528,6 +1528,22 @@ EndProcedure
 Global Dim v3d_ncLo.i[#V3D_NC_MAX] : Global Dim v3d_ncHi.i[#V3D_NC_MAX]
 Global v3d_ncN.i, v3d_ncSkipped.i
 
+; Explicit MMU-owner contract, like DmaSetCacheOff: true means the owner
+; has disabled the D-cache AND retired any dirty lines from its previous
+; cacheable state. It must clear this before enabling caches again.
+; Default false preserves every walk. No hardware state is guessed here.
+; Only the line walk is skipped; Range and BatchEnd keep their barriers.
+Global v3d_cacheOff.i, v3d_cacheOffSkipped.i
+Procedure V3dSetCacheOff(off.i)
+  v3d_cacheOff = Bool(off <> 0)
+EndProcedure
+Procedure.i V3dCacheOffGet()
+  ProcedureReturn v3d_cacheOff
+EndProcedure
+Procedure.i V3dCacheOffSkips()
+  ProcedureReturn v3d_cacheOffSkipped
+EndProcedure
+
 ; [lo, hi) is mapped uncached by the caller's own page tables. 1, or 0 when the table is full.
 Procedure.i V3dDeclareUncached(lo.i, hi.i)
   If hi <= lo Or v3d_ncN >= #V3D_NC_MAX
@@ -1588,6 +1604,10 @@ Procedure V3dCacheLines(addr.i, len.i)
   If len <= 0
     ProcedureReturn
   EndIf
+  If v3d_cacheOff <> 0
+    v3d_cacheOffSkipped = v3d_cacheOffSkipped + 1
+    ProcedureReturn
+  EndIf
   If v3d_ncN > 0
     If v3d_IsUncached(addr, len) <> 0
       ProcedureReturn
@@ -1637,24 +1657,14 @@ EndProcedure
 ;  dma.pi4:823-828 records the same trap.
 ; ----------------------------------------------------------------------
 Procedure V3dCacheRange(addr.i, len.i)
-  Protected a.i
-  Protected e.i
   If len <= 0
     ProcedureReturn
   EndIf
-  If v3d_ncN > 0
-    If v3d_IsUncached(addr, len) <> 0
-      V3dBarrier()                     ; the ordering the walk ended with is still owed
-      ProcedureReturn
-    EndIf
-  EndIf
-  a = (addr / #V3D_CACHE_LINE) * #V3D_CACHE_LINE
-  e = addr + len
-  While a < e
-    v3d_flushaddr = a
-    V3dCacheLine()
-    a = a + #V3D_CACHE_LINE
-  Wend
+  ; Use the same complete line walk as the batch owner. Calling the one-line
+  ; helper once per 64 bytes adds substantial CPU overhead to full images.
+  ; Lines retains the declared-uncached check and dc civac semantics; this
+  ; entry still owes exactly one completion barrier for every positive range.
+  V3dCacheLines(addr, len)
   V3dBarrier()
 EndProcedure
 
@@ -5217,6 +5227,7 @@ EndProcedure
 #V3D_PKT_END_OF_LOADS          = 26   ; :388
 #V3D_PKT_END_OF_TILE_MARKER    = 27   ; :390
 #V3D_PKT_STORE_TILE_BUFFER_GEN = 29   ; :392
+#V3D_PKT_LOAD_TILE_BUFFER_GEN = 30
 #V3D_PKT_INDEXED_PRIM_LIST     = 32   ; :500
 #V3D_PKT_INDEXED_INSTANCED     = 34   ; :493
 #V3D_PKT_VERTEX_ARRAY_PRIMS    = 36   ; :508
@@ -5449,8 +5460,9 @@ Procedure.i V3dClBegin(addr.i, bytes.i)
 EndProcedure
 
 ; ----------------------------------------------------------------------
-;  The three primitives every emitter goes through. All little-endian
-;  and all byte-wise.
+;  The three primitives every emitter goes through. All little-endian.
+;  Complete fields use one admission check, with aligned word stores where
+;  safe. Near capacity the byte path preserves the exact partial prefix.
 ;
 ;  A WRITE PAST THE END DOES NOT HAPPEN. v3d_ClU8 checks against the
 ;  USABLE size - capacity minus the readahead - so a list can never be
@@ -5477,11 +5489,33 @@ Procedure v3d_ClU8(v.i)
 EndProcedure
 
 Procedure v3d_ClU16(v.i)
+  ; A complete field needs one admission check. Near the boundary retain
+  ; the byte path, including its partial prefix and first-error semantics.
+  If v3d_clOpen <> 0 And v3d_clErr = #V3D_OK And v3d_clPos <= v3d_clCap - #V3D_CLE_READAHEAD - 2
+    PokeA(v3d_clBase + v3d_clPos, v & $FF)
+    PokeA(v3d_clBase + v3d_clPos + 1, (v >> 8) & $FF)
+    v3d_clPos = v3d_clPos + 2
+    ProcedureReturn
+  EndIf
   v3d_ClU8(v)
   v3d_ClU8(v >> 8)
 EndProcedure
 
 Procedure v3d_ClU32(v.i)
+  Protected addr.i
+  If v3d_clOpen <> 0 And v3d_clErr = #V3D_OK And v3d_clPos <= v3d_clCap - #V3D_CLE_READAHEAD - 4
+    addr = v3d_clBase + v3d_clPos
+    If (addr & 3) = 0
+      PokeL(addr, v)
+    Else
+      PokeA(addr, v & $FF)
+      PokeA(addr + 1, (v >> 8) & $FF)
+      PokeA(addr + 2, (v >> 16) & $FF)
+      PokeA(addr + 3, (v >> 24) & $FF)
+    EndIf
+    v3d_clPos = v3d_clPos + 4
+    ProcedureReturn
+  EndIf
   v3d_ClU8(v)
   v3d_ClU8(v >> 8)
   v3d_ClU8(v >> 16)
@@ -5495,7 +5529,7 @@ EndProcedure
 ;
 ;  THE READAHEAD CHECK BELOW IS A BACKSTOP AND IT CANNOT FIRE TODAY,
 ;  and saying so is better than leaving a reader to work it out.
-;  v3d_ClU8() already refuses any byte that would take the cursor past
+;  The complete-field and byte admission checks already refuse bytes past
 ;  `cap - #V3D_CLE_READAHEAD`, so by the time execution reaches here
 ;  `v3d_clPos + #V3D_CLE_READAHEAD <= v3d_clCap` is guaranteed. The
 ;  gate's mutation run proved it: deleting this condition kills no
@@ -6534,6 +6568,22 @@ Procedure V3dClStoreNone()
   v3d_ClU32(0)
 EndProcedure
 
+; LOAD_TILE_BUFFER_GENERAL, Mesa 24.3.4 v3d_packet.xml packet 30.
+; Hardware fields only: identical address/stride positions to STORE, with
+; input format at bit 12. Force-alpha-one, channel reverse and flip stay off.
+; No implementation code is incorporated. Raster stride is measured in bytes.
+Procedure V3dClLoadTileBufferGeneral(buffer.i, addr.i, inFmt.i, memFmt.i, strideOrUbHeight.i, rbSwap.i)
+  Protected lo.i,mid.i
+  If buffer<0 Or buffer>15 Or inFmt<0 Or inFmt>63 Or memFmt<0 Or memFmt>7 Or strideOrUbHeight<0 Or strideOrUbHeight>$FFFFF
+    v3d_clErr=#V3D_ERR_CL_ARGS : ProcedureReturn
+  EndIf
+  lo=buffer | (memFmt<<4) | (inFmt<<12) | ((strideOrUbHeight & $F)<<28)
+  If rbSwap<>0 : lo=lo | (1<<20) : EndIf
+  mid=(strideOrUbHeight>>4) & $FFFF
+  v3d_ClU8(#V3D_PKT_LOAD_TILE_BUFFER_GEN)
+  v3d_ClU32(lo) : v3d_ClU32(mid) : v3d_ClU32(addr)
+EndProcedure
+
 
 ; ======================================================================
 ;  STAGE 4 - THE TWO RECORDS A DRAW NEEDS THAT ARE NOT PACKETS
@@ -6599,17 +6649,16 @@ Global v3d_shrecAttrs.i = 0
 Global v3d_shrecOk.i    = 0
 
 ; ----------------------------------------------------------------------
-;  v3d_ShrecPut32 - one 32-bit word into the record, BYTE-WISE.
-;
-;  Same reason the control-list writer is byte-wise: with the ARM MMU
-;  off an unaligned 32-bit store is a fatal Alignment fault with no
-;  message. Every word of this record IS 4-aligned, because the record
-;  is 32-aligned and every offset below is a multiple of four - so
-;  this could have been PokeN. It is not, because the next field
-;  somebody adds may not be, and a writer that is safe only by
-;  coincidence is a trap.
+;  v3d_ShrecPut32 - little-endian word, including future unaligned fields.
+;  Natural alignment selects one word store; every other address retains
+;  byte stores so MMU-off/Device memory never sees an unaligned word access.
 ; ----------------------------------------------------------------------
 Procedure v3d_ShrecPut32(off.i, v.i)
+  Protected addr.i = v3d_shrecAddr + off
+  If (addr & 3) = 0
+    PokeL(addr, v)
+    ProcedureReturn
+  EndIf
   PokeA(v3d_shrecAddr + off,     v & $FF)
   PokeA(v3d_shrecAddr + off + 1, (v >> 8) & $FF)
   PokeA(v3d_shrecAddr + off + 2, (v >> 16) & $FF)
@@ -6619,9 +6668,9 @@ EndProcedure
 ; ----------------------------------------------------------------------
 ;  V3dShaderRecordBegin - zero the record and remember where it is.
 ;
-;  THE ZEROING IS A BACKSTOP AND IT CANNOT FIRE TODAY. Saying so is
-;  better than leaving a reader to work it out, and a64_v3d_tri_check
-;  --mutate proved it: deleting this loop kills no test.
+;  THE ZEROING IS A BACKSTOP. Earlier whole-pipeline mutation tests did
+;  not observe it because every setter overwrote its full word. The
+;  packet-word proof now checks partial records and every zeroed byte.
 ;
 ;  The reason is that the five setters below between them write ALL
 ;  thirty-six bytes as whole 32-bit words - flags 0-3, VPM 4-7,
@@ -6660,14 +6709,16 @@ Procedure.i V3dShaderRecordBegin(addr.i, numAttrs.i)
   v3d_shrecAddr  = addr
   v3d_shrecAttrs = numAttrs
   i = 0
+  ; Both record sizes are multiples of four and addr was checked above.
+  ; Keep all backstop zeroing, including bytes whose setter is never called.
   While i < #V3D_SHREC_BYTES
-    PokeA(addr + i, 0)
-    i = i + 1
+    PokeL(addr + i, 0)
+    i = i + 4
   Wend
   i = 0
   While i < (numAttrs * #V3D_ATTR_BYTES)
-    PokeA(addr + #V3D_SHREC_BYTES + i, 0)
-    i = i + 1
+    PokeL(addr + #V3D_SHREC_BYTES + i, 0)
+    i = i + 4
   Wend
   v3d_shrecOk = 1
   ProcedureReturn #V3D_OK
@@ -6875,32 +6926,14 @@ Procedure V3dAttrRecord(n.i, addr.i, stride.i, maxIndex.i, csValues.i, vsValues.
   EndIf
 
   base = V3dShaderRecordAttrAddr(n)
-  PokeA(base + 0, addr & $FF)
-  PokeA(base + 1, (addr >> 8) & $FF)
-  PokeA(base + 2, (addr >> 16) & $FF)
-  PokeA(base + 3, (addr >> 24) & $FF)
-
-  ; Byte 4: vec size 1 and type FLOAT, which is Mesa's own shape for
-  ; a single 32-bit component (v3dx_draw.c:881-883).
-  PokeA(base + 4, 1 | (#V3D_ATTR_FLOAT << 2))
-
-  ; Byte 5: values read by the coordinate shader 4 @40, by the vertex
-  ; shader 4 @44.
-  PokeA(base + 5, (csValues & $F) | ((vsValues & $F) << 4))
-
-  ; Instance divisor zero - nothing here is instanced.
-  PokeA(base + 6, 0)
-  PokeA(base + 7, 0)
-
-  PokeA(base + 8,  stride & $FF)
-  PokeA(base + 9,  (stride >> 8) & $FF)
-  PokeA(base + 10, (stride >> 16) & $FF)
-  PokeA(base + 11, (stride >> 24) & $FF)
-
-  PokeA(base + 12, maxIndex & $FF)
-  PokeA(base + 13, (maxIndex >> 8) & $FF)
-  PokeA(base + 14, (maxIndex >> 16) & $FF)
-  PokeA(base + 15, (maxIndex >> 24) & $FF)
+  ; Begin requires a 32-byte aligned base. The 36-byte header and 16-byte
+  ; attributes therefore keep every field below word-aligned. Native
+  ; little-endian word stores preserve the prior low-32-bit packing.
+  PokeL(base, addr)
+  ; Default float component, CS/VS read counts, and zero instance divisor.
+  PokeL(base + 4, 1 | (#V3D_ATTR_FLOAT << 2) | ((csValues & $F) << 8) | ((vsValues & $F) << 12))
+  PokeL(base + 8, stride)
+  PokeL(base + 12, maxIndex)
 EndProcedure
 
 ; Byte 4 and the instance divisor, for an attribute that is not a
@@ -7206,6 +7239,7 @@ Global v3d_rtBpp.i    = 0
 Global v3d_rtClamp.i  = 0
 
 Global v3d_clearColor.i = 0
+Global v3d_loadColor.i = 0
 Global v3d_clearZ.i     = 0
 Global v3d_clearS.i     = 0
 
@@ -7642,6 +7676,7 @@ Procedure.i V3dRenderBegin(width.i, height.i, outFmt.i)
   v3d_haveRt   = 0
   v3d_haveBcl  = 0
   v3d_haveRcl  = 0
+  v3d_loadColor = 0
 
   r = V3dRenderPlanBuild(width, height, outFmt, 1, 0, 0, @plan)
   If r <> #V3D_OK
@@ -7751,10 +7786,27 @@ EndProcedure
 ;  (v3dx_rcl.c:630-632) and is therefore always emitted.
 ; ----------------------------------------------------------------------
 Procedure V3dRenderClear(colorLow32.i, zClearBits.i, stencil.i)
+  v3d_loadColor  = 0
   v3d_clearColor = colorLow32
   v3d_clearZ     = zClearBits
   v3d_clearS     = stencil & $FF
   v3d_haveRcl    = 0
+EndProcedure
+
+; Preserve the registered raster RGBA8 attachment instead of clearing it.
+; Select after RenderClear and before building the render list. A refused
+; selection preserves the prior mode. The next RenderBegin/Clear resets it.
+Procedure.i V3dRenderLoadColor(on.i)
+  If on<>0 And on<>1
+    v3d_err=#V3D_ERR_CL_ARGS : ProcedureReturn #V3D_ERR_CL_ARGS
+  EndIf
+  If on<>0
+    If v3d_haveGeom=0 Or v3d_haveRt=0 Or v3d_rtMemFmt<>#V3D_MEMFMT_RASTER Or v3d_rtOutFmt<>#V3D_OFMT_RGBA8
+      v3d_err=#V3D_ERR_CL_ARGS : ProcedureReturn #V3D_ERR_CL_ARGS
+    EndIf
+  EndIf
+  v3d_loadColor=on : v3d_haveRcl=0
+  ProcedureReturn #V3D_OK
 EndProcedure
 
 ; ----------------------------------------------------------------------
@@ -8101,12 +8153,14 @@ Procedure.i V3dRclBuild(tileListAddr.i, tileListBytes.i, rclAddr.i, rclBytes.i)
 
   V3dClTileCoordsImplicit()
 
-  ; No loads. v3d_rcl_emit_loads emits one LOAD_TILE_BUFFER_GENERAL
-  ; per buffer in job->load and then END_OF_LOADS; with nothing to
-  ; load it emits only the terminator. END_OF_LOADS is what switches
+  ; A preserving pass reloads RT0 for each tile before rendering. Field
+  ; semantics: Mesa 24.3.4 v3d_packet.xml, packet 30. END_OF_LOADS switches
   ; the tile from loading to rendering on 4.x - v3dx_rcl.c:328-329,
   ; "V3D 4.x/7.x only requires a single tile coordinates, and
   ; END_OF_LOADS switches us between loading and rendering."
+  If v3d_loadColor<>0
+    V3dClLoadTileBufferGeneral(#V3D_BUF_RT0,v3d_rtAddr,v3d_rtOutFmt,v3d_rtMemFmt,v3d_rtStride,v3d_rtRbSwap)
+  EndIf
   V3dClEndOfLoads()
 
   V3dClPrimListFormat(#V3D_PLF_TRIANGLES, 0)

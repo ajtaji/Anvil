@@ -1,3 +1,4 @@
+XIncludeFile "Anvil/Services/usb_serial.pbi"
 ; ======================================================================
 ;  gnss.pbi - a GNSS receiver's stream: where it comes from, its frames, and
 ;  the fix in it. For the HwGnss* seam (Anvil/Hal/hal.pbi) and the `gnss`
@@ -859,7 +860,7 @@ EndProcedure
 Procedure.i gnss_SrcRead(*dst, max.i)
   Select gnss_src
     Case #GNSS_SRC_USB
-      ProcedureReturn UsbSerRead(*dst, max)
+      ProcedureReturn UsbSerialRead(*dst, max)
     Case #GNSS_SRC_BLUETOOTH
       ProcedureReturn -1                                      ; PLACEHOLDER: SPP over hci.pbi
     Case #GNSS_SRC_BLE
@@ -868,6 +869,20 @@ Procedure.i gnss_SrcRead(*dst, max.i)
       ProcedureReturn gnss_NetRead(*dst, max)
   EndSelect
   ProcedureReturn -1
+EndProcedure
+
+ ; Read at most capacity bytes and feed every returned byte to the decoder
+; exactly once. The caller may display these same bytes without touching the
+; private source/framer. Returns the byte count, zero when idle, or -1 for an
+; unavailable source, invalid buffer or a provider count outside the buffer.
+; Single caller, like GnssPump; this does not perform baud-search scheduling.
+Procedure.i GnssRead(*dst,capacity.i)
+  Define n.i,i.i
+  If *dst=0 Or capacity<=0 : ProcedureReturn -1 : EndIf
+  n=gnss_SrcRead(*dst,capacity)
+  If n<0 Or n>capacity : ProcedureReturn -1 : EndIf
+  For i=0 To n-1 : gnss_Byte(PeekA(*dst+i)) : Next
+  ProcedureReturn n
 EndProcedure
 
 Procedure.i GnssSourceName(src.i)
@@ -908,16 +923,16 @@ Procedure.i GnssOpen(src.i)
   gnss_FixReset()
   Select src
     Case #GNSS_SRC_USB
-      If UsbSerKind() = #USBSER_NONE
-        If UsbSerFind() = 0
-          gnss_why = UsbSerError() : If gnss_why < 1 Or gnss_why > 5 : gnss_why = 1 : EndIf
+      If UsbSerialKind() = 0
+        If UsbSerialFind() = 0
+          gnss_why = UsbSerialError() : If gnss_why < 1 Or gnss_why > 5 : gnss_why = 1 : EndIf
           ProcedureReturn 0
         EndIf
       EndIf
       gnss_bauds[0] = 9600 : gnss_bauds[1] = 115200 : gnss_bauds[2] = 38400 : gnss_bauds[3] = 57600
       gnss_bauds[4] = 19200 : gnss_bauds[5] = 4800 : gnss_bauds[6] = 230400 : gnss_bauds[7] = 460800
       gnss_baudAt = 0 : gnss_baudUs = HwMicros()
-      If UsbSerNeedsBaud() <> 0 : UsbSerSetBaud(gnss_bauds[0]) : EndIf
+      If UsbSerialNeedsBaud() <> 0 : UsbSerialSetBaud(gnss_bauds[0]) : EndIf
     Case #GNSS_SRC_BLUETOOTH : gnss_why = 10 : ProcedureReturn 0
     Case #GNSS_SRC_BLE       : gnss_why = 11 : ProcedureReturn 0
     Case #GNSS_SRC_NETWORK
@@ -942,14 +957,13 @@ Procedure.i GnssPump()
     ProcedureReturn -1
   EndIf
   before = gnss_fixes
-  n = gnss_SrcRead(@gnss_in[0], 512)
-  For i = 0 To n - 1 : gnss_Byte(gnss_in[i]) : Next
+  n = GnssRead(@gnss_in[0], 512)
   ; a bridge chip whose receiver says nothing we can frame: the next speed
-  If gnss_src = #GNSS_SRC_USB And UsbSerNeedsBaud() <> 0
+  If gnss_src = #GNSS_SRC_USB And UsbSerialNeedsBaud() <> 0
     now = HwMicros()
     If (gnss_lastGoodUs = 0 Or now - gnss_lastGoodUs > #GNSS_BAUD_WAIT_US) And now - gnss_baudUs > #GNSS_BAUD_WAIT_US
       gnss_baudAt = (gnss_baudAt + 1) % 8 : gnss_baudUs = now
-      UsbSerSetBaud(gnss_bauds[gnss_baudAt])
+      UsbSerialSetBaud(gnss_bauds[gnss_baudAt])
       GnfReset(0) : GnfReset(1)
     EndIf
   EndIf

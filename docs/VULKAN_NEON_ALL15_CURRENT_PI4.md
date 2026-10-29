@@ -42,3 +42,12 @@ backend. The 3,505 boxes are batched into one Vulkan draw; this proof does not
 establish 3,505 individual draw-list records. The monitor was not replaced and
 no storage was written. The board returned to build 242 at `pmf>` with its
 Vulkan console still selected and the deadman off.
+
+
+The 26 October current-source run after shared CPU-atlas ownership, native clear
+ownership and draw-admission recovery returns zero on resident 338 at capture
+222. It matches all 245,760 current-contract scene bytes and passes 124 widget
+checks. Historical line scenes 4/5 differ under the already accepted newer
+placement contract; this comparison does not change the native golden corpus.
+The separately built normal monitor 342 was not installed. Exact scope and
+payload identity are in `docs/evidence/neon-atlas-shared-pi4-20261026/`.

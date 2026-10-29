@@ -950,7 +950,15 @@ EndProcedure
 ;  `autoboot`, so the three cannot drift apart in what they flush, what
 ;  they stop and what they print.
 ; ======================================================================
+; Payload scope is a pure HAL owner, not an incidental dependency on a full
+; service table or a particular graphics composition. Boot diagnostics also
+; compile this engine without a resident device/provider.
+XIncludeFile "Anvil/Hal/neon_service_api.pbi"
+XIncludeFile "Anvil/Hal/graphics_service.pbi"
+XIncludeFile "Anvil/Hal/input_service.pbi"
+
 Procedure PmfEnter()
+  Define graphicsRc.i,inputRc.i
   gEntry = gPmfEntry
   gHaveEntry = 1
   If (gPmfFlags & #PMF_FLAG_WANTS_DTB) <> 0
@@ -996,6 +1004,21 @@ Procedure PmfEnter()
   If (gPmfFlags & #PMF_FLAG_WANTS_SERVICES) <> 0
     BuildServiceTable()
     SvcFileHReset()              ; no file handle outlives the payload that opened it
+    graphicsRc=GraphicsServiceEnter()
+    If graphicsRc<>0
+      gGoX0=0
+      PrintN("!! resident graphics cleanup is still outstanding, so this payload was not entered.")
+      Print("   Graphics status: ") : PrintDec(graphicsRc) : PrintNl()
+      ProcedureReturn 0
+    EndIf
+    inputRc=InputServiceEnter()
+    If inputRc<>0
+      gGoX0=0
+      GraphicsServiceLeave()
+      PrintN("!! resident input cleanup is still outstanding, so this payload was not entered.")
+      Print("   Input status: ") : PrintDec(inputRc) : PrintNl()
+      ProcedureReturn 0
+    EndIf
     gGoX0 = SvcTableAddr()
     Print("This payload asked for the service table, so it is entered with x0 = ")
     PutAddr(gGoX0)
@@ -1017,6 +1040,19 @@ Procedure PmfEnter()
   ScreenServiceTick()
   RunAt(gPmfEntry)
   If (gPmfFlags & #PMF_FLAG_WANTS_SERVICES) <> 0
+    ; GPU targets retire this scope before their platform bus-master recovery.
+    ; The idempotent fallback also covers targets with no graphics device and
+    ; a platform refusal that returned before entering the payload.
+    inputRc=InputServiceLeave()
+    If inputRc<>0
+      PrintN("!! the payload returned with a resident input owner still quarantined.")
+      Print("   Input status: ") : PrintDec(inputRc) : PrintNl()
+    EndIf
+    graphicsRc=GraphicsServiceLeave()
+    If graphicsRc<>0
+      PrintN("!! the payload returned with a resident graphics owner still quarantined.")
+      Print("   Graphics status: ") : PrintDec(graphicsRc) : PrintNl()
+    EndIf
     SvcFileHReset()              ; and none is left open behind it
   EndIf
 EndProcedure

@@ -110,6 +110,12 @@ def probe_source(source: str | None = None) -> str:
 
 def command_probe(source: str) -> str:
     template = COMMAND_FIXTURE.read_text(encoding="utf-8")
+    service = (ROOT / "Anvil/Services/wifi_control.pbi").read_text(encoding="utf-8")
+    adapter = (ROOT / "RaspberryPi4/Board/wifi_control_service.pi4").read_text(encoding="utf-8")
+    adapter = "\n".join(line for line in adapter.splitlines()
+                        if not line.startswith(("XIncludeFile", "WifiControlBind(")))
+    template = service + "\n" + template.replace(
+        "; @@PRODUCTION_CMD_WIFI@@", adapter + "\n; @@PRODUCTION_CMD_WIFI@@")
     marker = "; @@PRODUCTION_CMD_WIFI@@"
     if template.count(marker) != 1:
         raise SystemExit("wifi radio init gate: command fixture marker is not unique")

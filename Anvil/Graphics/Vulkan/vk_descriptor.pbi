@@ -1004,13 +1004,24 @@ EndProcedure
 ; destroying an image view or sampler, destroying/reusing its image slot, or
 ; transitioning the image away from the descriptor's promised layout can
 ; never leave a stale address or stale state in a later draw.
-Procedure.i AnvilVkDescriptorSetSampledImage(set.i, binding.i, *out.AnvilVkBackendSampledImage)
+; Portable lifetime references captured by the same validation pass as the
+; backend sample properties. These remain handles, never backend-visible slots.
+Structure AnvilVkSampledImageReferences Align #PB_Structure_AlignC
+  image.i
+  sampler.i
+  view.i
+EndStructure
+
+Procedure.i AnvilVkDescriptorSetSampledImageSnapshot(set.i, binding.i, *out.AnvilVkBackendSampledImage, *refs.AnvilVkSampledImageReferences)
   Define s.i
   Define idx.i
   Define sampler.i
   Define view.i
   Define image.i
   Define img.i
+  If *refs <> 0
+    *refs\image = 0 : *refs\sampler = 0 : *refs\view = 0
+  EndIf
   If *out = 0 : ProcedureReturn 0 : EndIf
   *out\base = 0
   *out\bytes = 0
@@ -1051,7 +1062,15 @@ Procedure.i AnvilVkDescriptorSetSampledImage(set.i, binding.i, *out.AnvilVkBacke
   *out\backendLayout = avkImgBackendLayout[img]
   *out\paddedWidth = avkImgPaddedW[img]
   *out\paddedHeight = avkImgPaddedH[img]
+  If *refs <> 0
+    *refs\image = image : *refs\sampler = sampler : *refs\view = view
+  EndIf
   ProcedureReturn 1
+EndProcedure
+
+; Preserve the properties-only API and its refusal behavior.
+Procedure.i AnvilVkDescriptorSetSampledImage(set.i, binding.i, *out.AnvilVkBackendSampledImage)
+  ProcedureReturn AnvilVkDescriptorSetSampledImageSnapshot(set, binding, *out, 0)
 EndProcedure
 
 ; The live VkImage behind a sampled descriptor, for submission retention.

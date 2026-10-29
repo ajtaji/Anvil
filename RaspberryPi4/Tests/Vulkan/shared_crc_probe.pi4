@@ -1,0 +1,35 @@
+; Shared CRC owner qualification; RAM only, no storage access.
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "Anvil/Hal/hal.pbi"
+#CRC_POLY = $EDB88320
+XIncludeFile "Anvil/Core/crc.pbi"
+Global Dim sector.a[514]
+Procedure.i Main(services.i)
+ Protected i.i,mode.i,c.i,n.i
+ For i=0 To 2047 : PokeA($E1C00000+i,0) : Next
+ PokeA(@sector[0],$A5) : PokeA(@sector[513],$5A)
+ PokeI($E1C00040,Crc32(@sector[1],0))
+ n=1
+ For mode=0 To 3
+  For i=0 To 511
+   If mode=0 : sector[i+1]=0 : EndIf
+   If mode=1 : sector[i+1]=255 : EndIf
+   If mode=2 : sector[i+1]=i & 255 : EndIf
+   If mode=3 : sector[i+1]=(i*73+19) & 255 : EndIf
+  Next
+  PokeI($E1C00040+n*8,Crc32(@sector[1],512)) : n+1
+  c=Crc32Part($FFFFFFFF,@sector[1],1)
+  c=Crc32Part(c,@sector[2],255)
+  c=Crc32Part(c,@sector[257],256)
+  PokeI($E1C00040+n*8,c ! $FFFFFFFF) : n+1
+ Next
+ For i=0 To 8 : sector[i+1]=49+i : Next
+ PokeI($E1C00040+n*8,Crc32(@sector[1],9)) : n+1
+ PokeI($E1C00040+n*8,Crc32Part($12345678,@sector[1],9)) : n+1
+ PokeI($E1C00040+n*8,Crc32Part($12345678,@sector[1],0)) : n+1
+ PokeI($E1C00018,PeekA(@sector[0]))
+ PokeI($E1C00020,PeekA(@sector[513]))
+ PokeI($E1C00008,n) : PokeI($E1C00010,$454E4421)
+ PokeI($E1C00000,$43524331)
+ ProcedureReturn 0
+EndProcedure

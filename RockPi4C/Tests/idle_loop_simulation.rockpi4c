@@ -1,3 +1,5 @@
+XIncludeFile "Anvil/Hal/aarch64_counter.pbi"
+
 ; Build 144 return-only rehearsal of the candidate EL3 recovery idle loop.
 ; Function offsets from anvil-flat.img.sym are rebased by $41000.
 ; The resident payload command arms the physical deadman before entry.
@@ -41,19 +43,12 @@ ProcedureNaked.i IdleSimDaif()
   ENDASM
 EndProcedure
 
-ProcedureNaked.i IdleSimHz()
-  ASM
-    mrs x0, cntfrq_el0
-    ret
-  ENDASM
+Procedure.i IdleSimHz()
+  ProcedureReturn A64CounterFrequency()
 EndProcedure
 
-ProcedureNaked.i IdleSimTicks()
-  ASM
-    isb
-    mrs x0, cntpct_el0
-    ret
-  ENDASM
+Procedure.i IdleSimTicks()
+  ProcedureReturn A64CounterReadOrdered()
 EndProcedure
 
 ProcedureNaked.i IdleSimKctl()
@@ -74,18 +69,8 @@ ProcedureNaked IdleSimWriteKctl()
   ENDASM
 EndProcedure
 
-ProcedureNaked.i IdleSimWait()
-  ASM
-    isb
-    mrs x9, cntpct_el0
-    .long $D50320BF ; SEVL
-    wfe
-    wfe
-    isb
-    mrs x0, cntpct_el0
-    sub x0, x0, x9
-    ret
-  ENDASM
+Procedure.i IdleSimWait()
+  ProcedureReturn A64CounterWaitEventTicks()
 EndProcedure
 
 ProcedureNaked.i IdleSimCall()

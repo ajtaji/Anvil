@@ -13,7 +13,7 @@
 ;
 ;   Anvil/Graphics/Vulkan/vk_backend_none.pbi   no device is enumerated
 ;   Anvil/Graphics/Vulkan/vk_backend_test.pbi   state only, owns no GPU
-;   Anvil/Graphics/Vulkan/vk_v3d_backend.pi4    the real Pi 4 V3D backend
+;   RaspberryPi4/Lib/Vulkan/vk_v3d_backend.pi4    the real Pi 4 V3D backend
 ;
 ; The seam is Declared here and defined there, so a build that forgets a
 ; backend fails to link rather than quietly enumerating nothing. Including
@@ -51,6 +51,17 @@ XIncludeFile "Anvil/Graphics/Vulkan/vk_core_1_0.pbi"
 ; avkBackendSubmitClear() answers.
 #ANVIL_VK_JOB_DONE = 0
 #ANVIL_VK_JOB_PENDING = 1
+; A distinct, explicit backend guarantee: no work was launched and no
+; completion is outstanding. A negative legacy result alone is uncertain.
+#ANVIL_VK_JOB_REFUSED = -2
+Global avkBackendRefusalCode.i
+
+Procedure.i avkBackendRefuseBeforeLaunch(code.i)
+  If code >= 0 : code = #VK_ERROR_INITIALIZATION_FAILED : EndIf
+  avkBackendRefusalCode = code
+  ProcedureReturn #ANVIL_VK_JOB_REFUSED
+EndProcedure
+
 
 #ANVIL_VK_TYPE_INSTANCE = 1
 #ANVIL_VK_TYPE_PHYSICAL_DEVICE = 2
@@ -115,6 +126,10 @@ XIncludeFile "Anvil/Graphics/Vulkan/vk_core_1_0.pbi"
 #ANVIL_VK_MAX_SET_LAYOUTS = 4
 #ANVIL_VK_MAX_DESCRIPTOR_POOLS = 2
 #ANVIL_VK_MAX_DESCRIPTOR_SETS = 4 + #ANVIL_VK_SPRITE_RESOURCE_SLOTS
+; Offscreen targets need their own color attachment as well as the sampled
+; sprite image already counted above. These are object-table rows, not a
+; promise of heap capacity. All allocations still pay their actual bytes.
+#ANVIL_VK_RENDER_TARGET_SLOTS = 16
 #ANVIL_VK_MAX_SET_BINDINGS = 2
 #ANVIL_VK_MAX_SAMPLERS = 8
 
@@ -218,6 +233,8 @@ XIncludeFile "Anvil/Graphics/Vulkan/vk_core_1_0.pbi"
 ; A backend can execute a closed triangle fan without expanding its vertices.
 ; Other backends keep refusing this topology until they advertise this bit.
 #ANVIL_VK_CAP_TRIANGLE_FAN = $200000
+; Whole-attachment preservation at render-pass entry, including empty passes.
+#ANVIL_VK_CAP_ATTACHMENT_LOAD = $400000
 
 ; Target-neutral closed-draw blend semantics. A backend maps these values to
 ; its own packet vocabulary; V3D blend-factor numbers never cross this seam.
@@ -410,7 +427,8 @@ Structure AnvilVkBackendDraw Align #PB_Structure_AlignC
   width.i
   height.i
   pitch.i
-  clearBgra.i         ; the render pass's clear value, already packed
+  clearBgra.i         ; used only when loadColor is zero
+  loadColor.i         ; exactly 0 (clear) or 1 (preserve); shared by the entire pass
   bindingCount.i      ; how many AnvilVkBackendBinding records follow
   bindings.i          ; the address of the first of them
   vertexCount.i
@@ -537,7 +555,7 @@ Declare.i avkBackendSubmitBufferCopy(source.i, destination.i, bytes.i)
 Declare.i avkBackendSubmitBufferCopyRows(source.i, sourcePitch.i, destination.i, destinationPitch.i, rowBytes.i, rows.i)
 Declare.i avkBackendSubmitBufferFill(destination.i, bytes.i, data.i)
 Declare.i avkBackendClearSupported(base.i, bytes.i, w.i, h.i, pitch.i)
-Declare.i avkBackendSubmitClear(base.i, bytes.i, w.i, h.i, pitch.i, bgra.i)
+Declare.i avkBackendSubmitClear(base.i, bytes.i, w.i, h.i, pitch.i, bgra.i, loadColor.i)
 Declare.i avkBackendPoll()
 Declare.i avkBackendLastNativeError()
 Declare.i avkBackendTicksUs()
@@ -602,8 +620,13 @@ Declare.i avkBackendSubmitDraw(*payload)
 ; what the first version of this file did, on every object type at once,
 ; and it is invisible until the table is full - the allocator only ever
 ; reaches the last slot when everything before it is taken.
+; Optional read-only extension-child checks. Zero keeps core-only composition.
+; A check must not destroy children or re-enter this ownership transition.
+Global *avkDeviceChildGuard = 0, *avkInstanceChildGuard = 0
+
 Global Dim avkInstLive.a[#ANVIL_VK_MAX_INSTANCES + 1]
 Global Dim avkInstGen.i[#ANVIL_VK_MAX_INSTANCES + 1]
+Global Dim avkInstSurfaceEnabled.a[#ANVIL_VK_MAX_INSTANCES + 1]
 Global Dim avkPhysLive.a[#ANVIL_VK_MAX_PHYSICAL_DEVICES + 1]
 Global Dim avkPhysGen.i[#ANVIL_VK_MAX_PHYSICAL_DEVICES + 1]
 Global Dim avkPhysInst.i[#ANVIL_VK_MAX_PHYSICAL_DEVICES + 1]
@@ -672,6 +695,22 @@ EndProcedure
 
 Procedure.i AnvilVkFaultCount()
   ProcedureReturn avkFaultCount
+EndProcedure
+
+Procedure.i avkApiNameEquals(*actual, expected.i, maxBytes.i)
+  Define n.i
+  Define a.i
+  Define b.i
+  If *actual = 0 Or expected = 0 Or maxBytes < 1 : ProcedureReturn 0 : EndIf
+  n = 0
+  While n < maxBytes
+    a = PeekA(*actual + n)
+    b = PeekA(expected + n)
+    If a <> b : ProcedureReturn 0 : EndIf
+    If a = 0 : ProcedureReturn 1 : EndIf
+    n = n + 1
+  Wend
+  ProcedureReturn 0
 EndProcedure
 
 Procedure.i avkNextGen(v.i)
@@ -852,6 +891,7 @@ Procedure.i AnvilVkInstanceCreate(*out)
   If p > #ANVIL_VK_MAX_PHYSICAL_DEVICES : ProcedureReturn #VK_ERROR_TOO_MANY_OBJECTS : EndIf
   avkInstGen[s] = avkNextGen(avkInstGen[s])
   avkInstLive[s] = 1
+  avkInstSurfaceEnabled[s] = 0
   avkPhysGen[p] = avkNextGen(avkPhysGen[p])
   avkPhysLive[p] = 1
   avkPhysInst[p] = s

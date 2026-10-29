@@ -1,12 +1,20 @@
 ; Monitor-owned service control. Include after HTTP parser, transport and engine.
 ; Disabled until `http serve [port]`. Plain public static resources only.
 ; One cooperative network owner; no socket manipulation from interrupts.
-Procedure HttpServerPoll()
+XIncludeFile "Anvil/Services/Http/poll.pbi"
+
+Procedure http_MonitorPoll()
   Protected now.i
   now = millis()
   If HtService(now) <> 0
     HsPoll(now)
   EndIf
+EndProcedure
+
+Procedure HttpServerInit()
+  ; Keep polling after Stop: the transport still owns TCP retirement work.
+  ; Registration does not open a listener or change transport state.
+  HttpPollInstall(@http_MonitorPoll)
 EndProcedure
 
 Procedure HttpServerStop()

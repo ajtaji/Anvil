@@ -351,13 +351,13 @@ def verify_program(data: bytes | Sequence[int], contract: ProgramContract) -> li
             if [i.index for i in ldtmu] != list(range(launches[0].index + 3,
                                                        launches[0].index + 7)):
                 raise VerifyError(f"{contract.name}: TMU reads require two THRSW delay slots then four results")
-        elif role == "fragment:sampled":
+        elif role in ("fragment:sampled", "fragment:computed-sampled"):
             if sum("wrtmuc" in i.signals for i in insns) != 2:
                 raise VerifyError(f"{contract.name}: requires texture and sampler WRTMUC loads")
             dests = [w for i in insns for w in i.magic_writes() if w in (33, 34)]
             if dests != [34, 33]:
                 raise VerifyError(f"{contract.name}: coordinates must write TMUT before TMUS")
-            if [i.signal_addr for i in insns if "ldvary" in i.signals] != [10, 11]:
+            if [i.signal_addr for i in insns if "ldvary" in i.signals] not in ([[10, 11]] if role == "fragment:sampled" else [[], [10, 11]]):
                 raise VerifyError(f"{contract.name}: sample coordinates must land in rf10/rf11")
             if [i.signal_addr for i in ldtmu] != [0, 1, 2, 3]:
                 raise VerifyError(f"{contract.name}: sampled TMU result must return to rf0..rf3")
@@ -372,6 +372,27 @@ def verify_program(data: bytes | Sequence[int], contract: ProgramContract) -> li
             varying = [i.signal_addr for i in insns if "ldvary" in i.signals]
             if varying != [0, 1, 2, 3]:
                 raise VerifyError(f"{contract.name}: varying colour requires four LDVARY signals")
+        elif role == "fragment:constant-arithmetic":
+            if any("ldvary" in i.signals or "ldtmu" in i.signals for i in insns):
+                raise VerifyError(f"{contract.name}: constant arithmetic unexpectedly uses VARY/TMU")
+            loaded = [i.signal_addr for i in insns if "ldunifrf" in i.signals]
+            if loaded != list(range(contract.uniform_words - 1)):
+                raise VerifyError(f"{contract.name}: arithmetic constants must load sequential RF destinations")
+        elif role == "fragment:constant-smoothstep":
+            if any("ldvary" in i.signals or "ldtmu" in i.signals for i in insns):
+                raise VerifyError(f"{contract.name}: constant SmoothStep unexpectedly uses VARY/TMU")
+            loaded = [i.signal_addr for i in insns if "ldunifrf" in i.signals]
+            if (contract.uniform_words != 7 or len(loaded) != 6 or loaded[:2] != [0, 1]
+                    or loaded[2] not in (5, 6, 7, 8)
+                    or loaded[2:] != list(range(loaded[2], loaded[2] + 4))):
+                raise VerifyError(f"{contract.name}: SmoothStep operands and polynomial constants have invalid destinations")
+        elif role == "fragment:constant-sine":
+            if any("ldvary" in i.signals or "ldtmu" in i.signals for i in insns):
+                raise VerifyError(f"{contract.name}: constant sine unexpectedly uses VARY/TMU")
+            loaded = [i.signal_addr for i in insns if "ldunifrf" in i.signals]
+            if (contract.uniform_words != 4 or len(loaded) != 3 or loaded[0] != 0
+                    or loaded[1] not in (2, 3, 4, 5) or loaded[2] != loaded[1] + 1):
+                raise VerifyError(f"{contract.name}: sine argument and reduction constants have invalid destinations")
         elif role == "fragment:flat":
             if any("ldvary" in i.signals or "ldtmu" in i.signals for i in insns):
                 raise VerifyError(f"{contract.name}: flat fragment unexpectedly uses VARY/TMU")

@@ -15,6 +15,10 @@
 ; ======================================================================
 
 EnableExplicit
+XIncludeFile "Anvil/Network/web_url.pbi"
+XIncludeFile "Anvil/Network/web_response.pbi"
+XIncludeFile "Anvil/Network/web_request.pbi"
+XIncludeFile "Anvil/Core/web_transport.pbi"
 
 #HTTPSC_REQ_MAX  = 1024
 #HTTPSC_WAIT_MS  = 30000
@@ -24,6 +28,24 @@ Global Dim httpsc_req.a[#HTTPSC_REQ_MAX]
 Global Dim httpsc_host.a[256]
 Global Dim httpsc_buf.a[2048]
 Global httpsc_reqLen.i
+Global httpsc_url.WebUrl
+Global Dim httpsc_target.a[#WEB_URL_TARGET]
+Global httpsc_request.WebRequest
+Global httpsc_response.WebResponse
+Global Dim httpsc_line.a[4096]
+Global Dim httpsc_headers.a[#WEB_RESPONSE_MAX_METADATA]
+Global Dim httpsc_decoded.a[2048]
+
+Procedure httpsc_PutPort(port.i)
+  Define divisor.i
+  divisor=10000
+  While divisor>1 And port<divisor : divisor=divisor/10 : Wend
+  While divisor>0
+    httpsc_req[httpsc_reqLen]=48+port/divisor
+    httpsc_reqLen=httpsc_reqLen+1
+    port=port%divisor : divisor=divisor/10
+  Wend
+EndProcedure
 
 Procedure httpsc_Put(*s)
   Define i.i
@@ -58,56 +80,54 @@ Procedure CmdHttpsGet()
   Define c.i
   Define inHead.i
   Define lastNl.i
+  Define urlResult.i
+  Define offset.i
+  Define consumed.i
+  Define responseError.i
 
   u = ArgWord()
   If u = 0
     PrintN("https get <url>   for example: https get https://example.com/")
     ProcedureReturn
   EndIf
-  ; skip "https://"
-  If PeekA(u) = 104 And PeekA(u + 4) = 115 And PeekA(u + 5) = 58 And PeekA(u + 6) = 47 And PeekA(u + 7) = 47
-    u = u + 8
-  EndIf
-  n = 0
-  port = 443
-  While PeekA(u + n) <> 0 And PeekA(u + n) <> 47 And PeekA(u + n) <> 58 And n < 253
-    httpsc_host[n] = PeekA(u + n)
-    n = n + 1
+  n=0
+  While n<=#WEB_URL_LIMIT
+    If PeekA(u+n)=0 : Break : EndIf
+    n=n+1
   Wend
-  httpsc_host[n] = 0
-  If n = 0
-    PrintN("https get: no host name in that URL.")
+  httpsc_url\host=@httpsc_host[0] : httpsc_url\hostCapacity=256
+  httpsc_url\target=@httpsc_target[0] : httpsc_url\targetCapacity=#WEB_URL_TARGET
+  urlResult=WebUrlParse(u,n,1,@httpsc_url)
+  If urlResult=#WEB_URL_OK And httpsc_url\secure=0 : urlResult=#WEB_URL_SCHEME : EndIf
+  If urlResult<>#WEB_URL_OK
+    Print("https get: invalid or unsupported HTTPS URL (code ")
+    PrintDec(urlResult) : PrintN(").")
     ProcedureReturn
   EndIf
-  i = n
-  If PeekA(u + i) = 58
-    i = i + 1
-    port = 0
-    While PeekA(u + i) >= 48 And PeekA(u + i) <= 57
-      port = port * 10 + PeekA(u + i) - 48
-      i = i + 1
-    Wend
+  ; Reserve space for all fixed headers and the longest decimal port. Refuse
+  ; before opening a connection; never send a silently shortened request.
+  If httpsc_url\targetLength+httpsc_url\hostLength+200>=#HTTPSC_REQ_MAX
+    PrintN("https get: request exceeds the command buffer.")
+    ProcedureReturn
   EndIf
-  pathAt = u + i
+  port=httpsc_url\port
+  pathAt=httpsc_url\target
 
-  httpsc_reqLen = 0
-  httpsc_Put("GET ")
-  If PeekA(pathAt) = 47
-    httpsc_Put(pathAt)
-  Else
-    httpsc_Put("/")
-  EndIf
-  httpsc_Put(" HTTP/1.1") : httpsc_Crlf()
-  httpsc_Put("Host: ") : httpsc_Put(@httpsc_host[0]) : httpsc_Crlf()
-  httpsc_Put("User-Agent: Anvil") : httpsc_Crlf()
-  httpsc_Put("Accept: */*") : httpsc_Crlf()
-  httpsc_Put("Connection: close") : httpsc_Crlf()
-  httpsc_Crlf()
+  responseError=WebRequestInit(@httpsc_request,@httpsc_url,"GET",3,0,0,@httpsc_req[0],#HTTPSC_REQ_MAX)
+  If responseError=0 : responseError=WebRequestHeader(@httpsc_request,"Accept-Encoding",15,"identity",8) : EndIf
+  If responseError=0 : responseError=WebRequestHeader(@httpsc_request,"User-Agent",10,"Anvil",5) : EndIf
+  If responseError=0 : responseError=WebRequestHeader(@httpsc_request,"Accept",6,"*/*",3) : EndIf
+  If responseError=0 : responseError=WebRequestFinishHeaders(@httpsc_request) : EndIf
+  If responseError<0 : PrintN("https: request headers could not be serialized.") : ProcedureReturn : EndIf
+  httpsc_reqLen=httpsc_request\length
 
+  responseError=WebResponseInit(@httpsc_response,@httpsc_line[0],4096,@httpsc_headers[0],#WEB_RESPONSE_MAX_METADATA,0)
+  If responseError<0 : PrintN("https: response storage could not be initialized.") : ProcedureReturn : EndIf
   h = TlsClientOpen(@httpsc_host[0], port)
   If h < 0
     Print("https: the connection was not opened: ")
-    tlsc_Say(gSvcDetail) : PrintNl()
+    If gSvcDetail <> 0 : str_print_at(gSvcDetail) : EndIf
+    PrintNl()
     ProcedureReturn
   EndIf
   Print("https: ")
@@ -127,7 +147,8 @@ Procedure CmdHttpsGet()
     st = TlsClientState(h)
     If st < 0
       Print("https: FAILED - ")
-      tlsc_Say(gSvcDetail) : PrintNl()
+      If gSvcDetail <> 0 : str_print_at(gSvcDetail) : EndIf
+      PrintNl()
       TlsClientShow()
       TlsClientClose(h)
       ProcedureReturn
@@ -143,39 +164,48 @@ Procedure CmdHttpsGet()
     EndIf
     k = TlsClientRecv(h, @httpsc_buf[0], 2048)
     If k > 0
-      For i = 0 To k - 1
-        c = httpsc_buf[i]
-        If inHead <> 0
-          If c = 10
-            PrintNl()
-            If lastNl <> 0
-              inHead = 0
-            EndIf
-            lastNl = 1
-          ElseIf c <> 13
-            UartWrite(c)
-            lastNl = 0
-          EndIf
-        Else
-          total = total + 1
-          If shown < #HTTPSC_SHOW
-            If c = 10 Or (c >= 32 And c < 127)
-              UartWrite(c)
-            Else
-              UartWrite(46)
-            EndIf
-            shown = shown + 1
-          EndIf
+      offset=0
+      While offset<k And httpsc_response\state<>#WEB_RESPONSE_DONE
+        consumed=WebResponseFeed(@httpsc_response,@httpsc_buf[offset],k-offset,@httpsc_decoded[0],2048)
+        If consumed<0
+          Print("https: HTTP response refused (code ") : PrintDec(consumed) : PrintN(").")
+          TlsClientClose(h) : ProcedureReturn
         EndIf
-      Next
+        offset=offset+consumed
+        If inHead<>0 And httpsc_response\status>=200 And httpsc_response\state<>#WEB_RESPONSE_HEADERS
+          For i=0 To httpsc_response\headerLength-1
+            c=httpsc_headers[i]
+            If c=10 : PrintNl() : ElseIf c<>13 : UartWrite(c) : EndIf
+          Next
+          inHead=0
+        EndIf
+        total=total+httpsc_response\written
+        For i=0 To httpsc_response\written-1
+          If shown<#HTTPSC_SHOW
+            c=httpsc_decoded[i]
+            If c=10 Or (c>=32 And c<127) : UartWrite(c) : Else : UartWrite(46) : EndIf
+            shown=shown+1
+          EndIf
+        Next
+        If consumed=0 And httpsc_response\written=0
+          PrintN("https: response processing made no progress.")
+          TlsClientClose(h) : ProcedureReturn
+        EndIf
+      Wend
     EndIf
+    If httpsc_response\state=#WEB_RESPONSE_DONE : Break : EndIf
     If st = #SVC_TLS_PEER_CLOSED And k <= 0
+      responseError=WebResponseEof(@httpsc_response)
+      If responseError<0
+        Print("https: server closed an incomplete response (code ") : PrintDec(responseError) : PrintN(").")
+        TlsClientClose(h) : ProcedureReturn
+      EndIf
       Break
     EndIf
     If ((millis() - t0) & $FFFFFFFF) > #HTTPSC_WAIT_MS
       PrintNl()
-      PrintN("https: stopped waiting after 30 seconds.")
-      Break
+      PrintN("https: stopped waiting after 30 seconds; response incomplete.")
+      TlsClientClose(h) : ProcedureReturn
     EndIf
   ForEver
   PrintNl()

@@ -745,7 +745,7 @@ def build_t0vm(t: Table, ram_probe_pad: int):
     64-bit cell contract, as a table of steps the board replays.
 
     WHY A STEP TABLE AND NOT A TRANSCRIBED SEQUENCE.  The bounds
-    contract is five lines in RaspberryPi4/Lib/t0vm.pi4 - an access of
+    contract is five lines in Anvil/Crypto/t0vm.pbi - an access of
     `n` bytes at `addr` is legal exactly when `0 <= addr <= RAM_SIZE - n`
     - and both numbers are read OUT OF THAT FILE here, by the desktop
     gate's own reader (a64_t0vm_check.module_constants).  Every
@@ -769,7 +769,7 @@ def build_t0vm(t: Table, ram_probe_pad: int):
     if N <= 0 or E <= 0:
         raise SystemExit(
             "a64_t0vm_check.module_constants could not read #T0_RAM_SIZE "
-            "and #T0ERR_RAM_BOUNDS out of RaspberryPi4/Lib/t0vm.pi4, so "
+            "and #T0ERR_RAM_BOUNDS out of Anvil/Crypto/t0vm.pbi, so "
             "every expectation below would be invented. Fix the reader.")
 
     steps, want = bytearray(), bytearray()

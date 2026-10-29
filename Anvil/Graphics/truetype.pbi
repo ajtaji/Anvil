@@ -116,23 +116,32 @@ Procedure.i anvil_tt_TableChecksum(offset.i, length.i, head.i)
   Protected pos.i
   Protected word.i
   Protected sum.q
-  words = (length + 3) / 4
+  ; Complete words need no per-byte loop or padded-tail bounds checks.
+  ; Use byte loads so borrowed buffers need no alignment or native endian.
+  words = length / 4
   sum = 0
   For n = 0 To words - 1
+    ; head.checkSumAdjustment is the third word, counted as zero by sfnt.
+    If head = 0 Or n <> 2
+      pos = *anvil_tt_data + offset + n * 4
+      word = ((PeekA(pos) & $FF) << 24) | ((PeekA(pos+1) & $FF) << 16) | ((PeekA(pos+2) & $FF) << 8) | (PeekA(pos+3) & $FF)
+      sum = (sum + word) & $FFFFFFFF
+    EndIf
+  Next
+  ; Only the final partial word is padded. Never read past the table bytes.
+  pos = words * 4
+  If pos < length
     word = 0
     For j = 0 To 3
-      pos = n * 4 + j
       word = word << 8
-      If pos < length
-        If head = 0 Or pos < 8 Or pos >= 12
-          ; head.checkSumAdjustment is zero while the head table checksum is
-          ; calculated, as required by the sfnt table checksum rule.
-          word = word | anvil_tt_U8(offset + pos)
+      If pos+j < length
+        If head = 0 Or pos+j < 8 Or pos+j >= 12
+          word = word | anvil_tt_U8(offset+pos+j)
         EndIf
       EndIf
     Next
     sum = (sum + word) & $FFFFFFFF
-  Next
+  EndIf
   ProcedureReturn sum
 EndProcedure
 

@@ -1,3 +1,4 @@
+XIncludeFile "Anvil/Services/wifi_control.pbi"
 
 ; ======================================================================
 ;  wifi - FOUR NUMBERED NETWORKS AND THE OLD SINGLE PAIR BEHIND THEM
@@ -386,6 +387,8 @@ Procedure WifiRxReadyStatus()
 EndProcedure
 
 Procedure CmdWifi()
+  Define replyStatus.i
+  Define replyValueOk.i
   Define v.i
   Define net.i
   Define pw.i
@@ -513,17 +516,21 @@ Procedure CmdWifi()
     EndIf
     ; A manual join owns the radio now. Cancel any automatic recovery
     ; generation before the synchronous compatibility path reads settings.
+    If WifiControlAvailable()=0
+      PrintN("Wi-Fi: manual control is unavailable on this composition.")
+      ProcedureReturn
+    EndIf
     WifiRecoveryCancel()
-    WifiEpManualBegin(2)                ; recorded before the join acts (2026-10-15)
+    r=WifiControlCall(#WIFI_CONTROL_MANUAL_BEGIN,2,0)
     If WifiJoinKnown() <> 0
       If WifiDhcp() <> 0
-        wifi_EpRecovered()
+        r=WifiControlCall(#WIFI_CONTROL_RECOVERED,0,0)
         NetConsoleRearm()
       Else
-        WifiEpManualFailed(2, 2)
+        r=WifiControlCall(#WIFI_CONTROL_MANUAL_FAILED,2,2)
       EndIf
     Else
-      WifiEpManualFailed(2, 1)
+      r=WifiControlCall(#WIFI_CONTROL_MANUAL_FAILED,2,1)
       WifiRecoveryInitialJoinFailed()
     EndIf
     ; AND AGAIN AFTER THE ATTEMPT, whatever it returned. DHCP may have
@@ -708,6 +715,10 @@ Procedure CmdWifi()
         r = 1
       EndIf
     EndIf
+    If WifiControlAvailable()=0
+      PrintN("Wi-Fi: the radio test is unavailable on this composition.")
+      ProcedureReturn
+    EndIf
     Print("Wi-Fi: not servicing the radio for ")
     PrintDec(n)
     If r <> 0
@@ -715,7 +726,11 @@ Procedure CmdWifi()
     Else
       PrintN(" s...")
     EndIf
-    WifiDeaf(n, r)
+    r=WifiControlCall(#WIFI_CONTROL_DEAF,n,r)
+    If r<>0
+      PrintN("Wi-Fi: the radio test is unavailable or its arguments were refused.")
+      ProcedureReturn
+    EndIf
     PrintN("Wi-Fi: listening again; the link check runs now. wifi incidents shows what happened.")
     ProcedureReturn
   EndIf
@@ -740,18 +755,27 @@ Procedure CmdWifi()
       ProcedureReturn
     EndIf
     r = Cyw43GetIovarData(k, n, n + 1 + 4, 2000)
+    ; Snapshot the borrowed reply before console output can service transport.
+    If r = #CYW43_IO_OK
+      replyValueOk = Cyw43ReplyI32(@v)
+    Else
+      replyStatus = Cyw43IoctlStatus()
+    EndIf
     str_print_at(k)
     If r <> #CYW43_IO_OK
       Print(": the firmware refused the read (rc ")
       PrintDec(r)
       Print(", firmware status ")
-      PrintDec(cyw43_Signed32(cyw43_ioctlStatus))
+      PrintDec(replyStatus)
       PrintN(").")
       ProcedureReturn
     EndIf
-    v = cyw43_RxLE32(cyw43_replyOff)
+    If replyValueOk = 0
+      PrintN(": the firmware reply does not contain a complete 32-bit value.")
+      ProcedureReturn
+    EndIf
     Print(" = ")
-    PrintDec(cyw43_Signed32(v))
+    PrintDec(v)
     PrintN("")
     ProcedureReturn
   EndIf
@@ -785,7 +809,7 @@ Procedure CmdWifi()
             n = 1
           EndIf
         EndIf
-        r = WifiRekeyAsk(n)
+        r = WifiControlCall(#WIFI_CONTROL_REKEY,n,0)
         If r = 0
           If n <> 0
             PrintN("Wi-Fi: asked the access point for a PAIRWISE rekey (EAPOL-Key Request sent).")

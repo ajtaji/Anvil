@@ -85,6 +85,7 @@ EndStructure
 #ANVIL_IR_TYPE_FUNCTION      = 7
 #ANVIL_IR_TYPE_IMAGE         = 8
 #ANVIL_IR_TYPE_SAMPLED_IMAGE = 9
+#ANVIL_IR_TYPE_BOOL          = 10
 
 #ANVIL_IR_STORAGE_UNIFORM_CONSTANT = 0
 #ANVIL_IR_STORAGE_INPUT            = 1
@@ -116,9 +117,20 @@ EndStructure
 #ANVIL_IR_OP_RETURN           = 7
 #ANVIL_IR_OP_FADD              = 8
 #ANVIL_IR_OP_FMUL              = 9
+#ANVIL_IR_OP_FSUB              = 10
+#ANVIL_IR_OP_DOT               = 11
+#ANVIL_IR_OP_VECTOR_SCALE      = 12
+#ANVIL_IR_OP_SIN               = 13
+#ANVIL_IR_OP_DISTANCE          = 14
+#ANVIL_IR_OP_SMOOTHSTEP        = 15
+#ANVIL_IR_OP_FORD_LESS         = 16
+#ANVIL_IR_OP_FORD_GREATER      = 17
+#ANVIL_IR_OP_LOGICAL_OR        = 18
+#ANVIL_IR_OP_SELECT            = 19
 
 ; Source opcode values from the Khronos grammar, retained in every record.
 #ANVIL_IR_SPV_TYPE_VOID = 19
+#ANVIL_IR_SPV_TYPE_BOOL = 20
 #ANVIL_IR_SPV_TYPE_INT = 21
 #ANVIL_IR_SPV_TYPE_FLOAT = 22
 #ANVIL_IR_SPV_TYPE_VECTOR = 23
@@ -127,6 +139,8 @@ EndStructure
 #ANVIL_IR_SPV_TYPE_STRUCT = 30
 #ANVIL_IR_SPV_TYPE_POINTER = 32
 #ANVIL_IR_SPV_TYPE_FUNCTION = 33
+#ANVIL_IR_SPV_CONSTANT_TRUE = 41
+#ANVIL_IR_SPV_CONSTANT_FALSE = 42
 #ANVIL_IR_SPV_CONSTANT = 43
 #ANVIL_IR_SPV_CONSTANT_COMPOSITE = 44
 #ANVIL_IR_SPV_ENTRY_POINT = 15
@@ -141,7 +155,14 @@ EndStructure
 #ANVIL_IR_SPV_COMPOSITE_EXTRACT = 81
 #ANVIL_IR_SPV_IMAGE_SAMPLE_IMPLICIT_LOD = 87
 #ANVIL_IR_SPV_FADD = 129
+#ANVIL_IR_SPV_FSUB = 131
 #ANVIL_IR_SPV_FMUL = 133
+#ANVIL_IR_SPV_DOT = 148
+#ANVIL_IR_SPV_VECTOR_SCALE = 142
+#ANVIL_IR_SPV_FORD_LESS = 184
+#ANVIL_IR_SPV_FORD_GREATER = 186
+#ANVIL_IR_SPV_LOGICAL_OR = 166
+#ANVIL_IR_SPV_SELECT = 169
 #ANVIL_IR_SPV_LABEL = 248
 #ANVIL_IR_SPV_RETURN = 253
 
@@ -409,6 +430,7 @@ Procedure.i avkIrConstantComponent(*c.AvkIrConstant, index.i)
 EndProcedure
 
 Procedure.i avkIrExpectedTypeOpcode(kind.i)
+  If kind = #ANVIL_IR_TYPE_BOOL : ProcedureReturn #ANVIL_IR_SPV_TYPE_BOOL : EndIf
   If kind = #ANVIL_IR_TYPE_VOID : ProcedureReturn #ANVIL_IR_SPV_TYPE_VOID : EndIf
   If kind = #ANVIL_IR_TYPE_INT : ProcedureReturn #ANVIL_IR_SPV_TYPE_INT : EndIf
   If kind = #ANVIL_IR_TYPE_FLOAT : ProcedureReturn #ANVIL_IR_SPV_TYPE_FLOAT : EndIf
@@ -422,6 +444,10 @@ Procedure.i avkIrExpectedTypeOpcode(kind.i)
 EndProcedure
 
 Procedure.i avkIrExpectedNodeOpcode(kind.i)
+  If kind = #ANVIL_IR_OP_FORD_LESS : ProcedureReturn #ANVIL_IR_SPV_FORD_LESS : EndIf
+  If kind = #ANVIL_IR_OP_FORD_GREATER : ProcedureReturn #ANVIL_IR_SPV_FORD_GREATER : EndIf
+  If kind = #ANVIL_IR_OP_LOGICAL_OR : ProcedureReturn #ANVIL_IR_SPV_LOGICAL_OR : EndIf
+  If kind = #ANVIL_IR_OP_SELECT : ProcedureReturn #ANVIL_IR_SPV_SELECT : EndIf
   If kind = #ANVIL_IR_OP_LOAD : ProcedureReturn #ANVIL_IR_SPV_LOAD : EndIf
   If kind = #ANVIL_IR_OP_ACCESS_CHAIN : ProcedureReturn #ANVIL_IR_SPV_ACCESS_CHAIN : EndIf
   If kind = #ANVIL_IR_OP_COMPOSITE_EXTRACT : ProcedureReturn #ANVIL_IR_SPV_COMPOSITE_EXTRACT : EndIf
@@ -430,6 +456,12 @@ Procedure.i avkIrExpectedNodeOpcode(kind.i)
   If kind = #ANVIL_IR_OP_STORE : ProcedureReturn #ANVIL_IR_SPV_STORE : EndIf
   If kind = #ANVIL_IR_OP_RETURN : ProcedureReturn #ANVIL_IR_SPV_RETURN : EndIf
   If kind = #ANVIL_IR_OP_FADD : ProcedureReturn #ANVIL_IR_SPV_FADD : EndIf
+  If kind = #ANVIL_IR_OP_FSUB : ProcedureReturn #ANVIL_IR_SPV_FSUB : EndIf
+  If kind = #ANVIL_IR_OP_VECTOR_SCALE : ProcedureReturn #ANVIL_IR_SPV_VECTOR_SCALE : EndIf
+  If kind = #ANVIL_IR_OP_SMOOTHSTEP : ProcedureReturn 12 : EndIf
+  If kind = #ANVIL_IR_OP_DISTANCE : ProcedureReturn 12 : EndIf
+  If kind = #ANVIL_IR_OP_SIN : ProcedureReturn 12 : EndIf
+  If kind = #ANVIL_IR_OP_DOT : ProcedureReturn #ANVIL_IR_SPV_DOT : EndIf
   If kind = #ANVIL_IR_OP_FMUL : ProcedureReturn #ANVIL_IR_SPV_FMUL : EndIf
   ProcedureReturn 0
 EndProcedure
@@ -458,6 +490,37 @@ Procedure.i avkIrFloatLanes(*m.AvkIrModule, typeId.i)
     ProcedureReturn 0
   EndIf
   ProcedureReturn *t\componentCount
+EndProcedure
+
+; Boolean shape is logical, with no declared bit width. Backend storage is
+; separate from the source type. This also bounds selection to represented
+; scalar/vector values; pointers and aggregate selection remain unsupported.
+Procedure.i avkIrBoolLanes(*m.AvkIrModule, typeId.i)
+  Protected *t.AvkIrType
+  *t=avkIrFindType(*m,typeId)
+  If *t=0 : ProcedureReturn 0 : EndIf
+  If *t\kind=#ANVIL_IR_TYPE_BOOL : ProcedureReturn 1 : EndIf
+  If *t\kind<>#ANVIL_IR_TYPE_VECTOR Or *t\componentCount<2 Or *t\componentCount>4 : ProcedureReturn 0 : EndIf
+  Protected lanes.i=*t\componentCount
+  *t=avkIrFindType(*m,*t\componentType)
+  If *t=0 Or *t\kind<>#ANVIL_IR_TYPE_BOOL : ProcedureReturn 0 : EndIf
+  ProcedureReturn lanes
+EndProcedure
+
+Procedure.i avkIrSelectableLanes(*m.AvkIrModule, typeId.i)
+  Protected *t.AvkIrType
+  Protected lanes.i=1
+  *t=avkIrFindType(*m,typeId)
+  If *t=0 : ProcedureReturn 0 : EndIf
+  If *t\kind=#ANVIL_IR_TYPE_VECTOR
+    lanes=*t\componentCount
+    If lanes<2 Or lanes>4 : ProcedureReturn 0 : EndIf
+    *t=avkIrFindType(*m,*t\componentType)
+    If *t=0 : ProcedureReturn 0 : EndIf
+  EndIf
+  If *t\kind=#ANVIL_IR_TYPE_BOOL : ProcedureReturn lanes : EndIf
+  If (*t\kind=#ANVIL_IR_TYPE_FLOAT Or *t\kind=#ANVIL_IR_TYPE_INT) And *t\width=32 : ProcedureReturn lanes : EndIf
+  ProcedureReturn 0
 EndProcedure
 
 ; Is id defined by an instruction that dominates nodeIndex? Global constants
@@ -694,14 +757,18 @@ Procedure.i avkIrCheckTypes(*m.AvkIrModule)
     If avkIrExpectedTypeOpcode(*t\kind) = 0 Or *t\sourceOpcode <> avkIrExpectedTypeOpcode(*t\kind)
       ProcedureReturn avkIrFail(#ANVIL_IR_ERR_UNSUPPORTED, id, *t\sourceOpcode, i)
     EndIf
-    If *t\kind = #ANVIL_IR_TYPE_INT
+    If *t\kind = #ANVIL_IR_TYPE_BOOL
+      If *t\width<>0 Or *t\signedness<>0 Or *t\componentCount<>0
+        ProcedureReturn avkIrFail(#ANVIL_IR_ERR_TYPE,id,*t\sourceOpcode,i)
+      EndIf
+    ElseIf *t\kind = #ANVIL_IR_TYPE_INT
       If *t\width <> 32 Or (*t\signedness <> 0 And *t\signedness <> 1) : ProcedureReturn avkIrFail(#ANVIL_IR_ERR_TYPE, id, *t\sourceOpcode, i) : EndIf
     ElseIf *t\kind = #ANVIL_IR_TYPE_FLOAT
       If *t\width <> 32 : ProcedureReturn avkIrFail(#ANVIL_IR_ERR_TYPE, id, *t\sourceOpcode, i) : EndIf
     ElseIf *t\kind = #ANVIL_IR_TYPE_VECTOR
       *u = avkIrFindType(*m, *t\componentType)
       If *u = 0 : ProcedureReturn avkIrFail(#ANVIL_IR_ERR_UNDEFINED, *t\componentType, *t\sourceOpcode, i) : EndIf
-      If (*u\kind <> #ANVIL_IR_TYPE_INT And *u\kind <> #ANVIL_IR_TYPE_FLOAT) Or *t\componentCount < 2 Or *t\componentCount > 4
+      If (*u\kind <> #ANVIL_IR_TYPE_INT And *u\kind <> #ANVIL_IR_TYPE_FLOAT And *u\kind <> #ANVIL_IR_TYPE_BOOL) Or *t\componentCount < 2 Or *t\componentCount > 4
         ProcedureReturn avkIrFail(#ANVIL_IR_ERR_TYPE, id, *t\sourceOpcode, i)
       EndIf
     ElseIf *t\kind = #ANVIL_IR_TYPE_STRUCT
@@ -747,7 +814,14 @@ Procedure.i avkIrCheckConstants(*m.AvkIrModule)
     *c = avkIrConstantAt(*m, i)
     *t = avkIrFindType(*m, *c\typeId)
     If *t = 0 : ProcedureReturn avkIrFail(#ANVIL_IR_ERR_UNDEFINED, *c\typeId, *c\sourceOpcode, i) : EndIf
-    If *t\kind = #ANVIL_IR_TYPE_INT Or *t\kind = #ANVIL_IR_TYPE_FLOAT
+    If *t\kind = #ANVIL_IR_TYPE_BOOL
+      If *c\wordCount<>0 Or *c\componentCount<>0 Or (*c\sourceOpcode<>#ANVIL_IR_SPV_CONSTANT_TRUE And *c\sourceOpcode<>#ANVIL_IR_SPV_CONSTANT_FALSE)
+        ProcedureReturn avkIrFail(#ANVIL_IR_ERR_TYPE,*c\sourceId,*c\sourceOpcode,i)
+      EndIf
+      If *c\word0<>Bool(*c\sourceOpcode=#ANVIL_IR_SPV_CONSTANT_TRUE)
+        ProcedureReturn avkIrFail(#ANVIL_IR_ERR_TYPE,*c\sourceId,*c\sourceOpcode,i)
+      EndIf
+    ElseIf *t\kind = #ANVIL_IR_TYPE_INT Or *t\kind = #ANVIL_IR_TYPE_FLOAT
       If *c\sourceOpcode <> #ANVIL_IR_SPV_CONSTANT Or *c\wordCount <> 1 Or *c\componentCount <> 0
         ProcedureReturn avkIrFail(#ANVIL_IR_ERR_TYPE, *c\sourceId, *c\sourceOpcode, i)
       EndIf
@@ -943,7 +1017,7 @@ Procedure.i avkIrCheckNodes(*m.AvkIrModule)
         If avkIrValueType(*m, avkIrOperand(*n, k)) <> *t\componentType : ProcedureReturn avkIrFail(#ANVIL_IR_ERR_TYPE, avkIrOperand(*n, k), *n\sourceOpcode, i) : EndIf
         k = k + 1
       Wend
-    ElseIf *n\kind = #ANVIL_IR_OP_FADD Or *n\kind = #ANVIL_IR_OP_FMUL
+    ElseIf *n\kind = #ANVIL_IR_OP_FADD Or *n\kind = #ANVIL_IR_OP_FMUL Or *n\kind = #ANVIL_IR_OP_FSUB
       If *n\sourceId = 0 Or *n\operandCount <> 2 Or *n\literalCount <> 0
         ProcedureReturn avkIrFail(#ANVIL_IR_ERR_TYPE, *n\sourceId, *n\sourceOpcode, i)
       EndIf
@@ -957,6 +1031,88 @@ Procedure.i avkIrCheckNodes(*m.AvkIrModule)
       If avkIrValueType(*m, *n\operand1) <> *n\resultType
         ProcedureReturn avkIrFail(#ANVIL_IR_ERR_TYPE, *n\operand1, *n\sourceOpcode, i)
       EndIf
+    ElseIf *n\kind = #ANVIL_IR_OP_SIN
+      If *n\sourceId=0 Or *n\operandCount<>1 Or *n\literalCount<>1 Or *n\literal0<>13
+        ProcedureReturn avkIrFail(#ANVIL_IR_ERR_TYPE,*n\sourceId,*n\sourceOpcode,i)
+      EndIf
+      If avkIrFloatLanes(*m,*n\resultType)<1 Or avkIrValueType(*m,*n\operand0)<>*n\resultType
+        ProcedureReturn avkIrFail(#ANVIL_IR_ERR_TYPE,*n\sourceId,*n\sourceOpcode,i)
+      EndIf
+    ElseIf *n\kind = #ANVIL_IR_OP_DOT
+      If *n\sourceId = 0 Or *n\operandCount <> 2 Or *n\literalCount <> 0
+        ProcedureReturn avkIrFail(#ANVIL_IR_ERR_TYPE, *n\sourceId, *n\sourceOpcode, i)
+      EndIf
+      lanes = avkIrFloatLanes(*m, avkIrValueType(*m, *n\operand0))
+      *t = avkIrFindType(*m, avkIrValueType(*m, *n\operand0))
+      If *t = 0 Or lanes < 2 Or avkIrValueType(*m, *n\operand0) <> avkIrValueType(*m, *n\operand1)
+        ProcedureReturn avkIrFail(#ANVIL_IR_ERR_TYPE, *n\sourceId, *n\sourceOpcode, i)
+      EndIf
+      If *t\componentType <> *n\resultType
+        ProcedureReturn avkIrFail(#ANVIL_IR_ERR_TYPE, *n\sourceId, *n\sourceOpcode, i)
+      EndIf
+    ElseIf *n\kind = #ANVIL_IR_OP_FORD_LESS Or *n\kind = #ANVIL_IR_OP_FORD_GREATER
+      If *n\sourceId=0 Or *n\operandCount<>2 Or *n\literalCount<>0
+        ProcedureReturn avkIrFail(#ANVIL_IR_ERR_TYPE,*n\sourceId,*n\sourceOpcode,i)
+      EndIf
+      valueType=avkIrValueType(*m,*n\operand0)
+      lanes=avkIrFloatLanes(*m,valueType)
+      If lanes<1 Or avkIrValueType(*m,*n\operand1)<>valueType Or avkIrBoolLanes(*m,*n\resultType)<>lanes
+        ProcedureReturn avkIrFail(#ANVIL_IR_ERR_TYPE,*n\sourceId,*n\sourceOpcode,i)
+      EndIf
+    ElseIf *n\kind = #ANVIL_IR_OP_LOGICAL_OR
+      If *n\sourceId=0 Or *n\operandCount<>2 Or *n\literalCount<>0 Or avkIrBoolLanes(*m,*n\resultType)<1
+        ProcedureReturn avkIrFail(#ANVIL_IR_ERR_TYPE,*n\sourceId,*n\sourceOpcode,i)
+      EndIf
+      If avkIrValueType(*m,*n\operand0)<>*n\resultType Or avkIrValueType(*m,*n\operand1)<>*n\resultType
+        ProcedureReturn avkIrFail(#ANVIL_IR_ERR_TYPE,*n\sourceId,*n\sourceOpcode,i)
+      EndIf
+    ElseIf *n\kind = #ANVIL_IR_OP_SELECT
+      If *n\sourceId=0 Or *n\operandCount<>3 Or *n\literalCount<>0
+        ProcedureReturn avkIrFail(#ANVIL_IR_ERR_TYPE,*n\sourceId,*n\sourceOpcode,i)
+      EndIf
+      lanes=avkIrSelectableLanes(*m,*n\resultType)
+      valueType=avkIrBoolLanes(*m,avkIrValueType(*m,*n\operand0))
+      If lanes<1 Or valueType<1 Or avkIrValueType(*m,*n\operand1)<>*n\resultType Or avkIrValueType(*m,*n\operand2)<>*n\resultType
+        ProcedureReturn avkIrFail(#ANVIL_IR_ERR_TYPE,*n\sourceId,*n\sourceOpcode,i)
+      EndIf
+      If valueType<>lanes
+        If valueType<>1 Or (*m\sourceVersion<>0 And *m\sourceVersion<$00010400)
+          ProcedureReturn avkIrFail(#ANVIL_IR_ERR_TYPE,*n\sourceId,*n\sourceOpcode,i)
+        EndIf
+      EndIf
+    ElseIf *n\kind = #ANVIL_IR_OP_SMOOTHSTEP
+      If *n\sourceId=0 Or *n\operandCount<>3 Or *n\literalCount<>1 Or *n\literal0<>49
+        ProcedureReturn avkIrFail(#ANVIL_IR_ERR_TYPE,*n\sourceId,*n\sourceOpcode,i)
+      EndIf
+      If avkIrFloatLanes(*m,*n\resultType)<1 Or avkIrValueType(*m,*n\operand0)<>*n\resultType Or avkIrValueType(*m,*n\operand1)<>*n\resultType Or avkIrValueType(*m,*n\operand2)<>*n\resultType
+        ProcedureReturn avkIrFail(#ANVIL_IR_ERR_TYPE,*n\sourceId,*n\sourceOpcode,i)
+      EndIf
+    ElseIf *n\kind = #ANVIL_IR_OP_DISTANCE
+      If *n\sourceId=0 Or *n\operandCount<>2 Or *n\literalCount<>1 Or *n\literal0<>67
+        ProcedureReturn avkIrFail(#ANVIL_IR_ERR_TYPE,*n\sourceId,*n\sourceOpcode,i)
+      EndIf
+      lanes=avkIrFloatLanes(*m,avkIrValueType(*m,*n\operand0))
+      If lanes<1 Or avkIrValueType(*m,*n\operand0)<>avkIrValueType(*m,*n\operand1) Or avkIrFloatLanes(*m,*n\resultType)<>1
+        ProcedureReturn avkIrFail(#ANVIL_IR_ERR_TYPE,*n\sourceId,*n\sourceOpcode,i)
+      EndIf
+      *t=avkIrFindType(*m,avkIrValueType(*m,*n\operand0))
+      If lanes=1
+        If *t\sourceId<>*n\resultType : ProcedureReturn avkIrFail(#ANVIL_IR_ERR_TYPE,*n\sourceId,*n\sourceOpcode,i) : EndIf
+      Else
+        If *t\componentType<>*n\resultType : ProcedureReturn avkIrFail(#ANVIL_IR_ERR_TYPE,*n\sourceId,*n\sourceOpcode,i) : EndIf
+      EndIf
+    ElseIf *n\kind = #ANVIL_IR_OP_VECTOR_SCALE
+      If *n\sourceId = 0 Or *n\operandCount <> 2 Or *n\literalCount <> 0
+        ProcedureReturn avkIrFail(#ANVIL_IR_ERR_TYPE, *n\sourceId, *n\sourceOpcode, i)
+      EndIf
+      lanes = avkIrFloatLanes(*m, avkIrValueType(*m, *n\operand0))
+      *t = avkIrFindType(*m, avkIrValueType(*m, *n\operand0))
+      If *t = 0 Or lanes < 2 Or avkIrValueType(*m, *n\operand0) <> *n\resultType
+        ProcedureReturn avkIrFail(#ANVIL_IR_ERR_TYPE, *n\sourceId, *n\sourceOpcode, i)
+      EndIf
+      If *t\componentType <> avkIrValueType(*m, *n\operand1)
+        ProcedureReturn avkIrFail(#ANVIL_IR_ERR_TYPE, *n\sourceId, *n\sourceOpcode, i)
+      EndIf
     ElseIf *n\kind = #ANVIL_IR_OP_IMAGE_SAMPLE_IMPLICIT_LOD
       If *n\sourceId = 0 Or *n\operandCount <> 2 Or *n\literalCount <> 0 : ProcedureReturn avkIrFail(#ANVIL_IR_ERR_TYPE, *n\sourceId, *n\sourceOpcode, i) : EndIf
       *t = avkIrFindType(*m, avkIrValueType(*m, *n\operand0))
@@ -969,10 +1125,9 @@ Procedure.i avkIrCheckNodes(*m.AvkIrModule)
       If *t = 0 Or *t\kind <> #ANVIL_IR_TYPE_VECTOR Or *t\componentCount <> 2 : ProcedureReturn avkIrFail(#ANVIL_IR_ERR_TYPE, *n\operand1, *n\sourceOpcode, i) : EndIf
       *u = avkIrFindType(*m, *t\componentType)
       If *u = 0 Or *u\kind <> #ANVIL_IR_TYPE_FLOAT Or *u\width <> 32 : ProcedureReturn avkIrFail(#ANVIL_IR_ERR_TYPE, *n\operand1, *n\sourceOpcode, i) : EndIf
-      *baseNode = avkIrFindNode(*m, *n\operand1)
-      If *baseNode = 0 Or *baseNode\kind <> #ANVIL_IR_OP_LOAD : ProcedureReturn avkIrFail(#ANVIL_IR_ERR_TYPE, *n\operand1, *n\sourceOpcode, i) : EndIf
-      *v = avkIrFindVariable(*m, *baseNode\operand0)
-      If *v = 0 Or *v\storageClass <> #ANVIL_IR_STORAGE_INPUT : ProcedureReturn avkIrFail(#ANVIL_IR_ERR_STORAGE, *baseNode\operand0, *n\sourceOpcode, i) : EndIf
+      ; Coordinate definitions already passed ordered-use checks. A vec2
+      ; constant, load or represented arithmetic/composite is equally typed;
+      ; sampling must not replace that value with one input variable.
       *t = avkIrFindType(*m, *n\resultType)
       If *t = 0 Or *t\kind <> #ANVIL_IR_TYPE_VECTOR Or *t\componentCount <> 4 : ProcedureReturn avkIrFail(#ANVIL_IR_ERR_TYPE, *n\sourceId, *n\sourceOpcode, i) : EndIf
       *u = avkIrFindType(*m, *t\componentType)

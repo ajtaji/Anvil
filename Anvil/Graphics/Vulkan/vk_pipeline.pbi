@@ -40,7 +40,7 @@
 ;   * no depth-stencil state, no other dynamic state, no pipeline cache, no
 ;     derivative pipelines
 ;   * a render pass of exactly one colour attachment, one subpass, no
-;     subpass dependencies, loadOp CLEAR and storeOp STORE
+;     subpass dependencies, CLEAR or capability-gated LOAD, and STORE
 ;   * a pipeline layout of no descriptor sets and at most one push
 ;     constant range, in the fragment stage, at offset 0, of 16 bytes
 ;
@@ -71,9 +71,10 @@ XIncludeFile "Anvil/Graphics/Vulkan/vk_spirv_ir_adapter.pbi"
 ; exactly on refuses the next honest use of it.
 #ANVIL_VK_MAX_LAYOUTS = 8
 #ANVIL_VK_MAX_RENDER_PASSES = 4
-#ANVIL_VK_MAX_IMAGE_VIEWS = 4 + #ANVIL_VK_SPRITE_RESOURCE_SLOTS
-#ANVIL_VK_MAX_FRAMEBUFFERS = 4
-#ANVIL_VK_MAX_PIPELINES = 4
+#ANVIL_VK_MAX_IMAGE_VIEWS = 4 + #ANVIL_VK_SPRITE_RESOURCE_SLOTS + #ANVIL_VK_RENDER_TARGET_SLOTS
+#ANVIL_VK_MAX_FRAMEBUFFERS = 4 + #ANVIL_VK_RENDER_TARGET_SLOTS
+; Chrome keeps three ordinary pipelines and lazily adds indexed outline/fill.
+#ANVIL_VK_MAX_PIPELINES = 5
 
 ; The push-constant block this slice carries: one four-component colour.
 #ANVIL_VK_PUSH_BYTES = 16
@@ -146,7 +147,21 @@ Global Dim avkRpLive.a[#ANVIL_VK_MAX_RENDER_PASSES + 1]
 Global Dim avkRpGen.i[#ANVIL_VK_MAX_RENDER_PASSES + 1]
 Global Dim avkRpDev.i[#ANVIL_VK_MAX_RENDER_PASSES + 1]
 Global Dim avkRpFormat.i[#ANVIL_VK_MAX_RENDER_PASSES + 1]
+ ; Compatibility snapshots outlive the render pass used at creation.
+; The accepted shape is one color reference at index zero, one sample and
+; one subpass, without input/depth/resolve/dependencies. Preserve every
+; remaining compatibility-significant field; load/store and layouts differ.
+Structure AvkRenderPassSignature
+  format.i
+  attachmentFlags.i
+  subpassFlags.i
+EndStructure
+Global Dim avkRpSignature.AvkRenderPassSignature[#ANVIL_VK_MAX_RENDER_PASSES + 1]
+Global Dim avkFbSignature.AvkRenderPassSignature[#ANVIL_VK_MAX_FRAMEBUFFERS + 1]
+Global Dim avkPipeSignature.AvkRenderPassSignature[#ANVIL_VK_MAX_PIPELINES + 1]
 Global Dim avkRpFinalLayout.i[#ANVIL_VK_MAX_RENDER_PASSES + 1]
+Global Dim avkRpInitialLayout.i[#ANVIL_VK_MAX_RENDER_PASSES + 1]
+Global Dim avkRpLoadColor.i[#ANVIL_VK_MAX_RENDER_PASSES + 1]
 Global Dim avkRpInFlight.i[#ANVIL_VK_MAX_RENDER_PASSES + 1]
 
 Global Dim avkIvLive.a[#ANVIL_VK_MAX_IMAGE_VIEWS + 1]
@@ -259,6 +274,7 @@ Global avkRenderClearRp.i = 0
 Global avkRenderClearView.i = 0
 Global avkRenderClearImage.i = 0
 Global avkRenderClearWord.i = 0
+Global avkRenderClearLoadColor.i = 0
 
 ; Generation-tagged handles are resolved once during whole-list preflight.
 ; Retain and release use only these captured slots, including the memory slot
@@ -1078,15 +1094,16 @@ Procedure.i avkShIrSummarizeFragment(slot.i)
       EndIf
       avkShSampleSet[slot] = avkShIrDecoration(*m, variableId, #ANVIL_IR_DEC_DESCRIPTOR_SET)
       avkShSampleBinding[slot] = avkShIrDecoration(*m, variableId, #ANVIL_IR_DEC_BINDING)
+      ; A computed coordinate has no single legacy input index. Its typed
+      ; dependencies remain live and the backend consumes their actual value.
+      avkShSampleCoord[slot] = -1
       *load = avkIrFindNode(*m, *n\operand1)
-      If *load = 0 Or *load\kind <> #ANVIL_IR_OP_LOAD
-        ProcedureReturn #ANVIL_VK_ERR_UNSUPPORTED
+      If *load <> 0 And *load\kind = #ANVIL_IR_OP_LOAD
+        variableId = 0 : member = -1
+        If avkShIrPointerSelection(*m, *load\operand0, @variableId, @member) <> 0
+          avkShSampleCoord[slot] = avkShIrInputIndex(*m, variableId)
+        EndIf
       EndIf
-      variableId = 0 : member = -1
-      If avkShIrPointerSelection(*m, *load\operand0, @variableId, @member) = 0
-        ProcedureReturn #ANVIL_VK_ERR_UNSUPPORTED
-      EndIf
-      avkShSampleCoord[slot] = avkShIrInputIndex(*m, variableId)
     EndIf
     i = i + 1
   Wend
@@ -1110,7 +1127,7 @@ Procedure.i avkShIrSummarizeFragment(slot.i)
         avkShColourIdx[slot] = 0
       EndIf
     EndIf
-  ElseIf *n <> 0 And *n\kind = #ANVIL_IR_OP_IMAGE_SAMPLE_IMPLICIT_LOD
+  ElseIf *n <> 0 And *n\kind = #ANVIL_IR_OP_IMAGE_SAMPLE_IMPLICIT_LOD And avkShSampleCoord[slot] >= 0
     avkShColourSrc[slot] = #ANVIL_SPV_COLOUR_SAMPLED
     avkShColourIdx[slot] = avkShSampleCoord[slot]
   Else
@@ -1400,6 +1417,16 @@ EndProcedure
 ; ======================================================================
 ;  RENDER PASS
 ; ======================================================================
+Procedure avkRenderPassSignatureCopy(*dst.AvkRenderPassSignature, *src.AvkRenderPassSignature)
+  *dst\format = *src\format
+  *dst\attachmentFlags = *src\attachmentFlags
+  *dst\subpassFlags = *src\subpassFlags
+EndProcedure
+
+Procedure.i avkRenderPassSignatureEqual(*a.AvkRenderPassSignature, *b.AvkRenderPassSignature)
+  ProcedureReturn Bool(*a\format = *b\format And *a\attachmentFlags = *b\attachmentFlags And *a\subpassFlags = *b\subpassFlags)
+EndProcedure
+
 Procedure.i AnvilVkRenderPassCreate(device.i, *att.VkAttachmentDescription, *sub.VkSubpassDescription, *out)
   Define d.i
   Define s.i
@@ -1415,16 +1442,22 @@ Procedure.i AnvilVkRenderPassCreate(device.i, *att.VkAttachmentDescription, *sub
     ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreateRenderPass was given a multisampled colour attachment (Anvil code -20005, multisampling not implemented); the render target this backend configures has one sample per pixel and there is no resolve path.")
   EndIf
   If (*att\loadOp & $FFFFFFFF) <> #VK_ATTACHMENT_LOAD_OP_CLEAR
-    ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreateRenderPass was given a colour attachment whose loadOp is not VK_ATTACHMENT_LOAD_OP_CLEAR (Anvil code -20005, unsupported load operation); this backend begins every frame by clearing the tile buffer, so LOAD would need a tile load this slice does not emit and DONT_CARE would leave the tile holding whatever the last frame left.")
+    If (*att\loadOp & $FFFFFFFF) <> #VK_ATTACHMENT_LOAD_OP_LOAD Or (avkBackendCaps() & #ANVIL_VK_CAP_ATTACHMENT_LOAD) = 0
+      ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreateRenderPass requires CLEAR or backend-supported LOAD; no render pass was created.")
+    EndIf
   EndIf
   If (*att\storeOp & $FFFFFFFF) <> #VK_ATTACHMENT_STORE_OP_STORE
     ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreateRenderPass was given a colour attachment whose storeOp is not VK_ATTACHMENT_STORE_OP_STORE (Anvil code -20005, unsupported store operation); a render pass that does not store its colour would produce nothing a reader could check.")
   EndIf
-  If (*att\initialLayout & $FFFFFFFF) <> #VK_IMAGE_LAYOUT_UNDEFINED
-    ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreateRenderPass was given a colour attachment whose initialLayout is not VK_IMAGE_LAYOUT_UNDEFINED (Anvil code -20005, unsupported layout); the loadOp is CLEAR, so the previous contents are discarded and the only honest initial layout is UNDEFINED.")
+  If (*att\loadOp & $FFFFFFFF) = #VK_ATTACHMENT_LOAD_OP_LOAD
+    If (*att\initialLayout & $FFFFFFFF) <> #VK_IMAGE_LAYOUT_GENERAL And (*att\initialLayout & $FFFFFFFF) <> #VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL And (*att\initialLayout & $FFFFFFFF) <> #VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
+      ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreateRenderPass LOAD requires a defined supported initial image layout; discarded contents cannot be preserved.")
+    EndIf
+  ElseIf (*att\initialLayout & $FFFFFFFF) <> #VK_IMAGE_LAYOUT_UNDEFINED And (*att\initialLayout & $FFFFFFFF) <> #VK_IMAGE_LAYOUT_GENERAL And (*att\initialLayout & $FFFFFFFF) <> #VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL And (*att\initialLayout & $FFFFFFFF) <> #VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreateRenderPass CLEAR requires UNDEFINED or a supported initial colour image layout.")
   EndIf
-  If (*att\finalLayout & $FFFFFFFF) <> #VK_IMAGE_LAYOUT_GENERAL And (*att\finalLayout & $FFFFFFFF) <> #VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
-    ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreateRenderPass was given a colour attachment whose finalLayout is neither VK_IMAGE_LAYOUT_GENERAL nor VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL (Anvil code -20005, unsupported layout); there is no swapchain here, so PRESENT_SRC does not exist, and those two are the layouts a host readback or a copy can follow.")
+  If (*att\finalLayout & $FFFFFFFF) <> #VK_IMAGE_LAYOUT_GENERAL And (*att\finalLayout & $FFFFFFFF) <> #VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL And (*att\finalLayout & $FFFFFFFF) <> #VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreateRenderPass requires a supported final colour layout: GENERAL, TRANSFER_SRC_OPTIMAL or COLOR_ATTACHMENT_OPTIMAL. No render pass was created.")
   EndIf
   If (*sub\pipelineBindPoint & $FFFFFFFF) <> #VK_PIPELINE_BIND_POINT_GRAPHICS
     ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreateRenderPass was given a subpass whose bind point is not VK_PIPELINE_BIND_POINT_GRAPHICS (Anvil code -20005, unsupported bind point); there is no compute pipeline in this implementation.")
@@ -1453,9 +1486,34 @@ Procedure.i AnvilVkRenderPassCreate(device.i, *att.VkAttachmentDescription, *sub
   avkRpLive[s] = 1
   avkRpDev[s] = d
   avkRpFormat[s] = *att\format & $FFFFFFFF
+  avkRpSignature[s]\format = avkRpFormat[s]
+  avkRpSignature[s]\attachmentFlags = *att\flags & $FFFFFFFF
+  avkRpSignature[s]\subpassFlags = *sub\flags & $FFFFFFFF
   avkRpFinalLayout[s] = *att\finalLayout & $FFFFFFFF
+  avkRpInitialLayout[s] = *att\initialLayout & $FFFFFFFF
+  avkRpLoadColor[s] = Bool((*att\loadOp & $FFFFFFFF) = #VK_ATTACHMENT_LOAD_OP_LOAD)
   PokeI(*out, avkToken(#ANVIL_VK_TYPE_RENDER_PASS, s, avkRpGen[s]))
   ProcedureReturn #VK_SUCCESS
+EndProcedure
+
+; Create a compatible preserving section after the source pass has stored.
+; Layout and compatibility metadata remain owned by the render-pass layer.
+Procedure.i AnvilVkRenderPassContinuationCreate(device.i, renderPass.i, *out)
+  Define d.i,s.i,att.VkAttachmentDescription,ref.VkAttachmentReference,sub.VkSubpassDescription
+  If *out=0 : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf
+  PokeI(*out,0)
+  d=avkDevSlot(device) : s=avkRpSlot(renderPass)
+  If d=0 Or s=0 : ProcedureReturn #ANVIL_VK_ERR_HANDLE : EndIf
+  If avkRpDev[s]<>d : ProcedureReturn #ANVIL_VK_ERR_OWNER : EndIf
+  att\flags=avkRpSignature[s]\attachmentFlags
+  att\format=avkRpFormat[s] : att\samples=#VK_SAMPLE_COUNT_1_BIT
+  att\loadOp=#VK_ATTACHMENT_LOAD_OP_LOAD : att\storeOp=#VK_ATTACHMENT_STORE_OP_STORE
+  att\stencilLoadOp=#VK_ATTACHMENT_LOAD_OP_DONT_CARE : att\stencilStoreOp=#VK_ATTACHMENT_STORE_OP_DONT_CARE
+  att\initialLayout=avkRpFinalLayout[s] : att\finalLayout=avkRpFinalLayout[s]
+  ref\layout=#VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
+  sub\flags=avkRpSignature[s]\subpassFlags
+  sub\pipelineBindPoint=#VK_PIPELINE_BIND_POINT_GRAPHICS : sub\colorAttachmentCount=1 : sub\pColorAttachments=@ref
+  ProcedureReturn AnvilVkRenderPassCreate(device,@att,@sub,*out)
 EndProcedure
 
 Procedure AnvilVkRenderPassDestroy(device.i, renderPass.i)
@@ -1571,6 +1629,7 @@ Procedure.i AnvilVkFramebufferCreate(device.i, renderPass.i, view.i, width.i, he
   avkFbDev[s] = d
   avkFbRp[s] = rp
   avkFbRpHandle[s] = renderPass
+  avkRenderPassSignatureCopy(@avkFbSignature[s], @avkRpSignature[rp])
   avkFbView[s] = iv
   avkFbViewHandle[s] = view
   avkFbW[s] = width
@@ -1578,6 +1637,58 @@ Procedure.i AnvilVkFramebufferCreate(device.i, renderPass.i, view.i, width.i, he
   avkFbLive[s] = 1
   PokeI(*out, avkToken(#ANVIL_VK_TYPE_FRAMEBUFFER, s, avkFbGen[s]))
   ProcedureReturn #VK_SUCCESS
+EndProcedure
+
+; Read-only whole-target preflight for renderer adapters. It borrows no
+; lifetime: the caller still externally synchronizes object changes, and
+; command recording/submission independently revalidate their references.
+; Current scanout adapters require a single linear BGRA8 colour attachment.
+Procedure.i AnvilVkFramebufferTargetCheck(device.i, renderPass.i, framebuffer.i, width.i, height.i, pitch.i)
+  Define d.i, rp.i, fb.i, iv.i, img.i, mem.i
+  If width < 1 Or height < 1 Or pitch < 1 : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf
+  d = avkDevSlot(device) : rp = avkRpSlot(renderPass) : fb = avkFbSlot(framebuffer)
+  If d = 0 Or rp = 0 Or fb = 0 : ProcedureReturn #ANVIL_VK_ERR_HANDLE : EndIf
+  If avkFbDev[fb] <> d Or avkRpDev[rp] <> d : ProcedureReturn #ANVIL_VK_ERR_OWNER : EndIf
+  If avkIvSlot(avkFbViewHandle[fb]) <> avkFbView[fb]
+    ProcedureReturn #ANVIL_VK_ERR_STATE
+  EndIf
+  If avkRenderPassSignatureEqual(@avkFbSignature[fb], @avkRpSignature[rp]) = 0 : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf
+  iv = avkFbView[fb]
+  img = avkImgSlot(avkIvImage[iv])
+  If img = 0 Or img <> avkIvImgSlot[iv] Or avkImgBound[img] = 0 : ProcedureReturn #ANVIL_VK_ERR_STATE : EndIf
+  mem = avkMemSlot(avkImgMemory[img])
+  If mem = 0 Or mem <> avkImgMemSlot[img] : ProcedureReturn #ANVIL_VK_ERR_STATE : EndIf
+  If avkIvDev[iv] <> d Or avkImgDev[img] <> d Or avkMemDev[mem] <> d : ProcedureReturn #ANVIL_VK_ERR_OWNER : EndIf
+  If avkImgTiling[img] <> #VK_IMAGE_TILING_LINEAR Or avkImgFormat[img] <> #VK_FORMAT_B8G8R8A8_UNORM
+    ProcedureReturn #ANVIL_VK_ERR_UNSUPPORTED
+  EndIf
+  If (avkImgUsage[img] & #VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) = 0 : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf
+  If width <> avkFbW[fb] Or height <> avkFbH[fb] Or width <> avkImgW[img] Or height <> avkImgH[img] Or pitch <> avkImgPitch[img]
+    ProcedureReturn #ANVIL_VK_ERR_ARGS
+  EndIf
+  If avkImgMemOffset[img] < 0 Or avkImgMemOffset[img] > avkMemSize[mem] : ProcedureReturn #ANVIL_VK_ERR_STATE : EndIf
+  If avkImgSize[img] > avkMemSize[mem] - avkImgMemOffset[img] : ProcedureReturn #ANVIL_VK_ERR_STATE : EndIf
+  If avkFbInFlight[fb] <> 0 Or avkIvInFlight[iv] <> 0 Or avkImgInFlight[img] <> 0 Or avkMemInFlight[mem] <> 0
+    ProcedureReturn #ANVIL_VK_ERR_STATE
+  EndIf
+  ProcedureReturn #VK_SUCCESS
+EndProcedure
+
+; Positive row pitch on success, an explicit negative Anvil error on refusal.
+; Resolve only enough of the live dependency graph to obtain the pitch, then
+; reuse the complete target preflight. No output is guessed from width.
+Procedure.i AnvilVkFramebufferTargetPitch(device.i, renderPass.i, framebuffer.i, width.i, height.i)
+  Define fb.i, iv.i, img.i, pitch.i, rc.i
+  fb = avkFbSlot(framebuffer)
+  If fb = 0 : ProcedureReturn #ANVIL_VK_ERR_HANDLE : EndIf
+  iv = avkIvSlot(avkFbViewHandle[fb])
+  If iv = 0 Or iv <> avkFbView[fb] : ProcedureReturn #ANVIL_VK_ERR_STATE : EndIf
+  img = avkImgSlot(avkIvImage[iv])
+  If img = 0 Or img <> avkIvImgSlot[iv] : ProcedureReturn #ANVIL_VK_ERR_STATE : EndIf
+  pitch = avkImgPitch[img]
+  rc = AnvilVkFramebufferTargetCheck(device, renderPass, framebuffer, width, height, pitch)
+  If rc <> #VK_SUCCESS : ProcedureReturn rc : EndIf
+  ProcedureReturn pitch
 EndProcedure
 
 Procedure AnvilVkFramebufferDestroy(device.i, framebuffer.i)
@@ -2134,6 +2245,7 @@ Procedure.i AnvilVkGraphicsPipelineCreate(device.i, *ci.VkGraphicsPipelineCreate
     k = k + 1
   Wend
   avkPipeRp[s] = rp
+  avkRenderPassSignatureCopy(@avkPipeSignature[s], @avkRpSignature[rp])
   *ia = *ci\pInputAssemblyState
   avkPipeTopology[s] = *ia\topology & $FFFFFFFF
   avkPipeDynamicViewport[s] = dynamicViewport
@@ -2527,18 +2639,17 @@ Procedure AnvilVkCmdBeginRenderPass(commandBuffer.i, renderPass.i, framebuffer.i
     avkCbFail(c, #ANVIL_VK_ERR_HANDLE, "vkCmdBeginRenderPass was given a VkRenderPass or VkFramebuffer handle that is not live (Anvil code -20002, stale or foreign handle); the command buffer is now invalid and vkEndCommandBuffer will say so.")
     ProcedureReturn
   EndIf
-  If avkFbRp[fb] <> rp
-    avkCbFail(c, #ANVIL_VK_ERR_ARGS, "vkCmdBeginRenderPass was given a framebuffer that was not created for this render pass (Anvil code -20001, incompatible framebuffer); a framebuffer is compatible only with the render pass whose attachment description it was created against.")
+  If avkRenderPassSignatureEqual(@avkFbSignature[fb], @avkRpSignature[rp]) = 0
+    avkCbFail(c, #ANVIL_VK_ERR_ARGS, "vkCmdBeginRenderPass was given a framebuffer that was not created for this render pass (Anvil code -20001, incompatible framebuffer); the attachment compatibility descriptions must match, while load/store operations and layouts may differ.")
     ProcedureReturn
   EndIf
-  ; A framebuffer retains Vulkan handles, not authority over whichever
-  ; objects later reuse the same slots. Resolve both recorded generations
-  ; before reading the cached slots or attachment state.
-  If avkRpSlot(avkFbRpHandle[fb]) <> avkFbRp[fb] Or avkIvSlot(avkFbViewHandle[fb]) <> avkFbView[fb]
-    avkCbFail(c, #ANVIL_VK_ERR_STATE, "vkCmdBeginRenderPass was given a framebuffer whose render pass or attachment view has since been destroyed or replaced (Anvil code -20004, stale framebuffer dependency); rebuild the framebuffer from current live handles.")
+  ; The view remains a live dependency. The creation render pass does not:
+  ; compatibility was captured when the framebuffer was created.
+  If avkIvSlot(avkFbViewHandle[fb]) <> avkFbView[fb]
+    avkCbFail(c, #ANVIL_VK_ERR_STATE, "vkCmdBeginRenderPass was given a framebuffer whose attachment view has since been destroyed or replaced (Anvil code -20004, stale framebuffer dependency); rebuild the framebuffer from current live handles.")
     ProcedureReturn
   EndIf
-  If avkRpDev[rp] <> avkPoolDev[avkCmdPool[c]]
+  If avkRpDev[rp] <> avkPoolDev[avkCmdPool[c]] Or avkFbDev[fb] <> avkPoolDev[avkCmdPool[c]]
     avkCbFail(c, #ANVIL_VK_ERR_OWNER, "vkCmdBeginRenderPass was given a render pass that belongs to a different VkDevice from the command buffer's pool (Anvil code -20003, wrong parent); every object in one command buffer must share one device.")
     ProcedureReturn
   EndIf
@@ -2550,8 +2661,10 @@ Procedure AnvilVkCmdBeginRenderPass(commandBuffer.i, renderPass.i, framebuffer.i
     avkCbFail(c, #ANVIL_VK_ERR_UNSUPPORTED, "vkCmdBeginRenderPass was given a render area that is not the whole framebuffer (Anvil code -20005, unsupported render area); see above - the tile geometry covers the whole target.")
     ProcedureReturn
   EndIf
-  If clearCount <> 1 Or *pClearValues = 0
-    avkCbFail(c, #ANVIL_VK_ERR_ARGS, "vkCmdBeginRenderPass was given other than exactly one clear value (Anvil code -20001, clear value count mismatch); the render pass has one attachment whose loadOp is VK_ATTACHMENT_LOAD_OP_CLEAR, so it needs one and only one.")
+  ; Clear values are indexed by attachment. Extra array entries are legal;
+  ; this single-colour pass consumes only entry zero (VUID 00902).
+  If avkRpLoadColor[rp] = 0 And (clearCount < 1 Or *pClearValues = 0)
+    avkCbFail(c, #ANVIL_VK_ERR_ARGS, "vkCmdBeginRenderPass requires a clear value for attachment zero (Anvil code -20001, missing clear value); supply at least one value and a non-null array for VK_ATTACHMENT_LOAD_OP_CLEAR.")
     ProcedureReturn
   EndIf
   iv = avkFbView[fb]
@@ -2569,17 +2682,31 @@ Procedure AnvilVkCmdBeginRenderPass(commandBuffer.i, renderPass.i, framebuffer.i
     avkCbFail(c, #VK_ERROR_OUT_OF_HOST_MEMORY, "one command buffer referenced more images than Anvil can retain for a submission (VkResult -1, VK_ERROR_OUT_OF_HOST_MEMORY); this slice retains two images per command buffer.")
     ProcedureReturn
   EndIf
-  ; VkClearValue is a union; its colour arm is four binary32 components in
-  ; R, G, B, A order whatever the attachment's format is. The packing into
-  ; VK_FORMAT_B8G8R8A8_UNORM's byte order is exactly what
-  ; vkCmdClearColorImage does, and for the same reason.
-  red = avkUnorm8FromF32Bits(avkU32(*pClearValues))
-  green = avkUnorm8FromF32Bits(avkU32(*pClearValues + 4))
-  blue = avkUnorm8FromF32Bits(avkU32(*pClearValues + 8))
-  alpha = avkUnorm8FromF32Bits(avkU32(*pClearValues + 12))
-  avkCbClearWord[c] = (alpha << 24) | (red << 16) | (green << 8) | blue
+  ; A defined initial layout is a submission precondition even when CLEAR
+  ; replaces the pixels. Only UNDEFINED permits discarding the layout claim.
+  If avkRpInitialLayout[rp] <> #VK_IMAGE_LAYOUT_UNDEFINED
+    If avkRefClaim(c, k, avkRpInitialLayout[rp]) = 0
+      avkCbFail(c, #ANVIL_VK_ERR_STATE, "vkCmdBeginRenderPass disagrees with the attachment's recorded initial layout; no render pass was begun.")
+      ProcedureReturn
+    EndIf
+  EndIf
+  If avkRpLoadColor[rp] <> 0
+    avkCbClearWord[c] = 0
+  Else
+    ; VkClearValue is a union; its colour arm is four binary32 components in
+    ; R, G, B, A order whatever the attachment's format is. The packing into
+    ; VK_FORMAT_B8G8R8A8_UNORM's byte order is exactly what
+    ; vkCmdClearColorImage does, and for the same reason.
+    red = avkUnorm8FromF32Bits(avkU32(*pClearValues))
+    green = avkUnorm8FromF32Bits(avkU32(*pClearValues + 4))
+    blue = avkUnorm8FromF32Bits(avkU32(*pClearValues + 8))
+    alpha = avkUnorm8FromF32Bits(avkU32(*pClearValues + 12))
+    avkCbClearWord[c] = (alpha << 24) | (red << 16) | (green << 8) | blue
+  EndIf
+  avkCbLoadColor[c] = avkRpLoadColor[rp]
   avkCbFb[c] = fb
   avkCbFbHandle[c] = framebuffer
+  avkCbRpHandle[c] = renderPass
   avkCbRpActive[c] = 1
   avkRefCur[avkRefIndex(c, k)] = avkRpFinalLayout[rp]
 EndProcedure
@@ -2627,6 +2754,7 @@ Procedure AnvilVkCmdClearAttachments(commandBuffer.i, *attachment.VkClearAttachm
   bgra = (alpha << 24) | (red << 16) | (green << 8) | blue
   If avkCbDrawCount[c] = 0 And *rect\rect\offset\x = 0 And *rect\rect\offset\y = 0 And *rect\rect\extent\width = avkFbW[fb] And *rect\rect\extent\height = avkFbH[fb]
     avkCbClearWord[c] = bgra
+    avkCbLoadColor[c] = 0
     ProcedureReturn
   EndIf
   If (avkFbW[fb] % 2) <> 0 Or (avkFbH[fb] % 2) <> 0
@@ -3063,7 +3191,7 @@ Procedure AnvilVkCmdDraw(commandBuffer.i, vertexCount.i, instanceCount.i, firstV
     avkCbFail(c, #ANVIL_VK_ERR_STATE, "vkCmdDraw was called after its framebuffer was destroyed or replaced (Anvil code -20004, stale framebuffer reference); begin a new render pass against a current live framebuffer.")
     ProcedureReturn
   EndIf
-  If avkPipeRp[p] <> avkFbRp[fb]
+  If avkRenderPassSignatureEqual(@avkPipeSignature[p], @avkFbSignature[fb]) = 0
     avkCbFail(c, #ANVIL_VK_ERR_ARGS, "vkCmdDraw was called with a pipeline created for a different render pass from the one that is begun (Anvil code -20001, incompatible render pass); a pipeline may only be used inside a render pass compatible with the one it was created against.")
     ProcedureReturn
   EndIf
@@ -3163,7 +3291,7 @@ Procedure AnvilVkCmdDraw(commandBuffer.i, vertexCount.i, instanceCount.i, firstV
     EndIf
   EndIf
   If avkRecordedDrawAppend(c, firstVertex, vertexCount, vx, vy, vw, vh, sx, sy, sw, sh, 0, 0, 0, instanceCount, firstInstance) < 1
-    avkCbFail(c, #VK_ERROR_OUT_OF_HOST_MEMORY, "vkCmdDraw exhausted the shared 4096-entry recorded-draw pool (VkResult -1, VK_ERROR_OUT_OF_HOST_MEMORY); no partial draw was linked. Reset or free command buffers that own older draws before recording more.")
+    avkCbFail(c, #VK_ERROR_OUT_OF_HOST_MEMORY, "vkCmdDraw exhausted the shared recorded-draw pool (VkResult -1, VK_ERROR_OUT_OF_HOST_MEMORY); no partial draw was linked. Reset or free command buffers that own older draws before recording more.")
     ProcedureReturn
   EndIf
 EndProcedure
@@ -3276,7 +3404,7 @@ Procedure AnvilVkCmdDrawIndexed(commandBuffer.i, indexCount.i, instanceCount.i, 
     avkCbFail(c, #ANVIL_VK_ERR_STATE, "vkCmdDrawIndexed was called after its framebuffer was destroyed or replaced (Anvil code -20004, stale framebuffer reference); begin a new render pass.")
     ProcedureReturn
   EndIf
-  If avkPipeRp[p] <> avkFbRp[fb]
+  If avkRenderPassSignatureEqual(@avkPipeSignature[p], @avkFbSignature[fb]) = 0
     avkCbFail(c, #ANVIL_VK_ERR_ARGS, "vkCmdDrawIndexed used a pipeline incompatible with the active render pass (Anvil code -20001, incompatible render pass); bind a compatible pipeline.")
     ProcedureReturn
   EndIf
@@ -3379,7 +3507,7 @@ Procedure AnvilVkCmdDrawIndexed(commandBuffer.i, indexCount.i, instanceCount.i, 
     EndIf
   EndIf
   If avkRecordedDrawAppend(c, firstIndex, indexCount, vx, vy, vw, vh, sx, sy, sw, sh, avkCbIndexBuf[c], avkCbIndexOffset[c], avkCbIndexType[c], instanceCount, firstInstance) < 1
-    avkCbFail(c, #VK_ERROR_OUT_OF_HOST_MEMORY, "vkCmdDrawIndexed exhausted the shared 4096-entry recorded-draw pool (VkResult -1, VK_ERROR_OUT_OF_HOST_MEMORY); no partial draw was linked.")
+    avkCbFail(c, #VK_ERROR_OUT_OF_HOST_MEMORY, "vkCmdDrawIndexed exhausted the shared recorded-draw pool (VkResult -1, VK_ERROR_OUT_OF_HOST_MEMORY); no partial draw was linked.")
   EndIf
 EndProcedure
 
@@ -3593,9 +3721,9 @@ Procedure.i avkDrawPreflight(c.i)
       ProcedureReturn avkFault(#ANVIL_VK_ERR_STATE, "vkQueueSubmit found the recorded combined-image-sampler descriptor unwritten or stale (Anvil code -20004, sampled descriptor not ready); nothing was submitted.")
     EndIf
   EndIf
-  rp = avkRpSlot(avkFbRpHandle[fb])
+  rp = avkRpSlot(avkCbRpHandle[c])
   iv = avkIvSlot(avkFbViewHandle[fb])
-  If rp = 0 Or rp <> avkFbRp[fb] Or iv = 0 Or iv <> avkFbView[fb]
+  If rp = 0 Or iv = 0 Or iv <> avkFbView[fb]
     ProcedureReturn avkFault(#ANVIL_VK_ERR_STATE, "vkQueueSubmit was given a command buffer whose framebuffer dependencies have since been destroyed or replaced (Anvil code -20004, stale render pass or image view); re-record against a framebuffer built from current live handles.")
   EndIf
   k = 0
@@ -3646,6 +3774,7 @@ Procedure.i avkDrawSubmit(c.i)
   avkDrawRecord\height = avkImgH[img]
   avkDrawRecord\pitch = avkImgPitch[img]
   avkDrawRecord\clearBgra = avkCbClearWord[c]
+  avkDrawRecord\loadColor = avkCbLoadColor[c]
   avkDrawRecord\bindingCount = avkPipeBindCount[p]
   avkDrawRecord\bindings = @avkBindStage[0]
   k = 0
@@ -3733,9 +3862,9 @@ Procedure.i avkRenderClearPreflight(c.i)
   If fb = 0 Or fb <> avkCbFb[c]
     ProcedureReturn avkFault(#ANVIL_VK_ERR_STATE, "vkQueueSubmit found a clear-only render pass with a stale framebuffer (Anvil code -20004, stale framebuffer); nothing was submitted.")
   EndIf
-  rp = avkRpSlot(avkFbRpHandle[fb])
+  rp = avkRpSlot(avkCbRpHandle[c])
   iv = avkIvSlot(avkFbViewHandle[fb])
-  If rp = 0 Or rp <> avkFbRp[fb] Or iv = 0 Or iv <> avkFbView[fb]
+  If rp = 0 Or iv = 0 Or iv <> avkFbView[fb]
     ProcedureReturn avkFault(#ANVIL_VK_ERR_STATE, "vkQueueSubmit found a clear-only render pass with a stale render pass or image view (Anvil code -20004, stale framebuffer dependency); nothing was submitted.")
   EndIf
   image = avkIvImage[iv]
@@ -3753,6 +3882,7 @@ Procedure.i avkRenderClearPreflight(c.i)
   avkRenderClearView = iv
   avkRenderClearImage = img
   avkRenderClearWord = avkCbClearWord[c]
+  avkRenderClearLoadColor = avkCbLoadColor[c]
   avkRenderClearPreparedCb = c
   ProcedureReturn #ANVIL_VK_OK
 EndProcedure
@@ -3790,7 +3920,7 @@ Procedure.i avkRenderClearSubmit()
     ProcedureReturn -1
   EndIf
   img = avkRenderClearImage
-  ProcedureReturn avkBackendSubmitClear(avkHeapBase + avkMemOffset[avkImgMemSlot[img]] + avkImgMemOffset[img], avkImgSize[img], avkImgW[img], avkImgH[img], avkImgPitch[img], avkRenderClearWord)
+  ProcedureReturn avkBackendSubmitClear(avkHeapBase + avkMemOffset[avkImgMemSlot[img]] + avkImgMemOffset[img], avkImgSize[img], avkImgW[img], avkImgH[img], avkImgPitch[img], avkRenderClearWord, avkRenderClearLoadColor)
 EndProcedure
 
 Procedure.i avkFlightVertexIndex(draw.i, binding.i)
@@ -3798,14 +3928,20 @@ Procedure.i avkFlightVertexIndex(draw.i, binding.i)
 EndProcedure
 
 Procedure.i avkDrawSetMatchesPipe(set.i, p.i)
-  Define k.i
+  Define k.i, ds.i, descriptorBase.i, pipelineBase.i
   If avkPipeSetCount[p] = 0 : ProcedureReturn 1 : EndIf
-  If AnvilVkDescriptorSetDeviceSlot(set) <> avkPipeDev[p] : ProcedureReturn 0 : EndIf
-  If AnvilVkDescriptorSetSchemaCount(set) <> avkPipeBindingCount[p] : ProcedureReturn 0 : EndIf
+  ; Resolve this generation once for this comparison, never across submits.
+  ; The immutable schema lives beside the already validated descriptor slot.
+  ds = avkDsSlot(set)
+  If ds = 0 : ProcedureReturn 0 : EndIf
+  If avkDsDev[ds] <> avkPipeDev[p] : ProcedureReturn 0 : EndIf
+  If avkDsCount[ds] <> avkPipeBindingCount[p] : ProcedureReturn 0 : EndIf
+  descriptorBase = ds * #ANVIL_VK_MAX_SET_BINDINGS
+  pipelineBase = p * #ANVIL_VK_MAX_SET_BINDINGS
   k = 0
   While k < avkPipeBindingCount[p]
-    If AnvilVkDescriptorSetSchemaType(set, k) <> avkPipeBindingType[(p * #ANVIL_VK_MAX_SET_BINDINGS) + k] : ProcedureReturn 0 : EndIf
-    If AnvilVkDescriptorSetSchemaStages(set, k) <> avkPipeBindingStages[(p * #ANVIL_VK_MAX_SET_BINDINGS) + k] : ProcedureReturn 0 : EndIf
+    If avkDsType[descriptorBase + k] <> avkPipeBindingType[pipelineBase + k] : ProcedureReturn 0 : EndIf
+    If avkDsStages[descriptorBase + k] <> avkPipeBindingStages[pipelineBase + k] : ProcedureReturn 0 : EndIf
     k = k + 1
   Wend
   ProcedureReturn 1
@@ -3816,6 +3952,7 @@ EndProcedure
 ; counter, fence, semaphore, command state and backend job remains untouched
 ; until every generation-tagged handle in the list has resolved successfully.
 Procedure.i avkDrawListPreflight(c.i)
+  Define sampleRefs.AnvilVkSampledImageReferences
   Define count.i
   Define draw.i
   Define slot.i
@@ -3870,9 +4007,9 @@ Procedure.i avkDrawListPreflight(c.i)
   If fb = 0 Or fb <> avkCbFb[c]
     ProcedureReturn avkFault(#ANVIL_VK_ERR_STATE, "vkQueueSubmit was given a draw list whose framebuffer has since been destroyed or replaced (Anvil code -20004, stale framebuffer); nothing was submitted.")
   EndIf
-  rp = avkRpSlot(avkFbRpHandle[fb])
+  rp = avkRpSlot(avkCbRpHandle[c])
   iv = avkIvSlot(avkFbViewHandle[fb])
-  If rp = 0 Or rp <> avkFbRp[fb] Or iv = 0 Or iv <> avkFbView[fb]
+  If rp = 0 Or iv = 0 Or iv <> avkFbView[fb]
     ProcedureReturn avkFault(#ANVIL_VK_ERR_STATE, "vkQueueSubmit was given a draw list whose render pass or attachment view has since been destroyed or replaced (Anvil code -20004, stale framebuffer dependency); nothing was submitted.")
   EndIf
   image = avkIvImage[iv]
@@ -3924,6 +4061,7 @@ Procedure.i avkDrawListPreflight(c.i)
       avkFlightDraw[draw]\width = avkImgW[img] : avkFlightDraw[draw]\height = avkImgH[img]
       avkFlightDraw[draw]\pitch = avkImgPitch[img]
       avkFlightDraw[draw]\clearBgra = avkCbClearWord[c]
+    avkFlightDraw[draw]\loadColor = avkCbLoadColor[c]
       avkFlightDraw[draw]\bindingCount = 0 : avkFlightDraw[draw]\bindings = 0
       avkFlightDraw[draw]\instanceCount = 0 : avkFlightDraw[draw]\firstInstance = 0
       avkFlightDraw[draw]\sampleMask = 0 : avkFlightDraw[draw]\sampledImage = 0
@@ -3943,7 +4081,7 @@ Procedure.i avkDrawListPreflight(c.i)
     If p = 0 Or avkPipeDev[p] <> avkFbDev[fb]
       ProcedureReturn avkFault(#ANVIL_VK_ERR_STATE, "vkQueueSubmit found a recorded draw whose pipeline is stale or belongs to another device (Anvil code -20004, stale pipeline); nothing was submitted.")
     EndIf
-    If avkPipeRp[p] <> avkFbRp[fb]
+    If avkRenderPassSignatureEqual(@avkPipeSignature[p], @avkFbSignature[fb]) = 0
       ProcedureReturn avkFault(#ANVIL_VK_ERR_STATE, "vkQueueSubmit found a recorded draw whose pipeline is incompatible with the list's render pass (Anvil code -20004, incompatible render pass); nothing was submitted.")
     EndIf
 
@@ -3980,6 +4118,7 @@ Procedure.i avkDrawListPreflight(c.i)
     avkFlightDraw[draw]\height = avkImgH[img]
     avkFlightDraw[draw]\pitch = avkImgPitch[img]
     avkFlightDraw[draw]\clearBgra = avkCbClearWord[c]
+    avkFlightDraw[draw]\loadColor = avkCbLoadColor[c]
     avkFlightDraw[draw]\bindingCount = avkPipeBindCount[p]
     baseIdx = draw * #ANVIL_VK_MAX_BINDINGS
     avkFlightDraw[draw]\bindings = @avkFlightBinding[baseIdx]
@@ -4163,12 +4302,12 @@ Procedure.i avkDrawListPreflight(c.i)
     EndIf
 
     If avkPipeUsesSample[p] <> 0
-      If AnvilVkDescriptorSetSampledImage(set, avkPipeSampleBinding[p], @avkFlightSample[draw]) = 0
+      If AnvilVkDescriptorSetSampledImageSnapshot(set, avkPipeSampleBinding[p], @avkFlightSample[draw], @sampleRefs) = 0
         ProcedureReturn avkFault(#ANVIL_VK_ERR_STATE, "vkQueueSubmit found a recorded sampled descriptor unwritten, stale or in the wrong layout (Anvil code -20004, sampled descriptor not ready); nothing was submitted.")
       EndIf
-      image = AnvilVkDescriptorSetSampledImageHandle(set, avkPipeSampleBinding[p])
-      sampler = AnvilVkDescriptorSetSamplerHandle(set, avkPipeSampleBinding[p])
-      view = AnvilVkDescriptorSetImageViewHandle(set, avkPipeSampleBinding[p])
+      image = sampleRefs\image
+      sampler = sampleRefs\sampler
+      view = sampleRefs\view
       simg = avkImgSlot(image)
       samp = avkSamplerSlot(sampler)
       siv = avkIvSlot(view)

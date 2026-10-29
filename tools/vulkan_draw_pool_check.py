@@ -24,7 +24,7 @@ HERE = pathlib.Path(__file__).resolve().parent
 ROOT = HERE.parent
 VULKAN = ROOT / "Anvil" / "Graphics" / "Vulkan"
 COMMAND = VULKAN / "vk_command.pbi"
-GATE = VULKAN / "Tests" / "vulkan_draw_pool_gate.pi4"
+GATE = ROOT / 'RaspberryPi4/Tests/Vulkan/vulkan_draw_pool_gate.pi4'
 
 DEFAULT_COMPILER = pathlib.Path(
     r"C:\Embedded Compiler\PureBasicCode\OpenGl Work\ArduinoBasic\PureMetalForge.exe"

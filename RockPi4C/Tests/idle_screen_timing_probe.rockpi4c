@@ -1,3 +1,5 @@
+XIncludeFile "Anvil/Hal/aarch64_counter.pbi"
+
 ; Build 144 only: bounded empty-path timing of resident RockScreenService.
 ; Its address and globals come from build/rockpi4c/anvil-flat.img.sym.
 ; The service is called through the A64 procedure ABI with a private stack.
@@ -18,19 +20,12 @@ ProcedureNaked.i ScreenProbeEl()
   ENDASM
 EndProcedure
 
-ProcedureNaked.i ScreenProbeHz()
-  ASM
-    mrs x0, cntfrq_el0
-    ret
-  ENDASM
+Procedure.i ScreenProbeHz()
+  ProcedureReturn A64CounterFrequency()
 EndProcedure
 
-ProcedureNaked.i ScreenProbeTicks()
-  ASM
-    isb
-    mrs x0, cntpct_el0
-    ret
-  ENDASM
+Procedure.i ScreenProbeTicks()
+  ProcedureReturn A64CounterReadOrdered()
 EndProcedure
 
 ProcedureNaked ScreenProbeCall()

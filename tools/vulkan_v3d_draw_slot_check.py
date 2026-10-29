@@ -24,8 +24,8 @@ from pmf_compiler import resolve_compiler
 
 HERE = pathlib.Path(__file__).resolve().parent
 ROOT = HERE.parent
-GATE = ROOT / "Anvil" / "Graphics" / "Vulkan" / "Tests" / "vulkan_v3d_draw_slot_gate.pi4"
-EMITTER = ROOT / "Anvil" / "Graphics" / "Vulkan" / "vk_v3d_shader.pi4"
+GATE = ROOT / 'RaspberryPi4/Tests/Vulkan/vulkan_v3d_draw_slot_gate.pi4'
+EMITTER = ROOT / 'RaspberryPi4/Lib/Vulkan/vk_v3d_shader.pi4'
 DEFAULT_COMPILER = pathlib.Path(
     r"C:\Embedded Compiler\PureBasicCode\OpenGl Work\ArduinoBasic\PureMetalForge.exe"
 )

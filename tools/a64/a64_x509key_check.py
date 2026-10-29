@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Executable gate for the X.509 end-entity key buffer's own bound on
-AArch64 - XkeyFits in RaspberryPi4/Lib/x509.pi4.
+AArch64 - XkeyFits in Anvil/Crypto/x509.pbi.
 
 WHAT THIS PROVES, AND WHY IT IS SEPARATE FROM a64_x509_check.py
 
@@ -89,7 +89,7 @@ from a64_interp import A64, attach_symbols  # noqa: E402
 PMFC = os.environ.get("PMF_COMPILER") or "PureMetalForge.exe"  # rebound from --compiler
 # Every compile resolves includes from THIS tree only.
 BUILD_ENV = dict(os.environ, PMF_ROOT=str(ROOT))
-X509 = ROOT / "RaspberryPi4" / "Lib" / "x509.pi4"
+X509 = ROOT / "Anvil" / "Crypto" / "x509.pbi"
 PROBE = (ROOT / "RaspberryPi4" / "Examples" / "Diagnostics"
          / "pi4X509KeyBoundProbe.pi4")
 WORK = ROOT / "_work" / "x509key"
@@ -308,7 +308,7 @@ def stage_sabotage() -> tuple[pathlib.Path, pathlib.Path, str]:
     sab_path.write_text(sab, encoding="utf-8")
 
     probe = PROBE.read_text(encoding="utf-8")
-    inc = 'XIncludeFile "RaspberryPi4/Lib/x509.pi4"'
+    inc = 'XIncludeFile "Anvil/Crypto/x509.pbi"'
     if probe.count(inc) != 1:
         raise SystemExit("the probe does not include x509.pi4 exactly once")
     probe = probe.replace(inc, 'XIncludeFile "_work/x509key/x509_sab.pi4"')
@@ -317,7 +317,7 @@ def stage_sabotage() -> tuple[pathlib.Path, pathlib.Path, str]:
 
     diff = "\n".join(difflib.unified_diff(
         orig.splitlines(), sab.splitlines(),
-        fromfile="RaspberryPi4/Lib/x509.pi4",
+        fromfile="Anvil/Crypto/x509.pbi",
         tofile="_work/x509key/x509_sab.pi4", lineterm="", n=1))
     return sab_path, probe_path, diff
 
@@ -408,7 +408,7 @@ def main(argv=None) -> int:
     print("=" * 70)
     print(" THE X.509 END-ENTITY KEY BUFFER'S BOUND, ON AArch64")
     print("=" * 70)
-    print("  library:  RaspberryPi4/Lib/x509.pi4  (XkeyFits, "
+    print("  library:  Anvil/Crypto/x509.pbi  (XkeyFits, "
           "#X509ERR_KEY_BOUNDS 901)")
     print("  probe:    RaspberryPi4/Examples/Diagnostics/"
           "pi4X509KeyBoundProbe.pi4")

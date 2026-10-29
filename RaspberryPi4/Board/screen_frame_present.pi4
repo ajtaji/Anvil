@@ -1,0 +1,93 @@
+; DSI display ownership for completed physical frames. This is not a WSI API.
+; The source is copied into a fixed inactive display buffer. A request remains
+; owned until DISPLACT confirms its list; timeout never cancels a hardware request.
+Global gScrFrameOwned.i
+; Optional owner-supplied qualified wait; zero keeps the bounded polling path.
+Global *gScrFrameWaitIdle = 0
+Global gScrFramePresentN.i, gScrFrameRestoreN.i, gScrFrameTimeoutN.i
+
+Procedure.i ScrFrameFront()
+  Define front.i
+  If DisplayMemorySafe() = 0 Or gScrSrc <> #SCR_SRC_DSI Or gScrDsiUp = 0
+    ProcedureReturn 0
+  EndIf
+  If HvsIsUp() = 0 Or HvsFlipPending() <> 0
+    ProcedureReturn 0
+  EndIf
+  If HvsWidth() <> #MON_FB_PANEL_W Or HvsHeight() <> #MON_FB_PANEL_H
+    ProcedureReturn 0
+  EndIf
+  front = HvsFb()
+  If front <> #MON_FB_SCAN And front <> #MON_FB_DRAW : ProcedureReturn 0 : EndIf
+  ProcedureReturn front
+EndProcedure
+
+Procedure.i ScrFrameBack()
+  Define front.i
+  front = ScrFrameFront()
+  If front = #MON_FB_SCAN : ProcedureReturn #MON_FB_DRAW : EndIf
+  If front = #MON_FB_DRAW : ProcedureReturn #MON_FB_SCAN : EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; A partial update first clones the confirmed front into its inactive peer.
+; No caller may damage the front just to keep the two buffers synchronized.
+Procedure.i ScrFrameCloneBack()
+  Define front.i, back.i, bytes.i
+  front = ScrFrameFront() : back = ScrFrameBack()
+  If front = 0 Or back = 0 Or gDma = 0 Or DmaReady() = 0 : ProcedureReturn 0 : EndIf
+  bytes = ScrGpuBytes()
+  DmaCacheRange(back, bytes)
+  If DmaCopy(back, front, bytes) = 0 : ProcedureReturn 0 : EndIf
+  DmaCacheRange(back, bytes)
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i ScrFrameWait()
+  Define deadline.i
+  deadline = Ticks() + TickHz() / 2
+  While HvsFlipResolve() = 0
+    If Ticks() > deadline
+      gScrFrameTimeoutN = gScrFrameTimeoutN + 1
+      ProcedureReturn 0
+    EndIf
+    If *gScrFrameWaitIdle <> 0
+      gScrFrameWaitIdle()
+    EndIf
+  Wend
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i ScrFramePublish(back.i)
+  If back = 0 Or back <> ScrFrameBack() : ProcedureReturn 0 : EndIf
+  ; Keep both fixed buffers away from framebuffer writers even if completion
+  ; later refuses. These flags are ownership, not permission to retry a flip.
+  gScrFrameOwned = 1
+  If HvsFlipBegin(back, HvsHFlip(), HvsVFlip()) = 0 : ProcedureReturn 0 : EndIf
+  If ScrFrameWait() = 0 : ProcedureReturn 0 : EndIf
+  If HvsFb() <> back Or HvsFlipPending() <> 0 : ProcedureReturn 0 : EndIf
+  gScrFramePresentN = gScrFramePresentN + 1
+  ProcedureReturn 1
+EndProcedure
+
+; Return scanout to its ordinary fixed buffer before another renderer writes.
+; A pending flip remains quarantined; it cannot be made safe by freeing Vulkan.
+Procedure.i ScrFrameRestore()
+  Define front.i, bytes.i
+  If gScrFrameOwned = 0 : ProcedureReturn 1 : EndIf
+  front = ScrFrameFront()
+  If front = 0 : ProcedureReturn 0 : EndIf
+  If front <> #MON_FB_SCAN
+    If gDma = 0 Or DmaReady() = 0 : ProcedureReturn 0 : EndIf
+    bytes = ScrGpuBytes()
+    DmaCacheRange(#MON_FB_SCAN, bytes)
+    If DmaCopy(#MON_FB_SCAN, front, bytes) = 0 : ProcedureReturn 0 : EndIf
+    DmaCacheRange(#MON_FB_SCAN, bytes)
+    If HvsFlipBegin(#MON_FB_SCAN, HvsHFlip(), HvsVFlip()) = 0 : ProcedureReturn 0 : EndIf
+    If ScrFrameWait() = 0 : ProcedureReturn 0 : EndIf
+    If HvsFb() <> #MON_FB_SCAN Or HvsFlipPending() <> 0 : ProcedureReturn 0 : EndIf
+  EndIf
+  gScrFrameOwned = 0
+  gScrFrameRestoreN = gScrFrameRestoreN + 1
+  ProcedureReturn 1
+EndProcedure

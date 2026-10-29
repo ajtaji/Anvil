@@ -1,3 +1,5 @@
+XIncludeFile "Anvil/Hal/aarch64_counter.pbi"
+
 ; Returning PL330 scroll-slice timing proof in private payload staging RAM.
 ; The resident payload command arms the physical deadman before entry.
 ; pmf:target rockpi4c
@@ -10,19 +12,12 @@
 #PROOF_SMALL = 8192
 Global scroll_probe_guard.i
 
-ProcedureNaked.i ScrollProbeTicks()
-  ASM
-    isb
-    mrs x0, cntpct_el0
-    ret
-  ENDASM
+Procedure.i ScrollProbeTicks()
+  ProcedureReturn A64CounterReadOrdered()
 EndProcedure
 
-ProcedureNaked.i ScrollProbeHz()
-  ASM
-    mrs x0, cntfrq_el0
-    ret
-  ENDASM
+Procedure.i ScrollProbeHz()
+  ProcedureReturn A64CounterFrequency()
 EndProcedure
 
 ProcedureNaked.i ScrollProbeDmaLarge()

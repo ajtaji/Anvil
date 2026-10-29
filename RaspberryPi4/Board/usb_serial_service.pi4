@@ -1,0 +1,19 @@
+; Pi USB host adapter for the shared serial transport (Pi 4 and Pi 5).
+XIncludeFile "Anvil/Services/usb_serial.pbi"
+Procedure.i HwUsbSerialDispatch(op.i,arg.i,count.i)
+  Select op
+    Case #USB_SERIAL_KIND : ProcedureReturn UsbSerKind()
+    Case #USB_SERIAL_KIND_TEXT : ProcedureReturn UsbSerKindText(arg)
+    Case #USB_SERIAL_NEEDS_BAUD : ProcedureReturn UsbSerNeedsBaud()
+    Case #USB_SERIAL_SET_BAUD : ProcedureReturn UsbSerSetBaud(arg)
+    Case #USB_SERIAL_ERROR : ProcedureReturn UsbSerError()
+    Case #USB_SERIAL_FIND : ProcedureReturn UsbSerFind()
+    Case #USB_SERIAL_READ : ProcedureReturn UsbSerRead(arg,count)
+    Case #USB_SERIAL_WRITE : ProcedureReturn UsbSerWrite(arg,count)
+    Case #USB_SERIAL_VID : ProcedureReturn UsbSerVid()
+    Case #USB_SERIAL_PID : ProcedureReturn UsbSerPid()
+    Case #USB_SERIAL_SLOT : ProcedureReturn UsbSerSlot()
+  EndSelect
+  ProcedureReturn -1
+EndProcedure
+UsbSerialBind(@HwUsbSerialDispatch)

@@ -1,0 +1,84 @@
+; Returning RAM test of the shared serial service and actual Pi adapter.
+; Driver doubles exercise routing and refusals; no USB device is claimed tested.
+Global testCalls.i,testBaud.i,testReadFailure.i,testWritten.i
+Procedure.i UsbSerKind() : testCalls+1 : ProcedureReturn 2 : EndProcedure
+Procedure.i UsbSerKindText(kind.i) : testCalls+1 : If kind=2 : ProcedureReturn "test serial" : EndIf : ProcedureReturn "other" : EndProcedure
+Procedure.i UsbSerNeedsBaud() : testCalls+1 : ProcedureReturn 1 : EndProcedure
+Procedure.i UsbSerSetBaud(baud.i) : testCalls+1 : testBaud=baud : ProcedureReturn 1 : EndProcedure
+Procedure.i UsbSerError() : testCalls+1 : ProcedureReturn 5 : EndProcedure
+Procedure.i UsbSerFind() : testCalls+1 : ProcedureReturn 1 : EndProcedure
+Procedure.i UsbSerRead(*dst,capacity.i)
+ testCalls+1
+ If testReadFailure<>0 : ProcedureReturn -1 : EndIf
+ If capacity<2 : ProcedureReturn 0 : EndIf
+ PokeA(*dst,65) : PokeA(*dst+1,66) : ProcedureReturn 2
+EndProcedure
+Procedure.i UsbSerWrite(*src,count.i) : testCalls+1 : testWritten=PeekA(*src) : ProcedureReturn count : EndProcedure
+Procedure.i UsbSerVid() : testCalls+1 : ProcedureReturn $1234 : EndProcedure
+Procedure.i UsbSerPid() : testCalls+1 : ProcedureReturn $ABCD : EndProcedure
+Procedure.i UsbSerSlot() : testCalls+1 : ProcedureReturn 3 : EndProcedure
+XIncludeFile "RaspberryPi4/Board/usb_serial_service.pi4"
+Global testChecks.i,testFailures.i
+Global Dim testBuffer.a[8]
+Procedure SerialCheck(actual.i,expected.i)
+ PokeI($E1C00040+testChecks*16,actual)
+ PokeI($E1C00048+testChecks*16,expected)
+ testChecks+1
+ If actual<>expected : testFailures+1 : EndIf
+EndProcedure
+Procedure.i AlternateSerial(op.i,arg.i,count.i)
+ If op=#USB_SERIAL_KIND : ProcedureReturn 9 : EndIf
+ ProcedureReturn -1
+EndProcedure
+Procedure.i Main(services.i)
+ Protected i.i,before.i
+ For i=0 To 2047 : PokeA($E1C00000+i,0) : Next
+ SerialCheck(UsbSerialAvailable(),1)
+ UsbSerialBind(0)
+ SerialCheck(UsbSerialAvailable(),0)
+ SerialCheck(UsbSerialKind(),0)
+ SerialCheck(PeekA(UsbSerialKindText(0)),117)
+ SerialCheck(UsbSerialNeedsBaud(),0)
+ SerialCheck(UsbSerialSetBaud(9600),0)
+ SerialCheck(UsbSerialError(),1)
+ SerialCheck(UsbSerialFind(),0)
+ SerialCheck(UsbSerialRead(@testBuffer[0],8),-1)
+ SerialCheck(UsbSerialWrite(@testBuffer[0],8),-1)
+ SerialCheck(UsbSerialVid(),0) : SerialCheck(UsbSerialPid(),0) : SerialCheck(UsbSerialSlot(),0)
+ SerialCheck(testCalls,0)
+ UsbSerialBind(@HwUsbSerialDispatch)
+ SerialCheck(UsbSerialAvailable(),1)
+ SerialCheck(UsbSerialKind(),2)
+ SerialCheck(PeekA(UsbSerialKindText(2)),116)
+ SerialCheck(PeekA(UsbSerialKindText(9)),111)
+ SerialCheck(UsbSerialNeedsBaud(),1)
+ SerialCheck(UsbSerialSetBaud(115200),1)
+ SerialCheck(testBaud,115200)
+ SerialCheck(UsbSerialError(),5) : SerialCheck(UsbSerialFind(),1)
+ SerialCheck(UsbSerialVid(),$1234) : SerialCheck(UsbSerialPid(),$ABCD) : SerialCheck(UsbSerialSlot(),3)
+ For i=0 To 7 : testBuffer[i]=99 : Next
+ SerialCheck(UsbSerialRead(@testBuffer[0],8),2)
+ SerialCheck(testBuffer[0],65) : SerialCheck(testBuffer[1],66) : SerialCheck(testBuffer[2],99)
+ SerialCheck(UsbSerialWrite(@testBuffer[0],2),2)
+ SerialCheck(testWritten,65)
+ testReadFailure=1
+ SerialCheck(UsbSerialRead(@testBuffer[0],8),-1)
+ before=testCalls
+ SerialCheck(UsbSerialRead(0,8),-1)
+ SerialCheck(UsbSerialRead(@testBuffer[0],0),-1)
+ SerialCheck(UsbSerialRead(@testBuffer[0],-1),-1)
+ SerialCheck(UsbSerialWrite(0,8),-1)
+ SerialCheck(UsbSerialWrite(@testBuffer[0],0),-1)
+ SerialCheck(UsbSerialSetBaud(0),0)
+ SerialCheck(UsbSerialSetBaud(-1),0)
+ SerialCheck(testCalls,before)
+ SerialCheck(HwUsbSerialDispatch(99,0,0),-1)
+ SerialCheck(testBuffer[0],65) : SerialCheck(testBuffer[1],66) : SerialCheck(testBuffer[2],99)
+ UsbSerialBind(@AlternateSerial)
+ SerialCheck(UsbSerialKind(),9)
+ UsbSerialBind(0)
+ SerialCheck(UsbSerialKind(),0)
+ PokeI($E1C00000,$55535331) : PokeI($E1C00008,testChecks) : PokeI($E1C00010,testFailures)
+ PokeI($E1C00018,$454E4421)
+ ProcedureReturn testFailures
+EndProcedure

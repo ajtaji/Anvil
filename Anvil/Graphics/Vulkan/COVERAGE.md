@@ -3,10 +3,17 @@
 The schema compatibility target is Vulkan 1.0. It is not an implementation or
 conformance claim. Vocabulary is derived from the official Khronos
 `Vulkan-Headers` tag `v1.4.350`, commit
-`a33416ed2ce6bf8ef48b4eda821825f66d1850d3`. The raw
+`8864cdc896bbc2a9b6eb36b3218fc9ef57908d77`. The raw
 `registry/vk.xml` SHA-256 is
 `50BD8C0F316EABF73D1C5FE3ADD2D89EAA480DBDA9282C12C289E80E9D081E08`.
 The registry is dual licensed Apache-2.0 OR MIT.
+
+The annotated tag object is `a33416ed2ce6bf8ef48b4eda821825f66d1850d3`; it is not the raw-file commit.
+Use `tools/fetch_vulkan_registry.py --out <vk.xml>` to download the exact
+commit-pinned input with size/SHA-256 verification. The original checksum is
+unchanged. The tag URL and resolved commit URL were independently fetched and
+compared byte for byte; the XML is an external build input, not vendored here.
+
 
 `../../../docs/VULKAN_COMPATIBILITY_STATUS.md` holds the authoritative
 entry-point table and the cross-layer inventory. `ROADMAP.md` holds the
@@ -30,9 +37,9 @@ currently amounts to and where the files are.
 | `vk_backend_test.pbi` | The explicit test backend: state and a call log, **no GPU and no pixels ever written**. |
 | `vk_descriptor.pbi` | `VkDescriptorSetLayout`, `VkDescriptorPool` and `VkDescriptorSet` for dense one- or two-binding schemas containing uniform buffers, bounded combined image samplers, or one of each. Pools sum duplicate input rows into checked per-type capacities; allocation, copied immutable schemas, independent writes and live resolution into closed backend records are transactional. |
 | `vk_interp_expect.pbi` | What an interpolated varying must be at a named pixel, in exact integers. Target neutral, no floating point, and no hardware. |
-| `vk_v3d_shader.pi4` | The Pi 4 QPU emitter for the accepted shader plans, including the V3D 4.2 TMU general vec4 load used by a uniform-buffer descriptor and the bounded combined-sampler texture request. BGRA8 sampling uses the format table's Z,Y,X,W logical swizzle; identity swizzle is a measured red/blue reversal, not an alternative. |
-| `vk_v3d_backend.pi4` | The real Pi 4 backend: validated full clears, bounded partial attachment clears and ordered draw lists lowered to one V3D bin/render transaction through Neon, including transition-cached per-draw `CLIP_WINDOW`, blend and varying state; bounded raster-to-`UIF_NO_XOR` uploads, linear-to-optimal image copies, and `UIF_NO_XOR`-to-`UIF_NO_XOR` whole-image copies lowered to the TFU; and buffer copies/fills/updates plus linear image copies/readbacks through guarded DMA. Its bounded optimal-to-linear partial `vkCmdCopyImage` detile path passed the 5×5 edge-tail Pi 4 proof; see `docs/evidence/vulkan-partial-optimal-linear-pi4-20260930/README.md`. A composition without DMA refuses those transfers rather than copying pixels on the CPU. Mapped ranges are validated/coalesced and handed to the V3D cache manager as one barrier batch. Partial attachment clears require even framebuffer dimensions; the full pre-draw load-clear path supports odd dimensions. |
-| `vk_v3d_texture.pi4` | The Pi 4 backend implements exact raw-four-byte TFU copies from raster staging or a level-zero `UIF_NO_XOR` source to a level-zero `UIF_NO_XOR` destination, reached through validated Vulkan image-transfer commands, including whole linear-to-optimal `vkCmdCopyImage`. The separate bounded optimal-to-optimal partial path uses guarded DMA. The 2026-09-30 Pi 4 proof matched all 16 copied texels, preserved 240 untouched texels, and passed 64 padding and 96 guard checks. TFU stayed at 2, DMA advanced 0→1 and backend jobs 2→3; a later full readback advanced DMA 1→17. An unaligned request returned `-20005` without extra transfer work. See ``docs/evidence/vulkan-partial-optimal-copy-pi4-20260930/README.md`. |
+| `RaspberryPi4/Lib/Vulkan/vk_v3d_shader.pi4` | The Pi 4 QPU emitter for the accepted shader plans, including the V3D 4.2 TMU general vec4 load used by a uniform-buffer descriptor and the bounded combined-sampler texture request. BGRA8 sampling uses the format table's Z,Y,X,W logical swizzle; identity swizzle is a measured red/blue reversal, not an alternative. |
+| `RaspberryPi4/Lib/Vulkan/vk_v3d_backend.pi4` | The real Pi 4 backend: validated full clears, bounded partial attachment clears and ordered draw lists lowered to one V3D bin/render transaction through Neon, including transition-cached per-draw `CLIP_WINDOW`, blend and varying state; bounded raster-to-`UIF_NO_XOR` uploads, linear-to-optimal image copies, and `UIF_NO_XOR`-to-`UIF_NO_XOR` whole-image copies lowered to the TFU; and buffer copies/fills/updates plus linear image copies/readbacks through guarded DMA. Its bounded optimal-to-linear partial `vkCmdCopyImage` detile path passed the 5×5 edge-tail Pi 4 proof; see `docs/evidence/vulkan-partial-optimal-linear-pi4-20260930/README.md`. A composition without DMA refuses those transfers rather than copying pixels on the CPU. Mapped ranges are validated/coalesced and handed to the V3D cache manager as one barrier batch. Partial attachment clears require even framebuffer dimensions; the full pre-draw load-clear path supports odd dimensions. |
+| `RaspberryPi4/Lib/Vulkan/vk_v3d_texture.pi4` | The Pi 4 backend implements exact raw-four-byte TFU copies from raster staging or a level-zero `UIF_NO_XOR` source to a level-zero `UIF_NO_XOR` destination, reached through validated Vulkan image-transfer commands, including whole linear-to-optimal `vkCmdCopyImage`. The separate bounded optimal-to-optimal partial path uses guarded DMA. The 2026-09-30 Pi 4 proof matched all 16 copied texels, preserved 240 untouched texels, and passed 64 padding and 96 guard checks. TFU stayed at 2, DMA advanced 0→1 and backend jobs 2→3; a later full readback advanced DMA 1→17. An unaligned request returned `-20005` without extra transfer work. See ``docs/evidence/vulkan-partial-optimal-copy-pi4-20260930/README.md`. |
 
 Exactly one backend file is linked per program. There is no run-time
 registration, so a build with none fails to link and a build with two fails to
@@ -120,7 +127,7 @@ path - a proof of the path and not of interpolation.
 
 That statement describes the first 2026-09-11 slice. The current path retains
 the verified module as immutable typed SSA IR and lowers straight-line
-binary32 `FAdd`/`FMul` graphs to V3D 4.2. It is still bounded: no general
+binary32 `FAdd`/`FSub`/`FMul` graphs to V3D 4.2. It is still bounded: no general
 control flow, phi, calls, conversions, optimizer or scheduler are claimed,
 and everything outside the declared IR/lowerer contract is refused.
 
@@ -295,7 +302,7 @@ pass, but it has not been sent while another lane owns the shared Pi 4.
 
 ## Next real backend layers
 
-`neon_vk_chrome.pi4` now implements the first engine-conversion layer. Its
+`neon_vk_chrome.pbi` now implements the first engine-conversion layer. Its
 all-or-none hook keeps the existing widget calls unchanged while persistent
 Vulkan resources translate boxes, atlas text and clip operations into ordered
 draws. The real-widget scene is desk-proved at 109 quads, 47 draws, 654 vertices
@@ -326,7 +333,7 @@ the new sprite API. Broader HDMI/DSI/rotation/resize coverage remains. After
 that, the broader backend stages are
 per-object GPU virtual addressing and residency above
 today's single window, arithmetic beyond the current straight-line binary32
-`FAdd`/`FMul` typed-IR subset, broader optimal-image shapes and transfer commands beyond the proved
+`FAdd`/`FSub`/`FMul` typed-IR subset, broader optimal-image shapes and transfer commands beyond the proved
 whole-image copy, broader immutable pipeline state, command lowering into V3D
 bin/render jobs with dependencies, interrupt-driven completion so submission is
 genuinely asynchronous, and then WSI against Anvil's existing HDMI/DSI present
@@ -486,3 +493,452 @@ Compact32-byte line records work in the isolated public Vulkan proof; production
 Neon still uses its prior144-byte lowering. Full native line/outline capacity
 and integration remain open, as does the wider high-register stage/mode issue.
 No throughput or full engine/Vulkan completion claim follows from this proof.
+
+
+## Board test ownership - 26 October 2026
+
+Board-specific compositions now belong under each board Tests/Vulkan tree, while portable state fixtures remain in the shared tree. The 61 exact moved paths, caller audit scope, five compiled-image comparisons across four targets, retained failure and corrected physical canvas-spy run are recorded in `docs/evidence/vulkan-board-test-ownership-20261026/`. This does not extend backend hardware coverage.
+
+
+## Driver ownership - 27 October 2026
+
+Pi4 runtime/emission/transfer/CSD modules belong to RaspberryPi4/Lib/Vulkan; the typed IR lowerer remains shared as vk_ir_v3d42.pbi. Backend composition explicitly includes one implementation and validates its supplied identity. Exact-image/body comparisons, cross-target compile results, actual software-CPU and current fifteen-scene GPU results are in docs/evidence/vulkan-gpu-owner-20261027/. Architecture/provenance publication gates still refuse; this is not conformance or another-board GPU support.
+
+
+## Shared primitive dispatch - 27 October 2026
+
+The float port now calls shared public Neon drawing wrappers. The Pi4 provider
+binds a separate complete native family before Main, preserving fallback after
+Vulkan clear/teardown and pre-frame clip writes. The shared 96-assertion contract
+passes on actual Pi4; UnoQ is compile-only. Fifteen Vulkan scenes preserve all
+245760 current-contract bytes/124 widget checks. Native frames before and after
+a real Vulkan scene are byte-identical with expected draw/glyph ledgers and
+independent pixel probes. This is dispatch ownership and transition coverage,
+not full raster-oracle, application-port or Vulkan completion. Evidence:
+`docs/evidence/neon-primitive-dispatch-20261027/`.
+
+
+## Shared module portability - 27 October 2026
+
+Core Chrome, float/font/UI/sprite/asset/particle adapters now have .pbi owners.
+Prepared-native lifecycle selection is an explicit shared integration header;
+ordinary lifecycle configuration stays in its existing .pbi binder. The Pi4
+hardware backend remains board-owned. All233 implementation bodies are unchanged.
+The full Pi4 composition and both GPU proof containers are byte-identical; the
+proofs link to their recorded physical scene/native-transition runs rather than
+claiming new hardware runs. The actual UnoQ core/file composition compiles with
+the absent backend. This does not add an UnoQ GPU or qualify the full application
+port. Evidence: `docs/evidence/neon-shared-modules-20261027/`.
+
+
+Retained control layer (2026-10-27): shared state/input passes89 checks and57
+ordered renderer calls on actual Pi4/Anvil354, and compiles for UnoQ. The real
+bitmap Vulkan scene passes two65-draw frames,56 interior probes and20224 text
+pixels. Fresh whole-frame SHA matches prove the faster poisoned/word-copy path
+preserves all8192000 capture bytes; returning time falls13.5s to8.6s. Old parent
+handles are rejected after teardown, glyph frame work/faults are zero, Vulkan is
+restored and deadman off. No monitor update/reset. Retained TrueType and wider
+application acceptance remain open; see docs/NEON_RETAINED_UI.md. These are not
+full-engine completion or source-publication claims.
+
+Mixed retained TrueType (2026-10-27): Anvil354/Pi4 now passes two prepared
+mixed-face/four-size/Unicode GPU frames,39 setup assertions,65draws each and
+720/708vertices. Independent FontTools/MuPDF8x boundary-aware checks pass56
+geometry probes and28text runs (6921solid/16929exterior pixels,1channel-unit
+tolerance). Current shared controller passes101assertions/57orderedcalls,
+including handled callback-mutation refusal without draw truncation. Final
+bitmap whole-image equality also passes. Every frame has zero glyph raster/
+upload work, clean retirement and restored Vulkan/deadmanoff. A portable full
+checksum validation loop is5.9times faster on the539-check workload; this is
+not an overall renderer speedup. Shared state/checksum compile for UnoQ; the
+full no-device retained canvas composition still refuses missing lifecycle
+providers, with no dummy GPU/native implementation. Live retained DSI/application
+acceptance and mandatory source publication remain open. Evidence:
+docs/evidence/neon-retained-truetype-20261027/.
+
+### Computed sampling coordinates — 28 October 2026
+
+The typed SPIR-V path accepts ordered binary32 vec2 coordinate values, including
+arithmetic, reconstruction and constants. Legacy direct-input summaries remain
+available only for direct loads; computed graphs retain typed dependencies.
+Scalar, vec3, undefined and self-dependent coordinates refuse. The V3D texture
+configuration is emitted immediately before the sample request, after any UBO
+load used to compute its coordinates. Emitting that configuration in the shader
+prologue let an earlier memory request consume it; the first GPU draw failed.
+
+Physical Anvil388 capture44 validates uniform offsets +0.5, -0.5 and zero against
+six independently expected red/blue texels, plus 25 API checks and the existing
+filter/idle/target/UI and scanout oracles. The initial captures41/43 failed safely
+and are retained. CPU captures42 and45 separately proves four coordinate forms through
+retained records, typed verification and decoded instructions. These are candidate
+payloads; installed388 is unchanged. Full CRT and general Vulkan remain incomplete.
+
+
+### Fragment dot product — 28 October 2026
+
+OpDot retains two ordered, identically typed binary32 vec2/vec3/vec4 operands
+and a scalar result of their component type. The typed verifier rejects shape,
+result-type and dominance errors. V3D fragment emission multiplies each lane,
+then adds products in lane order without fused contraction. The bounded vertex
+position planner does not yet support dot products.
+
+Physical CPU capture47 validates all three widths, a negative case, source
+retention after caller-memory destruction, invalid modules and typed mutations.
+The decoder checks multiplication operands/destinations, exact FADD encoding and
+accumulation order. All105 damaged report/instruction/uniform controls reject.
+The first candidate refused vec4 because five registers were requested through
+a four-component allocator; products and accumulator now allocate separately.
+
+GPU capture49 validates dot((x,0.5),(0.5,0.25)) for x=+0.5/-0.5, and zero input,
+producing coordinate shifts +0.375/-0.125/0.0. Fifteen texel probes distinguish
+missing terms and wrong scale from the correct result. Existing filter, target,
+idle-scope and scripted UI oracles remain passing. CPU capture47 covers emitted
+instructions for all widths; numerical GPU coverage here is vec2. Both are
+returning candidates on unchanged Anvil388. Full CRT remains incomplete.
+
+Semantics: https://registry.khronos.org/SPIR-V/specs/unified1/SPIRV.html#OpDot
+
+
+### Fragment vector scaling — 28 October 2026
+
+OpVectorTimesScalar is retained as a distinct typed operation: its binary32
+vec2/vec3/vec4 result matches its vector operand, and the multiplier is the
+same scalar component type. The V3D fragment lowerer multiplies each selected
+vector register by the one scalar register. Existing componentwise arithmetic
+keeps its own lane selection. The bounded vertex-position planner remains
+unchanged and does not claim this new operation.
+
+Physical CPU capture50 validates all widths with alternating vector components,
+a negative-value case, retained ownership after destroying caller words,
+malformed modules and typed operand/dominance mutations. An independent decoder
+checks each multiplication's operands, destination, scalar broadcast and uniform
+words;131 damaged report/instruction/uniform controls reject.
+
+Physical GPU capture51 composes scaling with dot product and texture sampling:
+dot(2*(x,0.5),(0.5,0.25)) produces +0.75/-0.25 for x=+0.5/-0.5;
+zero input produces zero. Fifteen expected texels detect omitted scaling and
+incorrect lane use. Existing filter, idle, target, UI and full scanout comparisons
+pass. CPU/emitted instruction coverage includes all widths; numerical GPU coverage
+is vec2. Installed Anvil388 is unchanged. Full CRT remains incomplete.
+
+
+### Composed CRT curvature — 28 October 2026
+
+The original radial coordinate equation is composed from the shared typed
+arithmetic path, including the original 0.015 strength. A zero coefficient and
+negative coefficient provide controls; the production Chrome source is unchanged.
+The generated fragment uses centered UV, dot(uv,uv), two vector scalings, the
+radial addition, and conversion back to texture coordinates before sampling.
+
+Physical Pi4 capture52 returned zero in14.0s on unchanged Anvil388. A64-column
+striped texture rendered to256x256 gives18 independently predicted texels at
+six positions for +0.015,-0.015,0. The sameX at differentY distinguishes both
+squared terms of the radial expression. All25APIchecks and existing filter,
+idle,target,UI,parentpixel and fullscanout oracles pass. All71changed API/pixel
+records refuse. This proves coordinate curvature, not scanlines, vignette,
+outside-bounds black output or the completeCRT effect.
+
+The original vignette uses reversed smoothstep edges(0.8,0.3), which the GLSL
+extended-instruction specification leaves undefined/poison. Its intended
+center-bright, edge-dark transition will be expressed with ordered edges as
+1-smoothstep(0.3,0.8,distance), preserving the cubic interpolation and thresholds.
+That path is not yet implemented or qualified.
+See https://registry.khronos.org/SPIR-V/specs/unified1/GLSL.std.450.html .
+
+
+### Sine numerical GPU qualification (28 October 2026)
+
+Physical Pi 4 capture 55 on Anvil 388 returned zero in 14.1 seconds. The typed
+fragment path evaluates a mixed vec4 of radians, with independently predicted
+RGB output on a mid-gray texture. Eighteen channel samples include zero,
+positive/negative extrema, pi boundaries, multiple periods, +/-800 radians,
+and nearby extrema. The maximum error against the reference was 0.418 of an
+8-bit channel step (allowed one step). This is sampled UNORM output evidence,
+not exhaustive binary32 accuracy. All 40 API calls, 45 filter, 142 idle-scope,
+164 target, scripted UI, 24511 parent pixels and full scanout comparisons pass.
+All 67 damaged GPU report controls reject. The existing rendering is preserved
+when the sine input is zero. CPU capture 54 covers all scalar/vector widths.
+
+The original time-dependent scanline expression is not yet composed and the
+complete CRT port remains unfinished. Forum 1513 remains open for that work;
+installed Anvil 388 is unchanged. Publication still requires architecture-gate
+corrections. No vertex-position Sin support is claimed.
+
+
+### Original scanline composition qualified
+
+Capture 56 on physical Pi 4, Anvil 388, returned zero in 14.1 seconds.
+The shader evaluates `sin(uv.y*800-time*10)*.04` and subtracts that scalar
+from RGB only. Six normalized image rows at times 0, 0.125 and 12.5 seconds
+produce all eighteen expected pixels; alpha remains 255. Maximum channel
+error is 0.376 of an 8-bit step. All 25 API calls and baseline filtering,
+target, idle, UI and scanout comparisons pass. All 100 damaged report controls
+reject. The source image uses its own normalized coordinates rather than an
+atlas rectangle. Baseline rendering sets the effect enable to zero.
+
+This closes the missing fragment sine prerequisite (forum 1513). Curvature
+and scanlines are qualified separately; the combined CRT pipeline, vignette
+and outside-black conditional still require implementation and verification.
+Installed monitor unchanged. Source publication remains blocked by the
+architecture gate; vertex-position Sin is not claimed.
+
+
+### Curvature and scanlines composed
+
+Pi 4 capture 57 on Anvil 388 returned zero in 14.2 seconds. The original .015
+radial warp feeds both texture coordinates and the vertical coordinate of
+`sin(uv.y*800-time*10)*.04`. Alternating gray source columns distinguish warped
+sampling from unchanged sampling; six points at three times distinguish the
+warped scanline phase. All eighteen pixels match within one UNORM step
+(maximum error 0.547), with alpha preserved. All 25 API calls and baseline
+filter/target/idle/UI/scanout checks pass; 100 corrupted report controls reject.
+The graph fits the existing register/code bounds without bypasses or ID-based
+special cases. The production Chrome shader is unchanged. Vignette and
+outside-black behavior remain absent; this is not the complete CRT port.
+
+
+### Fragment Distance qualified on Pi 4
+
+GLSL.std.450 Distance (67) retains two matching binary32 scalar or vector
+operands and a scalar component result. Import identity, type, arity and
+dominance checks precede lowering. The fragment backend subtracts components,
+squares and sums them, then computes reciprocal of reciprocal square root,
+with explicit SFU dependency spacing. The vertex planner is unchanged.
+
+CPU capture 58 on Anvil 388 covers scalar through vec4, eight malformed calls,
+retained semantics and emitted register/uniform operands. GPU capture 59
+returned zero in 14.0 seconds: six vectors include zero distance, signs and
+changes confined to the last two components. Eighteen RGB channel observations
+match independent Euclidean-distance predictions within one UNORM step;
+maximum error is 0.380 step and alpha stays 255. All 40 API results and existing
+filter, target, idle, UI, parent-pixel and scanout comparisons pass. There are
+149 rejected CPU and 67 rejected GPU report corruption controls.
+
+This is sampled display-output evidence, not exhaustive binary32 accuracy.
+Cores, fonts and Vulkan returned healthy, timeouts zero and watchdog off.
+Installed Anvil 388 is unchanged. SmoothStep, the complete vignette and
+outside-black behavior remain; the overall Neon work is still open. Source
+publication remains subject to the architecture gate.
+
+
+### Fragment SmoothStep qualified on Pi 4
+
+GLSL.std.450 SmoothStep (49) now retains edge0, edge1 and x, verifies matching
+binary32 scalar/vector types, and lowers the clamped cubic interpolation per
+component. The vertex planner is unchanged. Ordered edges are required for
+defined results; the intended Neon fade will use one minus SmoothStep(.3,.8,x).
+
+CPU capture 61 on Anvil 388 covers scalar through vec4, eight malformed calls,
+typed arity/dominance refusals and decoded instructions. The first fixture
+(capture 60) did not consume results for widths below four; dead-code removal
+correctly skipped those operations. The corrected fixture consumes each result.
+Its initial host check also assumed sequential constant-register placement and
+separate FMin/FMax decode names; the recorded bytes passed after these checking
+assumptions were corrected, without changing or rerunning the payload.
+All 235 corrupted CPU report/register/uniform controls reject.
+
+GPU capture 62 returned zero in 14.2 seconds. Six mixed input vectors exercise
+both endpoints, outside values and interior interpolation. All eighteen RGB
+channels agree with independent predictions within one UNORM step (maximum
+error 0.440); alpha remains 255. All 40 API results and existing filtering,
+target, idle, UI, parent-pixel and full scanout checks pass. All 67 damaged GPU
+report controls reject. This is sampled numeric output, not exhaustive binary32
+verification. Cores/fonts/Vulkan returned healthy, timeouts zero and watchdog
+off. Installed Anvil 388 is unchanged. The complete vignette composition and
+outside-black behavior remain; source publication awaits architecture checks.
+
+
+### Fragment register reuse candidate — rendering regression remains
+
+The full curvature/scanline/vignette graph exhausted the monotonic allocator
+at Distance result 76 (Pi capture 63, range error -23405 at allocation stage4).
+A general free-register allocator now reclaims dead values and scratch at SSA
+operation boundaries, protects future operands and aliases, keeps constants
+and deferred output, and reserves fixed resource registers. CPU capture65
+passes25 focused alias/lifetime/exhaustion checks;53 damaged controls reject.
+The graph passes pipeline creation with the candidate, but capture64 fails
+cross-target image checks55/57: expected red/green both read opaque black.
+This candidate is NOT qualified; the composed vignette and forum1516 remain
+open. No hardware bound increase, source-ID exception or monitor installation.
+All runs returned healthy on Anvil388, timeouts0 and watchdog off.
+
+
+### Fragment reuse and composed vignette qualified
+
+Capture66 traced the black output to Dot writing first+lanes rather than its
+allocated accumulator, overwriting cached constant1.0 in RF21. Dot now uses
+the returned register. Reclamation also retains cached input maps for later
+loads, avoiding another varying FIFO read. CPU69 passes36 lifetime, alias,
+input-cache, noncontiguous-accumulator and refusal checks;78 damaged controls
+reject. GPU70 returns zero13.2s with all18 composed curvature/scanline/vignette
+pixels matching within1UNORMstep (maxerror0.486),25API calls and the existing
+filter/target/idle/UI/parent-pixel/scanout checks passing.125 damaged GPU
+controls reject. Captured code944bytes,24uniformwords,39registers; Dot uses
+RF24 while cachedRF21 survives. The trace check rejects the broken capture66.
+No hardware limit change or shader-ID exception. Earlier candidate warnings
+above are superseded by this qualification. Installed388 unchanged and healthy;
+timeouts0, watchdog off. Outside-black behavior and full engine integration
+remain; source publication still awaits architecture checks.
+
+
+### Boolean IR validation — 29 October 2026
+
+The target-neutral IR now represents logical scalar/vector types, true/false
+constants, ordered binary32 less/greater comparisons, logical OR and selection
+of represented scalar/vector float32, int32 and Boolean values. The verifier
+checks exact operand types, result/condition shape, dominance, constant encoding,
+and the pre-1.4 per-component selection restriction.
+
+Physical Pi 4 CPU capture 72 passes 68 positive/refusal checks across widths
+1–4; this validates the shared verifier, not GPU comparison execution. The
+SPIR-V parser and V3D lowerer still refuse these operations pending integration.
+The outside-border regression (capture 71) therefore remains failing: 12 corner
+samples are gray instead of opaque black, while all six interior samples pass.
+Neither result establishes complete Neon application integration.
+
+
+### Boolean SPIR-V retention — 29 October 2026
+
+The typed parser path now validates and retains Boolean types/constants,
+ordered float less/greater comparisons, logical OR, and scalar/vector selection.
+The adapter maps each operation and its original operand order into shared IR.
+Physical CPU capture 73 passes 91 checks across widths 1–4, including malformed
+arity, types, IDs, use after return, SPIR-V selection-version rules and copied
+IR remaining valid after a failed parse. The legacy plan path still refuses
+Boolean modules. GPU emission remains unimplemented; the outside-border
+regression is still failing and the full Neon port remains incomplete.
+
+
+### Boolean GPU emission and outside border qualified — 29 October 2026
+
+The fragment lowerer emits ordered less/greater comparisons, logical OR and
+integer-move selection. GPU capture 74 passes 18 RGB checks including signed
+zero, both infinities and positive/negative quiet and signaling NaNs. Capture
+76 passes 18 more channels at exact 0/1 bounds and adjacent values. Each report
+checker rejects 29 damaged controls. This is sampled fragment verification;
+vertex logical operations and arbitrary structured control flow remain outside
+this qualification.
+
+The composed curvature, scanline, vignette and opaque outside-border shader
+passes GPU capture 75: all 12 outside samples are black and six interior samples
+match within one UNORM step across three times. All 77 damaged controls reject.
+The 1160-byte program uses 24 uniform words and 39 registers. Code slots expand
+from 1 KiB to 2 KiB, coordinated with scratch arrays and shader-record offsets
+inside the same 8 KiB pipeline allocation; hardware register limits are unchanged.
+All three runs return normally with cores, fonts and Vulkan healthy, zero
+display timeouts and watchdog off. Installed Anvil 388 remains unchanged.
+
+The original outside-border regression now passes in the generated shader
+fixture. Production Chrome and full Neon engine integration remain incomplete;
+this does not close the overall application topic. Source publication remains
+blocked by architecture findings.
+
+
+### Optional public CRT draw path — 29 October 2026
+
+`neon_vk_retro.pbi`, included after Chrome, supplies `NeonVkChromeRetroPrepare`
+and `NeonVkChromeRetroDrawId`. Preparation creates a separate pipeline while
+idle. A draw samples the complete image, uses its own push constants for time
+and effect parameters, and restores the ordinary pipeline. Chrome teardown
+owns the optional pipeline. Ordinary images keep the existing shader. The
+standard and optional paths share pipeline construction.
+
+Physical Pi 4 capture 80 passes all twelve outside-black samples and six
+interior samples across three times, plus the existing filtering, target,
+parent restoration and UI checks. The checker rejects 77 damaged controls.
+The initial wrapper selected the older fixture (capture 77); after that was
+corrected, captures 78/79 exposed an obsolete unread UBO declaration in the
+new shader. Removing that declaration produced capture 80. These earlier
+runs are failures, not qualification of the effect API. All returned with
+healthy cores/fonts/Vulkan, zero display timeouts and watchdog off on unchanged
+Anvil 388.
+
+Canvas-level effect selection, warped input mapping, mixed timed effect draws
+within one frame and complete engine presentation remain unqualified. This is
+not completion of the Neon application port. Architecture findings continue
+to block source publication.
+
+
+### Mixed timed CRT and ordinary draws â€” 29 October 2026
+
+Physical Pi 4 capture 81 records two 256x256 CRT draws at times 0 and .125,
+then an ordinary striped image and a red box, all in one frame. Twelve CRT
+samples pass the independent curvature/scanline/vignette/border oracle;
+three ordinary pixels match exactly. This checks per-draw time snapshots
+and restoration of the ordinary pipeline. All 18 API results and existing
+filtering, target restoration and UI checks pass; 65 damaged controls reject.
+The payload returns zero in 14.2 seconds with healthy cores/fonts/Vulkan,
+zero display timeouts and watchdog off. Installed Anvil 388 is unchanged.
+Canvas-level effect selection and curved input mapping remain incomplete.
+
+
+### Canvas CRT composition and curved pointer coordinates — 29 October 2026
+
+The optional `neon_vk_canvas_retro.pbi` interface prepares and draws a canvas
+with the existing aspect-fit viewport and checks owner state, completed content,
+target generation and sampled-image generation. It also exposes curved pointer
+mapping. The shared `neon_canvas_retro.pbi` helper follows the shader's .015
+radial mapping using bounded Q24 intermediates and returns Q16 canvas coordinates.
+Letterbox and opaque-border points preserve the output and return outside.
+
+Physical CPU capture 82 passes sixteen center, interior, border, letterbox and
+maximum-8192-size cases against a separate continuous-coordinate oracle, within
+1/1024 canvas pixel. The checker rejects 69 damaged controls. This qualifies the
+shared arithmetic on these samples, not interactive clicks or every refusal path.
+
+GPU capture 84 uses the public canvas preparation/draw interface at a 600x600
+aspect-fit size inside an 800x600 target. All twelve outside and six interior
+samples pass across three times, along with 29 API results and the surrounding
+filter/target/UI checks; 77 damaged controls reject. Capture 83 correctly refused
+the fixture's attempt to retarget during an active frame. The corrected fixture
+selects its temporary target while idle and restores the parent afterward.
+An earlier compile-only report layout overlapped one result slot with pixels;
+that layout was corrected before upload and was never run.
+
+Both successful proofs return on unchanged Anvil 388 with healthy cores/fonts/
+Vulkan, zero display timeouts and watchdog off. Interactive curved hit-testing,
+canvas-wrapper mapping refusals and full engine presentation remain. Source
+publication remains blocked by architecture findings.
+
+
+### CRT canvas state contract qualified — 29 October 2026
+
+Physical Pi 4 capture 85 passes 24 checks for the public canvas CRT interface:
+missing content and closed owners, mapping the center, preserving output for
+letterbox points and stale images, null/misaligned/overlapping outputs, malformed
+viewport state, drawing before preparation, preparation during an active frame,
+and nonfinite time rejection. Stale-image cases deliberately perturb and restore
+the fixture's generation field. Valid aspect-fit drawing still passes afterward.
+The host checker rejects 51 altered trace header/result fields.
+
+The initial host check incorrectly required unwritten trace padding to be zero.
+Only the 24-byte header and 24 result pairs are owned by this fixture; the checker
+now validates those fields exactly, with the initial failed check preserved.
+The payload itself returned zero in 14.4 seconds. All normal rendering checks,
+cores/fonts/Vulkan, zero display timeouts and watchdog-off checks passed on
+unchanged Anvil 388. This does not prove interactive event integration: the
+existing canvas event adapter still maps pointers without the CRT curve.
+
+
+### Curved canvas widget integration, 29 October 2026
+
+Anvil 388 on physical Pi 4 passes the existing text-field interaction sequence
+with both CRT presentation and curved pointer mapping enabled: 297 checks over
+13 frames, ending with ZA, one submission and cleared focus. The completed
+4,096,000-byte attachment equals physical DSI scanout. Captured pixels match
+curvature/scanline/vignette expectations. All 301 damaged report controls reject.
+This uses scripted normalized events; physical keyboard/pointer actuation is
+not claimed. First frame including pipeline preparation is 1061 ms; subsequent
+frames are 140–143 ms. Smooth interactive animation remains unqualified.
+Fixture: RaspberryPi4/Tests/Vulkan/neon_canvas_keyboard_retro.pbi.
+Checker: tools/neon_canvas_keyboard_retro_check.py.
+
+
+### Aligned shader writes, 29 October 2026
+
+The V3D shader writer uses native 32-bit stores for aligned little-endian words,
+retaining byte stores for unaligned packed fields. Physical Pi 4 paired runs
+pass all 297 curved-widget checks and full scanout comparison. Steady canvas
+preparation measured 9.03 to 8.03 ms; whole-frame means 141.88 to 140.98 ms.
+This modest improvement does not establish smooth interactive animation.
+Cache maintenance and display transfers remain dominant. Evidence captures91/92.

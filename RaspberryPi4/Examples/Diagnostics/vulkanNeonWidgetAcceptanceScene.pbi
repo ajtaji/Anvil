@@ -209,6 +209,34 @@ Neon_Panel(#NVWA_PANEL_X, #NVWA_PANEL_Y, #NVWA_PANEL_W, #NVWA_PANEL_H, "project"
   ProcedureReturn #NVWA_OK
 EndProcedure
 
+; These fixture-owned fallback callbacks preserve the no-frame sentinel.
+; A diagnostic composition does not reach into a renderer's private targets.
+Procedure.i nvwaPrimeFanBeginUnbound()
+  ProcedureReturn #NEON_ERR_NOFRAME
+EndProcedure
+
+Procedure nvwaPrimeFanPointUnbound(x.i, y.i)
+EndProcedure
+
+Procedure.i nvwaPrimeFanEndUnbound(colour.i)
+  ProcedureReturn #NEON_ERR_NOFRAME
+EndProcedure
+
+Procedure.i nvwaPrimeFanOutlineUnbound(colour.i)
+  ProcedureReturn #NEON_ERR_NOFRAME
+EndProcedure
+
+Procedure.i nvwaPrimeLinesBeginUnbound()
+  ProcedureReturn #NEON_ERR_NOFRAME
+EndProcedure
+
+Procedure nvwaPrimeLineUnbound(x0.i, y0.i, x1.i, y1.i)
+EndProcedure
+
+Procedure.i nvwaPrimeLinesEndUnbound(colour.i)
+  ProcedureReturn #NEON_ERR_NOFRAME
+EndProcedure
+
 ; Settle the real menu's next-frame dimensions without opening a native Neon
 ; V3D frame and without allocating any Vulkan object. It must run before
 ; NeonVkChromeCreate so Create can replace the no-op family with the resident
@@ -221,7 +249,7 @@ Procedure.i NvwaPrime()
   If Neon_SurfaceW() <> #NVWA_WIDTH Or Neon_SurfaceH() <> #NVWA_HEIGHT
     ProcedureReturn #NVWA_ERR_GEOMETRY
   EndIf
-  rc = NeonDrawBackendInstall(@nvwaPrimeBox, @nvwaPrimeText, @nvwaPrimeText, @nvwaPrimeScissorSet, @nvwaPrimeScissorClear, @neon_BackendFanBeginUnbound, @neon_BackendFanPointUnbound, @neon_BackendFanEndUnbound, @neon_BackendFanOutlineUnbound, @neon_BackendLinesBeginUnbound, @neon_BackendLineUnbound, @neon_BackendLinesEndUnbound)
+  rc = NeonDrawBackendInstall(@nvwaPrimeBox, @nvwaPrimeText, @nvwaPrimeText, @nvwaPrimeScissorSet, @nvwaPrimeScissorClear, @nvwaPrimeFanBeginUnbound, @nvwaPrimeFanPointUnbound, @nvwaPrimeFanEndUnbound, @nvwaPrimeFanOutlineUnbound, @nvwaPrimeLinesBeginUnbound, @nvwaPrimeLineUnbound, @nvwaPrimeLinesEndUnbound)
   If rc <> #NEON_OK
     ProcedureReturn rc
   EndIf

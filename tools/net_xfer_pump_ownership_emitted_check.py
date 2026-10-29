@@ -135,7 +135,7 @@ def production() -> dict[str, str]:
         # was LinkPumpAllNet(ms), the fair pump, whose rotating cursor
         # parked the whole 200 ms slice on the radio after every block on
         # a board holding a cable and a lease at once. See
-        # LinkPumpAllNetPrefer in RaspberryPi4/Lib/link.pi4.
+        # LinkPumpAllNetPrefer in Anvil/Network/link.pbi.
         ("xfer", "LinkPumpAllNetPrefer(kind, ms)"),
         ("xfer", "TftpTick(millis())"),
         ("xfer", "OutBreak()"),

@@ -433,7 +433,7 @@ EndProcedure
 ; ---- the interface pin -----------------------------------------------
 ; Anvil/Core/netif.pbi READS the pin rather than owning it, because `net
 ; link wired` is one decision and must not have two homes. On the board
-; it lives in RaspberryPi4/Lib/link.pi4, which would drag the whole
+; it lives in Anvil/Network/link.pbi, which would drag the whole
 ; policy layer and both drivers into this image; here it is two lines,
 ; and the script can set it.
 Global fxPin.i
@@ -610,7 +610,7 @@ XIncludeFile "Anvil/Core/dhcpd.pbi"
 ; FOUR NAMES THE CONSOLE REACHES THAT ARE NOT IN THIS IMAGE. The lease
 ; worker binds and drops an address through Anvil/Core/netcfg.pbi, and
 ; the dispatcher offers a datagram to Anvil/Core/ntp_service.pbi and a
-; segment to RaspberryPi4/Lib/tcp.pi4 before the console sees it. Each
+; segment to Anvil/Network/tcp.pbi before the console sees it. Each
 ; of those files brings the settings store or a transport with it. No
 ; DHCP client is started here and no datagram is SNTP, so the first three
 ; are empty. TCP IS NOT: section T hands the pump a verified segment.

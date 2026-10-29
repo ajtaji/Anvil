@@ -190,7 +190,7 @@ def rederive(gen, table) -> None:
     def _t0_expect(steps: bytes) -> bytes:
         """Re-run the bounds contract over the step table.
 
-        The contract is five lines in RaspberryPi4/Lib/t0vm.pi4 and both
+        The contract is five lines in Anvil/Crypto/t0vm.pbi and both
         of its numbers are read out of that file rather than written
         here, so this is a second reading of the source and not a second
         copy of the answer.

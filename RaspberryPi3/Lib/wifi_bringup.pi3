@@ -4,7 +4,7 @@
 ; from the firmware-provided flattened device tree and substitutes that
 ; address into a board NVRAM text file before the CYW43 NVRAM cooker runs.
 
-#PI3_WIFI_FDT_MAGIC = $D00DFEED
+XIncludeFile "Anvil/Core/fdt.pbi"
 #PI3_WIFI_FDT_MAX_BYTES = $100000
 #PI3_WIFI_FDT_MAX_DEPTH = 32
 #PI3_WIFI_NVRAM_MAX_BYTES = 16384
@@ -108,7 +108,8 @@ Procedure.i Pi3WifiReadLocalMacFromDtb(*dtb, *dtbEnd, *outMac)
   Protected Dim nodeLocalLen.i[#PI3_WIFI_FDT_MAX_DEPTH]
   Protected Dim nodeAddressLen.i[#PI3_WIFI_FDT_MAX_DEPTH]
   If *dtb = 0 Or *dtbEnd <= *dtb Or *outMac = 0 : ProcedureReturn 0 : EndIf
-  If *dtbEnd - *dtb < 40 Or p3wfBe32(*dtb) <> #PI3_WIFI_FDT_MAGIC : ProcedureReturn 0 : EndIf
+  ; Shared format validation precedes the Wi-Fi node/MAC selection policy.
+  If FdtCheck(*dtb,*dtbEnd-*dtb)<>#FDT_OK : ProcedureReturn 0 : EndIf
   total = p3wfBe32(*dtb + 4)
   If total < 40 Or total > #PI3_WIFI_FDT_MAX_BYTES Or total > *dtbEnd - *dtb : ProcedureReturn 0 : EndIf
   If p3wfBe32(*dtb + 20) < 17 Or p3wfBe32(*dtb + 24) > 17 : ProcedureReturn 0 : EndIf

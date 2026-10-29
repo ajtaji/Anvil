@@ -104,7 +104,7 @@ Procedure MsgLogFlush(force.i)
   If force = 0 And gMlPendN < #MLOG_SOON And ((millis() - gMlLast) & $FFFFFFFF) < #MLOG_EVERY_MS
     ProcedureReturn
   EndIf
-  If gMlBusy <> 0 Or StorageUp() = 0
+  If gMlBusy <> 0 Or HwStorageUp() = 0
     ProcedureReturn
   EndIf
   gMlBusy = 1

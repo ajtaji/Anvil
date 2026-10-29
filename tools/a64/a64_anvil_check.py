@@ -1746,7 +1746,7 @@ def section_netrecv(ctx: Ctx) -> None:
 #
 #  THE CLAMP IN THE MIDDLE IS PART OF THE PROPERTY. Cyw43DataMax answers
 #  1520 - the buffer minus the twelve octets of SDPCM header and the four of
-#  BDC - and RaspberryPi4/Lib/link.pi4 clamps that to #LINK_ETH_MAX, because
+#  BDC - and Anvil/Network/link.pbi clamps that to #LINK_ETH_MAX, because
 #  a board answering larger would invite tcp.pi4 to build a segment no
 #  classic Ethernet peer will accept. So 1520 and 1514 are each asserted in
 #  their own right: deleting link.pi4's clamp turns exactly the LinkTxMax
@@ -1794,7 +1794,7 @@ def section_sendceiling(ctx: Ctx) -> None:
         got = call(cpu, "linktxmaxon", kind)
         ctx.case(got == LINK_ETH_MAX,
                  "LinkTxMaxOn(%s) answered %d, wanted %d - the 1514 ceiling "
-                 "is applied in RaspberryPi4/Lib/link.pi4 and not left to "
+                 "is applied in Anvil/Network/link.pbi and not left to "
                  "each backend" % (label, got, LINK_ETH_MAX))
     kind_addr = sym["global_glinkkind"]
     tcp_addr = sym["global_tcp_kind"]
@@ -1806,7 +1806,7 @@ def section_sendceiling(ctx: Ctx) -> None:
             got = call(cpu, "linktxmax")
             ctx.case(got == LINK_ETH_MAX,
                      "LinkTxMax() with %s selected answered %d, wanted %d - "
-                     "the 1514 ceiling is applied in RaspberryPi4/Lib/link.pi4 "
+                     "the 1514 ceiling is applied in Anvil/Network/link.pbi "
                      "and not left to each backend"
                      % (label, got, LINK_ETH_MAX))
         poke64(cpu, kind_addr, saved_kind)
@@ -1937,14 +1937,14 @@ def section_netcon(ctx: Ctx) -> None:
 #  A STATIC ADDRESS ARMS THE CONSOLE, BY THE PATH A LEASE TAKES
 # =====================================================================
 def section_static(ctx: Ctx) -> None:
-    netcfg_code = code_of(read("Anvil/Core/netcfg.pbi"))
+    netcfg_code = code_of(read("Anvil/Core/netcfg.pbi") + "\n" + read("Anvil/Core/net_address.pbi"))
     ncmd_code = code_of(read("Anvil/Core/net_cmd.pbi"))
     eth = read("RaspberryPi4/Board/eth.pi4")
     eth_code = code_of(eth)
     con_code = code_of(read("Anvil/Core/netconsole.pbi"))
 
     bound = proc_body(netcfg_code, r"Procedure NetAddressBound\(")
-    if ctx.case(bool(bound), "Anvil/Core/netcfg.pbi has no NetAddressBound"):
+    if ctx.case(bool(bound), "Anvil/Core/net_address.pbi has no NetAddressBound"):
         for need in ("NetIfSet(kind, ip, mask, gw, src)", "gEthIp = ip",
                      "HwLinkAddressBound(", "NetConsoleRearm()"):
             ctx.case(need in bound,
@@ -1952,7 +1952,7 @@ def section_static(ctx: Ctx) -> None:
                      "and arm the console are what every address source does"
                      % need)
     told = sum(len(re.findall(r"HwLinkAddressBound\(", code_of(read(rel))))
-               for rel in ("Anvil/Core/netcfg.pbi", "Anvil/Core/net_cmd.pbi",
+               for rel in ("Anvil/Core/net_address.pbi", "Anvil/Core/netcfg.pbi", "Anvil/Core/net_cmd.pbi",
                            "RaspberryPi4/Board/eth.pi4",
                            "RaspberryPi4/Board/boot.pi4",
                            "RaspberryPi4/Lib/wifi.pi4",
@@ -2170,7 +2170,7 @@ def section_linklocal(ctx: Ctx) -> None:
     eth = read("RaspberryPi4/Board/eth.pi4")
     eth_code = code_of(eth)
     boot_code = code_of(read("RaspberryPi4/Board/boot.pi4"))
-    netcfg_code = code_of(read("Anvil/Core/netcfg.pbi"))
+    netcfg_code = code_of(read("Anvil/Core/netcfg.pbi") + "\n" + read("Anvil/Core/net_address.pbi"))
 
     recv = proc_body(hwl_code, r"Procedure\.i HwLinkRecv\(")
     if ctx.case(bool(recv), "RaspberryPi4/Board/hw_link.pi4 has no "
@@ -2304,7 +2304,7 @@ def section_linklocal(ctx: Ctx) -> None:
         ctx.case(0 <= a_s < a_l, "EthHasIpConfig reads its link-local fallback "
                  "before the settings store; a saved address must win")
     stored = 0
-    for rel in ("Anvil/Core/netll.pbi", "Anvil/Core/netcfg.pbi",
+    for rel in ("Anvil/Core/netll.pbi", "Anvil/Core/netcfg.pbi", "Anvil/Core/net_address.pbi",
                 "RaspberryPi4/Board/eth.pi4", "RaspberryPi4/Board/boot.pi4"):
         for mm in re.finditer(r"(SettingsSet|DhcpStore)\s*\([^\n]*",
                               code_of(read(rel))):
@@ -3033,7 +3033,7 @@ def section_interfaces(ctx: Ctx) -> None:
 
     # ---- K9. every consumer of the wire parses as the arrival interface --
     nc_code = code_of(read("Anvil/Core/netconsole.pbi"))
-    link_code = code_of(read("RaspberryPi4/Lib/link.pi4"))
+    link_code = code_of(read("Anvil/Network/link.pbi"))
     pump = proc_body(nc_code, r"Procedure netcon_PumpOne\(")
     ctx.case(bool(pump) and "HwLinkRecv(kind," in pump
              and "NetInput(kind," in pump,
@@ -3050,7 +3050,7 @@ def section_interfaces(ctx: Ctx) -> None:
     # interface, the selected link - would compile, satisfy a substring
     # test, and parse a frame as an interface it did not arrive on.
     for body, where in ((pump, "netcon_PumpOne in Anvil/Core/netconsole.pbi"),
-                        (lp, "LinkPumpKind in RaspberryPi4/Lib/link.pi4")):
+                        (lp, "LinkPumpKind in Anvil/Network/link.pbi")):
         firsts = [a.strip() for a in re.findall(
             r"\bNetInput\s*\(\s*([^,)]*)", code_cut(body or ""))]
         ctx.case(bool(firsts) and all(a == "kind" for a in firsts),
@@ -3062,9 +3062,9 @@ def section_interfaces(ctx: Ctx) -> None:
     ctx.case(bool(lpn) and "LinkPumpKind(" in lpn,
              "LinkPumpNet no longer goes through LinkPumpKind")
     callers = []
-    for rel in ("Anvil/Core/netconsole.pbi", "RaspberryPi4/Lib/link.pi4",
+    for rel in ("Anvil/Core/netconsole.pbi", "Anvil/Network/link.pbi",
                 "RaspberryPi4/Lib/wifi.pi4", "Anvil/Core/netrecv.pbi",
-                "Anvil/Core/net_cmd.pbi", "RaspberryPi4/Lib/tcp.pi4",
+                "Anvil/Core/net_cmd.pbi", "Anvil/Network/tcp.pbi",
                 "RaspberryPi4/Board/eth.pi4",
                 "RaspberryPi4/Board/hw_link.pi4", "Anvil/Core/netll.pbi",
                 "Anvil/Core/dhcpd.pbi"):
@@ -3072,7 +3072,7 @@ def section_interfaces(ctx: Ctx) -> None:
         if n:
             callers.append((rel, n))
     unexpected = [c_ for c_ in callers if c_[0] not in (
-        "Anvil/Core/netconsole.pbi", "RaspberryPi4/Lib/link.pi4",
+        "Anvil/Core/netconsole.pbi", "Anvil/Network/link.pbi",
         "RaspberryPi4/Lib/wifi.pi4")]
     ctx.case(not unexpected,
              "NetInput is called from %s as well; every caller has to pass the "

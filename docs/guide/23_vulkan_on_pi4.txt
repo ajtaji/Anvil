@@ -4,26 +4,26 @@
 
 @SECTION Rendering and transfers
 
-`vkCmdClearAttachments` accepts one in-bounds color rectangle and one layer. A full-frame clear before the first draw is folded into the render-pass load clear and works on odd-sized targets. Partial rectangles are recorded in draw order and run in the same V3D bin/render transaction, currently only when framebuffer width and height are even. The 64×64 Pi 4 proof checked all 4,096 pixels for two draws and two clears; an out-of-bounds rectangle was refused before GPU jobs. Its trace and decoded result are documented in `docs/evidence/vulkan-clear-attachments-pi4-20260930/README.md`.
+`vkCmdClearAttachments` accepts one in-bounds color rectangle and one layer. A full-frame clear before the first draw is folded into the render-pass load clear and works on odd-sized targets. Partial rectangles are recorded in draw order and run in the same V3D bin/render transaction, currently only when framebuffer width and height are even. The 64Ãƒâ€”64 Pi 4 proof checked all 4,096 pixels for two draws and two clears; an out-of-bounds rectangle was refused before GPU jobs. Its trace and decoded result are documented in `docs/evidence/vulkan-clear-attachments-pi4-20260930/README.md`.
 
 The resident Vulkan console uses the public command and resource path. An accepted draw list becomes one V3D bin/render transaction, with GPU tile clear and store. Supported whole-image buffer-to-optimal-image uploads and optimal-to-optimal image copies use the texture unit. Buffer copies, fills, updates, rectangular linear image copies, linear buffer-to-image uploads, and linear image readbacks use guarded DMA on the production Pi 4 backend. `vkCmdUpdateBuffer` captures caller bytes at recording time; submission transfers the captured bytes by DMA. The display owner presents a completed attachment separately.
 
 The production V3D backend advertises buffer and linear-image transfer execution only when its board DMA seam is linked. Without it, the public recorder refuses buffer copy, fill, update and DMA-dependent image commands; submission rechecks already recorded work before any backend job or resource reservation. Complete optimal-image uploads and optimal-to-optimal copies keep their independent TFU path. A separate test backend does perform byte writes as an explicit oracle for desk checks; that backend is not the Pi 4 runtime. CPU work is still needed to record commands, validate resources, stage caller data and rasterize source glyphs for the atlas. These are not GPU drawing operations.
 
-`vkCmdCopyImage` accepts an array of one to 32 nonempty rectangles between bound linear BGRA8 images with transfer usage, compatible transfer layouts, mip zero, one layer, and depth one. The source and destination may have different dimensions and offsets. The same image may serve both roles when both layouts are `GENERAL` and no source or destination texels overlap. The complete array is validated before recording; submission rechecks every row span and refuses any source/destination or destination/destination overlap within the call, including aliased allocations, before DMA starts. A tight whole-image region uses one linear DMA transfer; a supported strided subrectangle uses one 2D DMA submission. Larger row gaps retain guarded DMA row copies. A two-region same-image copy passed on Pi 4 silicon with eight guarded DMA rows and exact values for all source, destination and untouched pixels. Separate `vkCmdCopyImage` calls in one otherwise isolated command buffer also execute as ordered DMA transfers; a two-call 4×4 proof passed with eight DMA rows and exact whole-image pixels (`docs/VULKAN_MULTI_CALL_IMAGE_DMA_PI4_2026-09-27.md`). The bounded optimal-to-linear partial copy described below is a separate path; other partial optimal-tiled copies, mips and layers remain unsupported.
+`vkCmdCopyImage` accepts an array of one to 32 nonempty rectangles between bound linear BGRA8 images with transfer usage, compatible transfer layouts, mip zero, one layer, and depth one. The source and destination may have different dimensions and offsets. The same image may serve both roles when both layouts are `GENERAL` and no source or destination texels overlap. The complete array is validated before recording; submission rechecks every row span and refuses any source/destination or destination/destination overlap within the call, including aliased allocations, before DMA starts. A tight whole-image region uses one linear DMA transfer; a supported strided subrectangle uses one 2D DMA submission. Larger row gaps retain guarded DMA row copies. A two-region same-image copy passed on Pi 4 silicon with eight guarded DMA rows and exact values for all source, destination and untouched pixels. Separate `vkCmdCopyImage` calls in one otherwise isolated command buffer also execute as ordered DMA transfers; a two-call 4Ãƒâ€”4 proof passed with eight DMA rows and exact whole-image pixels (`docs/VULKAN_MULTI_CALL_IMAGE_DMA_PI4_2026-09-27.md`). The bounded optimal-to-linear partial copy described below is a separate path; other partial optimal-tiled copies, mips and layers remain unsupported.
 
-One full level-zero optimal BGRA8 image can now be copied to a distinct, equal-size optimal BGRA8 image in a separate transfer command buffer. The source and destination must have compatible transfer layouts and disjoint bound allocations. The Pi 4 backend preflights both padded UIF_NO_XOR ranges and submits one TFU job, then publishes the destination's final layout only after completion. An 8x8 copy of an atlas already uploaded by two ordered TFU jobs produced a third TFU job and the destination was sampled by V3D with exact pixel checks (`docs/VULKAN_OPTIMAL_COPY_TFU_PI4_2026-09-27.md`). A complete equal-size linear-to-optimal image copy also uses the TFU raster input, including the linear image's real row pitch. A fresh optimal destination sampled by V3D passed 402 exact checks after a fourth TFU job (`docs/VULKAN_LINEAR_OPTIMAL_TFU_PI4_2026-09-27.md`). A separate partial linear-to-optimal path is implemented for one region per command buffer between distinct, equal-size level-zero BGRA8 images. Linear source offsets may be any in-bounds texel coordinates, with the actual source pitch preserved; destination offsets and extent align to 4×4 utiles, up to 256 utiles. The shared layer preflights the stream, and Pi 4 uses guarded DMA behind a dedicated capability. The 2026-09-30 Pi 4 proof copied 16 exact texels, preserved 240 untouched texels and matched all 256 source texels; 64 padding and 96 guard checks passed. TFU stayed at 1, DMA advanced 0→1 and backend jobs 1→2; a later readback advanced DMA 1→17. A misaligned destination returned `-20005` before readback. MMU, OOM and native fault counts were zero, with one intentional validation fault. The complete-image TFU path is unchanged, and other boards do not advertise this partial path; see `docs/evidence/vulkan-partial-linear-optimal-pi4-20260930/README.md`. Supported buffer copies, fills and updates can share a transfer-only command buffer with buffer-to-image and image-to-image operations in recorded order; the whole stream is preflighted before any hardware job. A DMA staging update followed by TFU upload and TFU image copy passed on Pi 4 with the final destination sampled by V3D (`docs/VULKAN_DMA_TFU_STREAM_PI4_2026-09-27.md`). A Pi 4 run uploaded a changed atlas texel then copied the optimal image into a fresh optimal destination through two TFU jobs, with the destination sampled by V3D (`docs/VULKAN_MIXED_IMAGE_TFU_PI4_2026-09-27.md`). A bounded partial optimal-to-linear `vkCmdCopyImage` shape is now implemented: one region between distinct, equal-size level-zero BGRA8 images; source offsets align to 4×4 utiles; width and height are multiples of four unless that dimension reaches its corresponding source edge; destination coordinates remain in bounds; and the bound allocations are disjoint. The shared command layer preflights the full stream before guarded DMA detiles the accepted region on Pi 4. The 2026-09-30 Pi 4 proof copied 25 exact texels from `(32,8)` extent `5×5` in a 37×13 image, preserving 456 other texels and 32 guard words; the 148-byte row pitch had no padding words. DMA advanced 0→4, TFU 0→1 and backend jobs 1→2. A same-sized non-edge tail returned `-20005` before further transfer work. See `docs/evidence/vulkan-partial-optimal-linear-pi4-20260930/README.md`. Other optimal-to-optimal partial regions remain unsupported except for the bounded right/bottom edge-tail shape below; mips, layers, format conversion, and mixing with draws or clears remain unsupported. At most one partial optimal-to-optimal `vkCmdCopyImage` region per command buffer is also implemented for distinct, equal-size level-zero BGRA8 UIF images. Its source/destination offsets and extents align to 4×4 utiles, with at most 256 utiles per region. The shared layer preflights the command stream; Pi 4 uses guarded 64-byte-utile DMA selected by a dedicated capability. The full-image TFU path is unchanged, and the 2026-09-30 Pi 4 proof matched all 16 copied texels, preserved 240 untouched texels, and passed 64 padding and 96 guard checks. TFU stayed at 2, DMA advanced 0→1 and backend jobs 2→3; a later full readback advanced DMA 1→17. An unaligned request returned `-20005` without extra transfer work. See `docs/evidence/vulkan-partial-optimal-copy-pi4-20260930/README.md`. Other boards refuse it. Mips, layers, format conversion, and mixing with draws or clears remain unsupported. Bounded optimal image-to-buffer partial readback is documented separately. Supported linear image readbacks may join the transfer stream.
+One full level-zero optimal BGRA8 image can now be copied to a distinct, equal-size optimal BGRA8 image in a separate transfer command buffer. The source and destination must have compatible transfer layouts and disjoint bound allocations. The Pi 4 backend preflights both padded UIF_NO_XOR ranges and submits one TFU job, then publishes the destination's final layout only after completion. An 8x8 copy of an atlas already uploaded by two ordered TFU jobs produced a third TFU job and the destination was sampled by V3D with exact pixel checks (`docs/VULKAN_OPTIMAL_COPY_TFU_PI4_2026-09-27.md`). A complete equal-size linear-to-optimal image copy also uses the TFU raster input, including the linear image's real row pitch. A fresh optimal destination sampled by V3D passed 402 exact checks after a fourth TFU job (`docs/VULKAN_LINEAR_OPTIMAL_TFU_PI4_2026-09-27.md`). A separate partial linear-to-optimal path is implemented for one region per command buffer between distinct, equal-size level-zero BGRA8 images. Linear source offsets may be any in-bounds texel coordinates, with the actual source pitch preserved; destination offsets and extent align to 4Ãƒâ€”4 utiles, up to 256 utiles. The shared layer preflights the stream, and Pi 4 uses guarded DMA behind a dedicated capability. The 2026-09-30 Pi 4 proof copied 16 exact texels, preserved 240 untouched texels and matched all 256 source texels; 64 padding and 96 guard checks passed. TFU stayed at 1, DMA advanced 0Ã¢â€ â€™1 and backend jobs 1Ã¢â€ â€™2; a later readback advanced DMA 1Ã¢â€ â€™17. A misaligned destination returned `-20005` before readback. MMU, OOM and native fault counts were zero, with one intentional validation fault. The complete-image TFU path is unchanged, and other boards do not advertise this partial path; see `docs/evidence/vulkan-partial-linear-optimal-pi4-20260930/README.md`. Supported buffer copies, fills and updates can share a transfer-only command buffer with buffer-to-image and image-to-image operations in recorded order; the whole stream is preflighted before any hardware job. A DMA staging update followed by TFU upload and TFU image copy passed on Pi 4 with the final destination sampled by V3D (`docs/VULKAN_DMA_TFU_STREAM_PI4_2026-09-27.md`). A Pi 4 run uploaded a changed atlas texel then copied the optimal image into a fresh optimal destination through two TFU jobs, with the destination sampled by V3D (`docs/VULKAN_MIXED_IMAGE_TFU_PI4_2026-09-27.md`). A bounded partial optimal-to-linear `vkCmdCopyImage` shape is now implemented: one region between distinct, equal-size level-zero BGRA8 images; source offsets align to 4Ãƒâ€”4 utiles; width and height are multiples of four unless that dimension reaches its corresponding source edge; destination coordinates remain in bounds; and the bound allocations are disjoint. The shared command layer preflights the full stream before guarded DMA detiles the accepted region on Pi 4. The 2026-09-30 Pi 4 proof copied 25 exact texels from `(32,8)` extent `5Ãƒâ€”5` in a 37Ãƒâ€”13 image, preserving 456 other texels and 32 guard words; the 148-byte row pitch had no padding words. DMA advanced 0Ã¢â€ â€™4, TFU 0Ã¢â€ â€™1 and backend jobs 1Ã¢â€ â€™2. A same-sized non-edge tail returned `-20005` before further transfer work. See `docs/evidence/vulkan-partial-optimal-linear-pi4-20260930/README.md`. Other optimal-to-optimal partial regions remain unsupported except for the bounded right/bottom edge-tail shape below; mips, layers, format conversion, and mixing with draws or clears remain unsupported. At most one partial optimal-to-optimal `vkCmdCopyImage` region per command buffer is also implemented for distinct, equal-size level-zero BGRA8 UIF images. Its source/destination offsets and extents align to 4Ãƒâ€”4 utiles, with at most 256 utiles per region. The shared layer preflights the command stream; Pi 4 uses guarded 64-byte-utile DMA selected by a dedicated capability. The full-image TFU path is unchanged, and the 2026-09-30 Pi 4 proof matched all 16 copied texels, preserved 240 untouched texels, and passed 64 padding and 96 guard checks. TFU stayed at 2, DMA advanced 0Ã¢â€ â€™1 and backend jobs 2Ã¢â€ â€™3; a later full readback advanced DMA 1Ã¢â€ â€™17. An unaligned request returned `-20005` without extra transfer work. See `docs/evidence/vulkan-partial-optimal-copy-pi4-20260930/README.md`. Other boards refuse it. Mips, layers, format conversion, and mixing with draws or clears remain unsupported. Bounded optimal image-to-buffer partial readback is documented separately. Supported linear image readbacks may join the transfer stream.
 
 A returning Pi 4 diagnostic copied a 17 by 13 rectangle between differently sized linear images after a V3D clear, counted thirteen DMA transfers, and checked every copied and untouched destination pixel. The monitor verified the payload, received `x0=0`, and saved a fresh capture. The measured record is in `docs/VULKAN_IMAGE_RECTANGLE_PI4_2026-09-26.md`.
 
-`vkCmdCopyBufferToImage` accepts one to 32 rectangular upload regions into a linear BGRA8 image with transfer-destination usage and a transfer-destination or general layout. Source buffer offsets must satisfy the backend's published 64-byte alignment on Pi 4. `bufferRowLength` is in texels: zero packs the rows tightly, while a nonzero value at least as wide as the rectangle can leave padding between them. For this single 2D layer, `bufferImageHeight` is zero or at least the rectangle height. The whole array is checked before recording and again before submission. Source/destination and destination/destination overlap, including aliased allocations, is refused before DMA starts. Each tight full-width region uses one linear DMA transfer; a supported strided rectangle uses one 2D DMA submission. Larger row gaps retain guarded DMA row copies. Separate linear upload calls in one otherwise isolated command buffer execute in recorded order through guarded DMA; two calls passed on Pi 4 with eight rows and exact 1,024-pixel destination bytes (`docs/VULKAN_MULTI_CALL_UPLOAD_DMA_PI4_2026-09-27.md`). Optimal-tiled destinations keep one complete-image TFU transaction per call and the same 64-byte source alignment. An explicit padded `bufferRowLength` is passed to the TFU raster-stride register; an 8x8 atlas with 16-texel rows was sampled by V3D on Pi 4 and passed exact pixel checks (`docs/VULKAN_OPTIMAL_STRIDE_TFU_PI4_2026-09-27.md`). Multiple complete optimal-image calls in one command buffer are preflighted together and executed in order by the TFU; two uploads followed by V3D atlas sampling passed 213 exact board checks (`docs/VULKAN_ORDERED_TFU_PI4_2026-09-27.md`). Within the complete-image TFU route, multiple regions in one call and subrectangles remain unsupported. A bounded partial optimal-image upload accepts up to two separate one-region calls in one command buffer, targeting the same optimal BGRA8 image. Buffer offsets are 64-byte aligned; rows may be tight or padded and the source range ends after the last row payload; destination offsets and extents align to 4×4 utiles. Source byte spans and destination rectangles must be disjoint, and the combined tile count is at most 256. The shared layer preflights the full stream before Pi 4 guarded DMA dispatch; the calls execute in recorded order behind `BUFFER_TO_TILED_RECT_COPY`. Desk checks reject a 257-tile aggregate before backend work; an exact 256-tile aggregate has not been separately tested. The 2026-09-30 Pi 4 proof replaced 32 destination texels and preserved 224; it checked 288 source words including 48 source-padding words, 64 readback-padding words and 128 guard words. TFU stayed at 1, DMA advanced 0→2 and jobs 1→3; later readback advanced DMA 2→18. A misaligned second operation returned `-20005` during recording before submit or DMA. See `docs/evidence/vulkan-two-partial-optimal-uploads-pi4-20260930/README.md`. Full-image TFU uploads remain unchanged, and other boards do not advertise this capability. Edge-tail extension: destination XY remains 4-aligned; a width or height not divisible by four is accepted only when that rectangle reaches the matching image right or bottom edge. The backend clamps each 4×4 UIF tile to its valid columns and rows, issuing guarded DMA for only `validColumns * 4` bytes across `validRows`; this preserves neighboring texels and padded storage. It requires both `BUFFER_TO_TILED_RECT_COPY` and the separate `BUFFER_TO_TILED_TAIL_COPY` capability. Up to two calls remain allowed, with disjoint rectangles and source spans and a cumulative limit of 256 `ceil(width/4) * ceil(height/4)` tiles. Source bounds remain `(height - 1) * pitch + width * 4`, with DMA row-skip bounds checked for the smallest tail row. The complete stream and every tile address/span are preflighted before DMA. Full-image TFU uploads remain unchanged; other boards fail closed. The 2026-09-30 Pi 4 proof changed 25 texels, left 196 valid texels untouched, and preserved 291 padded UIF backing words outside the copy. It checked 246 source words including 54 source-padding words, 91 readback-padding words and 92 guards. TFU stayed at 1, DMA advanced 0→4 and jobs 1→2; later readback advanced DMA 4→24. A non-edge 5×5 request returned `-20005` during recording before more DMA. MMU, OOM and native faults were zero, with one intentional validation fault. Submit-time malformed-stream preflight remains desk-gate evidence. See `docs/evidence/vulkan-optimal-upload-edge-tail-pi4-20260930/README.md`. One-utile micro upload: a separate guarded-DMA shape accepts a 1–4 by 1–4 BGRA8 rectangle wholly contained in one 4×4 UIF utile, including an unaligned interior pixel origin. It writes only the requested row bytes and rows, preserving the other texels in that utile. It requires both `BUFFER_TO_TILED_RECT_COPY` and `BUFFER_TO_TILED_MICRO_COPY`; a micro upload is isolated from other buffer-to-image operations in its command buffer. Buffer offsets remain 64-byte aligned, source bounds use `(height - 1) * pitch + width * 4`, and source/image alias, row-stride, utile and guarded-window bounds are preflighted before DMA. Other boards do not advertise this capability. The 2026-09-30 Pi 4 proof changed six requested texels and preserved 250, including ten same-utile neighbors; checks covered 272 source words (262 payload and ten padding words), 64 readback-padding words and 96 guards. TFU stayed at 1, DMA advanced 0→1 and jobs 1→2. A crossing-utile request returned `-20005` during recording. MMU, OOM and native fault counts were zero. See `docs/evidence/vulkan-buffer-optimal-microrect-pi4-20260930/README.md`. Submit-time malformed-stream preflight remains desk-gate evidence. A separate two-call Pi 4 proof used a 13×13 target: 17 texels changed, 152 valid texels remained unchanged, and 343 padded UIF backing words outside the copies were preserved. It checked 186 source words including 58 source-padding words, 39 readback-padding words and 112 guards. TFU stayed at 1, DMA advanced 0→2 and jobs 1→3; later readback advanced DMA 2→18. A non-edge second call returned `-20005` during recording before DMA. Submit-time malformed-second preflight is proven by signed desk regression only. See `docs/evidence/vulkan-optimal-upload-edge-tail-pi4-20260930/README.md` (`two-call-report.bin`).
+`vkCmdCopyBufferToImage` accepts one to 32 rectangular upload regions into a linear BGRA8 image with transfer-destination usage and a transfer-destination or general layout. Source buffer offsets must satisfy the backend's published 64-byte alignment on Pi 4. `bufferRowLength` is in texels: zero packs the rows tightly, while a nonzero value at least as wide as the rectangle can leave padding between them. For this single 2D layer, `bufferImageHeight` is zero or at least the rectangle height. The whole array is checked before recording and again before submission. Source/destination and destination/destination overlap, including aliased allocations, is refused before DMA starts. Each tight full-width region uses one linear DMA transfer; a supported strided rectangle uses one 2D DMA submission. Larger row gaps retain guarded DMA row copies. Separate linear upload calls in one otherwise isolated command buffer execute in recorded order through guarded DMA; two calls passed on Pi 4 with eight rows and exact 1,024-pixel destination bytes (`docs/VULKAN_MULTI_CALL_UPLOAD_DMA_PI4_2026-09-27.md`). Optimal-tiled destinations keep one complete-image TFU transaction per call and the same 64-byte source alignment. An explicit padded `bufferRowLength` is passed to the TFU raster-stride register; an 8x8 atlas with 16-texel rows was sampled by V3D on Pi 4 and passed exact pixel checks (`docs/VULKAN_OPTIMAL_STRIDE_TFU_PI4_2026-09-27.md`). Multiple complete optimal-image calls in one command buffer are preflighted together and executed in order by the TFU; two uploads followed by V3D atlas sampling passed 213 exact board checks (`docs/VULKAN_ORDERED_TFU_PI4_2026-09-27.md`). Within the complete-image TFU route, multiple regions in one call and subrectangles remain unsupported. A bounded partial optimal-image upload accepts up to two separate one-region calls in one command buffer, targeting the same optimal BGRA8 image. Buffer offsets are 64-byte aligned; rows may be tight or padded and the source range ends after the last row payload; destination offsets and extents align to 4Ãƒâ€”4 utiles. Source byte spans and destination rectangles must be disjoint, and the combined tile count is at most 256. The shared layer preflights the full stream before Pi 4 guarded DMA dispatch; the calls execute in recorded order behind `BUFFER_TO_TILED_RECT_COPY`. Desk checks reject a 257-tile aggregate before backend work; an exact 256-tile aggregate has not been separately tested. The 2026-09-30 Pi 4 proof replaced 32 destination texels and preserved 224; it checked 288 source words including 48 source-padding words, 64 readback-padding words and 128 guard words. TFU stayed at 1, DMA advanced 0Ã¢â€ â€™2 and jobs 1Ã¢â€ â€™3; later readback advanced DMA 2Ã¢â€ â€™18. A misaligned second operation returned `-20005` during recording before submit or DMA. See `docs/evidence/vulkan-two-partial-optimal-uploads-pi4-20260930/README.md`. Full-image TFU uploads remain unchanged, and other boards do not advertise this capability. Edge-tail extension: destination XY remains 4-aligned; a width or height not divisible by four is accepted only when that rectangle reaches the matching image right or bottom edge. The backend clamps each 4Ãƒâ€”4 UIF tile to its valid columns and rows, issuing guarded DMA for only `validColumns * 4` bytes across `validRows`; this preserves neighboring texels and padded storage. It requires both `BUFFER_TO_TILED_RECT_COPY` and the separate `BUFFER_TO_TILED_TAIL_COPY` capability. Up to two calls remain allowed, with disjoint rectangles and source spans and a cumulative limit of 256 `ceil(width/4) * ceil(height/4)` tiles. Source bounds remain `(height - 1) * pitch + width * 4`, with DMA row-skip bounds checked for the smallest tail row. The complete stream and every tile address/span are preflighted before DMA. Full-image TFU uploads remain unchanged; other boards fail closed. The 2026-09-30 Pi 4 proof changed 25 texels, left 196 valid texels untouched, and preserved 291 padded UIF backing words outside the copy. It checked 246 source words including 54 source-padding words, 91 readback-padding words and 92 guards. TFU stayed at 1, DMA advanced 0Ã¢â€ â€™4 and jobs 1Ã¢â€ â€™2; later readback advanced DMA 4Ã¢â€ â€™24. A non-edge 5Ãƒâ€”5 request returned `-20005` during recording before more DMA. MMU, OOM and native faults were zero, with one intentional validation fault. Submit-time malformed-stream preflight remains desk-gate evidence. See `docs/evidence/vulkan-optimal-upload-edge-tail-pi4-20260930/README.md`. One-utile micro upload: a separate guarded-DMA shape accepts a 1Ã¢â‚¬â€œ4 by 1Ã¢â‚¬â€œ4 BGRA8 rectangle wholly contained in one 4Ãƒâ€”4 UIF utile, including an unaligned interior pixel origin. It writes only the requested row bytes and rows, preserving the other texels in that utile. It requires both `BUFFER_TO_TILED_RECT_COPY` and `BUFFER_TO_TILED_MICRO_COPY`; a micro upload is isolated from other buffer-to-image operations in its command buffer. Buffer offsets remain 64-byte aligned, source bounds use `(height - 1) * pitch + width * 4`, and source/image alias, row-stride, utile and guarded-window bounds are preflighted before DMA. Other boards do not advertise this capability. The 2026-09-30 Pi 4 proof changed six requested texels and preserved 250, including ten same-utile neighbors; checks covered 272 source words (262 payload and ten padding words), 64 readback-padding words and 96 guards. TFU stayed at 1, DMA advanced 0Ã¢â€ â€™1 and jobs 1Ã¢â€ â€™2. A crossing-utile request returned `-20005` during recording. MMU, OOM and native fault counts were zero. See `docs/evidence/vulkan-buffer-optimal-microrect-pi4-20260930/README.md`. Submit-time malformed-stream preflight remains desk-gate evidence. A separate two-call Pi 4 proof used a 13Ãƒâ€”13 target: 17 texels changed, 152 valid texels remained unchanged, and 343 padded UIF backing words outside the copies were preserved. It checked 186 source words including 58 source-padding words, 39 readback-padding words and 112 guards. TFU stayed at 1, DMA advanced 0Ã¢â€ â€™2 and jobs 1Ã¢â€ â€™3; later readback advanced DMA 2Ã¢â€ â€™18. A non-edge second call returned `-20005` during recording before DMA. Submit-time malformed-second preflight is proven by signed desk regression only. See `docs/evidence/vulkan-optimal-upload-edge-tail-pi4-20260930/README.md` (`two-call-report.bin`).
 
 A returning Pi 4 diagnostic uploaded a 17 by 13 rectangle into a differently pitched 32 by 32 image, counted thirteen DMA transfers, and checked all copied and untouched pixels. The monitor verified the payload, received `x0=0`, and saved a fresh capture. The measured record is in `docs/VULKAN_LINEAR_UPLOAD_PI4_2026-09-27.md`.
 A later two-region upload used one tight and one padded source rectangle. The Pi 4 diagnostic counted eight guarded DMA rows, checked every destination pixel and untouched byte, returned `x0=0`, and saved fresh capture 52. See `docs/VULKAN_IMAGE_UPLOAD_ARRAY_DMA_PI4_2026-09-27.md`.
 
 @SECTION The supported image readback
 
-`vkCmdCopyImageToBuffer` accepts one to 32 nonempty rectangular regions from a linear BGRA8 image into a destination buffer with tightly packed or explicitly padded rows. The source must have transfer-source usage and be in `TRANSFER_SRC_OPTIMAL` or `GENERAL`; the destination must be a bound transfer-destination buffer with four-byte-aligned offsets and enough space for every copied row. The whole array is checked before recording and rechecked before submission. Source/destination and destination/destination overlaps, including aliased allocations, are refused before DMA begins. A tight full-width region uses one linear DMA transfer; a supported strided rectangle or padded destination uses one 2D DMA submission. Larger row gaps retain guarded DMA row copies. Separate readback calls and supported buffer/image transfers in one transfer-only command buffer execute in recorded order through guarded DMA or TFU, after whole-stream preflight. Optimal-tiled sources now support a bounded Pi 4 subset: full level-zero BGRA8 readback, including odd full-image extents, and partial regions with source offsets aligned to 4×4 utiles. Width and height must be multiples of four unless that dimension reaches the corresponding image edge. R2 checked 16 exact texels, 16 padding words and 32 guard words with one DMA and refused an unaligned request with `-20005`. R3 read a padded `(32,8)` `5×5` region ending at the right and bottom edges of a 37×13 image; all 25 texels matched, 15 padding words and 32 guard words remained intact, and DMA advanced from zero to four operations. A non-edge `(28,4)` `5×5` request was refused with `-20005` before extra work. Array layers and mixed render/transfer jobs remain unsupported. See `docs/VULKAN_OPTIMAL_IMAGE_BUFFER_DMA_PI4_2026-09-27.md` and `docs/evidence/vulkan-optimal-edge-tail-pi4-20260930/README.md`.
+`vkCmdCopyImageToBuffer` accepts one to 32 nonempty rectangular regions from a linear BGRA8 image into a destination buffer with tightly packed or explicitly padded rows. The source must have transfer-source usage and be in `TRANSFER_SRC_OPTIMAL` or `GENERAL`; the destination must be a bound transfer-destination buffer with four-byte-aligned offsets and enough space for every copied row. The whole array is checked before recording and rechecked before submission. Source/destination and destination/destination overlaps, including aliased allocations, are refused before DMA begins. A tight full-width region uses one linear DMA transfer; a supported strided rectangle or padded destination uses one 2D DMA submission. Larger row gaps retain guarded DMA row copies. Separate readback calls and supported buffer/image transfers in one transfer-only command buffer execute in recorded order through guarded DMA or TFU, after whole-stream preflight. Optimal-tiled sources now support a bounded Pi 4 subset: full level-zero BGRA8 readback, including odd full-image extents, and partial regions with source offsets aligned to 4Ãƒâ€”4 utiles. Width and height must be multiples of four unless that dimension reaches the corresponding image edge. R2 checked 16 exact texels, 16 padding words and 32 guard words with one DMA and refused an unaligned request with `-20005`. R3 read a padded `(32,8)` `5Ãƒâ€”5` region ending at the right and bottom edges of a 37Ãƒâ€”13 image; all 25 texels matched, 15 padding words and 32 guard words remained intact, and DMA advanced from zero to four operations. A non-edge `(28,4)` `5Ãƒâ€”5` request was refused with `-20005` before extra work. Array layers and mixed render/transfer jobs remain unsupported. See `docs/VULKAN_OPTIMAL_IMAGE_BUFFER_DMA_PI4_2026-09-27.md` and `docs/evidence/vulkan-optimal-edge-tail-pi4-20260930/README.md`.
 
 The whole-image readback passed a desk byte check, including all pixels of a 64 by 64 image and the untouched prefix of a destination buffer. A returning Pi 4 diagnostic then cleared a 64 by 64 image on V3D and copied it by DMA. It returned zero after checking every pixel, prefix and suffix guards, one GPU bin/render pair, one DMA operation and restoration of the previous DMA write bound. The monitor verified the payload and saved a fresh screenshot. The exact record is in `docs/VULKAN_IMAGE_READBACK_PI4_2026-09-26.md`. A later returning diagnostic read a nonzero-offset 17 by 13 rectangle using thirteen DMA transfers and checked all copied and untouched bytes; see `docs/VULKAN_IMAGE_RECT_READBACK_PI4_2026-09-27.md`.
 
@@ -41,32 +41,32 @@ The current Pi 4 image-transfer diagnostic passed all exact pixel, padding, DMA-
 
 ### One-utile optimal-to-optimal microcopy
 
-A separate Pi 4 capability copies one 1–4 by 1–4 BGRA8 rectangle between distinct equal-size level-zero optimal images. Source and destination offsets are independent; each rectangle must fit within one 4×4 UIF utile, and each image’s other texels are preserved. The route requires both `TILED_RECT_COPY` and dedicated `TILED_MICRO_COPY`; it is isolated as the sole copy/transfer/draw operation in its command buffer. Shared recording and submit validation recheck capability, resource/layout generations, extents and allocation aliasing before dispatch. Pi 4 lowers only the requested row bytes with guarded DMA at a 16-byte row stride; it does not use CPU pixels or TFU. Other backends fail closed. The 2026-09-30 proof changed four destination texels and preserved 252 (including twelve same-utile neighbors); all 256 source texels remained unchanged. Each readback checked 64 padding words and 128 guards. TFU stayed at 2, DMA advanced 0→1 and jobs 2→3; a source utile-crossing request returned `-20005` during recording. MMU, OOM and native fault counts were zero. See `docs/evidence/vulkan-optimal-optimal-microrect-pi4-20260930/README.md`. Submit-time malformed-stream preflight remains desk-gate evidence.
+A separate Pi 4 capability copies one 1Ã¢â‚¬â€œ4 by 1Ã¢â‚¬â€œ4 BGRA8 rectangle between distinct equal-size level-zero optimal images. Source and destination offsets are independent; each rectangle must fit within one 4Ãƒâ€”4 UIF utile, and each imageÃ¢â‚¬â„¢s other texels are preserved. The route requires both `TILED_RECT_COPY` and dedicated `TILED_MICRO_COPY`; it is isolated as the sole copy/transfer/draw operation in its command buffer. Shared recording and submit validation recheck capability, resource/layout generations, extents and allocation aliasing before dispatch. Pi 4 lowers only the requested row bytes with guarded DMA at a 16-byte row stride; it does not use CPU pixels or TFU. Other backends fail closed. The 2026-09-30 proof changed four destination texels and preserved 252 (including twelve same-utile neighbors); all 256 source texels remained unchanged. Each readback checked 64 padding words and 128 guards. TFU stayed at 2, DMA advanced 0Ã¢â€ â€™1 and jobs 2Ã¢â€ â€™3; a source utile-crossing request returned `-20005` during recording. MMU, OOM and native fault counts were zero. See `docs/evidence/vulkan-optimal-optimal-microrect-pi4-20260930/README.md`. Submit-time malformed-stream preflight remains desk-gate evidence.
 
 ### One-utile optimal-image buffer readback
 
-A separate Pi 4 DMA capability supports one interior `vkCmdCopyImageToBuffer` region of 1–4 by 1–4 BGRA8 texels, wholly inside one source 4×4 UIF utile. Destination offset remains four-byte aligned; tight or padded rows are checked against the exact last-row span `(height - 1) * pitch + width * 4`. The shared API requires both ordinary linear-transfer support and dedicated `TILED_MICRO_READBACK`; it rejects image/buffer aliasing and verifies capability, resource lifetime, bounds and destination stride before any DMA. The Pi 4 backend reads from the source's independent local UIF offset with guarded DMA; other backends fail closed. The 2026-10-01 proof matched four requested texel words, passed twelve row-padding checks, left all 256 source texels unchanged (including twelve same-utile neighbors), and passed 64 full-readback-padding, 16 stage-spare and 128 guard checks. TFU stayed at 1, DMA advanced 0→1 and jobs 1→2. A crossing-utile request returned `-20005` during recording; MMU, OOM and native faults were zero. See `docs/evidence/vulkan-optimal-buffer-microreadback-pi4-20261001/README.md`. Submit-time malformed-stream preflight remains desk-gate evidence. Other backends do not advertise this capability.
+A separate Pi 4 DMA capability supports one interior `vkCmdCopyImageToBuffer` region of 1Ã¢â‚¬â€œ4 by 1Ã¢â‚¬â€œ4 BGRA8 texels, wholly inside one source 4Ãƒâ€”4 UIF utile. Destination offset remains four-byte aligned; tight or padded rows are checked against the exact last-row span `(height - 1) * pitch + width * 4`. The shared API requires both ordinary linear-transfer support and dedicated `TILED_MICRO_READBACK`; it rejects image/buffer aliasing and verifies capability, resource lifetime, bounds and destination stride before any DMA. The Pi 4 backend reads from the source's independent local UIF offset with guarded DMA; other backends fail closed. The 2026-10-01 proof matched four requested texel words, passed twelve row-padding checks, left all 256 source texels unchanged (including twelve same-utile neighbors), and passed 64 full-readback-padding, 16 stage-spare and 128 guard checks. TFU stayed at 1, DMA advanced 0Ã¢â€ â€™1 and jobs 1Ã¢â€ â€™2. A crossing-utile request returned `-20005` during recording; MMU, OOM and native faults were zero. See `docs/evidence/vulkan-optimal-buffer-microreadback-pi4-20261001/README.md`. Submit-time malformed-stream preflight remains desk-gate evidence. Other backends do not advertise this capability.
 
 ### One-utile optimal-to-linear microcopy
 
-A separate Pi 4 DMA capability copies one interior 1–4 by 1–4 BGRA8 rectangle from an optimal image into a distinct, equal-size linear image. The rectangle must fit in one 4×4 UIF utile. It requires `LINEAR_TRANSFER` and `TILED_TO_LINEAR_MICRO_COPY`; the backend checks the linear destination pitch and exact written span, then DMA-copies only the requested rows. Other backends refuse this shape. The 2026-10-01 Pi 4 proof changed four destination texels and preserved 252; all 256 source texels remained unchanged, including twelve neighbors in the same utile. The 64-byte destination pitch had zero row padding. Separate oracle and guard checks covered 64 padded words and 96 guards. DMA advanced 0→1, jobs 1→2, and TFU remained at 1. A crossing-utile request returned `-20005` while recording. Submit-time whole-stream preflight is desk-gate evidence only. See `docs/evidence/vulkan-optimal-linear-microcopy-pi4-20261001/README.md`.
+A separate Pi 4 DMA capability copies one interior 1Ã¢â‚¬â€œ4 by 1Ã¢â‚¬â€œ4 BGRA8 rectangle from an optimal image into a distinct, equal-size linear image. The rectangle must fit in one 4Ãƒâ€”4 UIF utile. It requires `LINEAR_TRANSFER` and `TILED_TO_LINEAR_MICRO_COPY`; the backend checks the linear destination pitch and exact written span, then DMA-copies only the requested rows. Other backends refuse this shape. The 2026-10-01 Pi 4 proof changed four destination texels and preserved 252; all 256 source texels remained unchanged, including twelve neighbors in the same utile. The 64-byte destination pitch had zero row padding. Separate oracle and guard checks covered 64 padded words and 96 guards. DMA advanced 0Ã¢â€ â€™1, jobs 1Ã¢â€ â€™2, and TFU remained at 1. A crossing-utile request returned `-20005` while recording. Submit-time whole-stream preflight is desk-gate evidence only. See `docs/evidence/vulkan-optimal-linear-microcopy-pi4-20261001/README.md`.
 
 ### One-utile linear-to-optimal microcopy
 
-A separate Pi 4 DMA capability copies one interior 1–4 by 1–4 BGRA8 rectangle from a linear image to a distinct, equal-size optimal image. The rectangle must fit in one destination 4×4 UIF utile. It requires `LINEAR_TRANSFER`, `LINEAR_TO_TILED_RECT_COPY` and `LINEAR_TO_TILED_MICRO_COPY`; the actual linear pitch, exact source span and destination utile window are checked before DMA. Other backends refuse this shape. The 2026-10-01 Pi 4 proof changed four destination texels and preserved 252, including twelve same-utile neighbors, while all 256 source texels remained unchanged. Source pitch was 64 bytes with zero row padding; offset/span were 332/72 bytes and the UIF destination offset was 1,316 bytes. Separate oracle and guard checks covered 64 padded words and 96 guards. TFU stayed at 1, DMA advanced 0→1, and jobs 1→2. A crossing-utile request returned `-20005` while recording, before DMA. Submit-time whole-stream preflight remains desk-gate evidence only. See `docs/evidence/vulkan-linear-optimal-microcopy-pi4-20261001/README.md`.
+A separate Pi 4 DMA capability copies one interior 1Ã¢â‚¬â€œ4 by 1Ã¢â‚¬â€œ4 BGRA8 rectangle from a linear image to a distinct, equal-size optimal image. The rectangle must fit in one destination 4Ãƒâ€”4 UIF utile. It requires `LINEAR_TRANSFER`, `LINEAR_TO_TILED_RECT_COPY` and `LINEAR_TO_TILED_MICRO_COPY`; the actual linear pitch, exact source span and destination utile window are checked before DMA. Other backends refuse this shape. The 2026-10-01 Pi 4 proof changed four destination texels and preserved 252, including twelve same-utile neighbors, while all 256 source texels remained unchanged. Source pitch was 64 bytes with zero row padding; offset/span were 332/72 bytes and the UIF destination offset was 1,316 bytes. Separate oracle and guard checks covered 64 padded words and 96 guards. TFU stayed at 1, DMA advanced 0Ã¢â€ â€™1, and jobs 1Ã¢â€ â€™2. A crossing-utile request returned `-20005` while recording, before DMA. Submit-time whole-stream preflight remains desk-gate evidence only. See `docs/evidence/vulkan-linear-optimal-microcopy-pi4-20261001/README.md`.
 
 ### Two-by-two UIF grid buffer upload
 
-A separate Pi 4 DMA capability accepts one interior buffer-to-optimal region that intersects up to two adjacent 4×4 UIF tile columns and two rows. It requires `BUFFER_TRANSFER`, `LINEAR_TRANSFER`, `BUFFER_TO_TILED_RECT_COPY` and `BUFFER_TO_TILED_GRID_COPY`; a 64-byte source offset, tight or padded row pitch and exact source span are validated. All tile source spans and destination windows are checked before any DMA. Other backends refuse this shape; the full-image TFU upload is unchanged. The 2026-10-01 Pi 4 proof copied a `5×5` rectangle at `(3,3)` through intersections `1×1`, `4×1`, `1×4`, `4×4`; it changed 25 texels and preserved 231, including 39 neighbors within the touched grid. Source checks covered 25 exact words plus 327 sentinels (including 15 padding words); separate oracle checks covered 64 padding words and 96 guards. TFU remained at 1, DMA advanced 0→4, jobs 1→2, and later readback advanced DMA 4→20. The recorded `6×6` refusal was tested with only the original ≤2×2 grid cap, before the extended cap existed. With `BUFFER_TO_TILED_GRID_4X4_COPY` enabled, an otherwise-valid `6×6` region can be admitted; that exact size has not been silicon-tested. Submit-time malformed-stream preflight is desk-gate evidence only. See `docs/evidence/vulkan-buffer-optimal-grid-pi4-20261001/README.md`.
+A separate Pi 4 DMA capability accepts one interior buffer-to-optimal region that intersects up to two adjacent 4Ãƒâ€”4 UIF tile columns and two rows. It requires `BUFFER_TRANSFER`, `LINEAR_TRANSFER`, `BUFFER_TO_TILED_RECT_COPY` and `BUFFER_TO_TILED_GRID_COPY`; a 64-byte source offset, tight or padded row pitch and exact source span are validated. All tile source spans and destination windows are checked before any DMA. Other backends refuse this shape; the full-image TFU upload is unchanged. The 2026-10-01 Pi 4 proof copied a `5Ãƒâ€”5` rectangle at `(3,3)` through intersections `1Ãƒâ€”1`, `4Ãƒâ€”1`, `1Ãƒâ€”4`, `4Ãƒâ€”4`; it changed 25 texels and preserved 231, including 39 neighbors within the touched grid. Source checks covered 25 exact words plus 327 sentinels (including 15 padding words); separate oracle checks covered 64 padding words and 96 guards. TFU remained at 1, DMA advanced 0Ã¢â€ â€™4, jobs 1Ã¢â€ â€™2, and later readback advanced DMA 4Ã¢â€ â€™20. The recorded `6Ãƒâ€”6` refusal was tested with only the original Ã¢â€°Â¤2Ãƒâ€”2 grid cap, before the extended cap existed. With `BUFFER_TO_TILED_GRID_4X4_COPY` enabled, an otherwise-valid `6Ãƒâ€”6` region can be admitted; that exact size has not been silicon-tested. Submit-time malformed-stream preflight is desk-gate evidence only. See `docs/evidence/vulkan-buffer-optimal-grid-pi4-20261001/README.md`.
 
 ### Extended optimal-image buffer upload grid
 
-A separate Pi 4 DMA capability handles a single `vkCmdCopyBufferToImage` region that crosses three or four adjacent UIF columns or rows, up to 16 intersections. It has a dedicated `BUFFER_TO_TILED_GRID_4X4_COPY` cap/tag; the earlier `BUFFER_TO_TILED_GRID_COPY` remains limited to at most two columns and rows. The buffer offset remains 64-byte aligned, with tight or padded pitch and exact source span. The whole tile grid is validated before any guarded DMA. Other backends do not advertise the extended shape. The 2026-10-01 proof copied a `(3,3)` `9×9` region using buffer offset 64, row length 12, 48-byte pitch and 420-byte span. Intersections were `1×1`, `4×1`, `4×1`, `1×4`, `4×4`, `4×4`, `1×4`, `4×4`, `4×4`; 81 texels changed and 175 remained unchanged, including 63 inside the touched 12×12 grid. Source checks covered 81 exact words plus 271 sentinels (27 padding words), 64 oracle-padding words and 96 guards. TFU stayed at 1, DMA advanced 0→9, jobs 1→2, and later readback advanced DMA 9→25. All reported statuses and fault counts were zero. The fifth-row/column refusal and submit-time malformed-stream preflight are desk-only checks. See `docs/evidence/vulkan-buffer-optimal-grid4-pi4-20261001/README.md`.
+A separate Pi 4 DMA capability handles a single `vkCmdCopyBufferToImage` region that crosses three or four adjacent UIF columns or rows, up to 16 intersections. It has a dedicated `BUFFER_TO_TILED_GRID_4X4_COPY` cap/tag; the earlier `BUFFER_TO_TILED_GRID_COPY` remains limited to at most two columns and rows. The buffer offset remains 64-byte aligned, with tight or padded pitch and exact source span. The whole tile grid is validated before any guarded DMA. Other backends do not advertise the extended shape. The 2026-10-01 proof copied a `(3,3)` `9Ãƒâ€”9` region using buffer offset 64, row length 12, 48-byte pitch and 420-byte span. Intersections were `1Ãƒâ€”1`, `4Ãƒâ€”1`, `4Ãƒâ€”1`, `1Ãƒâ€”4`, `4Ãƒâ€”4`, `4Ãƒâ€”4`, `1Ãƒâ€”4`, `4Ãƒâ€”4`, `4Ãƒâ€”4`; 81 texels changed and 175 remained unchanged, including 63 inside the touched 12Ãƒâ€”12 grid. Source checks covered 81 exact words plus 271 sentinels (27 padding words), 64 oracle-padding words and 96 guards. TFU stayed at 1, DMA advanced 0Ã¢â€ â€™9, jobs 1Ã¢â€ â€™2, and later readback advanced DMA 9Ã¢â€ â€™25. All reported statuses and fault counts were zero. The fifth-row/column refusal and submit-time malformed-stream preflight are desk-only checks. See `docs/evidence/vulkan-buffer-optimal-grid4-pi4-20261001/README.md`.
 
 @SECTION Bounded partial optimal-to-optimal edge-tail copy
 The shared `vkCmdCopyImage` API supports one partial region per command buffer between distinct, equal-size level-zero BGRA8 `UIF_NO_XOR` images. Source and destination XY offsets remain 4-texel aligned. Width or height may end with a short UIF tile only when that dimension reaches the right or bottom edge in both images; the ceil-divided tile count is capped at 256. This shape requires `TILED_RECT_COPY` plus the separate `TILED_EDGE_TAIL_COPY` capability. Whole-image copies retain their TFU path, aligned full-utile rectangles retain the rectangle path, and one-utile microcopies retain their separate path. The Pi 4 backend preflights all clamped tile windows and performs guarded DMA for valid texel rows only, preserving source data, untouched destination texels and padded UIF storage. Other backends fail closed.
 
-The 2026-10-01 Pi 4 proof copied a `(8,8)` `5×5` region between distinct 13×13 images: 25 destination texels changed, 144 stayed unchanged, and all 169 source texels were unchanged. The report checked 338 exact staging words plus 78 staging-padding words, 91 readback-padding words in each full readback, and 160 guard checks. TFU stayed at 2, partial DMA advanced 0→4 and jobs 2→3; the oracle readbacks advanced DMA 4→20→36. A non-edge `(4,4)` `5×5` request returned `-20005` during `vkEndCommandBuffer` before further DMA. Status slots were zero; MMU, OOM and native faults were zero, with one intentional validation fault. The measured trace is `docs/evidence/vulkan-optimal-optimal-edge-tail-pi4-20261001/report.bin`; the PMF SHA-256 is `8594C760D6E3206CFDC5DEAE41DBAAF6C0A770EDDA5FB5A369EBC3AA40ED027F`. Right-only `5×4` and bottom-only `4×5` cases have desk validation but no separate silicon proof.
+The 2026-10-01 Pi 4 proof copied a `(8,8)` `5Ãƒâ€”5` region between distinct 13Ãƒâ€”13 images: 25 destination texels changed, 144 stayed unchanged, and all 169 source texels were unchanged. The report checked 338 exact staging words plus 78 staging-padding words, 91 readback-padding words in each full readback, and 160 guard checks. TFU stayed at 2, partial DMA advanced 0Ã¢â€ â€™4 and jobs 2Ã¢â€ â€™3; the oracle readbacks advanced DMA 4Ã¢â€ â€™20Ã¢â€ â€™36. A non-edge `(4,4)` `5Ãƒâ€”5` request returned `-20005` during `vkEndCommandBuffer` before further DMA. Status slots were zero; MMU, OOM and native faults were zero, with one intentional validation fault. The measured trace is `docs/evidence/vulkan-optimal-optimal-edge-tail-pi4-20261001/report.bin`; the PMF SHA-256 is `8594C760D6E3206CFDC5DEAE41DBAAF6C0A770EDDA5FB5A369EBC3AA40ED027F`. Right-only `5Ãƒâ€”4` and bottom-only `4Ãƒâ€”5` cases have desk validation but no separate silicon proof.
 
 
 @SECTION Transactional Neon atlas generations
@@ -221,10 +221,11 @@ data and guards, and teardown releases every allocation. The strict checker
 rejects 38 corrupted proofs. The full current 15 scenes still match 245,760
 bytes and pass 124 widget checks with the larger variable layout.
 
-Line staging accepts the same input boundary, but its quad expansion needs
-786,432 output vertices and still refuses before writing. Line/outline storage
-remains open. Build 337 compiles but is not installed. The current port target
-is Pi 4/Anvil, using desktop OpenGL behavior as its reference. Evidence:
+At that proof stage, line staging accepted the same input boundary but its
+quad expansion needed 786,432 output vertices and refused before writing.
+The compact line/outline implementation described below replaces that cost.
+Build 337 was desk-built at that stage. The current port target is Pi 4/Anvil,
+using desktop OpenGL behavior as its reference. Original evidence:
 docs/evidence/neon-native-points-pi4-20261026/README.md.
 
 
@@ -242,8 +243,2289 @@ Physical checks cover 510 sizing cases, four rotations, 131,072 exact GPU
 bytes, zero live allocations and 41 rejected corrupt proofs. The complete
 15-scene regression retains 245,760 bytes and passes 124 widget checks.
 
-The isolated Vulkan proof stores lines in 32 bytes rather than the production
-144-byte representation. Production integration and full line/outline capacity
-remain open; this is not a throughput or completion claim. Build 338 compiles
-but is not installed. The broader high-register execution-mode issue remains
-open. See docs/evidence/vertex-shared-vpm-pi4-20261026/README.md.
+That isolated Vulkan proof stores lines in 32 bytes rather than the older
+144-byte representation. The later production integration is described below;
+the earlier isolated result is not a throughput or completion claim. Build 338
+is now installed and verified on Pi 4, with the previous image backed up. The
+pending compact storage and shared ownership changes run in RAM proofs and
+are not part of that installed build. The broader high-register execution-mode
+issue remains open. Original evidence:
+docs/evidence/vertex-shared-vpm-pi4-20261026/README.md.
+
+
+@SECTION Compact native line and outline storage
+
+Line lists now retain four exact corners in 32 bytes per segment and draw an
+instanced triangle strip. The complete native 262,144-point input becomes 131,072
+line instances. Mixed-state pixel comparisons at four rotations preserve the
+current line-placement contract, including reversed and zero-length lines.
+Ten complete captures match their oracles, and a deliberate missing binding
+restore is detected before a frame is accepted. Explicit smaller caller
+buffers still refuse without changing already recorded work.
+
+Outlines retain four vec2 corners per point and use stable open-chain indices
+plus immutable closing edges. Repeating an unchanged outline reuses geometry;
+appending points preserves earlier closing edges even with intervening boxes
+and textures. A following fill reuses the point cache. A fan without an
+outline keeps the existing direct storage path. Preparation failures roll
+back resources; uncertain submissions retain resources until safe retirement.
+
+The full 262,144-point outline/repeat/fill uses 349,526 occupied 24-byte slots.
+Another physical frame combines all 262,144 flat points with 98,304 textured
+vertices, occupying 447,830 slots. Its entire independent frame oracle matches.
+The maximum requested buffer is derived from both native vertex families
+plus cache padding: 75,094 quad units. Allocation still follows the caller's
+explicit request; raising a ceiling does not enlarge the resident console.
+
+One logical outline lowers to two physical draws. The recording and GPU
+arenas share 10,240 rows, covering 4,096 logical outlines plus 2,048 textured calls.
+That complete mix now submits and retires with exact pixels. The native
+binning command-list reservation is 335,872 bytes; its former 204,800-byte
+reservation refused the combined packets before GPU execution. Distinguishing
+preflight failure from uncertain execution in the public recovery path
+remains open.
+
+Capacity stress tests deliberately clip most geometry. Their timings do not
+establish smooth-map performance or all-visible throughput. The combined
+vertex test's submission takes about 5.57 seconds. Final measured memory,
+buffer, pipeline and layout counts are zero; these four counts are not an
+exhaustive census of every Vulkan object. Exact scope, failures and physical
+negative controls are in:
+docs/evidence/neon-indexed-outline-pi4-20261026/README.md.
+
+@SECTION Shared numeric and bitmap font ownership
+
+Anvil/Graphics/float_bits.pbi owns the existing integer-to-binary32 conversion.
+Native compatibility wrappers delegate to it. The bounded fixed-point
+quotient, nearest/ties-away mantissa rounding and zero-denominator result are
+preserved; this is not general IEEE division. On 64-bit targets, numerator and
+denominator magnitudes must be at most 2,147,483,647. Physical before/after checks
+retain 4,047 values and 53,960 captured bytes. Evidence:
+docs/evidence/graphics-float-shared-pi4-20261026/README.md.
+
+Anvil/Graphics/neon_bitmap_font.pbi owns bitmap state, four face identifiers,
+setup/defaults, fixed metrics, glyph-row handling and transactional binding.
+The native frontend retains error reporting and compatibility wrappers;
+Vulkan calls the shared row reader directly. The legacy reader consumes the
+first byte of an in-range row. This move adds neither wider-cell rasterization
+nor desktop TrueType point-size semantics.
+
+The physical font proof retains 3,040 regular/bold rows, six metric cases and a
+complete 16,384-byte four-face frame. A separate 8,288-byte payload links the shared
+module without native Neon or Vulkan and passes 59 API checks. The current
+fifteen-scene regression still retains 245,760 bytes and 124 widget checks. Exact
+sources, captures and corruption controls are in:
+docs/evidence/neon-bitmap-shared-pi4-20261026/README.md.
+
+These source changes and their guide update await the mandatory architecture
+gate. Its remaining ownership findings are not waived. They do not establish
+the whole Neon port, desktop backend parity, or Vulkan 1.0 conformance.
+
+
+@SECTION Shared Neon frontend and colour
+
+Anvil/Graphics/neon_frontend.pbi owns the typed primitive callback family,
+measurement and state pairing, frontend errors and logical query routing.
+Complete replacement or clear removes the old measurement/state pair. A
+partial family refuses without replacing the previous binding. Native
+fallback counters keep their established meaning; an external owner's query
+does not rewrite those counters. The shared header also owns logical quota
+and selector declarations. The private unbound targets use their own namespace.
+
+Anvil/Graphics/neon_colour.pbi owns packed ARGB colours, channel extraction,
+alpha replacement, integer colour ratios and hover lift. Thirty-eight frontend
+procedure bodies are unchanged after entry/routing name normalization; all ten
+colour bodies and the four logical quota declarations are unchanged. Native
+hardware ownership, lifecycle guards, resource addresses and GPU packet
+emission remain in the native backend.
+
+On the physical Pi 4, the native-before and shared-only compositions produce
+identical complete API and colour captures: 102 API checks and 2,880 results
+from 288 colour inputs. An independent integer oracle checks every result and
+all output guards. A private executed mutant omits state clearing during draw
+replacement and fails exactly its stale-state check. The strict checker rejects
+3,211 corrupted captures per case. These are CPU API proofs with controlled
+callbacks, separate from GPU rendering evidence.
+
+Diagnostic fixtures now use fixture-owned callbacks or check typed fallback
+behavior instead of depending on private callback addresses. The existing
+primitive-hook gate returns zero on the Pi. The actual fifteen-scene Vulkan
+regression retains all 245,760 current-contract bytes and passes 124 widget
+checks. No historical golden is replaced. Exact scope and identities:
+docs/evidence/neon-frontend-shared-pi4-20261026/README.md.
+
+The canonical full monitor build succeeds as counted build 339, with a
+5,773,504-byte image. Its linked BSS ends at 0EE46A4F; the existing extent rule
+derives reservation through 0EEFFFFF. This build is not installed: the Pi
+remains on verified build 338. The pending source and guide await the mandatory
+architecture gate, whose remaining findings are still refusals. This does not
+establish the complete Neon port or Vulkan conformance.
+
+
+@SECTION Shared QPU instruction encoder
+
+Anvil/Graphics/V3D42/qpu_encode.pbi owns the CPU V3D 4.2 instruction encoder
+and stream validator. The native board library is a compatibility include,
+and the Vulkan shader translator includes the shared owner directly. All
+86 procedures retain the original implementation. The encoder writes to a
+caller-provided buffer; peripheral access remains with the hardware backend.
+
+A physical Pi 4 composition checks 173 corpus records, 157 decoded words,
+a 17-word golden program and 13 hazard cases. It covers 150 pinned instruction
+comparisons with one documented branch normalization, seven table-derived
+LDVPM encodings and sixteen refusals. Refusal and hazard-state checks establish
+internal consistency. There are 325 source-table checks. The readback checker
+rejects 771 corrupted captures, including wrong shader hazard, count and index
+fields. It runs no emulator.
+
+The returning probe uses guarded scratch at 06000000 and bounded RAM text
+capture, with no UART writes or GPU submission. Both include compositions
+produce the exact container entered on the Pi. The post-move fifteen-scene
+GPU container is also byte-identical to verified capture 198. These identity
+checks are not extra physical runs. Scope, readbacks and identities:
+docs/evidence/qpu-encoder-shared-pi4-20261026/README.md.
+
+The ownership move removes 37 more layering findings; 294 new or grown keys
+still refuse. The provenance inventory separately reports older missing
+citation classifications elsewhere. The encoder retains its existing Mesa
+and py-videocore classifications; historical export hashes remain unchanged.
+Neither gate is waived. Build 339 remains uninstalled and the Pi runs 338.
+These results do not establish complete Vulkan support or full Neon parity.
+
+
+@SECTION Direct fan fallback capacity
+
+A backend without triangle-fan capability uses an indexed triangle list for
+direct fan fills. Each logical point occupies one ordinary vertex, with three
+indices per triangle. The lazy index buffer belongs to the device; ranges
+append within a frame, reset with frame state and release with the adapter.
+An outlined fan still reuses its existing four-corner cache. The advertised
+native triangle-fan path is unchanged.
+
+The old direct fallback expanded the native 262,144-point quota into 786,426
+vertices and refused beyond the adapter ceiling. The new direct path stores
+262,144 vertices plus indices and fits a caller-selected 65,536-quad buffer.
+On the physical Pi, a complete 16,384-byte capture matches an independent
+rectangle oracle. An explicitly smaller buffer refuses atomically. Eight
+capability-masked captures across four rotations also match all 131,072 bytes,
+including mixed boxes and batch transitions. This exercises the real GPU's
+triangle-list fallback under a diagnostic mask, not another GPU model.
+
+The full fifteen-scene regression retains all 245,760 current-contract bytes
+and passes 124 widget checks. Two earlier failed attempts are retained: a
+four-corner candidate exhausted memory, and an over-budget fixture attempted
+boxes after using the complete point quota. Neither is pixel acceptance.
+Exact containers, checker results and scope:
+docs/evidence/neon-fan-fallback-capacity-pi4-20261026/README.md.
+
+The canonical monitor now builds as counted build 340, raw 5,775,552 bytes,
+with linked BSS through 0EE46A6F. It is not installed; the Pi remains on 338.
+The architecture gate still refuses 294 new or grown keys; historical
+provenance inventory gaps also remain. No gate is waived. Combined no-fan
+outline workloads, recovery, presentation, desktop parity and wider Vulkan
+support still require work. Capacity captures are not throughput benchmarks.
+
+
+@SECTION Refused draw admission and retry
+
+The draw backend now distinguishes an explicit refusal before GPU launch from
+uncertain execution. The queue clears that classification before each attempt;
+a negative legacy status alone still quarantines resources. A qualified
+unlaunched refusal releases references and the queue lease, rolls back binary
+semaphores and restores executable command state. It leaves the fence
+unsignalled, does not publish image layouts or completion, and removes the
+unadmitted attempt from the submission count. Failed lease release still
+quarantines. Chrome restores Abort only when the error is not device loss and
+no submission remains outstanding.
+
+The physical Pi proof exercises the real binning-list preflight twice. Both
+refusals return out-of-device-memory without touching the target or advancing
+queue counts. Fence, semaphore and reference states roll back. Restoring
+capacity lets the exact recorded command retry successfully, then Abort and a
+normal new frame also succeed. Both complete captures match all 32,768 bytes
+of independent rectangle oracles. The strict checker rejects 35 corruptions.
+The fifteen-scene regression retains 245,760 bytes and 124 widget checks.
+The existing uncertain-failure branch and completion/polling source bodies
+are unchanged; this is not a newly induced uncertain GPU-failure test.
+
+Scope and exact identities:
+docs/evidence/neon-draw-admission-pi4-20261026/README.md.
+This covers unlaunched draw-list admission. Transfer, compute and failures
+after live-surface rebinding retain their existing handling and still require
+broader review. Resident 338 remains installed. Normal build 340 predates this
+change and is uninstalled; no newer normal build was made in this phase.
+Architecture and provenance gates still refuse publication. No reset or
+storage write was required for either physical proof.
+
+
+@SECTION Native rectangle ownership and target checks
+
+NeonHardwareClearRect now owns the native replacement-clear operation:
+hardware-frame validation, bounded rectangle arguments, private vertices,
+uniforms and shader records. The Vulkan bridge passes typed arguments instead
+of reaching into private renderer helpers.
+
+Two physical draws and two clears
+retain all 16,384 independently checked bytes, including alpha-zero replacement
+and application-scissor independence. The initially wrong public-frame guard
+was caught and corrected to the hardware latch; its failed capture is retained.
+The checker rejects 37 corruptions. The ownership change removes seven gate
+findings, leaving 287 new or grown keys, without changing the gate or ratchet.
+
+The shared clear-attachment state fixture also compiles for Pi 3, Pi 4,
+Arduino Q and Rock Pi 4C. Only its Pi 4 image was executed; it passes with a
+state backend that writes no pixels and submits no GPU job. Other-target
+compilation is not proof of hardware drivers. Each target keeps its own
+compiler-validated load, stack and heap range. Evidence and builders:
+docs/evidence/neon-clear-owner-pi4-20261026/README.md.
+
+The cumulative canonical monitor builds as counted 341, raw 5,777,888 bytes,
+with linked BSS through 0EE46A7F. It includes the previous admission fix but
+is not installed. The Pi still runs 338. Source publication still awaits
+architecture and provenance reconciliation. Shared Vulkan object, memory and
+synchronization behavior must serve all Anvil targets; each hardware driver
+must provide and prove its own capabilities before advertising them.
+
+
+@SECTION Shared queue contracts and proof layouts
+
+The explicit state backend checks the shared queue without GPU execution or
+pixel writes. Six returning Pi 4 cases cover qualified refusals with and
+without a GPU lease, unqualified negative statuses, stale-classification
+prevention, failed lease release and invalid refusal-code normalization.
+Rollback cases retry and retire the four counted object classes. Quarantine
+cases intentionally retain simulated references and synchronization. A private
+negative omitting classification reset fails the expected check; the positive
+checker rejects it. Each complete report rejects 65 planted corruptions.
+
+Admission and default-clear state compositions compile for Pi 3, Pi 4,
+Arduino Q and Rock Pi 4C; only Pi 4 images were executed. One layout owner now
+separates linked code, BSS, stack, heap and report storage. Pi 3 uses its high
+payload window, and Rock's candidate is above the monitor reservation. The
+old Pi 4 report address and overlapping raw compile layouts are refused;
+34 unsafe-range variants are rejected. A live monitor map and firmware RAM
+ceiling still need checking before another target is entered. Compile layouts
+are not hardware-driver or loader acceptance.
+
+Builders, complete reports, target ranges and exact scope:
+docs/evidence/vulkan-state-contracts-20261026/README.md.
+This phase changes test support and builders, so no new production monitor
+build or installation is needed. Built 341 and resident 338 remain distinct.
+The architecture gate still refuses 287 new or grown keys; provenance gaps
+remain. Full Neon parity and Vulkan compatibility on all targets are incomplete.
+
+
+@SECTION Portable clear fixture ownership
+
+The clear-state fixture body now has a shared source extension and takes its
+heap address from the composition. Its Pi 4 entry point lives with the board
+tests. Both public builders use the shared body directly. Ten complete rebuilt
+containers match the previous clear/admission compositions, including the
+stale-classification control. No repeat board entry or monitor build is needed.
+Other-target builds remain compile-only, not hardware-driver acceptance.
+
+Exact source hashes and container comparisons:
+docs/evidence/vulkan-clear-fixture-ownership-20261026/README.md.
+The mandatory architecture gate still refuses 286 new or grown keys.
+
+
+@SECTION Shared CPU font atlas
+
+The bitmap-to-RGBA atlas builder and its borrowed read-only queries now live in
+the shared graphics layer. Thirteen procedure bodies preserve their previous
+behavior using the existing shared bitmap and numeric helpers. Allocation and
+lifetime remain with the composition; native TFU tiling is unchanged.
+
+A shared-only physical Pi 4 test passes 46 contract checks and matches every
+byte of the 65,536-byte raster and 1,520-byte UV capture against an independent
+bitmap oracle. Twenty corrupted reports, captures or lengths are rejected.
+The composition also compiles for Pi 3, Arduino Q and Rock Pi 4C, without a
+native renderer. These other-target images were not executed.
+
+The current fifteen-scene Vulkan integration preserves all 245,760 scene bytes
+and passes 124 widget checks after the atlas move, clear-owner change and draw
+admission recovery. This does not establish desktop parity or new GPU drivers.
+Exact sources, data and scope:
+docs/evidence/neon-atlas-shared-pi4-20261026/README.md.
+
+The canonical monitor builds as counted 342, raw 5,777,888 bytes, and is not
+installed. The Pi 4 remains on 338. No monitor replacement was needed for the
+returning payload validation. The architecture gate removes ten downward-call
+keys but still refuses 276 new or grown keys; provenance reconciliation and
+source publication remain pending.
+
+
+@SECTION Indexed fan fallback lifetime
+
+This work concerns the Neon Vulkan port within Anvil. Desktop Vulkan is outside
+this task. The triangle-list fallback now has physical checks for distinct
+immutable fan ranges mixed with ordinary boxes, abort and reuse of lazy storage,
+and atomic capacity refusal followed by successful reuse. All three captured
+frames match 49,152 independent oracle bytes; 59 corruptions are rejected.
+
+The full mixed fallback also passes 262,144 outline/fill points and 98,304
+textured vertices, with 2,051 records and an exact 16,384-byte GPU capture.
+Native fan capability was withheld only in private test composition. This is
+shared fallback coverage on Pi 4, not another board's GPU driver acceptance.
+
+The earlier 28,409,856-byte diagnostic heap cleanly runs out of memory before
+submission. The fallback needs 3,145,728 additional triangle-index bytes. A new
+explicit 31 MiB test heap uses disjoint surface, heap, linked BSS and stack
+ranges. Live Vulkan allocations total 29,647,104 bytes. The strict checker
+requires the new layout and absent fan capability; 49 corruptions are rejected.
+No production heap or renderer changed. The 6.124-second submission is a
+clipped capacity stress result, not a UI frame-rate claim.
+
+Builders and complete scope:
+docs/evidence/neon-fan-fallback-lifetime-pi4-20261026/README.md.
+Use build_neon_fan_fallback_capacity_proof.py with --lifetime, or
+build_neon_outline_proof.py with --case combined-vertices --without-native-fan.
+The Pi remains on resident 338; build 342 is still uninstalled. The mandatory
+architecture gate remains red at 276 new or grown keys; source publication and
+broader Anvil Vulkan work remain pending.
+
+
+@SECTION Shared public font binding
+
+NeonFontUse now belongs to the shared frontend, using the existing bitmap
+validation and canonical error route. Native lifecycle guards remain intact.
+
+The shared-only Pi 4 contract passes 50 checks. Invalid binds preserve the
+selected font and atlas generation. All 65,536 raster bytes and 1,520 UV bytes
+match the oracle; 20 corruptions are rejected. The other three target builds
+are compile-only. Historical atlas reports require --contract-checks 46.
+
+The fifteen-scene GPU regression retains all 245,760 current-reference bytes
+and 124 widget checks. Evidence:
+docs/evidence/neon-font-binding-shared-pi4-20261026/README.md.
+Normal build 343 succeeds, raw 5,777,888 bytes, but is not installed; resident
+338 remains. The architecture gate removes two downward-call keys but still
+refuses 274 new or grown keys. Source publication and broader Anvil work remain
+incomplete. No gate, ratchet or hardware seam changed.
+
+
+@SECTION Shared lifecycle policy and native ownership
+
+Renderer selection and external lifecycle dispatch now have a shared owner.
+Six typed native operations retain hardware work and expose ownership/frame
+flags without private-field reads from shared policy. Fifteen policy procedures
+preserve their previous behavior through that boundary; native operation bodies
+remain intact. This does not establish general asynchronous/fault recovery.
+
+The controlled-provider Pi 4 CPU proof passes 409 observations, including every
+prepared/unprepared guard combination, callback refusal and ownership rollback.
+Its checker rejects 830 corruptions. A deliberately removed frame guard fails
+four observations and is rejected by the positive checker. Three other target
+compositions compile only; they do not prove hardware drivers.
+
+The real prepared Vulkan lifecycle matches all 16,384 captured GPU bytes,
+returns its borrowed native context, then releases it after caller teardown.
+The fifteen-scene regression retains 245,760 reference bytes and 124 widget
+checks. These physical tests ran under resident 338. Evidence and exact scope:
+docs/evidence/neon-lifecycle-shared-pi4-20261026/README.md.
+
+@SECTION Monitor 344 boot verification pending
+
+Normal build 344 is 5,779,936 bytes. Its authorized boot-file update preserves a
+verified 338 backup and verifies the upload, candidate and final boot-file hashes.
+After one reset command, the planned network check received no response. The
+running build, map and console are unconfirmed; no retry or reset replay followed.
+Board commands are on hold pending the console check required by the vault rule.
+This is a verified file write, not successful startup acceptance. The cause is
+not yet isolated. The architecture gate remains red at 270 new or grown keys,
+and source publication and broader Anvil Vulkan work remain incomplete.
+
+
+@SECTION Async completion and teardown candidates
+
+A failed asynchronous fence wait must retain the submitted-frame marker.
+The candidate completion path clears it only after a successful wait, before
+publishing the frame. Timeout, device error and publication failure are distinct.
+
+NeonVkChromeDestroyChecked reports teardown success or refusal. The existing
+void Destroy delegates to it. Both lifecycle callbacks retain ownership on
+refusal; the console retains its target/device if adapter release fails, even
+when Chrome readiness is already false. Successful release clears pending state.
+
+Controlled compositions compile for four CPU targets, with planned reports of
+48 completion and 238 teardown observations. Their synthetic checker tests
+reject 108 and 488 corruptions; this does not execute the renderer. The real
+Pi 4 prepared Vulkan composition also compiles. None of these candidates has
+run on hardware, and none is in boot-file build 344. Board commands remain on
+hold pending the console check. Topics 1453 and 1454 remain open. Exact scope:
+docs/evidence/neon-async-teardown-candidates-20261026/README.md.
+
+
+@SECTION Checking current Neon source owners
+
+Five named source owners cover shared callbacks, copied glyph plans, publication
+and compact/indexed geometry: 62 hook, 396 adapter and five scene checks; 39
+targeted source faults are rejected. From the repository root,
+tools/neon_vk_chrome_acceptance_check.py --source-only uses no compiler,
+interpreter or board. Its --source-report option records owner hashes and marks
+emitted, GPU and full acceptance NOT RUN. The emitted geometry fixture and
+physical async/teardown checks remain owed; the board hold is unchanged.
+Exact scope: docs/evidence/neon-acceptance-source-repair-20261026/README.md.
+
+
+@SECTION Current emitted acceptance candidates
+
+The geometry fixture now follows the current compact/indexed recording paths,
+with 1,200 planned observations over real production procedures and controlled
+Vulkan providers. Four rotations, exact corner/index words, ordered records,
+whole reservations and refusal/retry inputs are included. It compiles for four
+CPU targets, but has not executed. Synthetic positive and negative checker
+tests each reject 2,412 corruptions; they do not run the renderer.
+
+The canonical hook, current geometry and 28-assertion box fixtures now compile.
+Their host-gate images at 00400000 overlap the resident monitor and must NEVER
+be uploaded directly. Separate returning CPU candidates for hooks, box spans
+and the independent oracle compile at prospective safe ranges; current map and
+ownership checks are still required before entry. Their reports are fixture
+status, not GPU traces. No board command, emulator or installation occurred.
+
+Full execution, hostile oracle variants, current GPU pixels and async/teardown
+proof remain owed after console reconciliation. The board hold is unchanged.
+See docs/evidence/neon-current-emitted-candidates-20261026/README.md.
+
+
+@SECTION Shared ABI and fixture ownership
+
+The twelve AArch64 ABI checks now have one shared body, with target entries in
+the four board test folders. tools/build_vulkan_alignc_abi.py selects the entry
+with --target and compiles it without running it. All four complete containers
+are byte-identical before and after the move. Shared CPU templates use shared
+file types; the native hook composition is in the Pi test area. Generated
+fixture programs are unchanged. No emulator or board command was used.
+
+The architecture gate still refuses publication at 264 new/grown keys, six
+fewer than before; no gate or ratchet changed. Wider provenance omissions and
+current hardware acceptance remain unresolved. The board hold is unchanged.
+Mapping and evidence: docs/evidence/neon-shared-owner-placement-20261026/README.md.
+
+
+@SECTION Shared text metric queries
+
+Public line height and text width now live with the shared frontend. Owner
+callbacks retain priority; bitmap fallback uses existing shared getters.
+Measured width may be zero, while measured height must be positive. Null text
+returns zero before an owner callback. The established byte-scan bound is
+preserved. Drawing stays with the selected renderer.
+
+A shared-only composition compiles for four CPU targets with 79 planned
+observations, and the Pi 4 Vulkan composition also compiles. Positive and
+explicit source-negative checker tests each reject 170 synthetic corruptions;
+these do not execute the queries. All other 160 native procedure bodies are
+unchanged. Runtime/GPU proof still awaits the console check. Exact scope:
+docs/evidence/neon-shared-text-metrics-20261026/README.md.
+
+
+@SECTION Target changes between asynchronous frames
+
+A submitted frame keeps its target identity until completion. Rebind refuses
+an open, submitted or abort-required frame. WSI attachment applies the same
+frame-ownership guards before calling the provider. Complete or abort the
+frame and consume its present record before changing target ownership.
+
+The two added entry guards are compile-checked in four CPU-target proofs
+and the Pi4 Vulkan composition. The focused 214-observation proof and a
+private old-guard negative have not executed. Checker self-tests use only
+synthetic reports. Topic1456 and hardware acceptance remain open; the Pi
+console check after update344 is still pending. Exact candidate scope:
+docs/evidence/neon-target-ownership-candidate-20261026/README.md.
+
+
+@SECTION Warming resources around asynchronous frames
+
+Finish a submitted frame before warming glyphs, resetting its font cache,
+replacing or clearing sprites, or changing atlas generations. If End failed
+before submission and the frame is abortable, abort it before those mutations.
+The mutation entries now refuse both states before cache or provider work.
+The upload helper applies the same guard before resetting its shared command
+buffer, so a warm upload cannot take over the preceding frame's fence.
+
+Nine entry guards change. The Vulkan composition compiles and source checks
+reject missing guards and missing refusal returns, but no emitted or GPU run
+has validated this candidate. Topic1457 remains open. The post-update344
+console check is still required before board access. Exact evidence scope:
+docs/evidence/neon-async-resource-candidate-20261026/README.md.
+
+
+@SECTION Shared Vulkan lifecycle binder and CPU proof
+
+The renderer-neutral lifecycle binder has one shared implementation. Its older
+Pi4 include path forwards to that owner for existing callers. The controlled
+binder proof now uses the shared frontend, lifecycle, colour and float owners
+with explicit controlled native callbacks. Unexpected native work refuses and
+is counted. Configure, create refusal, frame callbacks, clear conversion and
+checked-shutdown retry cases retain their established expectations.
+
+Four CPU-target compositions compile; none executed. The compatibility include
+produces the same entire Pi4 container. Two graphics proofs use public float
+conversion APIs in place of exact native forwarding aliases. Architecture
+publication remains refused at261 keys, three fewer; the compatibility extension
+finding remains counted. Full runtime/GPU acceptance and the existing console
+check after update344 remain owed. Scope and identities:
+docs/evidence/neon-shared-graphics-proof-20261026/README.md.
+
+
+@SECTION Cleanup after failed renderer initialization
+
+A failed external initialization can still own partial resources. The shared
+lifecycle now retains that cleanup obligation, exposed by
+NeonLifecycleCleanupPending. Call NeonShutdown until cleanup succeeds before
+retrying initialization, replacing callbacks or selecting the native renderer.
+Readiness zero alone does not prove that cleanup is complete. Failed teardown
+also blocks new frame work until its cleanup callback succeeds.
+
+For the Vulkan binder, failed creation is released through checked shutdown.
+Successful cleanup releases its configuration; configure again before retrying.
+Prepared cleanup returns the borrowed native context before final native release.
+The 477-observation controlled lifecycle proof, four-target binder builds and
+Pi4 Vulkan composition compile, but runtime/GPU acceptance is NOT RUN. Earlier
+409-observation reports require the checker's explicit --legacy-409 option and
+do not validate this policy. Topic1458 remains open. Exact candidate scope:
+docs/evidence/neon-init-cleanup-candidate-20261026/README.md.
+
+
+@SECTION Framebuffer validation before target rebind
+
+Rebind validates live framebuffer dependencies, device, render pass, bound
+memory, extent, pitch and use state before changing target state. Callers
+still own synchronization and lifetime. Four-target object/adapter proofs and
+the Pi4 Vulkan composition compile only; runtime/GPU validation is NOT RUN.
+For initial creation, see the next section; topic1459 stays open. Scope:
+docs/evidence/neon-framebuffer-target-candidate-20261026/README.md.
+
+
+@SECTION Initial target row pitch
+
+Creation now asks the framebuffer owner for its validated row pitch before
+publishing target metadata or allocating renderer resources. Padded rows use
+the image's actual pitch rather than width times four; errors and zero refuse.
+Callers still synchronize object changes and retain attachment lifetimes.
+Four-target object proofs and the Pi4 Vulkan composition compile only.
+Runtime/GPU acceptance is NOT RUN; topic1460 remains open. Scope:
+docs/evidence/neon-initial-target-pitch-candidate-20261026/README.md.
+
+
+@SECTION Safe teardown of presentation ownership
+
+Checked teardown stops new recording, confirms device idle, then requires WSI
+rollback success. Only then does it clear the present record and callbacks,
+unmap vertex memory and release resources. Refusal keeps those resources for
+cleanup retry, with readiness stopped. An acquired WSI image is not released
+while completion is unknown. Four-target controlled proofs and Pi4 Vulkan
+integration compile only; runtime/GPU recovery remains NOT RUN. Topic1461 stays
+open. Scope: docs/evidence/neon-wsi-teardown-candidate-20261026/README.md.
+
+
+@SECTION Physical validation on running build 344
+
+Live version/map and a fresh Vulkan-console capture now confirm build 344 and
+its enlarged variable reservation. The current Pi4 returning proofs pass 477
+shared-cleanup, 360 checked-teardown, 81 framebuffer-target, 235 adapter-ownership
+and 1200 geometry observations, plus the 18-word shared binder report. Controlled
+CPU providers remain distinct from hardware failure recovery. Real Vulkan
+prepared-owner handoff matches 16,384 bytes and finally releases every counted
+object; the freshly rebuilt 15-scene composition matches 245,760 current-baseline
+bytes and 124 widget checks. All accepted runs return zero, with healthy cores,
+Vulkan restored and deadman off. A target-builder schema mismatch was corrected
+without relaxing its oracle, then rerun successfully. No reset/install/emulator
+was used in this phase. These results supersede preceding compile-only status
+for the exact cases listed in docs/evidence/neon-current344-pi4-20261026/;
+actual GPU-fault/WSI refusal recovery and other-board runtime remain unproved.
+Architecture still refuses 261 keys; broader provenance/publication remains open.
+
+
+@SECTION WSI recording ownership
+
+Begin now validates attached WSI recording ownership before atlas work, mapping
+or command reset. It permits non-WSI frames and a matching acquired image, while
+refusing other bridge/core states, foreign device, stale image identity or target
+generation. Failed publication alone does not return an image to writable state.
+The bridge and completed-frame record have shared .pbi implementation owners;
+their former .pi4 include paths remain compatible. No display driver is changed.
+
+The actual WSI state/bridge/record and extracted Begin composition passes 199
+observations on Pi4; admitted Begin uses a rejecting atlas spy, while refusals
+reach no resource work. Four CPU targets compile; only Pi4 executed. A separate
+fresh real Vulkan regression matches all 245,760 current scene bytes and 124
+widget checks. It does not establish hardware WSI scanout or GPU-fault recovery.
+The installed monitor remains build344; these are returning RAM payloads. Source
+checks pass 62/446/5 and reject 96 hostile cases. Architecture still refuses 261
+keys and broader provenance remains open. Exact scope and identities:
+docs/evidence/neon-wsi-recording-pi4-20261026/README.md. Topic1462 stays open.
+
+
+@SECTION WSI surface changes before presentation
+
+An acquired image remains writable only while its bridge and core agree on the
+device, target generation and image identity. Commit then validates every item's
+surface before advancing any image or ticket. A provider change after reservation
+must not partially commit a batch.
+
+Before publishing or consuming a completed record, the shared WSI owner now
+validates the committed ticket's live device, images and current surface epoch.
+The bridge also matches the captured ticket, swapchain, image and target. A lost
+or resized surface refuses without discarding cleanup ownership. Explicit
+invalidation/rollback remains available; retirement alone does not prevent an
+already-acquired image from being presented. avkWsiPresentValidate(ticket) is a
+read-only state query, not a presentation or completion operation.
+
+Pi4 state captures cover 201 commit observations and 334 later freshness/identity
+observations, with explicit old-code reproductions. Four CPU targets compile;
+only Pi4 ran. The ordinary real Vulkan 15-scene regression retains 245,760 bytes
+and 124 widget checks. These are RAM tests under unchanged monitor 344, not hardware
+WSI scanout or failed-device recovery. Those tests did not validate display-copy
+ordering; later resident results follow below. Exact source and evidence scopes:
+docs/evidence/wsi-present-freshness-pi4-20261026/README.md.
+
+@SECTION Completed-frame display ownership and live geometry
+
+Use `vkstat` to inspect the resident console's banner and whole-frame counts,
+build time, GPU submission/wait time and display-copy time since the previous
+query. Reading it resets those timing counters. The retained failure stage,
+console reason and original Chrome error survive resource teardown and are not
+cleared by that timing reset. An inactive renderer is reported explicitly.
+
+The display copy validates the completed record, retains its image during the
+transfer, and consumes ownership only on success. A failed transfer retains the
+record and possible DMA source; teardown must establish DMA quiescence as well
+as GPU idle. The banner target is restored only after successful copying and
+consumption. Clock/status glyphs are warmed outside the render pass before a
+banner-only frame, so changing text cannot require an atlas mutation inside it.
+
+Interactive screen rotate and screen scale use the existing checked settings
+geometry transition. It retires the old Vulkan target, adopts the new geometry,
+and resumes Vulkan with a presented frame. Refusal stays diagnosed. Installed
+Pi4 build 348 passes all four DSI rotations with keyboard show/hide, scale 2/auto,
+and explicit DMA-to-Vulkan return. Original defaults are restored. HDMI uses
+the same source transition but was not tested on hardware in this run.
+
+These DSI console results do not prove full Vulkan compatibility, public WSI,
+HDMI or hardware-fault recovery. Scope: docs/evidence/neon-interactive-geometry-pi4-20261026/README.md.
+
+The resident Vulkan DSI console prepares the inactive fixed display buffer,
+then asks the HVS to adopt a complete display list at a frame boundary. It
+consumes the rendered record only after the controller confirms that list.
+Banner-only updates clone the displayed image before changing the inactive
+copy. Capture reads the confirmed front, rather than assuming a fixed address.
+Checked renderer handoff restores the ordinary scan buffer before CPU/native
+framebuffer rendering. A timed-out pending flip retains ownership and refuses
+unsafe fallback; waiting longer is not treated as successful recovery.
+
+`vkstat` also reports cumulative confirmed DSI presentations, ordinary-front
+restores and flip timeouts since boot. Build 349 passes the DSI rotation/keyboard/
+scale matrix and DMA/native renderer return with zero timeouts. Controlled
+refusal tests are distinct from real stopped-controller or DMA/GPU-fault recovery.
+This is not an advertised WSI extension or FIFO queue API. Build 350 supplies the prompt-qualified idle wait only during banner presentation and clears it before returning, including failure. Other callers retain bounded polling; refresh latency is unchanged and no speed gain is claimed. HDMI and the remaining WSI work are still owed.
+Evidence: docs/evidence/neon-dsi-frame-presentation-pi4-20261026/README.md.
+
+
+Build 351 connects real DSI sources to private WSI ownership: acquire before recording,
+complete after confirmed transfer, and checked rollback before freeing images. The live
+display matrix passes. Evidence: docs/evidence/neon-dsi-wsi-provider-pi4-20261026/README.md.
+
+Build 352 requires child devices, WSI surfaces and swapchains to be destroyed first.
+Refusal retains ownership and diagnostics. Evidence:
+docs/evidence/vulkan-parent-lifetime-pi4-20261026/README.md.
+
+
+VK_KHR_surface revision 25 is now the one available instance extension. Query
+vkEnumerateInstanceExtensionProperties and enable VK_KHR_surface when creating
+the instance. Unknown extension names and layers are refused; no device extension,
+including VK_KHR_swapchain, is advertised yet.
+
+AnvilVkSurfaceCreate binds a registered native Anvil presentation provider and
+its native key to an enabled instance. It does not create an OS window or claim
+an unimplemented platform extension. Existing private source providers can still
+use the internal ownership path.
+
+The public commands are vkGetPhysicalDeviceSurfaceSupportKHR,
+vkGetPhysicalDeviceSurfaceCapabilitiesKHR, vkGetPhysicalDeviceSurfaceFormatsKHR,
+vkGetPhysicalDeviceSurfacePresentModesKHR and vkDestroySurfaceKHR. Capabilities
+use the 52-byte C record; each format uses 8 bytes. Counts, modes and VkBool32 outputs
+are 32-bit values. A null output array queries the count; a short supplied array
+receives only its capacity and returns VK_INCOMPLETE with the number written.
+
+vkGetInstanceProcAddr exposes these five commands only for a live instance that
+enabled the extension. Null-instance/device lookup, disabled instances and stale
+generations disclose no surface function address. Public queries reject foreign,
+stale or lost surfaces without changing caller outputs.
+
+The DSI console enables the extension and checks its actual main/banner target
+metadata on creation and geometry rebuilds. vkstat reports cumulative public
+surface target checks. Build 353 passes the live rotation/keyboard/scale and
+renderer-return matrix; this does not prove HDMI or hardware-fault recovery.
+Public swapchain APIs and blocking acquisition remain future work. Scope:
+docs/evidence/vulkan-public-surface-pi4-20261026/README.md.
+
+
+The float Neon port counts geometry against the shared native point budget.
+Static lines allow 262144 endpoints; a filled polygon allows 262142 sides because
+its centre and closing point use two slots. Outlined polygons use two endpoints
+per edge and allow 131072 sides. These are per-call limits; remaining frame quotas,
+configured storage and command capacity can still refuse a draw. LimitVertices
+is applied before dropping an unmatched trailing static-line endpoint.
+
+
+NeonVkPortText now maps bitmap-font labels as well as TrueType labels when the
+canvas size or camera zoom changes. TextWidth stays in source-canvas units so
+right and centre alignment transform with the label. Bitmap origins snap to a
+source pixel before mapping, and the atlas raster stays unchanged. The mapped
+bitmap path preflights visible cells, UVs and whole-run capacity before recording
+geometry; a refusal preserves the frame for retry. Ordinary unmapped bitmap text
+keeps its existing path. Scale, zoom, alignment, clipping and refusal/retry pass
+four-rotation Pi 4 GPU tests. Whole-row rejection retains the clipped-row counter.
+Evidence: docs/evidence/neon-bitmap-mapped-pi4-20261026/README.md.
+
+
+Board-specific Vulkan test programs live under each board's Tests/Vulkan tree.
+RaspberryPi4/Tests/Vulkan holds the Pi 4 GPU/Neon compositions; Pi 3, UnoQ and Rock
+keep their absent-backend programs in their own board test trees. Shared state
+fixtures remain under Anvil/Graphics/Vulkan/Tests. A relocated test is not a new
+hardware result: the ownership proof separately compares five compiled programs
+across four targets. See docs/evidence/vulkan-board-test-ownership-20261026/.
+
+
+Pi 4 GPU runtime modules now live in RaspberryPi4/Lib/Vulkan. The pure typed-IR
+lowerer remains shared as Anvil/Graphics/Vulkan/vk_ir_v3d42.pbi. Programs include
+their selected implementation before vk_backend_select.pbi. That shared header
+validates ANVIL_VULKAN_BACKEND against the implementation's supplied
+ANVIL_VULKAN_BACKEND_PRESENT identity and imports no board driver. The Pi 4 root
+explicitly includes its shader, DMA seam and V3D backend. Software programs set
+selection 2 and explicitly include vk_backend_software.pbi. The portable smoke
+program is Anvil/Graphics/Vulkan/Tests/vk_backend_software_test.pbi; its large
+software heap requires a stack outside the linked BSS. Tested layouts and code
+examples are in docs/evidence/vulkan-gpu-owner-20261027/README.md.
+
+
+Neon public boxes, text, scissors, fans and line lists now dispatch through the
+shared neon_frontend.pbi. The native provider binds one complete typed family
+before Main. NeonNativeDrawBackendInstall accepts twelve nonzero addresses once,
+before rendering or an external family is active; partial or late binding
+refuses without replacing the family. NeonDrawBackendInstall selects the optional
+external renderer. NeonDrawBackendClear removes only that external family, so
+the native fallback remains available. Scissor updates still reach the native
+clip mirror before the external owner, including calls outside a frame. Native
+vertex emission, counters and GPU submission remain with the board provider.
+The shared contract compiles for Pi 4 and UnoQ; only the Pi 4 hardware run is
+claimed. Evidence: docs/evidence/neon-primitive-dispatch-20261027/README.md.
+
+
+Shared Neon modules now use .pbi: neon_vk_chrome, neon_vk_port,
+neon_vk_sprite_port, neon_vk_sprite_asset, neon_vk_font_port,
+neon_vk_particles, neon_vk_particle_port and neon_vk_ui_chrome_port.
+Core Chrome needs the shared frontend, atlas raster, colour/float helpers,
+Vulkan API, shader fixtures and the selected backend. Native GPU code remains
+in the board library. The ordinary lifecycle binder is neon_vk_lifecycle.pbi;
+the old .pi4 compatibility include is removed. Prepared native-context use
+additionally links neon_vk_prepared_lifecycle.pbi after the shared lifecycle
+and Chrome. Its public NeonVkChromeLifecycleInstallPrepared operation is
+unchanged. The canonical Pi 4 compositions include that bridge explicitly.
+An actual UnoQ core/file composition with the absent backend compiles the
+shared renderer; this adds no device there. All 233 implementation bodies and
+three complete Pi 4 executable/container comparisons are unchanged. The scene
+and native-transition executables exactly match their recorded physical runs.
+Evidence: docs/evidence/neon-shared-modules-20261027/README.md.
+
+The ordinary lifecycle binder retains its public-provider contract and does not
+import concrete prepared-Chrome state. Link the prepared integration header only
+when that mode is required. Its controlled cleanup proof passes on actual Pi 4
+and compiles for UnoQ; this CPU test does not execute a GPU.
+
+@SECTION Retained Neon controls
+
+Anvil/Graphics/neon_retained_ui.pbi adds retained labels, breadcrumbs, buttons,
+sliders, toggles, meters, DIP banks and carousels. The caller owns bounded arena
+storage and copied UTF8 text. Handles expire on Reset or Configure. Input maps
+caller-transformed target coordinates to the virtual canvas; noninteractive
+focus navigation remains bounded. Derived geometry overflow refuses before a
+control is published. Focus animation wraps for indefinite sessions.
+
+A typed event handler receives control ID, event type and application tag. It may
+clear/rebuild the screen; input then returns without accessing its old records.
+Input/draw/prepare reentry and renderer mutation are forbidden. Calls are
+serialized. This is an optional layer; it does not replace the monitor screen.
+
+The Vulkan adapter is neon_vk_retained_ui.pbi. Compose it after the shared Neon
+frontend and Chrome. Create Chrome, configure NeonVkPortCanvas, install
+NeonVkRetainedInstall and configure retained storage. Call NeonRetainedPrepare
+before the caller's frame, then NeonRetainedDrawUI inside Begin/End. Abort the
+frame on drawing error. The UI never owns a caller device or frame.
+
+On Anvil 354 / Pi 4, 101 CPU assertions and 57 ordered renderer calls pass.
+They include per-control font assignment, stale/reference refusal and a handled
+mutation refusal inside a renderer callback without silently truncating drawing.
+Two offscreen bitmap frames retain their earlier complete image hashes. Two
+mixed TrueType frames pass 39 setup assertions, two loaded faces, four sizes,
+Unicode, zero frame glyph raster/upload work and parent-handle retirement checks.
+Independent FontTools/MuPDF checks cover 28 text runs, 6,921 stable ink pixels
+and 16,929 distant exterior pixels at one channel-unit tolerance. Curve edges
+are excluded with an independent 8x mask and a 1/8-pixel boundary margin.
+
+For independent per-control fonts, configure a caller-owned font arena with
+NeonVkRetainedFontsConfigure and register loaded slots using
+NeonVkRetainedFontRegister. Set the returned handle through NeonRetainedFontSet
+before adding controls. Registry reconfiguration or slot replacement makes old
+references stale. Legacy roles retain active-face semantics. The caller keeps
+arenas and font bytes alive and prepares all runs before beginning a frame.
+GadgetFontSet preserves existing geometry; rebuild for changed metric bounds.
+
+The shared checksum loop preserves all font validation and passes 539 checks.
+On the same Pi workload, its time falls from 2,253,658 us to 380,113 us. This is
+checksum throughput, not an overall renderer speedup. Shared state/checksum
+proofs compile for UnoQ; its full no-device retained canvas composition still
+requires the explicit lifecycle provider and is not claimed qualified.
+At that offscreen qualification stage, live retained DSI presentation was still
+open. The resident application result follows below; wider engine acceptance
+remains open. Details: docs/NEON_RETAINED_UI.md and
+docs/evidence/neon-retained-truetype-20261027/README.md.
+
+
+The application boundary follows Anvil's hybrid-kernel rule: drivers stay in
+Anvil, and pure scene/UI code calls the resident renderer. The pure
+neon_service_api/client/retained candidate uses sized requests and a single
+integer-result dispatcher. Its controlled CPU proof passes 82 checks on Pi 4
+and compiles for UnoQ; this is not a live display test. That historical phase
+used build 354/ABI 1.7 and correctly refused before querying the proposed slot.
+
+Build 355 now supplies resident graphics at console slot 38, service ABI 1.8.
+All existing slots keep their meanings and the table remains 200 entries.
+The pure contract belongs to Anvil/Hal; targets with no registered graphics
+provider return unavailable. UnoQ monitor build 84 compiles that common path;
+no UnoQ GPU support is implied.
+
+The initial retained application links no driver. Through Anvil it opens the
+existing Vulkan owner, registers an already-loaded font, prepares text, aborts
+an unsubmitted frame, then presents a label, button and shapes. End includes
+physical full-frame publication before releasing the completed source. Two
+actual Pi4 runs pass 22 checks and independent display probes, with fresh
+captures 382 and 383. On return, Anvil captures the displayed frame before
+retiring the application's retained owner and restoring its Vulkan console.
+Both runs have healthy core status and zero display timeouts. The application
+records a full actual/required version-refusal sentence; for a different ABI
+major it calls no service slot.
+
+Build the application with tools/build_neon_service_resident_app.py. That first
+resident UI was a single-frame proof; the loop qualification follows below.
+Font/asset loading, the full Neon engine API and broader Vulkan acceptance
+remain unfinished. Details: docs/NEON_RETAINED_UI.md.
+
+The next resident loop qualification completes 90 displayed frames at 30 FPS
+on actual Anvil 355. It polls the existing touch service through a pure adapter;
+the board alone performs coordinate rotation. One contact and an epoch control
+handle capture a press. Cancel, unmatched/foreign releases and a release over
+another control do not click. DIP banks and carousels change once per fresh
+press instead of repeating every frame; topmost hit testing matches draw order.
+The controlled state/drawing proof now passes 115 checks with 57 ordered packets.
+
+Build with tools/build_neon_service_loop_app.py. Its default injects no input;
+--scripted is an explicit contact-record test that changes Start to Started.
+Final captures 394 and 395 each show 90 completed physical End calls, 33,333 us
+frame intervals, healthy core status and clean Vulkan restoration. Mean frame
+work is 25.6 ms for the scripted small UI and 26.3 ms without injection, including
+GPU/display waits. No physical finger actuation is claimed: the real queue
+contained no records. The same loop compiles for UnoQ, Pi3 and RockPi4C.
+
+The portable 32-byte touch vocabulary lives in Anvil/Hal/touch_event.pbi.
+Isolated boot cleanup dependencies compile without a full device/service table.
+Pi4 monitor 356 and UnoQ monitor 85 also compile; this phase leaves the physical
+board on 355. Application assets/fonts, other input devices and full engine and
+Vulkan acceptance are still unfinished.
+
+
+RESIDENT SPRITE ASSETS
+
+Anvil 357 adds graphics protocol 1.1 with a SPRITES capability, preserving the
+service-table ABI 1.8, slot 38 and basic protocol 1.0 compatibility. The pure
+neon_service_sprite.pbi client uploads bounded RGBA/BGRA pixels to the resident
+owner, draws cropped/tinted/rotated sprites, applies a camera, and flushes ordered
+128-item batches. Sixteen slots support dimensions up to 2048, subject to device
+heap capacity. Pixel input is copied during upload. Replacement publishes a new
+opaque handle only after success; old handles refuse, while failed replacement
+keeps the prior texture. Upload/clear require idle frames. Angles are radians.
+Nested/unfinished batches refuse; failed cleanup retains ownership for retry.
+
+Physical Pi4 capture 399 passes 182 assertions and 4,806 interior pixel checks,
+including a full-backed 16 MiB capacity refusal whose old texture still renders,
+RGBA/BGRA source reuse, crop/tint/alpha, rotation/camera and 128 deferred sprites.
+Abort/Close/reopen and stale-handle checks pass. Return cleanup restores Vulkan,
+with healthy cores and zero display timeouts. The pure application also compiles
+for UnoQ without claiming a renderer there. The controlled packet proof passes
+50 checks on Pi4, with 514 corrupted-report refusals in its independent oracle.
+
+See docs/NEON_RETAINED_UI.md and tools/build_neon_service_sprite_app.py. Encoded
+asset files, application font bytes, particles, remaining engine APIs and broad
+Vulkan conformance/recovery remain unfinished. Source publication gates remain
+mandatory; this resident sprite milestone does not complete the Neon port.
+
+
+ENCODED APPLICATION ASSETS
+
+The pure neon_sprite_decode.pbi module owns bounded RGBA and uncompressed
+Windows BMP24/32 decoding. Native wrappers and neon_service_asset.pbi share that
+CPU implementation. It supports row padding, bottom-up/top-down images, straight
+alpha, color-key transparency and caller-owned alpha masks, with dimensions
+published only after successful decode. PNG/JPEG and other BMP encodings remain
+unfinished. The service asset client decodes into caller buffers, then asks the
+resident owner to copy the pixels. No Vulkan driver is linked into the app.
+
+A separate pure file_service_client.pbi binds existing service ABI 1.4 file
+handles at slots 192..195. Whole-file reads allow partial progress and close on
+errors. Failed Close retains its handle for explicit retry; rebind/unbind and
+another whole-file helper cannot discard it. Storage stays resident in Anvil.
+
+Physical Pi4 capture 401 on installed build 357 reads a real drive BMP, uploads
+it and presents its keyed/alpha sprites: 133 checks, 40 exact decoded bytes,
+10 mask bytes and 300 display pixels pass. The 78-byte named test file was
+created without overwriting an existing file, reloaded and SHA verified. Source
+buffers are erased before drawing, and return cleanup restores Vulkan with
+healthy cores and zero display timeouts. The independent oracle rejects 199
+report/image corruptions. The same pure app compiles for UnoQ; execution is only
+claimed on Pi4. See tools/build_neon_service_asset_app.py and
+neon_service_asset_app_check.py. Additional formats, application fonts and full
+engine/Vulkan acceptance remain open, as do mandatory source publication gates.
+
+
+OWNED APPLICATION FONTS
+
+Anvil 358 adds graphics protocol 1.2 and FONT_BYTES bit 8. Its optional load and
+unload operations append at 22/23 with 32/8-byte records, preserving service-table
+ABI 1.8, slot 38 and the basic graphics query. The pure neon_service_font.pbi
+client loads memory or a file through existing file services. Core copies bytes
+into an empty existing font buffer and validates before publishing a generation;
+the application may reuse its input after return. Four 1 MiB command slots are
+shared with existing file faces. Preexisting slots and the boot font are never
+replaced. Idle-frame unload and checked Close retire only matching application
+ownership, restoring the prior selected parser face. Failed cleanup retains its
+context/resources for explicit recovery. Prewarm each run before Begin.
+
+Pi4 capture 403 on build 358 passes 53 checks with the existing Lato file and
+three empty slots. Capacity, bad/unsafe input, erased caller buffers, selected
+unload, stale handles and Close/reopen are exercised. Two Lato rasters match
+exactly (2,117 ink pixels each); the embedded face differs (3,899 ink pixels).
+Return cleanup proves the application slots empty while preserving the original
+slot 0's bytes, generation, selection and path. Vulkan returns healthy with zero
+display timeouts. The same pure application and Core owner compile for UnoQ,
+without claiming a native renderer there. The independent oracle rejects 63
+report/image corruptions. See tools/build_neon_service_font_app.py and
+neon_service_font_app_check.py. Additional formats, particles, remaining engine
+APIs and broad Vulkan work still need completion and source publication gates.
+
+
+RESIDENT PARTICLE BATCHES
+
+Graphics protocol 1.3 adds PARTICLES bit 16 and operations 24..26 for limits,
+preparation and drawing, without changing service ABI 1.8 or slot 38. Pure apps
+submit up to 10,000 records of 32 bytes: centre, size, radians and RGBA floats.
+Preparation outside a frame retains fractional geometry until Q8 corners and
+copies the snapshot into the existing palette/draw owner. Caller records may be
+reused; source edits become visible only after another preparation. DrawPrepared
+runs inside a frame in array order. A differing camera or failed preparation
+refuses drawing. Empty lists draw nothing. The native route renders coloured
+quads; broader fragment effects and instanced-shader conformance are not implied.
+
+Build 360 adds portable MathFToI32, preserving Int() saturation/NaN policy while
+leaving the software reference untouched. It passes 67,584 Pi4 comparisons and
+32 pinned host cases. Hoisted constants and faster conversion reduce warm
+10,000-particle preparation from 39,404 to 13,956 us with a byte-identical app PMF.
+Capture 409 passes 39 checks and an exact 1,024,000-pixel comparison. The prepared
+frame costs 28,946 us including GPU/display waits; input build and preparation
+add about 21 ms. This is not a claim of 30/60 FPS for fully dynamic 10,000-particle
+frames. Capture 410 passes 58 checks and 113,222 fractional/rotation/alpha/clip
+samples, including degenerate geometry. Source reuse, stale-camera refusal and
+return cleanup are verified. Vulkan/cores stay healthy with zero display timeouts
+and the original Lato face preserved. Oracles reject 48/67/69 mutations for the
+dense/mixed/conversion evidence. The shared app and math proof compile for UnoQ;
+no execution there. See docs/NEON_RETAINED_UI.md and the particle/math builders.
+Additional formats/effects/APIs, high-rate particle updates and broader Vulkan
+conformance/recovery/source publication remain unfinished.
+
+Resident canvas and clipping (graphics protocol 1.4)
+
+MAPPING bit 32 and operations 27..33 expose the existing native virtual canvas,
+scissor, camera-aware boxes/polygons/text and immediate static lines through the
+resident service. The pure application links no Vulkan driver. Canvas dimensions
+are 1..8192; changes are idle-only, reset the camera and invalidate prepared
+particles. Surface Width/Height continue to report the logical target extent.
+Mapped drawing flags are explicit 0/1. Scissors use virtual coordinates, ignore
+the camera and replace the previous rectangle. Empty spans suppress all drawing;
+Begin clears the old clip. An active sprite batch refuses mapping operations.
+Static lines borrow float XY pairs for the call, use the virtual canvas and ignore
+the camera. The complete source span is checked; at most 262144 vertices, with a
+positive limit and an unmatched final vertex handled as desktop GL_LINES.
+
+Physical Anvil 361 capture 413 passes 59 application checks and 44564 independent
+raster samples. It combines clipped sprites, UI vectors, world polygons and
+mapped text. Both coordinate routes produce identical 1620-ink-pixel text runs;
+replaced scissors produce identical 1024-ink-pixel clipped runs with no escaped
+ink. A static line covers 250 pixels. Abort/reopen, malformed inputs, unsafe line
+sources and particle invalidation are checked. The final PNG was inspected.
+Return/cleanup keeps all cores healthy, Vulkan selected, zero display timeouts
+and the existing Lato font. The same final application compiles for UnoQ; there
+is no execution claim there. The 1.6-second host run is not an FPS measurement.
+See neon_service_mapping.pbi and the public mapping application builder/checker.
+Additional engine APIs, formats/effects and broader Vulkan completion remain open.
+
+Immediate chrome scrollbar input
+
+neon_chrome_scroll.pbi adds vertical/horizontal bars through a typed box renderer.
+Zeroed caller-owned state tracks input and drag. Install the resident adapter
+after Open, feed Input once per frame in virtual coordinates, and draw inside the
+caller-owned frame. Negative status requires abort; IDs are stable and nonzero.
+
+Dragging keeps its grab point, track presses page once, and inert bars release
+only their own drag. Short thumbs stay in the track. Release works when a widget
+is omitted; renderer failure preserves the offset/owner. Callback reentry refuses.
+
+Anvil 361 capture 416 passes 90 checks, two exact callback packets and all
+1024000 pixels, including clipped and short bars. Cores, Vulkan, timeouts and Lato remain
+healthy. No firmware update/reset. UnoQ compiles only; no finger/FPS claim.
+The oracle rejects 216 mutations. See docs/NEON_RETAINED_UI.md for API bounds and
+the scrollbar builder/checker. Remaining chrome and broader Vulkan work is open.
+
+Prepared chrome menus in neon_chrome_menu.pbi provide root menus, checked/disabled rows, shortcuts, separators
+and one-level submenus through resident callbacks. Build copies labels into the
+caller arena; Seal measures and prepares all glyphs before Begin. Draw issues
+no metrics or preparation callbacks. Stable IDs preserve open owners on rebuild.
+Input resolves one root before rendering, preventing overlapping old/new panels.
+
+Input supports click selection, Escape/outside dismissal, hover root/submenu
+transfer, wheel/arrow scrolling, left flips and upward edge placement. The frame's
+BlocksMouse flag remains set after dismissal/selection to prevent click-through.
+Draw clears its scissor on exit; abort the caller's frame after a negative result.
+The initial desktop palette is present; theme/animation integration remains open.
+
+Anvil 361 captures 417/418/419 pass 95/95/96 checks, 49 exact callback records each,
+51/83/52 geometry probes and 6720-pixel reference text cells within one channel
+unit. Normal, scrolling and right-edge scenes were inspected. Cores, Vulkan,
+timeouts and the original Lato font remain healthy; no firmware update/reset.
+UnoQ compiles only. Scripted input is not finger/FPS acceptance. Oracles reject
+912/912/914 mutations. See docs/NEON_RETAINED_UI.md for API bounds and the menu
+builder/checker. Additional effects/formats and full Vulkan
+completion/publication remain unfinished.
+
+Prepared tab strips in neon_chrome_tabs.pbi copy literal UTF8 labels into a caller
+arena and prepare all glyphs before Begin. Stable IDs, close/pin events, clipped
+hit tests, wheel/arrows, selection reveal and eased hover/indicator are supported.
+Long labels fit a bounded tail without splitting UTF8 scalars; joining support is
+limited, not full grapheme segmentation. Draw has no measurement/preparation calls
+and clears scissor; abort the caller frame after a negative result.
+
+Anvil 361 captures 420/421 pass 93 assertions each, 17 complete callback records,
+8/6 geometry probes and 3328/11544 reference-cell pixels within one channel unit.
+Both scenes were inspected. Cores, Vulkan, Lato and timeouts remain healthy;
+no firmware update/reset. UnoQ compiles only. Each oracle rejects 2401 mutations.
+See docs/NEON_RETAINED_UI.md for bounds, lifecycle and qualification limits.
+Themes and combined engine acceptance remain open; this is progress
+on the Anvil port, not full Neon or Vulkan completion.
+
+Single-line text entry in neon_chrome_edit.pbi provides focus, UTF8 scalar caret
+movement, editing, select-all, copy/cut/paste, submit/blur and placeholder. The
+caller provides input/clipboard transport. Seal prepares glyphs and metrics before
+Begin; Draw does no measurement/preparation. Buffers are caller-owned and bounded;
+capacity refusal preserves text/caret/selection. Long text is clipped, matching
+the desktop field. Full grapheme editing and IME are not claimed.
+
+Anvil361 captures423/424 pass119 checks each, eleven complete callback records,
+80240 reference-field pixels and seven probes per scene. Native caret, placeholder,
+clipping and selection highlight were inspected. Both restore Vulkan/healthy cores
+with zero timeouts and preserved Lato. No firmware update/reset. UnoQ compiles only.
+Oracles reject1675 mutations per scene. See docs/NEON_RETAINED_UI.md for API bounds,
+lifecycle and host responsibilities. Combined engine application/input, themes and
+remaining effects/formats and broad Anvil Vulkan work are still unfinished.
+
+Prepared list/tree panes in neon_chrome_list.pbi copy labels/details and fit the
+label first, leaving remaining room for right-aligned detail. Group/selected
+styles, depth indentation, clipped partial rows, stable click IDs, wheel/page/
+drag scrolling and hover easing are supported. The caller owns flattened tree
+visibility, selection and expansion. Seal prepares glyphs before Begin.
+
+Shared scroll UpdateV/H now handles input without drawing; PaintV/H draws without
+changing offset or drag ownership. Legacy combined BarV/H behavior is preserved.
+Feed one shared scroll input per UI frame, update panes before Begin and draw
+inside the caller frame. Negative Draw requires Abort. See docs/NEON_RETAINED_UI.md
+for bounds, lifecycle and host responsibilities.
+
+Anvil361 captures427/428 pass103 checks each, fifteen complete callback records,
+85000 reference-pane pixels and seven probes per scene. Both were inspected.
+Scrollbar regression426 passes its unchanged90checks and full1024000-pixel oracle.
+List verifiers reject2152 mutations per scene. UnoQ compiles only. Cores, Vulkan,
+Lato and timeouts remain healthy; no firmware update/reset. Combined engine/input,
+themes and remaining effects/formats and broader Anvil Vulkan are still open.
+
+Composed resident Vulkan application testing now combines chrome menus/tabs/text/
+list, retained controls, sprite batches, particles and static lines. Pause/Speed/
+particle controls affect the preview. A common pointer tracker maps logical screen
+coordinates once and owns one contact/transport consumer; the retained-only touch
+adapter delegates to it. Menu dismissal and captured releases do not click through.
+Default mode polls real touch; --scripted explicitly injects the controlled input.
+Live keyboard and physical finger actuation are not claimed.
+
+Anvil361 captures434/435 each finish90 frames and43 pointer checks; per-frame
+interaction state, ten retained box records and26/27 integration probes pass.
+The verifier rejects1674 mutations per mode. Compatibility433 still passes the
+original90-frame scripted retained loop. Both final images were inspected. UnoQ
+compiles only; no firmware update/reset. Cores/Vulkan/Lato/timeouts remain healthy.
+
+Final frame work averages31914us, including submission/presentation waits. Input/
+preparation/command recording average about3.4ms together; submit/present about
+28.4..28.5ms. Pacing is approximately30FPS. The first frames exceed33333us by14/96us;
+the remaining89-frame maxima are33295us. This does not measure GPU-only time or
+prove spare time for another workload. See docs/NEON_RETAINED_UI.md for contracts,
+exact timing scope and build/check tools. Full Neon and Anvil Vulkan remain open.
+
+
+Shared chrome palette and motion controls
+
+Menus, tabs, text entry, lists and scrollbars now use a copied15-role RGB palette
+from neon_chrome_style.pbi. Defaults preserve desktop appearance. PaletteSet
+validates all45 finite[0,1] fields before publishing; PaletteGet returns a copy.
+AnimationsSet disables chrome easing/caret blinking: transitions snap on next
+input and the caret stays visible. The shared revision invalidates resting widget
+NeedsRedraw after changes. Draw callbacks cannot change/read back the palette or
+motion policy; nested list/scroll guards unwind after refusal. Serialize APIs and
+apply preferences between frames. Retained arcade styling/motion is separate.
+
+Anvil361 capture438 passes188 assertions,88 callback records, seven colour probes
+and200 field-text pixels. The checker rejects2771 corruptions. Final composed
+regression439 still passes its unchanged90-frame/43-pointer oracle. Both images
+were inspected. UnoQ style compiles only; no monitor update/reset/storage/audio.
+See docs/NEON_RETAINED_UI.md for bounds, lifecycle, timing and historical records.
+Native keyboard/physical-input qualification, remaining effects/formats/math/
+collision and broader Anvil Vulkan completion/publication remain open.
+
+
+Shared Neon collision and geometry
+
+neon_collision.pbi provides box/circle/line collision, cubic Bezier points,
+alpha-mask sampling, convex hulls and SAT without renderer/device allocation.
+Caller-owned descriptors, masks, points and scratch have explicit size/alias/
+geometry checks. Negative results are refusals, not collision booleans. Pixel
+sampling has an explicit work budget and conservative rotated bounds; hull output
+is transactional. The desktop corner-radius rejection is not copied into Anvil.
+See docs/NEON_RETAINED_UI.md for boundary rules, namespace, capacities and limits.
+
+Anvil361 capture443 passes511 assertions,21 cubic points, eight hull scenes and
+sparse/transformed mask tests. The native hull/curve view passes six probes and
+671/409 line pixels plus1860 title pixels. Its verifier rejects1181 corruptions.
+UnoQ compiles only. No monitor update/reset/storage/audio; cores/Vulkan/Lato and
+zero display timeouts are preserved. This is shared geometry qualification, not
+maximum-capacity timing, native input or full Neon/Anvil Vulkan completion.
+
+
+Keyed chrome easing and draw-owned hover regions
+
+neon_chrome_animation.pbi adds bounded copied UTF8 keys and desktop exponential
+easing, finite/clamped delta time, explicit initial value and shared reduced
+motion. neon_chrome_hotzones.pbi records visible regions from widget Draw calls,
+not a second host layout. It publishes a double-buffered map only after successful
+frame End; capacity/refusal requires Abort and leaves the last map intact. Opaque
+menus block covered hover regions. Hosts may compare identities to redraw only
+when hover changes. These are serialized optional helpers, not input/clock owners.
+
+Anvil361 captures446/447/448 pass396/402/405 assertions,60 End calls/easing samples
+each and10/12/13 hover regions. Narrow tabs exercise close/overflow regions and
+both scrollbar axes. Five probes/716 field-text pixels per mode pass; images
+inspected. Verifiers reject2239/2793/2446 mutations. Style compatibility449 passes
+its unchanged188checks with tracking unbound. UnoQ overflow compiles only. No
+monitor update/reset/storage/audio; cores/Vulkan/Lato/timeouts remain healthy.
+See docs/NEON_RETAINED_UI.md for API bounds, lifecycle and qualification limits.
+Full engine/native input and broader Anvil Vulkan completion remain open.
+
+
+Prepared chrome button and decorative helpers
+
+neon_chrome_button.pbi provides copied UTF8 labels, prepared glyph/metric sealing,
+lit/disabled states, exponential hover, press-edge events and hot-map registration.
+Draw preserves caller scissor and owns no frame. Shared style/reduced-motion and
+callback refusal guards apply. NeonChromeGlow/Frame expose the existing four-box
+decoration. See docs/NEON_RETAINED_UI.md for capacities and host input/clip policy.
+
+Final Anvil361 captures452/453 pass143 checks each, all28 fake and28 native callback
+records, seven probes and340992 reference pixels with maximum channel error0.
+Both images were inspected. The verifier rejects4981 corruptions per scene.
+The resident adapter is exercised before the captured recording/reference frame.
+UnoQ final eased export compiles only. These synthetic single-scene checks do not
+qualify physical input or application frame timing. No monitor update/reset.
+
+A pre-upload read-only status reply was lost; no payload was sent in that attempt.
+The bounded tool recovery now covers exact version/map/shot status queries only.
+An injected status-loss replay recovers and boots exactly once; seven mocked-I/O
+checks pass. Cores/Vulkan/Lato/timeouts remain healthy with deadmanoff. Full Neon
+and broader Anvil Vulkan remain unfinished and source publication gates apply.
+
+
+Compressed sprite stream decoding
+
+neon_inflate.pbi adds caller-owned raw DEFLATE and zlib decoding without board,
+renderer, heap or service dependencies. Stored/fixed/dynamic blocks, canonical
+trees, history copies, wrapper/window checks and Adler verification are covered.
+Output remains disposable on refusal. Use it outside drawing; no per-frame or
+maximum-capacity timing claim is made. docs/NEON_PNG_DECODING.md gives API details.
+
+Anvil361 capture455 passes69cases/93assertions,306945 exact decoded bytes and294912
+native sprite pixels plus four background probes. The decoded RGBA source is
+erased after resident upload. The inspected picture and910 planted-fault refusals
+qualify this stream prerequisite, not a PNG file decoder. PNG chunks/filters/
+samples/interlace and service integration remain open; BMP24/32 loading is unchanged.
+UnoQ compiles only. No firmware update/reset/storage/audio; all postchecks healthy.
+Full Neon/Anvil Vulkan remains unfinished and source publication gates apply.
+
+
+PNG sprites from memory and files
+
+The compressed-stream prerequisite is now connected to shared PNG validation,
+filters, sample conversion and Adam7. NeonPngInspect reports caller scratch needs;
+NeonPngDecode publishes metadata/RGBA/mask only after complete success. Explicit
+NeonServiceSpriteLoadPNGMemory/File decode then upload through the existing
+resident owner. The old BMP-only signatures remain unchanged. No device/frame
+ownership or hidden allocation is introduced. docs/NEON_PNG_DECODING.md gives
+colour-depth, CRC/order, storage, error and compatibility contracts.
+
+Anvil361 capture458 passes81cases/209assertions and20752RGBA/5188mask exact bytes,
+covering all15 colour/depth pairs both normally and interlaced. Eight native
+textures pass164736 image pixels; one is read from a real943-byte Pi-drive PNG.
+CPU buffers are erased after upload. The picture was inspected and3771 planted
+faults refused. UnoQ compiles only. The entire suite returns0/1.9hostseconds, not
+a maximum-capacity/FPS claim. The fixture file was created and verified through
+Anvil; no firmware update/reset/audio. Cores/Vulkan/Lato/timeouts remain healthy.
+Other formats, legacy allocating convenience, full Neon and broader Vulkan remain
+unfinished; mandatory source publication gates apply.
+
+
+Board-owned VPM proof and returning RAM layout
+
+The V3D shader-record diagnostic belongs to RaspberryPi4/Tests/Vulkan, with its
+builder updated accordingly. The ownership-only move preserves complete payload
+bytes and removes three downward-call failures;119 architecture entries remain.
+The all15 base now declares EnableFloatingPoint. Returning builds place the GPU
+arena, surface/window and banners within checked payload RAM, separate from stack
+and monitor reservations. No standalone-only arena assumption authorizes entry.
+
+The reference path explicitly emits eight triangle quads; the ordinary line API
+now uses compact records and cannot serve as that reference. Capture460 on361
+passes the unchanged eight-frame/four-rotation/131072-byte GPU oracle,510 VPM cases,
+16-node render/17-node refusal and zero live memory.41 damaged proofs refuse.
+Return0/7.5hostseconds is the whole diagnostic, not throughput/FPS. Its return
+screenshot is CPU tier; offscreen GPU readbacks prove these VPM frames, not a new
+DSI display guarantee. All postchecks healthy;no firmware/reset/storage/audio.
+Full Neon/Vulkan and mandatory source-publication closure remain unfinished.
+
+
+Public coordinate-cache and rollback probe
+
+The returning Pi4 CPU probe uses NeonRebindSurface for initial build, alternating
+cache reuse, rotation and recovery from an oversized4097x8 surface. Private table
+procedures are no longer called from tests. Payload-owned ranges replace legacy
+addresses; an eight-row rejected stride preserves rollback coverage within8MiB.
+CPU descriptor state is seeded deliberately: no GPU initialization, MMU change,
+framebuffer write or job submission occurs in this fixture.
+
+Capture461 on Anvil361 returns0/1.74hostseconds. All56475 captured coordinate words
+and655360 report bytes match the independent rational oracle, including cache
+counters, full descriptor rollback, guards, padding and reset state.385 damaged
+reports refuse. The CPU-tier return screenshot was inspected; postchecks healthy.
+This removes two source-architecture failures (117 remain); provenance98 still
+refuses. It is qualification-tool maintenance, not new GPU or full-port support.
+
+
+Procedural rope assets
+
+NeonSpriteCreateRope generates the engine's32x64 orange/yellow rope with dark
+borders and eight-row repeating ridges. Supply8192 RGBA bytes, optional2048 mask
+bytes and aligned8 metadata; used spans must be disjoint. Refusals preserve all
+outputs. Integer source-over rounds to nearest byte and leaves alpha255. This
+does not promise platform image-library bit identity. NeonServiceSpriteCreateRope
+uses existing resident upload ownership; prepare outside Draw, then reuse source
+buffers. Failed replacement preserves the previous resident handle. No new
+provider ABI/driver or firmware update is needed. Full contracts are in
+docs/NEON_RETAINED_UI.md.
+
+Anvil361 capture463 passes76 assertions,16384 exact RGBA bytes,2048 mask bytes and
+98304 native pixels from two copied textures (normal/scaled/cropped), after source
+erasure and a refused replacement.125 damaged reports/images refuse. UnoQ compiles
+only. The image was inspected;1.5hostseconds is whole-fixture time, not FPS.
+Historical462 was refused for two undersized guard arrays in the new test; only
+their counts changed, with original expectations retained. Postchecks healthy,
+no firmware/reset/storage/audio. Full Neon/Vulkan and source publication remain
+unfinished.
+
+
+Measured UTF8 fitting qualification
+
+The new shared measured-text helper supplies bounded UTF8 fitting with explicit
+caller scratch, transactional output and caller-selected ellipsis/dots. It uses
+existing scalar/combining/selector/joiner boundary rules and the actual prepared
+font width callback. Font glyph availability policy remains the application's
+responsibility; full grapheme shaping is not claimed. See NEON_RETAINED_UI.md for
+API, capacities, errors and callback contracts. Existing widget fitters remain.
+
+Anvil361 capture464 passes95 assertions/64 cases plus an independent native-font
+enumeration of39 prefixes. Fitted/reference text matches35840 pixels exactly;
+683 damaged reports/images refuse. The image was inspected; UnoQ compiles only.
+Initial recursion-test compilation refused before upload; legal nonrecursive
+binding checks replaced it without weakening compiler policy. All postchecks
+healthy/no firmware/reset/storage/audio. Full Neon/Anvil Vulkan remains open.
+
+
+Unicode uppercase title preparation
+
+Shared NeonTextUpperBytes/NeonTextUpper now provide locale-independent Unicode17
+default full uppercase with explicit caller storage and transactional output.
+This is a prerequisite for the panel title behavior, not the completed panel.
+All1580 changed mappings are pinned to official UnicodeData/SpecialCasing;1525
+also cross-check host Unicode15.1. Unicode-3.0 data notice/license and the new
+source inventory are retained; no existing classification or policy changed.
+No OS-specific UCase parity, locale tailoring, normalization or font fallback
+claim is made. See NEON_RETAINED_UI.md for capacities/errors/ownership.
+
+Anvil361 capture466 passes67 checks/14cases and13735 exact output bytes. Converted
+and reference labels match35840 pixels exactly;236 damaged proofs refuse. UnoQ
+compiles only. Capture467 also passes the unchanged95-check fitting regression,
+whose complete PMF bytes remain identical with the extended UTF8 header. Images
+were inspected. Historical465 refused an incorrect padded-label length in its
+fixture; only encoded length constants changed before466. All postchecks healthy,
+no firmware/reset/storage/audio. Full Neon/Vulkan and source publication remain open.
+
+
+Prepared panel composition
+
+The new shared prepared panel and resident service adapter now implement the
+desktop body/header/accent/divider/uppercase-title/four-border composition.
+Titles are copied and prepared before Draw; cached geometry/accent updates do
+not reprepare glyphs. Shared palette revisions drive redraw. Caller clip, frame
+and input ownership remain intact. Untitled and zero-header cases preserve the
+original nondegenerate drawing behavior. See NEON_RETAINED_UI.md for caller
+storage, Unicode policy, coordinates, errors, callbacks and lifetime contracts.
+
+Anvil361 capture468 passes131 assertions,30 complete ordered callback records,
+title guards and358400 native/reference pixels with zero channel difference.
+Default/custom themes and caller scissor retention are covered; allthree title
+windows contain visible text.1681 damaged reports/images refuse. The image was
+inspected; UnoQ compiles only. This is panel qualification, not full engine/input/
+font-policy/Vulkan completion or an FPS/headroom claim. All postchecks healthy;
+no firmware/reset/storage/audio. Mandatory source-publication gates still apply.
+
+
+Scalar caret column mapping
+
+Shared UTF8 column-to-x and x-to-nearest-column helpers now use prepared renderer
+prefix metrics, with explicit matching fixed-cell advance when selected. Columns
+count Unicode scalars; supplementary characters count once. Midpoint ties choose
+the later edge. Caller scratch/result storage is explicit; every refusal preserves
+the result. Metrics and UTF8/span/range/alias errors refuse. Measurements stay
+outside Draw, with no allocation, glyph preparation or frame ownership. This does
+not add grapheme shaping, bidi, multiline policy or migrate existing widget code.
+
+Anvil361 capture469 passes150assertions/91cases plus14 pointer/range refusals.
+Independent literal native prefixes check12boundaries/11midpoints; four carets
+and text match44800pixels exactly/max0, with visible text/caret probes.1058 damaged
+reports/images refuse. Image inspected; UnoQcompile-only. Wholefixture1.4hostseconds
+is not FPS/headroom. Postchecks healthy/no firmware/reset/storage/audio. Full Neon/
+Vulkan and mandatory source publication remain unfinished. See NEON_RETAINED_UI.
+
+
+Fixed TrueType layout prerequisite
+
+Shared layout adds explicit Q16 fixed cells without pair positioning. UTF8,
+CRLF, wrapping, alignment and original proportional behavior stay in one owner.
+This is a prerequisite: Vulkan font references, cache/draw policy, snap and
+controls remain open.
+
+Physical original-owner470 and extended-owner471 agree on16 proportional cases.
+48 fixed cases and5 refusals pass;1318 corruptions refuse. CPU layout only, no
+glyph-rendering/FPS/headroom claim. Wholefixtures4.3/4.0hostseconds; UnoQcompile-
+only. Postchecks healthy; no firmware/reset/storage/audio. Full Neon/Vulkan and
+mandatory source publication remain unfinished.
+
+
+Resident per-font fixed spacing
+
+Installed Anvil362 adds optional graphics protocol1.5 fixed spacing. Registered
+references carry their own Q16 advance; measurement and drawing pass it explicitly,
+and short-run layout cache identity includes it. Legacy/default calls stay
+proportional. Native source callers must rebuild for40-byte font references.
+Pixel snap and control display remain open; direct native qualification follows below.
+
+Capture472 passes92checks and161280 exact native/reference pixels across6
+alternating proportional/fixed/fractional rows;114 corruptions refuse. A separate
+comparison with Anvil361 capture469 matches35840 default pixels and exact width.
+Image inspected; UnoQ service-client compile-only. The verified362 boot update
+has a reloaded/hash-checked361 backup and one restart with90 quiet boot seconds.
+All postchecks healthy. Wholefixture1.4hostseconds is not FPS/headroom evidence.
+Full Neon/Anvil Vulkan and source publication remain unfinished.
+
+
+Direct native fixed-font qualification
+
+Capture475 on Anvil362 passes124checks and46080 exact GPU attachment pixels for
+native setters/getter, proportional/fixed/fractional text, retained font spacing
+and right/centre alignment. Zero in-frame raster/upload work and exact stale-owner
+refusals pass.219 damaged reports/pixel buffers refuse. The montage was inspected.
+
+This is a returning native Vulkan composition in payload-owned RAM, with an
+independent positioned-glyph reference; it does not adopt a display target.
+Historical473/474 fixture setup/count refusals are retained. Production code and
+pixel expectations were unchanged. The retained pointer still submits one compact
+fan outside the viewport, included in58draws/738vertices. Wholefixture7.9hostseconds
+is not FPS/headroom. All postchecks healthy; no firmware/reset/storage/audio.
+Pixel snap, visible controls, application acceptance, source publication and
+broader Anvil Vulkan remain open.
+
+
+Per-font pixel snapping on Anvil
+
+Anvil363 adds optional resident protocol1.6/flag128/op35 and a pure
+NeonServiceFontSetSnapToPixel client. Native fonts expose SetSnapToPixel and
+SnapToPixel; the retained registry exposes its own setter. Exact0/1 only; idle
+mutation only; default1 preserves existing Anvil snapping. Source references
+are48bytes: rebuild native callers and query retained storage size.
+
+Snap-off retains fractional Q16 ink origins through camera/canvas transforms.
+Snap-on rounds each glyph before mapping. Text widths, layout and raster caches
+stay valid; no in-frame preparation is introduced.476passes97direct checks/
+46080exact attachment pixels and192corruption refusals, including actual retained
+and right/centre drawing.478passes82resident checks/46080exact native pixels;
+88damaged reports refuse. Shared client compiles for UnoQ; physical GPU tests
+are Pi4 only.477's deliberate Close restored the console before capture, so its
+image check refused despite passing API checks; exact original evidence remains.
+
+363raw6004264B SHA8eb4ac7bba9878b4059e048ad529ad791b4a167c81463e147ebecd7ddff6575c;
+code00200000..007B9E27/BSS0D000000..0EE4760F. Verified362backup/candidate/boot
+readback, one authorized reset and90quiet boot seconds precede live postchecks.
+Visible controls, full application acceptance, publication and broader Vulkan
+remain unfinished. No FPS/headroom/another-GPU claim.
+
+Default regression capture479 on363 additionally passes124checks. All368672
+fresh crop/guard bytes are identical to the old475 result, proving the historical
+snapped default across proportional/fixed/fractional, retained and aligned text.
+The current fixture uses48byte references. Cores/Vulkan/Lato healthy;DSItimeouts0,
+deadmanoff/leaseFREE. The full Neon/Anvil Vulkan goal remains active.
+
+
+@SECTION Visible controls in Anvil fonts
+
+Anvil364 adds optional protocol1.7/flag256/op36 and a pure resident font-controls
+client. Native/retained fonts expose SetControlMode and SetShowControls. Legacy0
+preserves existing CR/LF layout; hidden1 drops C0/DEL; visible2 draws one common
+box per control, including CR/LF separately. Desktop-style ShowControls false/true
+selects hidden/visible. Native references are now56bytes; rebuild source callers
+and query retained storage size.
+
+Width, preparation, layout cache and drawing share the same mode. A shared strict
+decoder validates before writing; a bounded pure raster owns visible-box coverage.
+The atlas admits controls before a frame. Pixel snapping remains independent.
+480passes244checks/46080exact attachment pixels, including independent box
+references and a completely empty hidden-control crop. In-frame raster/upload
+deltas are0;339corruptions refuse.481passes78resident checks/46080native pixels;
+84damaged reports refuse. Shared client compiles for UnoQ; physical GPU evidence
+is Pi4 only. The actual montage and resident screenshot were inspected.
+
+482's69layout cases produce the same65536report bytes as471.483's124native checks
+produce the same368672crop/guard bytes as479. The installed364 image has a verified
+363backup, candidate and boot readback; one authorized reset and90quiet boot
+seconds precede live version/map/core/Vulkan checks. Final original font/cores/
+Vulkan healthy, display timeouts0, deadmanoff. Full application/input acceptance,
+remaining image paths/effects, publication and broader Vulkan remain unfinished.
+
+
+@SECTION Composed drive assets on Anvil
+
+Anvil366 adds optional graphics protocol1.8/flag512/op37 for independent
+references to one loaded font face. NeonServiceFontDerive(parent,role,pixels)
+copies spacing/snap/control policies, then setters vary them independently.
+No second face allocation is required; unloading the owning face invalidates
+all references. Native references remain56bytes. Shared signed span checks
+reject overflow before dereferencing; the original failing boundary is retained.
+
+Native484 passes164checks/46080exact GPU attachment pixels,259corruptions refuse.
+Composed485 reads an actual font and RGBA16 Adam7 PNG from board storage, erases
+caller buffers and runs90frames of menus/tabs/editor/list/retained controls,
+sprites/particles/lines.65checks,5148PNGpixels(tolerance1),14400exact font-policy
+pixels;99corruptions refuse. Cleanup retires the owning face and derived refs.
+Screenshots inspected. UnoQ compiles only; physical execution is Pi4.
+
+Measured29.932FPS,25.724ms mean work,40.072ms worst;89of90frames meet33.333ms.
+The late menu-opening frame spends34.207ms in submit/present, not preparation.
+Strict30FPS worst-case is not met; further present-stage diagnosis remains.
+Input is scripted with real polling and no physical contacts. Native-input
+acceptance and the full engine/Vulkan completion are not claimed.
+
+366raw6014504B SHA945510a517cda8f8852c5463ac2f97ac530bd567762f529d3a16d68509e4e137.
+Verified365backup/candidate/boot,one reset,90quiet boot seconds,live version/map.
+Final cores/original font/Vulkan healthy,timeouts0,deadmanoff. The host tool
+allows one fresh read-only pre-boot status recovery; mutations never replay.
+
+
+@SECTION Resident frame-end timing and DMA visibility
+
+Anvil 368 extends vkstat with the latest resident application's End count,
+failures, aggregate stage ticks and worst End call. It separates submission/
+completion, DMA, extra cleaning, display publication and other overhead.
+Counts reset on Open and survive Close; no payload or graphics ABI changes.
+
+The DMA helper already completes destination maintenance and a visibility
+barrier. The following duplicate whole-frame clean is removed from the DMA
+application/console presentation paths. DMA maintenance, CPU-rendered flushing
+and display ownership/error handling remain. The duplicate cost about 2.155 ms
+per frame; display-wait phase also affects the observed total reduction.
+
+Capture 487 on 368 passes all 65 checks in the same 90-frame composed asset
+application. Every frame meets 33.333 ms: mean work 23.343 ms, worst 24.763 ms,
+measured 30.0003 FPS. All 1,024,000 final pixels match the instrumented baseline.
+Raw stage sums and the independent application timer agree. The restored
+Vulkan console was separately captured and inspected. This proves the measured
+Pi4 DSI fixture, not HDMI actuation or a universal performance guarantee.
+
+The 368 boot file/candidate and 367 backup were reloaded and SHA-verified
+before one reset and 90 quiet boot seconds. Final cores/font/Vulkan healthy,
+display timeouts zero and deadman off. Physical input and full engine/Vulkan
+completion remain open, as do mandatory source publication gates.
+
+
+@SECTION Earlier input broker qualification (Anvil 368)
+
+Portable input is CPU-qualified but not yet a resident endpoint. Anvil 368/
+service-table ABI1.8 remain installed. A shared48-byte event carries typed
+text, named navigation, pointer/wheel/cancellation and separate physical-key
+edges for games. The existing normalized vocabulary has one owner; its
+original numbers, CRLF handling and Ctrl+C behavior are preserved.
+
+Payload focus owns the original typed queue plus a bounded device lane.
+Ready lanes alternate. Focus/screen changes and overflow cancel before fresh
+input, preventing stale clicks or keys from crossing into another screen.
+Failed service cleanup retains ownership and blocks reuse until recovery.
+
+The final controlled-producer CPU test passes267checks on Pi4;541damaged
+reports/truncations refuse. Wrapped FIFO order, releases, modifiers, focus
+handoffs, overflow and legacy bytes are covered. UnoQ compiles only. No
+physical input or resident integration is claimed: driver producers, payload
+client, lifetime hooks and application adapter remain to wire. No monitor
+update/reset was performed; cores/font/Vulkan remain healthy, deadman off.
+
+
+@SECTION Resident input endpoint: Anvil 370
+
+Anvil 370 now exposes service-table ABI 1.9 slot 39, retaining the 200-entry
+table and all existing signatures. A portable client validates old tables,
+capabilities and complete events before publishing them to the caller.
+Failed Open descriptor validation retains the acquired context for checked
+Close. Failed Close preserves ownership. Targets without a registered
+provider answer ENOSYS; no unsupported device is advertised as attached.
+
+The Pi4 adapter uses the existing HID and touch drivers. It does not reset
+or enumerate USB while opening a payload. It separates physical key edges,
+named navigation and printable text, tracks modifier-only changes, and
+provides bounded key repeat. Mouse coordinates retain one position owner;
+the monitor cursor does not paint over payload graphics. Touch has one
+consumer and rearms only after a fresh validated empty frame. Devices held
+before Open, cancellation or return cannot become a new press by replay.
+Raw touch consumers refuse while native input owns the stream.
+
+Input scope retires before console restoration, with the existing shared
+quarantine/recovery policy for failed cleanup. Pi4 CPU capture 491 passes 88
+portable-client checks with a controlled provider; 183 damaged reports refuse.
+The same client compiles for UnoQ, with no execution claim there.
+
+Actual resident captures 492 and 493 each pass 38 boundary/lifetime checks.
+The first deliberately returns with input still open; the next payload
+successfully opens again, proving return cleanup. The report checker rejects
+93 corruptions/truncations and invalid telemetry values. The observed live
+capability mask is 4 (touch), at 1280x800. No physical events were generated.
+Keyboard/mouse hardware actuation and the Neon application adapter remain
+unverified; neither the full port nor interactive acceptance is complete.
+
+Build 370 was installed with a verified 368 backup and reloaded SHA-256 checks
+of the candidate and boot file, followed by one authorized reset and 90 quiet
+boot seconds. Cores, resident font and Vulkan remain healthy, with zero
+display timeouts and deadman off. Mandatory source publication gates and the
+remaining image/effect and broader Vulkan work are still open.
+
+
+@SECTION Native input in the composed application
+
+The shared Neon native-input adapter now connects resident events to pointer
+hover, left-button dragging, wheel input, named editor navigation and text.
+It translates Ctrl+A/C/X/V from physical key edges once. The composed
+application copies editor clipboard output into its own bounded buffer for
+paste input. Cancellation clears captures; generation changes require a
+cancel barrier. Held touch and mouse cannot steal each other's contact.
+Right or middle button changes do not become left clicks.
+
+The composed application builder selects this with --native-input. Scripted
+injection remains explicit and mutually exclusive. Native mode uses slot 39
+and never drains the raw touch service. Idle hover retains its position;
+the input queue drains before drawing, with transient actions consumed once.
+
+Pi4 capture 494 passes 125 controlled-record translation checks; 257 corrupted
+reports/truncations refuse. Capture 495 runs the actual native input service
+with the composed Vulkan application and drive-loaded PNG/derived fonts.
+All 65 existing integration checks and all 90 frames pass, at 30.0003 FPS.
+Mean frame work is 22.102 ms, maximum 23.523 ms; input averages 0.546 ms.
+This is an idle-input render fixture: capability 4 (touch), zero physical
+events. Hand-actuated controls, visible mouse cursor behavior and first-tap
+rearming remain unverified. No interactive completion claim follows from it.
+The same pure composed application compiles for UnoQ only. After returning,
+cores, resident font and Vulkan are healthy, display timeouts 0, deadman off.
+
+
+@SECTION Automatic PNG/BMP selection in legacy loaders
+
+The existing SpriteLoadMemory/File service and native signatures now use a
+shared decoder selector. The default remains the original BMP24/32 decoder.
+Include neon_sprite_decoder_png.pbi after the existing Core CRC owner and
+install an aligned caller-owned workspace with NeonSpriteDecoderPngInstall.
+The unchanged legacy calls then select PNG or BMP from the encoded content.
+NeonSpriteDecoderPngReset restores BMP. Explicit PNG APIs remain available.
+JPEG, GIF, other image codecs and allocating convenience wrappers are not
+implemented by this change.
+
+NeonSpriteDecoderInstall accepts the same eight-argument decode contract
+and a file-source byte limit, allowing further decoders without copying
+upload or file code. Installation, reset and nested decoding refuse while
+the decoder is active. Refused installation preserves the selected decoder
+and workspace. Unexpected positive decode status becomes a provider error.
+Installed code and scratch must remain valid; callers serialize operations.
+Busy is -21325; an invalid positive provider status becomes -21326.
+Custom providers must retain the decoder's validation and transactional
+output contract; registration is not a hostile-code sandbox.
+
+PNG uses its existing explicit workspace requirements and decode limits.
+Install requires an aligned, representable span of at least 8192 bytes;
+NeonPngInspect gives the exact image-specific workspace size. Too little
+workspace refuses before publishing outputs. The installed file limit is
+16 MiB; BMP's internal limit remains 4194432 bytes. Legacy file helpers query
+the active decoder's limit. The native helper also refuses an oversized
+read count and validates its encoded destination span before file access.
+
+Pi4 capture 497 passes the unchanged 133 BMP/file checks plus 43 new registry/
+PNG integration checks. It loads 1:/NPNG457.PNG using legacy SpriteLoadFile,
+uploads the same encoded PNG using legacy SpriteLoadMemory, resets decoding
+to BMP and successfully loads another BMP. It erases caller image/encoded/
+scratch buffers before drawing. Independent readback checks 572 PNG RGBA
+bytes, 143 mask bytes, 18304 PNG display pixels and 300 existing BMP pixels.
+The checker rejects 109 changed reports/images. The source and PNG decoding
+algorithm are reused; this is loader integration evidence, not a new codec
+conformance or maximum-image performance claim.
+
+An earlier capture496 used the original fixture helper names. The final
+fixture has its own names; its changed binary was physically retested rather
+than assumed equivalent. Both complete images are byte-identical.
+
+The same pure application compiles for UnoQ only. The complete Pi4 native
+composition also compiles with all three native entry points and the PNG
+installer referenced so their code is emitted. That diagnostic was neither
+installed nor executed; native HwFile-wrapper runtime remains unverified.
+Anvil 370 remains installed, with healthy cores/font/Vulkan, zero display
+timeouts and deadman off. No boot-image update, reset or storage write was
+needed. Full engine effects/physical input and broad Vulkan remain open.
+
+
+@SECTION GPU copies from an offscreen canvas
+
+NeonVkChromeImageSpriteCopyId updates an already allocated sprite from a
+completed Vulkan image; NeonVkChromeImageSpriteCopy selects ID 1. The source
+must have the same extent and device, TRANSFER_SRC usage and GENERAL or
+TRANSFER_SRC_OPTIMAL layout. Call between frames after consuming the prior
+present intent. The source stays caller-owned and retains its layout.
+
+Copies reuse the destination allocation/view/descriptor and advance its
+generation. Recording refusal preserves it. Failed submission poisons the
+renderer: use DestroyChecked to establish idle before retiring/recreating it.
+This path performs no source readback or CPU pixel upload.
+
+Pi4 capture 500 passes 45 checks and 40960 sampled pixels across two GPU
+passes, including independent slots 1 and 16. The source changes after the
+first copy; updating one sprite leaves the other unchanged. UnoQ compiles
+both entry points with its absent backend; no execution is claimed there.
+Full canvas ownership, aspect-correct final presentation/input mapping and
+the optional CRT effect remain unfinished. This is not full Neon completion.
+
+
+@SECTION Fixed canvas and aspect-correct presentation
+
+The native NeonVkCanvas owner renders to a fixed Vulkan attachment, copies
+the completed image into a retained sprite, then restores the display target.
+DrawPassthrough fits that image without stretching its aspect ratio. Its
+shared viewport calculation also maps logical input pixels into Q16 canvas
+coordinates. Points in letterbox bars leave the output unchanged.
+
+Initialize caller-owned state, Create with one-time texture scratch, then
+Begin/draw/End each source frame. Begin the caller's final Chrome frame,
+DrawPassthrough, finish it and perform the normal display transfer. Close the
+canvas before destroying Chrome. Close refuses to abort or consume a caller's
+final frame; target changes require explicit Retarget. Source asynchronous
+work is joined before copying. Repeated frames allocate no canvas resources.
+
+Canvas sampling uses linear min/mag filtering with clamp-to-edge. Other
+sprites and the shared atlas keep their nearest defaults. Pi4 capture 504
+passes 161 checks and 307200 pixel comparisons across all four rotations.
+Only interpolated boundary channels allow a one-level rounding difference.
+UnoQ build 91 compiles the shared owner with its absent backend; no execution
+is claimed there. Capture 510 adds the real native menu/panel/list scene and
+physical DSI DMA transfer: 60 checks, complete 4,096,000-byte attachment/scanout
+equality and all 1,024,000 captured pixels identical to the earlier reference.
+
+Two retained clip-coordinate dimension banks avoid rebuilding 16,384 ratios
+on every canvas/display switch, at a cost of 128 KiB BSS. All direct line
+readers use the selected complete bank. Capture 508 checks 31,488 coordinate
+and line results across repeated dimensions and four rotations. The Pi4
+single-range cache operation reuses its existing complete line walker while
+preserving the same maintenance operations and completion barrier.
+
+Matched profiling runs reduce warm frames from about 775 to 231 ms, with
+identical captured pixels. The final display qualification measures about
+278 ms per warm frame. This remains below smooth-animation performance;
+it is not full engine acceptance. Pi4 monitor build 372 compiles but is not
+installed; the board still runs 370. Complete application/input-event routing,
+physical input, CRT effects and full Vulkan acceptance remain unfinished.
+
+
+@SECTION Input through a scaled canvas
+
+The shared NeonCanvasInput owner routes existing logical-screen native input
+records into the canvas viewport. Configure zeroed caller-owned state from
+the canvas viewport, then Feed each event and consume its transient outputs
+once. Idle clears transients while preserving position and capture. The
+owner does not open a device, take focus or drain another input queue.
+
+Presses in bars are ignored. A mouse held from a bar into the canvas stays
+blocked until release or cancellation. Captured movement and release outside
+the viewport retain signed coordinates, so the release ends capture without
+being clamped onto a control. Wheel input in bars is suppressed. Existing
+contact, timestamp, focus-generation and keyboard rules still apply. Finish
+or cancel an active/blocked press before reconfiguring for a changed viewport.
+Keyboard outputs use the shared editor command vocabulary; legacy integer
+Chrome codes are a separate interface.
+
+Capture 511 passes 79 checks using controlled records on the Pi4 CPU. Capture 512
+adds eight scripted events, real native Neon buttons, Vulkan canvas drawing
+and physical DSI output. All 155 device checks pass: bar and held-entry
+presses do not activate, two fresh presses do, and outside releases clear
+capture. All 4,096,000 final attachment/scanout bytes are equal. Host checkers
+reject 166 pure-input report corruptions and 317 UI report/five image
+corruptions. The corrected UI label check uses the native teal theme rather
+than assuming white text; both the original refusal and recheck are retained.
+
+Pure input and actual UnoQ composition 92 compile only. No hand-actuated
+input or UnoQ execution is claimed. The small button scene's warm frame is
+about 121 ms, not a controlled comparison with the larger widget scene.
+Full application keyboard integration, physical input and smooth rendering
+acceptance remain unfinished. The Pi4 still runs installed Anvil 370.
+
+
+@SECTION Keyboard input in the native text field
+
+The native input protocol, shared editor and legacy integer Chrome field
+use separate key-number domains. NeonLegacyKeyFromNative converts a named
+AIK key from an accepted AIE_KEY_DOWN record into the unchanged legacy
+Chrome key values. Typed text stays in its scalar channel. Unsupported
+named keys return zero; NCE editor commands and raw HID usages are not
+inputs to this conversion. The shared legacy-key header owns the constants
+for every native composition rather than leaving them inside the Pi4 driver.
+
+Capture 513 passes 297 checks with a real Neon_TextInput, Vulkan canvas and
+physical DSI output. Thirteen controlled events focus the field, move the
+caret, insert/delete text, submit, Escape and attempt unfocused typing. Text,
+caret, focus and submission counts are checked throughout. The final text
+is ZA, submitted once, with focus cleared; later typing has no effect.
+All 4,096,000 final attachment/scanout bytes match. The host checker rejects
+610 changed reports and five changed images. The existing shared editor
+keeps its NCE command values; no legacy Ctrl clipboard/selection behavior
+or unsupported page/insert commands are claimed.
+
+This is scripted event integration, not physical keyboard actuation. The
+small text-field scene measures roughly 114-118 ms per warm frame, a
+different workload from the larger widget scene. Physical input, cursor,
+first-tap and complete application routing remain unfinished.
+
+
+@SECTION Live canvas input and measured packet costs
+
+Capture 520 opens the real Anvil input service, renders native buttons and a
+text field through the canvas to DSI, polls for five seconds and closes the
+context. All 41 checks pass. The device advertises touch and returns zero
+events: physical input, keyboard availability and first-tap are not proved.
+The compiler now preserves loader register arguments across top-level
+initializers before automatic Main; captures 517-519 verify the entry fix.
+
+V3D complete-field writers now check capacity once. Aligned 32-bit fields
+use word stores; unaligned fields retain byte stores. The old byte path
+still handles partial overflow and first errors. Shader-record backstop
+zeroing remains complete. Captures 523/524 return identical full 16 KiB
+reports across 144 packet cases, four word alignments and six record cases.
+The strict host checker rejects 931 changed reports.
+
+Matched instrumented canvas captures 522/525 keep all 1,024,000 RGB pixels
+identical. Median warm frame time falls from 181.29 to 178.42 ms, about
+1.6 percent. Record preparation and list construction each save roughly a
+millisecond. The later Finish call alone does not measure total hardware
+completion. No cache maintenance, barrier or ownership check was removed.
+These results still fall short of smooth rendering; full application
+routing, physical input and the remaining engine/Vulkan work stay open.
+
+Pi4 build 374 and actual UnoQ composition 94 compile only. The Pi remains
+on installed Anvil 370; no UnoQ GPU execution or capability is claimed.
+
+
+@SECTION Native coordinate table selection
+
+Native geometry cache hits now select the existing CPU table-bank addresses
+instead of exchanging all table entries. Four addresses add 32 bytes of BSS;
+no table allocation, GPU mapping, cache operation or barrier is removed.
+Misses retain the original exact-ratio builder. Geometries above the bounded
+BSS-bank limit use the capacity-sized arena, including recovery from a
+previous bounded-bank hit.
+
+Matched physical captures 528/529 retain all 61,788 coordinate words and
+all 1,024,000 final RGB pixels exactly. The same 297 keyboard checks and
+13 rendered frames pass. Median warm frame time falls from 179.25 to
+139.42 ms (22.2 percent). Warm native rebinds fall from roughly 8.4-9.5 ms
+to 0.11-0.13 ms. Cache misses remain expensive; 139 ms is not smooth.
+Capture 527 separately measured native frame begin at roughly 1.35 ms.
+
+Captures 530/531 check 123,813 coordinate words over 20 visits, including
+4097-wide/high CPU geometries, rotation, reset and bank recovery. Unused
+tail words in both bounded banks remain intact. These are in-bank tail
+canaries, not allocated redzones. The GPU canvas remains 800 by 600;
+these checks do not qualify a 4097-pixel GPU render target.
+
+Counted Pi4 monitor 375 is installed after backup, full-file digest checks
+and one restart. Raw image: 6,054,332 bytes, SHA-256
+acb717316d4141a8186be7dbf31c5c6f1ed5ddf27fff1eac1ab46bca969708e2.
+Actual UnoQ root composition 95 compiles only; no GPU capability is added.
+The previous 374/94 paragraph above records that earlier test phase.
+
+Capture 532 runs the full composed resident application on Anvil 375 with
+stored PNG/font assets and the real input service. All 65 checks pass over
+90 frames at 30.0003 FPS. Mean frame work is 23.77 ms, maximum 25.19 ms;
+no frame exceeds 33.333 ms. This direct resident-service workload differs
+from the offscreen fixed-canvas comparison above. Input advertises touch
+and returns zero events; physical actuation is still unqualified. Vulkan,
+fonts and cores are healthy after return, with zero display timeouts.
+
+Evidence: docs/evidence/neon-native-coordinate-20261028/. Full engine
+routing through the fixed canvas, physical input, remaining rendering APIs
+and wider Vulkan support remain open.
+
+
+@SECTION Explicit cold-cache owner policy
+
+V3dSetCacheOff now accepts an explicit declaration from the MMU owner, like
+DmaSetCacheOff. A true value means D-cache is disabled and dirty lines from
+any previous cacheable state have been retired. The owner must clear this
+before enabling caches. The default remains false; it does not guess the
+hardware state. Only the line walk is skipped. Positive-range and batch
+completion barriers remain unchanged, including batch refusal behavior.
+Anvil's CacheDmaPolicy supplies its measured state to both libraries.
+
+Captures 534/535 separated native record cleaning, binning and rendering.
+The final native render interval included roughly 8.8 ms ARM target cache
+walks before and after rendering; its GPU completion poll was about 3.1 ms.
+The standalone returning diagnostic has private V3D/DMA globals and does
+not inherit the resident cache policy. Capture 536 reads active SCTLR as
+0x30c50830 before and after its scene: MMU and D-cache are off. Anvil hands
+the payload cold, with old dirty lines retired. This does not establish a
+safe skip for cacheable memory, nor a resident-renderer speed improvement.
+
+Matched cache-state runs preserve all 61,788 coordinate words, all 297
+keyboard checks and all 1,024,000 RGB pixels exactly. Old-code baseline
+536 is 114.04 ms per median warm frame. New-code conservative default 538
+is 113.97 ms with zero skipped walks. Explicit V3D and DMA cache-off policy
+537 is 63.73 ms, about 44 percent lower. In its final render, target walks
+drop to roughly 0.01/0.004 ms while GPU completion remains about 3.14 ms.
+This combined policy result is not attributed solely to V3D. Its different
+cache-state fixture is not a matched comparison with the earlier 139 ms
+profile. About 64 ms per frame is still short of smooth animation.
+
+Physical CPU capture 539 passes 29 checks covering conservative default,
+nonzero normalization, no-op ranges, positive walks, reset, full/partial
+uncached ranges, successful batches, poisoned batches and nested-begin
+refusal. It runs cold only; cacheable dirty-data silicon qualification is
+not claimed. The Range/BatchBegin/BatchRange/BatchEnd procedure bodies are
+unchanged. The public fixture and builder are in Tests/Vulkan and tools.
+
+Pi4 monitor 376 and actual UnoQ root 96 compile only. Neither is installed;
+the Pi remains on verified Anvil 375. GPU execution is qualified only on
+the physical Pi4; absent backends acquire no capability. Evidence:
+docs/evidence/neon-cache-owner-20261028/. Resident offscreen service
+support, complete engine render-target/routing behavior, physical input,
+and wider Vulkan support remain open.
+
+
+@SECTION Retained offscreen targets and resize
+
+The native shared canvas owner now retains up to 16 targets, each using a
+different existing sprite slot. Only one source frame can be active. Internal
+target restoration propagates the new renderer generation only to peers
+which captured that same caller target epoch. An external rebind still makes
+old captures stale, even after another target is explicitly retargeted.
+The shared resource-lifetime reference is released only when the last target
+successfully closes. Caller state objects remain alive while registered.
+
+NeonVkCanvasResize(state,width,height,scratch,bytes) validates arguments before
+retiring the old image. Resize discards its contents, as the original engine
+contract does. Invalid arguments preserve the old resources; once retirement
+succeeds, allocation failure is reported with CLOSED or retained failed-cleanup
+state. Drawing the resized image before its first completed source frame
+refuses. No old contents are presented under the new dimensions.
+
+The first physical test, capture 540, exposed a portable Vulkan capacity
+defect: the fourth retained canvas returned VK_ERROR_TOO_MANY_OBJECTS.
+The framebuffer table had four rows including the display, and the image,
+view and memory budgets reserved sampled sprites without their separate
+color attachments. The shared tables now reserve attachment rows from a
+named 16-target budget. Heap admission, actual allocation sizes and lifetime
+checks are unchanged; sixteen maximum-size targets are not promised to fit.
+
+After correction, capture 541 passes 98 target checks. Captures 542/543 add
+cross-target sampling, stale-epoch isolation and sampling after resize.
+The repository builder build_neon_canvas_targets.py and neon_canvas_targets_check.py
+then pass on the physical Pi4 in capture 544: 123 target checks plus the
+original 297 keyboard checks over 13 final frames. The target proof retains
+16 small targets; two differently sized targets render red/green, a third
+samples both, and a resized target is sampled again with its new green data.
+It also verifies live-frame refusal, invalid resize preservation, partial
+retirement, full retirement and reuse. Three GPU-derived sampled color
+checks pass. Every one of the final 1,024,000 RGB pixels matches the prior
+keyboard scene. The host checker rejects 375 damaged reports.
+
+Pi4 monitor 377 and actual UnoQ root 97 compile only; neither is installed.
+The Pi remains on verified Anvil 375. The new owner is executed by returning
+payloads; resident offscreen service operations are still absent. There is
+no physical input-actuation, nested/mid-frame render-target or complete
+engine/Vulkan qualification. Evidence:
+docs/evidence/neon-canvas-targets-20261028/. Capacity finding remains open
+in forum topic 1486 while source publication gates refuse.
+
+
+@SECTION Blank targets and prepared offscreen scopes
+
+NeonVkCanvasCreateBlank(state,width,height,sprite) and
+NeonVkCanvasResizeBlank(state,width,height) use zeroed bytes in the existing
+checked upload staging allocation. They need no caller pixel buffer and add no
+large static scratch array. The original scratch-taking APIs remain available.
+Blank pixels are transparent, but drawing a target still requires a completed
+source frame. Resize discards the prior image; invalid dimensions preserve it.
+
+For preparation between binding and recording, call NeonVkCanvasBind(state),
+prepare fonts or particles, then use Begin/End. End completes the offscreen
+copy while leaving the scope selected. Multiple frames can use that scope.
+NeonVkCanvasAbort discards an unsubmitted source frame and preserves the last
+completed sampled image. NeonVkCanvasUnbind(state) restores the captured
+caller target. Close can retire its own selected scope. An active caller frame,
+nested scope or unannounced target epoch does not become a valid switch.
+
+Physical Pi4 capture 545 passes 131 target checks and 297 keyboard/UI checks,
+including transparent first and odd-tail texels. Capture 546 passes 163 target
+checks and the same 297 UI checks. It renders a prepared floating-point
+particle while targets remain retained, checks that abort preserves its yellow
+pixels, and closes/reuses a selected target. All 4,096,000 attachment/scanout
+bytes agree in the final UI scene. This is lifecycle and pixel evidence, not
+smooth-animation acceptance or a real GPU-fault recovery test.
+
+The additive resident graphics target family uses feature bit 1024 and minor 9;
+the console service table contract remains ABI 1.8 at slot 38. Include the HAL
+contract, base service client and optional neon_service_targets client.
+Create returns a positive opaque token or zero with NeonServiceError.
+Resize, Free, Bind, Unbind and Draw use that token. No device/image addresses
+cross the API. Limits report 16 slots and a maximum dimension of 2048, subject
+to backend validation and available heap. Ordinary sprite uploads cannot
+replace a target-owned slot.
+
+NeonServiceTargetBind(handle) enters an idle scope and reports that target's
+Width/Height. Prepare fonts/particles, use ordinary Begin/End/Abort, then call
+NeonServiceTargetUnbind(handle). Child End performs no display transfer.
+Unbind restores parent surface and virtual-canvas dimensions; camera state,
+including changes inside the scope, persists as in the original engine.
+Create/Resize/Free refuse while a scope is bound. Self-sampling, an unfinished
+source image, stale tokens, invalid scalar inputs and unsupported old providers
+refuse explicitly. Close retires the active scope before other retained targets.
+
+The resident path now passes its 35,372-byte pure-client test on Anvil 380:
+108 exact report rows, eight color/filter/camera probes and 80 filtered white
+text pixels. Explicit close while bound with sixteen targets and context reuse
+are checked before the final scene. The final context remains owned until the
+loader captures its frame, then normal scope cleanup retires it. A missing-text
+image and a damaged report are rejected. The original refused runs are retained.
+The composed native-input/assets application also passes 65 checks over 90
+frames. Input remained idle; no physical input actuation is established.
+
+Legacy role preparation now uses the existing font pixel-height query. Line
+height includes two pixels of spacing and must not be used as a raster cache
+key. The first 379 resident run exposed this mismatch: preparation succeeded,
+then the text draw returned -21203. The corrected 380 draw and image pass.
+The initial fixture also closed before capture; its console image is preserved.
+The final text oracle checks filtered white coverage rather than requiring
+fully white texels after two linear sampling stages.
+
+Monitor 378 also exposed an unsafe startup cache assumption. D-cache disabled
+does not certify that previous dirty lines were retired. The V3D skip now starts
+conservative, becomes eligible only after a completed owner flush, and is revoked
+before cache enable. Controlled exact old/new owner bodies execute on Pi4:
+37 checks per version, eight old contract failures and zero candidate failures.
+Those callbacks do not perform a real cache/MMU transition. Real 379/380 monitor
+boots separately confirm working Wi-Fi/DHCP/console, matching live-image hashes,
+healthy cores/fonts/Vulkan, zero display timeouts and watchdog off. Post-hash
+CPU samples are 6.72-11.87 percent on 379 and 5.96-12.55 percent on 380.
+
+The verified 375 USB rollback, failed 378 candidate and both later verified
+updates are retained. At that checkpoint the Pi ran 380. UnoQ root 98 remains compile-only
+with an absent native lifecycle; CPU capture 547's twelve absence checks do not
+establish another board's GPU. Full application/input behavior, CRT effects,
+maximum-size/performance and wider Vulkan remain open. Mid-frame resident
+target support is qualified in the following section.
+Publication gates remain unresolved; no full port or conformance is claimed.
+
+
+@SECTION Resident parent-frame continuation
+
+Anvil 382 qualifies continuation through the resident provider and pure public
+client. The additive capability is bit 2048 at minor 10; target capability 1024
+and the service-table ABI 1.8 at slot 38 are unchanged. Bind during a recording
+window frame suspends that parent, enters an idle child scope, and exposes the
+child dimensions. Use ordinary Begin/End or Abort, then Unbind to restore the
+parent binding, mapping and recording phase through LOAD. Only the final
+window End presents. Child camera changes persist. Older providers refuse the
+new operation explicitly. Independent scopes do not nest, matching the original
+engine; nesting is not an outstanding parity requirement.
+
+The shared canvas preflight rejects stale ownership before suspension. The
+provider and client retain the parent phase, and failed mutations quarantine
+readiness. Open batches refuse a switch. Close handles a suspended parent and
+its child. It also aborts an unfinished, unsubmitted window recording before
+retiring idle targets; this fixes forum 1494. Submitted GPU/display ownership
+checks remain required. Arbitrary GPU/DMA fault recovery is not established.
+
+Physical capture 15 on installed 382 returns zero in 1.9 seconds: 145 exact
+state assertions, twelve pixel probes and 80 filtered white text pixels pass.
+The test includes close/reopen without End, close while suspended with sixteen
+targets, stale/nested refusal, child abort and resumed parent abort. Parent red
+and blue boxes and the green/yellow child remain visible. Host controls reject
+439 damaged reports, the prior 137-row report and the missing-parent image.
+Cores, fonts and Vulkan recover healthy, no display timeout, watchdog off.
+
+Earlier capture 13 returned successfully but its image correctly refused:
+two fixture boxes used scaled canvas coordinates for physical-pixel probes.
+The correction explicitly selects target coordinates; expectations stay fixed.
+Capture 14 on unchanged 381 passes 137 assertions and the same image checks.
+Forum 1493 is fixed/locked at reply 4092; 1494 at reply 4094. Overall 1483 stays
+open with progress reply 4095. Source-publication gates remain unresolved.
+
+Both complete monitor builds use the counted build helper and retain 311
+literal source/binary inputs. Build 381's ledger caller label was corrected to
+the actual wrapper; its original ledger bytes remain in evidence. Verified
+backup, candidate, boot-file and live-image hashes precede qualification.
+Build 382 is installed; 381 backup is 1:/B381V382.IMG. Saved paths increase BSS
+by about 4 MiB; fresh dynamic reserved ranges were checked before each payload.
+This is Pi 4 execution evidence for shared code, not other-board qualification.
+
+Attached-WSI continuation, preserved child rendering without an implicit clear,
+remaining full engine/input behavior, effects and wider Vulkan remain open.
+Evidence: docs/evidence/neon-resident-continuation-20261028/manifest.json.
+
+
+
+@SECTION Preserving a completed offscreen target
+
+NeonServiceTargetBeginLoad() begins another drawing section without clearing
+the selected target. It requires capability 4096 at minor 11, a bound target
+and a previously completed target image. Use ordinary End or Abort afterward.
+The existing Begin(r,g,b,a) still clears. Fresh and resized targets must first
+complete a clear frame; an unbound or already recording target refuses LOAD.
+The service table remains ABI 1.8 at slot 38; opcode 45 is additive.
+
+The shared NeonVkCanvasBeginLoad and NeonVkChromeBeginLoad entries use the
+existing compatible LOAD render pass. A saved parent's state must still be
+restored through Resume, not a fresh BeginLoad. Canvas checks completed-content
+validity and ownership before rebinding or recording. Pending completion and
+display ownership guards remain unchanged. This preserves the original engine's
+ability to add drawing to a target without an implicit clear.
+
+The pure-client physical proof on installed Anvil 383 passes 156 state checks,
+thirteen pixel probes and 80 filtered text pixels. Empty LOAD and aborted drawing
+preserve earlier colors and glyphs. New yellow drawing coexists with old blue
+pixels inside the child while its parent is suspended. A full 1,024,000-pixel
+comparison with capture 15 differs only at the eight deliberately preserved
+blue pixels. Host controls reject 472 damaged reports and the previous cleared
+child image. The existing close/reopen and parent-continuation checks also pass.
+Cores, fonts and renderer recover healthy, display timeouts zero, watchdog off.
+
+The complete counted build 383 retains 311 literal inputs. Its boot file and
+live image were hash-verified, with backup 382 at 1:/B382V383.IMG. Shared source
+benefits other providers, but this execution evidence covers Pi 4 only. Forum
+1495 records the gap and its physical resolution. Full engine/input behavior,
+attached-WSI continuation, effects, wider Vulkan and source publication remain
+unfinished. Evidence: docs/evidence/neon-target-load-20261028/manifest.json.
+
+
+
+@SECTION Attached presentation and target continuation
+
+Chrome Suspend now keeps an attached acquired image in a separate saved WSI
+owner while the child records. Child completion cannot present or release the
+parent. Resume verifies the saved device, image key, acquisition and surface
+freshness before restoring the owner at the parent's new target generation.
+Loss or resize refuses resume without discarding ownership. CancelSuspended
+waits for idle and releases the held image; checked destruction also retires
+saved ownership. Attaching another owner while a parent is suspended refuses.
+The normal active-WSI Rebind guard remains in force.
+
+The shared avkWsiAcquiredValidate query also protects new recording against
+surface loss and resize. Retirement alone permits an already acquired image
+to finish, as before. Canvas creation can retain an attached writable parent.
+Idle canvas close skips an unnecessary rebind when the parent identity is
+unchanged, preserving attachment ownership. Ordinary idle binding with an
+attached parent still needs an explicit scope contract; it is not implied by
+the mid-frame Suspend/Resume path.
+
+Physical capture 18 on Anvil 383 passes 131 WSI/continuation assertions,
+24,511 exact parent pixels, 164 target-lifecycle checks and 297 scripted UI
+checks, returning zero in 12.3 seconds. The final 4,096,000 scanout bytes agree.
+Cases include child rendering, restored parent pixels, same-size resize,
+retirement, loss/resize refusal, safe cancellation, creating/freeing a target
+while attached and refusing a fresh Begin after loss. Capture 17 retains the
+earlier 110-check subset. Host controls reject 397 damaged reports and the
+old report shape. The GPU test uses real shared WSI state with offscreen
+provider image keys; it does not perform a physical WSI display transfer.
+
+Counted complete monitor 384 is installed with verified backup 383 at
+1:/B383V384.IMG and verified boot/live hashes. Its resident service passes the
+existing 156-check preserving-target test. Cores, fonts and renderer recover
+healthy, display timeouts zero and watchdog off. Forum 1496 records the fix.
+Shared code is qualified on Pi 4; no other-board GPU claim is made. Physical
+input, full application behavior, broader Vulkan, fault recovery and mandatory
+source-publication checks remain unfinished.
+Evidence: docs/evidence/neon-wsi-continuation-20261028/manifest.json.
+
+
+@SECTION Idle attached target scopes
+
+Explicit CanvasBind/Unbind and implicit CanvasBegin/End now retain an acquired
+presentation parent without starting a parent drawing frame. ChromeSuspendIdle
+records the exact parent identity and saves acquisition; ChromeResumeIdle
+restores only that parent, revalidates surface freshness and leaves it idle.
+ChromeSuspended returns 2 for this idle scope and 1 for a recording scope.
+The active-attachment Rebind refusal remains in force.
+
+Loss during child rendering refuses normal restoration and close while keeping
+the child resources and parent acquisition. Whole-context target cleanup uses
+CanvasCloseContextScope to explicitly discard the unpublished parent after GPU
+idle. Ordinary target free does not silently discard a stale parent.
+
+On physical Pi 4, capture 20 passes 107 idle-scope assertions and 24,511 exact
+parent pixels, plus 164 target and 297 scripted UI checks. Capture 21 passes
+the earlier 131-check mid-frame continuation regression. Both return zero in
+12.2 seconds with exact final scanout agreement. The checker rejects 325
+mutated reports. These use actual GPU rendering and shared WSI state with
+offscreen provider image keys, not physical WSI display-transfer testing.
+
+Anvil 385 is installed with verified backup 384, boot and live image hashes.
+The resident preserving-target regression passes 156 checks; fonts, cores and
+Vulkan recover healthy with zero display timeouts and watchdog off. Forum 1497
+tracks this correction. Full application/input behavior, wider Vulkan and
+mandatory source publication remain unfinished.
+
+@SECTION Public console font metrics
+The console uses AnvilTrueTypeScaleMetric(value, pixels, unitsPerEm, resultOut)
+for glyph advances and pair adjustments. On Anvil's 64-bit targets, this converts
+signed 32-bit font units to signed 16.16 pixels, truncating toward zero. Pixels
+must be 1 through 512 and unitsPerEm must be 1 through 65535. The caller owns
+an aligned, writable eight-byte destination. Return 1 means success. Invalid
+scalar inputs or null, negative or misaligned output addresses return 0 without
+writing output. The function cannot validate arbitrary caller memory ownership.
+It does not select a font face or alter layout state.
+
+A failed glyph conversion refuses cache construction. A failed pair conversion
+retains the measured glyph advance and increments the existing pair error count.
+Physical Pi 4 tests pass 51 arithmetic and refusal cases plus 38 console cache
+and pair cases. The console test uses exact production consumers and a controlled
+font-provider double; it does not test the font parser. The shared arithmetic
+proof also compiles for UnoQ, without claiming physical UnoQ execution.
+
+Anvil 386 is installed with a verified 385 backup and matching boot and live
+image hashes. Its resident target and text rendering regression passes, and
+network, fonts, cores and Vulkan remain healthy after return. Forum defect 1500
+is resolved for this boundary correction. Wider Neon and Vulkan work remains
+open, and unrelated architecture findings still prevent source publication.
+
+@SECTION Shared incremental font ownership
+
+AnvilFontFileBegin(slot, path, pathBytes, maxBytes) starts a bounded load into an
+empty, unselected slot and returns a positive request token, or zero on refusal.
+The shared owner copies the caller's path and tracks buffer, progress and slot
+generation. AnvilFontFileStep(slot, token, maxChunk) reads at most one chunk of
+1..4096 bytes, closes the file, and returns 1 pending, 2 committed or 0 failed.
+The final step validates the font and can take longer than an ordinary read.
+AnvilFontFileCancel cancels only a matching pending token; it unloads no face.
+
+Stale tokens and invalid chunk limits leave the active request intact. Storage,
+short-read, changed-size and parser failures cancel it. The selected face is not
+overwritten. The source file must remain stable during the request; size checks
+are not a filesystem snapshot guarantee. Memory and synchronous loaders refuse
+a slot reserved by an incremental request. The synchronous loader retains its
+single-open read loop. Pi 3 startup now calls this interface and retains policy
+for font selection, defaults and settings after commitment.
+
+The optional embedded-face initializer is a separate shared composition module,
+font_boot_embedded.pbi. Pi 4 includes it with its image font; file-only targets
+can include the common font owner without requiring image-font symbols.
+
+Tests passed 55 controlled storage/slot cases on physical Pi 4 and another 26
+checks using the actual parser, embedded font bytes and a memory-backed storage
+provider. The latter checks exact copying, parser metrics, and preservation of
+the selected face after rejecting corrupt data; it does not test a storage device.
+Complete Pi 3 build 46 and Pi 4 build 387 compile successfully. Pi 3 execution is
+not claimed. Forum topics 1502 and 1503 track these two corrections.
+Installed Anvil 387 has matching verified boot/live hashes and a verified 386
+backup. Its resident target/text regression passes with healthy fonts, cores,
+network and Vulkan on return. Topics 1502 and 1503 are resolved within those
+scopes. Architecture still refuses 102 findings; provenance passes 1,401 checks.
+
+
+@SECTION Canvas filtering and cleanup
+
+NeonVkCanvasSetLinear(state, enabled) selects nearest (0) or linear (1)
+sampling between frames. The canvas owns the descriptor transaction and
+updates its generation only on success. Invalid modes, active/bound or
+suspended scopes and stale ownership refuse. Resize preserves the selected
+policy. The default remains linear. The resident target service retains its
+creation-time choice and now uses the same owner without an ABI change.
+Whole-context close also accepts an idle parent explicitly cancelled earlier;
+other suspension and foreign-owner checks remain in force.
+
+Installed Anvil 388 is verified by its full running-image hash. The resident
+regression passes 156 checks, 13 pixel probes and 80 filtered-text checks.
+The native filtering candidate passes 37 checks and the larger target/UI
+regressions. A verified 387 boot backup is retained. These results do not
+establish full application behavior, physical input, effects or conformance.
+
+
+@SECTION Positive render-target extents
+
+The Pi4 backend and native Neon surface/rebind validation now accept positive
+width and height down to one pixel, matching the existing V3D planner. Capacity,
+mapped extent, pitch, output-format and display-ownership guards are retained.
+For a one-pixel axis the native integer coordinate transform uses centre/scale
+one instead of zero. That enclosing viewport still maps pixel coordinates
+identically; the actual framebuffer extent, clipping and tile-store limits
+remain one pixel. Larger geometries retain their previous transform.
+
+A physical returning candidate on Anvil 388 passes 45 target/filter checks,
+142 idle-scope checks, 164 target-pool checks and 297 scripted UI checks. It
+renders and samples a 2x2 red/blue attachment with both nearest and linear
+filtering, then renders a 1x1 green attachment and samples two magnified pixels.
+All expected colors pass, including exact green FF00FF00 for the 1x1 image.
+The existing 24,511 retained-parent pixels and 4,096,000-byte scanout equality
+also pass. Capture 35 returns zero in 13.3 seconds with healthy monitor state,
+zero display timeouts and watchdog off. All 141 corrupted trace/pixel controls
+are rejected. The original 2x2 refusal remains in the previous evidence archive.
+
+This changes the Pi4 hardware adapter and its native engine; the portable
+Vulkan planner already accepted positive extents. Other hardware backends are
+not changed or execution-qualified. The installed 388 image still predates
+this candidate. This does not establish every format, extent, rotation or
+presentation path, or full engine/Vulkan conformance.

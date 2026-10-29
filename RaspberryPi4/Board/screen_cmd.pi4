@@ -352,7 +352,7 @@ Procedure.i ScreenFontMetricCacheBuild()
     If glyph < 0 Or glyph >= AnvilTrueTypeGlyphCount() : ProcedureReturn 0 : EndIf
     If AnvilTrueTypeHorizontalMetric(glyph, @metric, @lsb) = 0 : ProcedureReturn 0 : EndIf
     gScreenGlyph[cp] = glyph
-    gScreenGlyphAdvance[cp] = anvil_ttl_Scale(metric, pixels, units)
+    If AnvilTrueTypeScaleMetric(metric, pixels, units, @gScreenGlyphAdvance[cp])=0 : ProcedureReturn 0 : EndIf
     ; ASCII input must always move the pen. Reject a broken hmtx/scale
     ; reading before allowing the face to control console wrapping.
     If gScreenGlyphAdvance[cp] <= 0 Or gScreenGlyphAdvance[cp] > pixels * 4 * 65536
@@ -367,6 +367,7 @@ EndProcedure
 
 Procedure.i ScreenProportionalAdvance(previous.i, current.i)
   Define idx.i, pairRc.i, delta.i, slot.i, pairIndex.i
+  Define pairAdvance1.q, pairAdvance2.q
   If current < 32 Or current > 126 : ProcedureReturn 0 : EndIf
   slot = AnvilTrueTypeSlotSelected()
   If slot < 0 : ProcedureReturn 0 : EndIf
@@ -382,7 +383,12 @@ Procedure.i ScreenProportionalAdvance(previous.i, current.i)
       For pairIndex = 0 To 7 : gScreenPairValues[pairIndex] = 0 : Next
       pairRc = AnvilTrueTypePairPosition(gScreenGlyph[previous], gScreenGlyph[current], @gScreenPairValues[0])
       If pairRc <> 0
-        gScreenPairAdvance[idx] = delta + anvil_ttl_Scale(gScreenPairValues[2], gScreenMetricPixels, gScreenMetricUnits) + anvil_ttl_Scale(gScreenPairValues[6], gScreenMetricPixels, gScreenMetricUnits)
+        If AnvilTrueTypeScaleMetric(gScreenPairValues[2], gScreenMetricPixels, gScreenMetricUnits, @pairAdvance1)=0 Or AnvilTrueTypeScaleMetric(gScreenPairValues[6], gScreenMetricPixels, gScreenMetricUnits, @pairAdvance2)=0
+          pairRc=0
+          gScreenPairAdvance[idx]=delta
+        Else
+          gScreenPairAdvance[idx] = delta + pairAdvance1 + pairAdvance2
+        EndIf
       Else
         gScreenPairAdvance[idx] = delta
       EndIf
@@ -2424,7 +2430,6 @@ EndProcedure
 Procedure CmdScreenRotate()
   Define n.i
   Define buf.i
-  Define was.i
 
   If gScrSrc <> #SCR_SRC_DSI
     ; SAY IT AND SAVE IT ANYWAY. Rotation is a property of the DSI panel
@@ -2526,31 +2531,14 @@ Procedure CmdScreenRotate()
     PrintN("   medium is back to make it stick.")
   EndIf
 
-  was = gScrRot
-  gScrRot = n
-  Print("The console is now turned ")
+  Print("The saved DSI rotation is ")
   PrintDec(n)
-  PrintN(" degrees on the DSI panel, and it will come")
-  PrintN("up that way with nothing typed.")
-
-  If gScrSrc <> #SCR_SRC_DSI
-    ProcedureReturn
+  PrintN(" degrees. Applying it through the display geometry owner.")
+  If gScrSrc = #SCR_SRC_DSI
+    ; The shared stored-geometry path retires and restores the active
+    ; renderer, adopts the target atomically, and diagnoses refusal.
+    ScreenApplyStoredGeometry()
   EndIf
-
-  ; THE PANEL IS REBUILT RATHER THAN NUDGED. Turning the console changes
-  ; the surface it draws into, its width and height, the font
-  ; magnification, the console rectangle, the grid, and the mirror bits
-  ; in the display list. Setting six things by hand and hoping they agree
-  ; is how the two halves of a screen end up describing different
-  ; geometries; taking it down and bringing it up is the same path the
-  ; boot takes and cannot disagree with itself.
-  gScrRot = was
-  If ScreenDetach() = 0
-    PrintN("!! Vulkan ownership is quarantined; rotation was not applied.")
-    ProcedureReturn
-  EndIf
-  gScrRot = n
-  ScreenUpOn(#SCR_SRC_DSI, -1)
 EndProcedure
 
 ; ======================================================================
@@ -2680,9 +2668,9 @@ Procedure CmdScreenScale()
       PrintN("   reset. The type is being resized anyway; type settings save when")
       PrintN("   the medium is back to make it stick.")
     EndIf
-    Print("The font is now magnified by ")
+    Print("The saved font magnification is ")
     PrintDec(n)
-    PrintN(", on whichever screen the console is")
+    PrintN(", for whichever screen the console is")
     PrintN("on, and it will come up that way with nothing typed.")
   EndIf
 
@@ -2692,24 +2680,10 @@ Procedure CmdScreenScale()
     ProcedureReturn
   EndIf
 
-  ; THE SCREEN IS REBUILT RATHER THAN NUDGED, for the same reason
-  ; `screen rotate` rebuilds: the magnification decides the cell size,
-  ; the console rectangle, the number of columns and rows, and the size
-  ; of the shared grid. Bringing it up again is the boot path and cannot
-  ; disagree with itself.
-  If gScrSrc = #SCR_SRC_DSI
-    If ScreenDetach() = 0
-      PrintN("!! Vulkan ownership is quarantined; the display was not rebuilt.")
-      ProcedureReturn
-    EndIf
-    ScreenUpOn(#SCR_SRC_DSI, -1)
-  Else
-    If ScreenDetach() = 0
-      PrintN("!! Vulkan ownership is quarantined; the display was not rebuilt.")
-      ProcedureReturn
-    EndIf
-    ScreenUpOn(#SCR_SRC_HDMI, gScreenIndex)
-  EndIf
+  ; DSI and HDMI use the same checked geometry transition as settings
+  ; loaded at boot. Rebuilding the framebuffer alone loses Vulkan and,
+  ; on HDMI, forgets the selected display index during detach.
+  ScreenApplyStoredGeometry()
 EndProcedure
 
 ; ======================================================================

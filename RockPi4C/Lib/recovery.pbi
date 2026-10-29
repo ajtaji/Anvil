@@ -1,3 +1,4 @@
+XIncludeFile "Anvil/Core/token_parse.pbi"
 ; FTDI recovery console for the original Rock Pi 4C direct SD handoff.
 ; Include after arch_timer.pbi and uart2.pbi. The board may enter this poll
 ; loop only after its DTB, timer and UART contracts validate. Once EL3 vectors
@@ -224,7 +225,7 @@ Procedure RockRecoveryPayload()
   Protected length.i
   Protected checksum.i
   Protected armed.i
-  If rock_storage_parseHexToken(@rock_recovery_line[0],rock_recovery_length,@position,@length)=0 Or rock_storage_parseHexToken(@rock_recovery_line[0],rock_recovery_length,@position,@checksum)=0 Or rock_storage_onlySpace(@rock_recovery_line[0],rock_recovery_length,position)=0
+  If TokenHex32Bounded(@rock_recovery_line[0],rock_recovery_length,@position,@length)=0 Or TokenHex32Bounded(@rock_recovery_line[0],rock_recovery_length,@position,@checksum)=0 Or TokenOnlySpace(@rock_recovery_line[0],rock_recovery_length,position)=0
     RockUartLine("USAGE: payload <length-hex> <crc32-hex>")
     ProcedureReturn
   EndIf

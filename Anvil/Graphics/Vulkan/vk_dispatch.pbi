@@ -30,19 +30,7 @@ Declare.i vkGetDeviceProcAddr(device.i, *pName)
 ; malformed non-terminated caller string from turning lookup into an unbounded
 ; read.  Vulkan core command names are far shorter than 128 bytes.
 Procedure.i avkDispatchName(*actual, expected.i)
-  Define n.i
-  Define a.i
-  Define b.i
-  If *actual = 0 Or expected = 0 : ProcedureReturn 0 : EndIf
-  n = 0
-  While n < 128
-    a = PeekA(*actual + n)
-    b = PeekA(expected + n)
-    If a <> b : ProcedureReturn 0 : EndIf
-    If a = 0 : ProcedureReturn 1 : EndIf
-    n = n + 1
-  Wend
-  ProcedureReturn 0
+  ProcedureReturn avkApiNameEquals(*actual, expected, 128)
 EndProcedure
 
 Procedure.i avkDispatchAddress(commandDomain.i, address.i, queryDomain.i)
@@ -176,11 +164,14 @@ Procedure.i avkDispatchLookup(*pName, domain.i)
 EndProcedure
 
 Procedure.i vkGetInstanceProcAddr(instance.i, *pName)
+  Define address.i
   If *pName = 0 : ProcedureReturn 0 : EndIf
   If instance = #VK_NULL_HANDLE
     ProcedureReturn avkDispatchLookup(*pName, #AVK_QUERY_GIPA_NULL)
   EndIf
   If avkInstSlot(instance) = 0 : ProcedureReturn 0 : EndIf
+  address = avkSurfaceDispatch(instance, *pName)
+  If address <> 0 : ProcedureReturn address : EndIf
   ProcedureReturn avkDispatchLookup(*pName, #AVK_QUERY_GIPA_INSTANCE)
 EndProcedure
 

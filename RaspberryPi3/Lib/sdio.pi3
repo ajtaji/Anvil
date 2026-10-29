@@ -1,3 +1,5 @@
+XIncludeFile "Anvil/Hal/aarch64_counter.pbi"
+
 ; Pi 3 SDIO host transport for the on-board wireless device.
 ;
 ; The Pi 3 uses the Arasan SDHCI controller at ARM physical 0x3F300000
@@ -154,15 +156,11 @@ Procedure Pi3SdioWriteReg(offset.i, value.i)
 EndProcedure
 
 Procedure.i Pi3SdioTicks()
-  ASM
-    mrs x0, cntpct_el0
-  EndASM
+  ProcedureReturn A64CounterRead()
 EndProcedure
 
 Procedure.i Pi3SdioTickHz()
-  ASM
-    mrs x0, cntfrq_el0
-  EndASM
+  ProcedureReturn A64CounterFrequency()
 EndProcedure
 
 Procedure.i Pi3SdioExpired(start.i, microseconds.i)

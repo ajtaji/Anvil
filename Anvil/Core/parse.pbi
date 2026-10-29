@@ -1,3 +1,4 @@
+XIncludeFile "Anvil/Services/wifi_maintenance.pbi"
 
 ; ======================================================================
 ;  Line editing and parsing
@@ -23,19 +24,10 @@ Global anvil_promptCpuPercent.i = -1
 Global anvil_promptCpuHundredths.i = -1
 Global anvil_promptWindowReady.i = 0
 
-; System-register helpers keep the values in the ABI return/argument register.
-; Inline assembly does not bind an arbitrary local variable to x0.
-Procedure.i AnvilSchedulerCounterHz()
-  Asm
-    mrs x0, cntfrq_el0
-  EndAsm
-EndProcedure
+XIncludeFile "Anvil/Kernel/Scheduler/prompt_clock.pbi"
 
-Procedure.i AnvilSchedulerCounterValue()
-  Asm
-    mrs x0, cntpct_el0
-  EndAsm
-EndProcedure
+; The event-stream control helpers retain their ABI return/argument register.
+
 
 Procedure.i AnvilSchedulerReadControl()
   Asm
@@ -65,7 +57,7 @@ Procedure.i AnvilSchedulerPrepareWfe()
   Define secondCount.i
   Define readback.i
 
-  If MmuEl() <> 3
+  If HwIdEl() <> 3
     ProcedureReturn 0
   EndIf
   hz = AnvilSchedulerCounterHz()
@@ -181,7 +173,7 @@ Procedure.i AnvilSchedulerWakeProbeTotalTicks()
 EndProcedure
 
 Procedure AnvilSchedulerWfeVerified(enabled.i)
-  If enabled <> 0 And anvil_promptWfeReady <> 0 And anvil_promptProbePassed <> 0 And MmuEl() = 3
+  If enabled <> 0 And anvil_promptWfeReady <> 0 And anvil_promptProbePassed <> 0 And HwIdEl() = 3
     anvil_promptWfeEnabled = 1
   Else
     anvil_promptWfeEnabled = 0
@@ -197,7 +189,7 @@ Procedure.i AnvilSchedulerQualifyPi3Wfe()
   anvil_promptWfeReady = 0
   anvil_promptProbePassed = 0
   anvil_promptWfeEnabled = 0
-  If MmuEl() <> 3 Or AnvilSchedulerCounterHz() <> 19200000
+  If HwIdEl() <> 3 Or AnvilSchedulerCounterHz() <> 19200000
     ProcedureReturn 0
   EndIf
   If AnvilSchedulerPrepareWfe() <= 0
@@ -218,7 +210,7 @@ Procedure.i AnvilSchedulerQualifyPi4Wfe()
   anvil_promptWfeReady = 0
   anvil_promptProbePassed = 0
   anvil_promptWfeEnabled = 0
-  If MmuEl() <> 3 Or AnvilSchedulerCounterHz() <> 54000000
+  If HwIdEl() <> 3 Or AnvilSchedulerCounterHz() <> 54000000
     ProcedureReturn 0
   EndIf
   If AnvilSchedulerPrepareWfe() <= 0
@@ -291,7 +283,7 @@ Procedure AnvilPromptServiceOne()
     Case 1
       ScreenServiceTick()
     Case 2
-      WifiLinkTick()
+      WifiMaintenanceTick()
       NetDhcpTick()
       CompilerIf #CAP_NET = 1
         NtpServiceTick()
@@ -333,7 +325,7 @@ Procedure AnvilSchedulerIdleIfSafe()
   If anvil_promptWfeEnabled = 0 Or anvil_promptWfeReady = 0
     ProcedureReturn
   EndIf
-  If MmuEl() <> 3 Or UartReadReady() <> 0 Or InputEventsQueued() <> 0
+  If HwIdEl() <> 3 Or UartReadReady() <> 0 Or InputEventsQueued() <> 0
     ProcedureReturn
   EndIf
   CompilerIf #CAP_PWM = 1

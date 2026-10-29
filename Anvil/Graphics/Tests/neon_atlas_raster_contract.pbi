@@ -1,0 +1,137 @@
+; SPDX-License-Identifier: MIT
+; Shared-only CPU atlas and public font binding contract: 46 atlas checks
+; plus four invalid-bind/error-preservation checks. No native renderer/GPU.
+XIncludeFile "Anvil/Graphics/neon_frontend.pbi"
+XIncludeFile "Anvil/Graphics/neon_atlas_raster.pbi"
+
+#NAC_FIRST = 32
+#NAC_LAST = 126
+#NAC_GLYPHS = 95
+#NAC_CELL_W = 8
+#NAC_CELL_H = 16
+#NAC_FONT_BYTES = 1520
+#NAC_EXPECT_W = 16
+#NAC_EXPECT_H = 1024
+#NAC_EXPECT_BYTES = 65536
+#NAC_F_ONE = $3F800000
+
+Global Dim nacFontA.a[#NAC_FONT_BYTES]
+Global Dim nacFontB.a[#NAC_FONT_BYTES]
+Global Dim nacRaster.a[#NEON_ATLAS_MAXBYTES]
+Global Dim nacUv.a[4096]
+
+Procedure NacFillFont(*dst, seed.i)
+  Protected ch.i
+  Protected row.i
+  Protected bit.i
+  ch = #NAC_FIRST
+  While ch <= #NAC_LAST
+    row = 0
+    While row < #NAC_CELL_H
+      bit = 128 >> ((ch + row + seed) % 8)
+      PokeA(*dst + (((ch - #NAC_FIRST) * #NAC_CELL_H) + row), bit)
+      row = row + 1
+    Wend
+    ch = ch + 1
+  Wend
+EndProcedure
+
+Procedure.i NacContractMain()
+  Protected uv.NeonAtlasGlyphUV
+  Protected again.NeonAtlasGlyphUV
+  Protected base.i
+  Protected ch.i
+  Protected stableLeft.i
+  Protected generation.i
+
+  ; The allocator normally assigns these two private buffers in NeonInit.
+  ; Keeping them in BSS makes this a CPU-only emitted test.
+  neon_texSrc = @nacRaster[0]
+  neon_glyphUV = @nacUv[0]
+  NacFillFont(@nacFontA[0], 0)
+  NacFillFont(@nacFontB[0], 3)
+  If NeonFontUse(@nacFontA[0], #NAC_CELL_W, #NAC_CELL_H, #NAC_FIRST, #NAC_LAST) <> #NEON_OK : ProcedureReturn 1 : EndIf
+
+  If Neon_AtlasRasterReady() <> 0 : ProcedureReturn 2 : EndIf
+  If Neon_AtlasRasterBase() <> 0 : ProcedureReturn 3 : EndIf
+  If Neon_AtlasRasterWidth() <> 0 Or Neon_AtlasRasterHeight() <> 0 : ProcedureReturn 4 : EndIf
+  If Neon_AtlasRasterBytes() <> 0 : ProcedureReturn 5 : EndIf
+  If Neon_AtlasRasterFirstGlyph() <> 0 Or Neon_AtlasRasterLastGlyph() <> 0 : ProcedureReturn 6 : EndIf
+  If Neon_AtlasRasterGlyphUV(#NAC_FIRST, @uv) <> 0 : ProcedureReturn 7 : EndIf
+  If Neon_AtlasRasterGlyphUV(#NAC_FIRST, 0) <> 0 : ProcedureReturn 8 : EndIf
+
+  If Neon_AtlasRasterEnsure() <> #NEON_OK : ProcedureReturn 9 : EndIf
+  If Neon_AtlasRasterReady() <> 1 : ProcedureReturn 10 : EndIf
+  base = Neon_AtlasRasterBase()
+  If base <> @nacRaster[0] : ProcedureReturn 11 : EndIf
+  If Neon_AtlasRasterWidth() <> #NAC_EXPECT_W : ProcedureReturn 12 : EndIf
+  If Neon_AtlasRasterHeight() <> #NAC_EXPECT_H : ProcedureReturn 13 : EndIf
+  If Neon_AtlasRasterBytes() <> #NAC_EXPECT_BYTES : ProcedureReturn 14 : EndIf
+  If Neon_AtlasRasterFirstGlyph() <> #NAC_FIRST Or Neon_AtlasRasterLastGlyph() <> #NAC_LAST : ProcedureReturn 15 : EndIf
+  If PeekN(base) <> $FFFFFFFF Or PeekN(base + 4) <> 0 : ProcedureReturn 16 : EndIf
+
+  ; Every supported ASCII glyph has a nonempty, normalized cell rectangle.
+  ch = #NAC_FIRST
+  While ch <= #NAC_LAST
+    If Neon_AtlasRasterGlyphUV(ch, @uv) <> 1 : ProcedureReturn 17 : EndIf
+    If uv\left < 0 Or uv\right > #NAC_F_ONE Or uv\left >= uv\right : ProcedureReturn 18 : EndIf
+    If uv\top < 0 Or uv\bottom > #NAC_F_ONE Or uv\top >= uv\bottom : ProcedureReturn 19 : EndIf
+    ch = ch + 1
+  Wend
+  If Neon_AtlasRasterGlyphUV(#NAC_FIRST - 1, @uv) <> 0 : ProcedureReturn 20 : EndIf
+  If Neon_AtlasRasterGlyphUV(#NAC_LAST + 1, @uv) <> 0 : ProcedureReturn 21 : EndIf
+
+  ; UV metadata is copied. Changing the caller's copy cannot change the next
+  ; lookup, and the contract never hands out the private table address.
+  If Neon_AtlasRasterGlyphUV(65, @uv) <> 1 : ProcedureReturn 22 : EndIf
+  stableLeft = uv\left
+  uv\left = $7F800000
+  uv\right = 0
+  If Neon_AtlasRasterGlyphUV(65, @again) <> 1 : ProcedureReturn 23 : EndIf
+  If again\left <> stableLeft Or again\right = 0 : ProcedureReturn 24 : EndIf
+
+  ; Ensure is idempotent for one font and publishes the same borrowed view.
+  If Neon_AtlasRasterEnsure() <> #NEON_OK : ProcedureReturn 25 : EndIf
+  If Neon_AtlasRasterBase() <> base Or Neon_AtlasRasterBytes() <> #NAC_EXPECT_BYTES : ProcedureReturn 26 : EndIf
+
+  ; A new font makes the old snapshot unavailable until that font is built.
+  If NeonFontUse(@nacFontB[0], #NAC_CELL_W, #NAC_CELL_H, #NAC_FIRST, #NAC_LAST) <> #NEON_OK : ProcedureReturn 27 : EndIf
+  If Neon_AtlasRasterReady() <> 0 Or Neon_AtlasRasterBase() <> 0 : ProcedureReturn 28 : EndIf
+  If Neon_AtlasRasterGlyphUV(65, @uv) <> 0 : ProcedureReturn 29 : EndIf
+  If Neon_AtlasRasterEnsure() <> #NEON_OK : ProcedureReturn 30 : EndIf
+  If Neon_AtlasRasterBase() <> base : ProcedureReturn 31 : EndIf
+  If Neon_AtlasRasterWidth() <> #NAC_EXPECT_W Or Neon_AtlasRasterHeight() <> #NAC_EXPECT_H : ProcedureReturn 32 : EndIf
+  If Neon_AtlasRasterBytes() <> #NAC_EXPECT_BYTES : ProcedureReturn 33 : EndIf
+  If PeekN(base) <> 0 Or PeekN(base + 12) <> $FFFFFFFF : ProcedureReturn 34 : EndIf
+
+  ; Solid-colour geometry shares the sampled pipeline with glyphs. The atlas
+  ; therefore owns one explicit white texel below every glyph row, and copies
+  ; its exact UV rectangle just like it copies glyph UVs.
+  If Neon_AtlasRasterWhiteUV(@uv) <> 1 : ProcedureReturn 35 : EndIf
+  If Neon_AtlasRasterWhiteUV(0) <> 0 : ProcedureReturn 36 : EndIf
+  If uv\left <> 0 Or uv\right <> $3D800000 : ProcedureReturn 37 : EndIf
+  If uv\top <= 0 Or uv\top >= uv\bottom Or uv\bottom <> #NAC_F_ONE : ProcedureReturn 38 : EndIf
+  If PeekN(base + (((#NAC_EXPECT_H - 1) * #NAC_EXPECT_W) * 4)) <> $FFFFFFFF : ProcedureReturn 39 : EndIf
+  If PeekN(base + ((((#NAC_EXPECT_H - 1) * #NAC_EXPECT_W) + 1) * 4)) <> 0 : ProcedureReturn 40 : EndIf
+  If Neon_AtlasRasterGlyphUV(#NAC_LAST, @again) <> 1 Or again\bottom >= uv\top : ProcedureReturn 41 : EndIf
+
+  ; Reusing a bitmap address is an explicit new generation. The caller may
+  ; have changed the bits or cell metadata in place.
+  generation = Neon_AtlasRasterGeneration()
+  If generation <= 0 : ProcedureReturn 42 : EndIf
+  PokeA(@nacFontB[0], $FF)
+  If NeonFontUse(@nacFontB[0], #NAC_CELL_W, #NAC_CELL_H, #NAC_FIRST, #NAC_LAST) <> #NEON_OK : ProcedureReturn 43 : EndIf
+  If Neon_AtlasRasterReady() <> 0 Or Neon_AtlasRasterGeneration() <> 0 : ProcedureReturn 44 : EndIf
+  If Neon_AtlasRasterEnsure() <> #NEON_OK : ProcedureReturn 45 : EndIf
+  If Neon_AtlasRasterGeneration() <= generation Or PeekN(base) <> $FFFFFFFF : ProcedureReturn 46 : EndIf
+
+  ; Public validation reports to the frontend without replacing the selected
+  ; bitmap or invalidating its already-published generation.
+  generation = Neon_AtlasRasterGeneration()
+  If NeonFontUse(0, #NAC_CELL_W, #NAC_CELL_H, #NAC_FIRST, #NAC_LAST) <> #NEON_ERR_FONT : ProcedureReturn 47 : EndIf
+  If Neon_Error() <> #NEON_ERR_FONT Or Neon_AtlasRasterReady() <> 1 Or Neon_AtlasRasterGeneration() <> generation : ProcedureReturn 48 : EndIf
+  If NeonFontUse(@nacFontA[0], 0, #NAC_CELL_H, #NAC_FIRST, #NAC_LAST) <> #NEON_ERR_FONT : ProcedureReturn 49 : EndIf
+  If Neon_Error() <> #NEON_ERR_FONT Or Neon_AtlasRasterReady() <> 1 Or Neon_AtlasRasterGeneration() <> generation Or neon_fbits <> @nacFontB[0] : ProcedureReturn 50 : EndIf
+
+  ProcedureReturn 0
+EndProcedure

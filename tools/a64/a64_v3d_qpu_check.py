@@ -137,7 +137,7 @@ import tempfile
 
 HERE = pathlib.Path(__file__).resolve().parent
 ROOT = pathlib.Path(__file__).resolve().parents[2]
-LIB = ROOT / "RaspberryPi4" / "Lib" / "v3dqpu.pi4"
+LIB = ROOT / "Anvil" / "Graphics" / "V3D42" / "qpu_encode.pbi"
 PROBE = ROOT / "RaspberryPi4" / "Examples" / "Diagnostics" / "pi4V3dQpuAsm.pi4"
 CSD_PROBE = ROOT / "RaspberryPi4" / "Examples" / "Diagnostics" / "pi4V3dCsd.pi4"
 LIB_INCLUDE = 'XIncludeFile "RaspberryPi4/Lib/v3dqpu.pi4"'
@@ -871,16 +871,19 @@ HAZARDS = [
     ("unif_vary", "V3DQ_ERR_HAZARD", "V3DQ_HZ_UNIF_VARY"),
     ("br_br", "V3DQ_ERR_HAZARD", "V3DQ_HZ_BR_BR"),
     ("no_threnD", "V3DQ_ERR_HAZARD", "V3DQ_HZ_NO_THREND"),
-    ("buf_full", "V3DQ_ERR_FULL", None),
-    ("buf_align", "V3DQ_ERR_RANGE", None),
+    # These four cases begin from a reset hazard state. Buffer refusals
+    # preserve it; successful begin/end leave it clear. This is a probe
+    # state-consistency expectation, not an independently derived ISA rule.
+    ("buf_full", "V3DQ_ERR_FULL", "V3DQ_HZ_NONE"),
+    ("buf_align", "V3DQ_ERR_RANGE", "V3DQ_HZ_NONE"),
     # The positive side of the same guard.  With only the plus-four case,
     # changing the library's `addr % 8` to `addr % 16` survived.  A guard
     # needs a case on each side.
-    ("buf_align8", "V3DQ_OK", None),
+    ("buf_align8", "V3DQ_OK", "V3DQ_HZ_NONE"),
     # The single-segment program: qpu_validate.c starts last_thrsw_found
     # at `!c->last_thrsw`, so a shader spawned in the final thread section
     # ends with one thrsw and three nops and one that is not does not.
-    ("singleseg_ok", "V3DQ_OK", None),
+    ("singleseg_ok", "V3DQ_OK", "V3DQ_HZ_NONE"),
     ("singleseg_off", "V3DQ_ERR_HAZARD", "V3DQ_HZ_NO_THREND"),
     ("singleseg_two", "V3DQ_ERR_HAZARD", "V3DQ_HZ_TWO_LAST"),
 ]
@@ -1138,6 +1141,14 @@ def check_shader(shader, oracle_words, header, fails):
                      "V3dQpuProgramEnd/Emit returned %s with hazard %s."
                      % (header.get("build"), header.get("hazard")))
         return 0
+    if header.get("hazard") != 0:
+        fails.append("The successful shader reports a nonzero hazard: %s."
+                     % header.get("hazard"))
+        return 0
+    if header.get("count") != len(oracle_words):
+        fails.append("The shader header reports %s instructions, expected %d."
+                     % (header.get("count"), len(oracle_words)))
+        return 0
     if header.get("bytes") != len(oracle_words) * 8:
         fails.append("The shader is %s bytes and py-videocore6's golden shader is %d."
                      % (header.get("bytes"), len(oracle_words) * 8))
@@ -1147,7 +1158,10 @@ def check_shader(shader, oracle_words, header, fails):
                      % (len(shader), len(oracle_words)))
         return 0
     n = 0
-    for (i, hi, lo), want in zip(shader, oracle_words):
+    for expected_i, ((i, hi, lo), want) in enumerate(zip(shader, oracle_words)):
+        if i != expected_i:
+            fails.append("Shader entry %d reports index %d; instruction order is not trustworthy."
+                         % (expected_i, i))
         got = (hi << 32) | lo
         if got != want:
             fails.append("Shader instruction %d: this library says %016X and "

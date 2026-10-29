@@ -138,6 +138,12 @@ described by the Broadcom V3D backend of Mesa at tag `mesa-24.3.4`, commit
 `769e51468b49b2a42f0a0eaf71cf9eed5ff4e5de`. For a block whose vendor
 documentation contains one fact about V3D, that backend is the specification.
 
+The typed sine lowering in `Anvil/Graphics/Vulkan/vk_ir_v3d42.pbi` also consults
+`nir_to_vir.c` and `qpu_schedule.c` at Android mirror revision
+`224e91e39836d3ca31f80df2e0379e55c70574f8`, for argument convention,
+period sign correction and SFU latency. The per-file copyright is
+Copyright © 2016 Broadcom, under the same retained MIT permission notice.
+
 No Mesa source file is vendored here. The complete
 [Mesa MIT text](../licenses/Mesa-MIT.txt) is retained as an acknowledgment.
 Per-routine classification is in
@@ -181,7 +187,7 @@ retains the same text. Both stay as they are.
 `Anvil/Graphics/Vulkan/vk_core_1_0.pbi` and the registry generator take
 API names, values, type/member relationships and ordering from the Khronos Vulkan
 API Registry, pinned to Vulkan-Headers tag `v1.4.350`, commit
-`a33416ed2ce6bf8ef48b4eda821825f66d1850d3`. An API's names and numbers are the
+`8864cdc896bbc2a9b6eb36b3218fc9ef57908d77`. An API's names and numbers are the
 interface; they are what makes a binding a binding. The registry is offered under
 Apache-2.0 OR MIT and this repository retains the complete
 [Khronos MIT text](../licenses/Khronos-Vulkan-Registry-MIT.txt). The XML itself is
@@ -189,6 +195,15 @@ not vendored. The pinned inputs are recorded in
 [`Anvil/Graphics/Vulkan/THIRD_PARTY_NOTICES.md`](../Anvil/Graphics/Vulkan/THIRD_PARTY_NOTICES.md).
 
 ## DejaVu fonts
+
+`RaspberryPi4/Monitor/anvil_boot_ttf.pi4` embeds 705,684 bytes of DejaVu
+Sans Bold TrueType data (SHA-256
+`e6476c1b80502924294eed40894c5b18e06c181444ca953e5334262df9c27724`).
+Its font copyright and permission notice are retained in
+`licenses/DejaVu-Fonts-LICENSE.txt`. The font data is not relicensed under
+Anvil's MIT license. The publication checker verifies the embedded bytes,
+declarations and retained license. The generated tables below use the same
+explicit licensed-font-asset classification, rather than consulted behavior.
 
 `RaspberryPi4/Monitor/anvil_fonts.pi4` contains 4-bit coverage maps for printable
 ASCII glyphs, generated at 48 pixels from `DejaVuSans-Bold.ttf`,
@@ -254,3 +269,43 @@ licence is that tree's `debian/firmware/broadcom/LICENSE.cypress`, retained
 byte-exact as [licenses/Cypress-bluez-firmware-LICENSE.cypress.html](../licenses/Cypress-bluez-firmware-LICENSE.cypress.html)
 (upstream stores it as a saved HTML page of linux-firmware's `LICENCE.cypress`).
 Source: [RPi-Distro/bluez-firmware at the pinned commit](https://github.com/RPi-Distro/bluez-firmware/tree/cdf61dc691a49ff01a124752bd04194907f0f9cd/debian/firmware/broadcom)
+
+
+## Unicode 17 character data
+
+The default uppercase character-property constants in the generated Unicode17
+data header come from the official Unicode Character Database17.0.0:
+[UnicodeData](https://www.unicode.org/Public/17.0.0/ucd/UnicodeData.txt) and
+[SpecialCasing](https://www.unicode.org/Public/17.0.0/ucd/SpecialCasing.txt).
+The input digests and independent generator are recorded in PROVENANCE.json and
+the uppercase qualification evidence. The mapping data is redistributed under
+[Unicode License V3](../licenses/Unicode-Data-V3.txt), with its copyright and
+permission notice retained. It is separate from the independently written MIT
+conversion/lookup code. No third-party implementation program was imported.
+This data notice qualifies the earlier general discussion of implementation
+references; it does not change terms or notices for any existing component.
+
+
+## Raspberry Pi 5 Trusted Firmware-A
+
+`RaspberryPi5/Board/armstub8-2712.asm` declares a port of the adapted Pi 4
+stub and BCM2712 setup transcribed from Raspberry Pi's Trusted Firmware-A
+fork, commit `fc45bc492dd655f9ea4893a384527341a48cf03d`:
+
+- `plat/rpi/rpi5/aarch64/plat_helpers.S`
+- `lib/cpus/aarch64/cortex_a76.S`
+- `plat/rpi/rpi5/aarch64/armstub8_header.S`
+- `plat/rpi/rpi5/rpi5_bl31_setup.c`
+- `plat/rpi/rpi5/include/rpi_hw.h`
+- `plat/rpi/rpi5/platform.mk`
+
+The source headers identify BSD-3-Clause. Their copyright notices and the
+complete terms from that revision's `docs/license.rst` are retained in
+`licenses/Arm-Trusted-Firmware-BSD-3-Clause.txt`; notices also appear in the
+Pi 5 stub. The inherited Raspberry Pi armstub copyright, conditions and
+disclaimer are retained in its header and in
+`licenses/RaspberryPi-armstub8-BSD-3-Clause.txt`. These are licensed
+adaptations, not merely consulted facts or a relicensing under Anvil's MIT
+license. The notice update changes no assembly instruction or directive.
+The checker permits only the reviewed stub/source pairs and checks required
+copyright notices and the complete retained license text (LF/CRLF normalized).

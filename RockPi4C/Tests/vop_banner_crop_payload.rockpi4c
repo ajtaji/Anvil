@@ -1,3 +1,5 @@
+XIncludeFile "Anvil/Hal/aarch64_counter.pbi"
+
 ; Read two bounded crops from VOPB's active scanout buffer. The host runner
 ; validates the live VOPB scanout base, mode, stride, and bounded DDR range.
 ; This payload never writes to framebuffer memory. Run only through
@@ -21,18 +23,12 @@ Global cap_fb.i
 Global cap_pitch.i
 Global Dim cap_packet.l[32]
 
-ProcedureNaked.i CapTicks()
-  ASM
-    mrs x0, cntpct_el0
-    ret
-  ENDASM
+Procedure.i CapTicks()
+  ProcedureReturn A64CounterRead()
 EndProcedure
 
-ProcedureNaked.i CapTickRate()
-  ASM
-    mrs x0, cntfrq_el0
-    ret
-  ENDASM
+Procedure.i CapTickRate()
+  ProcedureReturn A64CounterFrequency()
 EndProcedure
 
 ; Acknowledgment is required for every bounded PIX packet. The board never

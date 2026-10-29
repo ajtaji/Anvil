@@ -2,7 +2,8 @@
 ;  Vulkan 1.0 vocabulary foundation -- registry-derived, not conformance
 ; ======================================================================
 ; Source registry: KhronosGroup/Vulkan-Headers tag v1.4.350
-; Commit: a33416ed2ce6bf8ef48b4eda821825f66d1850d3
+; Commit: 8864cdc896bbc2a9b6eb36b3218fc9ef57908d77
+; Annotated tag object: a33416ed2ce6bf8ef48b4eda821825f66d1850d3
 ; registry/vk.xml SHA-256:
 ; 50BD8C0F316EABF73D1C5FE3ADD2D89EAA480DBDA9282C12C289E80E9D081E08
 ; SPDX-License-Identifier: Apache-2.0 OR MIT

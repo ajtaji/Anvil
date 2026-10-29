@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Executable gate for RaspberryPi4/Lib/ecdsa.pi4 - ECDSA P-256 signature
+"""Executable gate for Anvil/Crypto/ecdsa.pbi - ECDSA P-256 signature
 VERIFY on AArch64.
 
 WHY THIS FILE IS WRITTEN THE WAY IT IS
@@ -118,7 +118,7 @@ PMFC = os.environ.get("PMF_COMPILER") or "PureMetalForge.exe"  # rebound from --
 BUILD_ENV = dict(os.environ, PMF_ROOT=str(ROOT))
 # --jobs, remembered for the pools that are not handed it directly.
 JOBS_CAP = None
-ECDSA = ROOT / "RaspberryPi4" / "Lib" / "ecdsa.pi4"
+ECDSA = ROOT / "Anvil" / "Crypto" / "ecdsa.pbi"
 WORK = ROOT / "_work"
 
 LOAD = 0x00400000
@@ -178,9 +178,9 @@ HARNESS = r'''
 ;  NOT A SOURCE FILE. DO NOT EDIT.
 ; ======================================================================
 XIncludeFile "RaspberryPi4/Lib/uart.pi4"
-XIncludeFile "RaspberryPi4/Lib/bignum.pi4"
-XIncludeFile "RaspberryPi4/Lib/ec256.pi4"
-XIncludeFile "RaspberryPi4/Lib/ecp.pi4"
+XIncludeFile "Anvil/Crypto/bignum.pbi"
+XIncludeFile "Anvil/Crypto/ec256.pbi"
+XIncludeFile "Anvil/Crypto/ecp.pbi"
 XIncludeFile "__ECDSA__"
 
 #H_SCRIPT = $06000000
@@ -969,7 +969,7 @@ def mutate_source(idx, which, find, replace, harness_text):
         if harness_text.count(find) != 1:
             raise SystemExit("mutation anchor not unique in the harness:\n%r"
                              % find)
-        return "RaspberryPi4/Lib/ecdsa.pi4", harness_text.replace(
+        return "Anvil/Crypto/ecdsa.pbi", harness_text.replace(
             find, replace, 1)
     text = ECDSA.read_text(encoding="utf-8")
     if text.count(find) != 1:
@@ -1201,7 +1201,7 @@ def main(argv=None):
 
     s = build_script(g, level="full")
     img = WORK / "ecdsaharness.img"
-    size = build("RaspberryPi4/Lib/ecdsa.pi4", WORK / "ecdsaharness.pi4", img)
+    size = build("Anvil/Crypto/ecdsa.pbi", WORK / "ecdsaharness.pi4", img)
     npos, nneg, ncannot, nextra = record_counts(g, s)
     print("[gate] image %d bytes, %d jobs: all %d records of the shared "
           "table run - %d signatures must verify, %d must be refused; "

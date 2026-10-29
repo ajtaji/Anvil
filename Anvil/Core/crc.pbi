@@ -1,3 +1,4 @@
+XIncludeFile "Anvil/Core/crc_constants.pbi"
 
 ; ======================================================================
 ;  CRC32 - IEEE 802.3, reflected, $EDB88320

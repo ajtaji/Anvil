@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Executable gate for RaspberryPi4/Lib/ecp.pi4 - ECDSA verification on
+"""Executable gate for Anvil/Crypto/ecp.pbi - ECDSA verification on
 P-384 and P-521 - and for the route to it through ecdsa.pi4's
 certificate seam EcdsaVrfy.
 
@@ -79,7 +79,7 @@ import gen_ecp_vectors as gen  # noqa: E402
 
 PMFC = os.environ.get("PMF_COMPILER") or "PureMetalForge.exe"
 BUILD_ENV = dict(os.environ, PMF_ROOT=str(ROOT))
-LIB_REL = "RaspberryPi4/Lib/ecp.pi4"
+LIB_REL = "Anvil/Crypto/ecp.pbi"
 LIB = ROOT / LIB_REL
 FIXTURE = ROOT / "tools" / "fixtures" / "ecp_vectors.json"
 WORK = ROOT / "_work"
@@ -111,10 +111,10 @@ HARNESS = r'''
 ;  NOT A SOURCE FILE. DO NOT EDIT.
 ; ======================================================================
 XIncludeFile "RaspberryPi4/Lib/uart.pi4"
-XIncludeFile "RaspberryPi4/Lib/bignum.pi4"
-XIncludeFile "RaspberryPi4/Lib/ec256.pi4"
+XIncludeFile "Anvil/Crypto/bignum.pbi"
+XIncludeFile "Anvil/Crypto/ec256.pbi"
 XIncludeFile "__ECP__"
-XIncludeFile "RaspberryPi4/Lib/ecdsa.pi4"
+XIncludeFile "Anvil/Crypto/ecdsa.pbi"
 
 #H_SCRIPT = $06000000
 #H_RESULT = $0A000000

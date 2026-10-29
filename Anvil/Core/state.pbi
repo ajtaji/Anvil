@@ -104,7 +104,7 @@ XIncludeFile "Anvil/Core/screen_connection.pbi"
 ;  does can type four.
 ; ----------------------------------------------------------------------
 #LEN_MAX   = $40000000         ; 1 GiB, in bytes
-#CRC_POLY  = $EDB88320         ; IEEE 802.3, reflected
+XIncludeFile "Anvil/Core/crc_constants.pbi"
 #BOOT_MS   = 2000              ; autoboot countdown
 #BOOT_DOT  = 250               ; ... and how often it prints a dot
 

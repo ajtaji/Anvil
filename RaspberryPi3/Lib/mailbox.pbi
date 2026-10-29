@@ -105,6 +105,11 @@ Procedure Pi3MailboxBarrier()
     isb
   EndASM
 EndProcedure
+; Both call styles use one encoding after the same buffer/context checks.
+Procedure.i Pi3MailboxRequestWord(buffer.i)
+  ProcedureReturn buffer | $C0000008
+EndProcedure
+
 Procedure.i Pi3MailboxCallTimeout(buffer.i, bytes.i, timeoutUs.i)
   Protected request.i
   Protected start.i
@@ -127,7 +132,7 @@ Procedure.i Pi3MailboxCallTimeout(buffer.i, bytes.i, timeoutUs.i)
   If start < 0
     ProcedureReturn 0
   EndIf
-  request = buffer | $C0000008
+  request = Pi3MailboxRequestWord(buffer)
   Pi3MailboxBarrier()
   ; Linux gives a firmware transaction three seconds. Framebuffer allocation
   ; is a cold display operation, not a register read; the former 100 ms limit
@@ -181,7 +186,7 @@ Procedure.i Pi3MailboxBegin(buffer.i,bytes.i,timeoutUs.i)
       EndIf
       ProcedureReturn 0
     EndIf
-    request=buffer|$C0000008 : pi3_mailbox_async_request=request
+    request=Pi3MailboxRequestWord(buffer) : pi3_mailbox_async_request=request
     pi3_mailbox_begin_waiting=0
     Pi3MailboxBarrier() : PokeL(#PI3_MBOX+$20,request)
     ProcedureReturn 1
@@ -199,7 +204,7 @@ Procedure.i Pi3MailboxBegin(buffer.i,bytes.i,timeoutUs.i)
   If (PeekL(#PI3_MBOX+$38)&$80000000)<>0
     pi3_mailbox_begin_waiting=1 : ProcedureReturn 0
   EndIf
-  request=buffer|$C0000008 : pi3_mailbox_async_request=request
+  request=Pi3MailboxRequestWord(buffer) : pi3_mailbox_async_request=request
   Pi3MailboxBarrier() : PokeL(#PI3_MBOX+$20,request)
   ProcedureReturn 1
 EndProcedure

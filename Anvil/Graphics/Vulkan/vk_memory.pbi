@@ -37,8 +37,8 @@ XIncludeFile "Anvil/Graphics/Vulkan/vk_foundation.pbi"
 ; The sprite table reserve adds one memory row per separate image,
 ; one additional image generation for replacement, and one transient
 ; staging row. The heap itself remains caller-sized and may still refuse.
-#ANVIL_VK_MAX_MEMORY = 16 + #ANVIL_VK_SPRITE_RESOURCE_SLOTS + #ANVIL_VK_SPRITE_STAGING_SLOTS
-#ANVIL_VK_MAX_IMAGES = 8 + #ANVIL_VK_SPRITE_RESOURCE_SLOTS
+#ANVIL_VK_MAX_MEMORY = 16 + #ANVIL_VK_SPRITE_RESOURCE_SLOTS + #ANVIL_VK_SPRITE_STAGING_SLOTS + #ANVIL_VK_RENDER_TARGET_SLOTS
+#ANVIL_VK_MAX_IMAGES = 8 + #ANVIL_VK_SPRITE_RESOURCE_SLOTS + #ANVIL_VK_RENDER_TARGET_SLOTS
 
 ; BGRA8 is four bytes per texel. This is the one format this slice knows,
 ; and the constant exists so the arithmetic below names it rather than

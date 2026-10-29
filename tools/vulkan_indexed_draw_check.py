@@ -25,10 +25,10 @@ from pmf_compiler import resolve_compiler
 
 ROOT = Path(__file__).resolve().parents[1]
 VULKAN = ROOT / "Anvil/Graphics/Vulkan"
-PUBLIC_GATE = VULKAN / "Tests/vulkan_indexed_draw_gate.pi4"
+PUBLIC_GATE = ROOT / 'RaspberryPi4/Tests/Vulkan/vulkan_indexed_draw_gate.pi4'
 PACKET_GATE = ROOT / "RaspberryPi4/Tests/vulkan_index_packet_emitted_gate.pi4"
 PIPELINE = VULKAN / "vk_pipeline.pbi"
-BACKEND = VULKAN / "vk_v3d_backend.pi4"
+BACKEND = ROOT / 'RaspberryPi4/Lib/Vulkan/vk_v3d_backend.pi4'
 V3D = ROOT / "RaspberryPi4/Lib/v3d.pi4"
 COMPILER = Path(r"C:\Embedded Compiler\PureBasicCode\OpenGl Work\ArduinoBasic\PureMetalForge.exe")
 INTERP = ROOT / "tools/a64/a64_interp.py"

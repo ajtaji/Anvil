@@ -1,3 +1,5 @@
+XIncludeFile "Anvil/Hal/aarch64_counter.pbi"
+
 ; ======================================================================
 ;  timer.pi4 - microseconds and milliseconds on the Raspberry Pi 4,
 ;              from the ARM architectural counter
@@ -21,15 +23,8 @@
 ;
 ;  ---- DEPENDENCIES ---------------------------------------------------
 ;
-;  NONE. This file includes no other library and needs none, which is
-;  the point of using CNTPCT_EL0 (below) instead of a peripheral: there
-;  is no clock to bring up, no reset to release and no tick generator to
-;  start, so there is nothing for a clocks library to own.
-;
-;  House rule 10 (vault RULES.md, 2026-07-30) - a library never
-;  includes another library; the MAIN file lists what it needs, one per
-;  line, and a dependency is DOCUMENTED HERE instead. This file has the
-;  easiest possible time obeying it.
+;  Anvil/Hal/aarch64_counter.pbi owns the architecture register reads.
+;  This facade retains Pi timer scaling, readiness checks and bounded waits.
 ;
 ;  ---- WHY THE ARCHITECTURAL COUNTER AND NOT THE SYSTEM TIMER --------
 ;
@@ -218,9 +213,7 @@ Global timer_ms_div.i
 ;  in x0, which is where a .i return value goes.
 ; ----------------------------------------------------------------------
 Procedure.i Ticks()
-  ASM
-    mrs x0, cntpct_el0
-  EndASM
+  ProcedureReturn A64CounterRead()
 EndProcedure
 
 ; ----------------------------------------------------------------------
@@ -230,9 +223,7 @@ EndProcedure
 ;  expectation and not an assumption.
 ; ----------------------------------------------------------------------
 Procedure.i TickHz()
-  ASM
-    mrs x0, cntfrq_el0
-  EndASM
+  ProcedureReturn A64CounterFrequency()
 EndProcedure
 
 ; ----------------------------------------------------------------------

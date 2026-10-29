@@ -82,6 +82,12 @@ Procedure.i pi3ut_WriteLine(text.i)
   ProcedureReturn pi3ut_WriteByte(10)
 EndProcedure
 
+; Bounded diagnostic line on the updater transport, with CRLF and write result.
+; Does not initialize storage, update state or command dispatch.
+Procedure.i Pi3UpdateWriteLine(text.i)
+  ProcedureReturn pi3ut_WriteLine(text)
+EndProcedure
+
 Procedure.i pi3ut_WriteDec(value.i)
   Protected Dim digits.a[24]
   Protected n.i

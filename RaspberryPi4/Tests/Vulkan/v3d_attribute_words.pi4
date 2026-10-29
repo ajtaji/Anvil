@@ -1,0 +1,70 @@
+; neonCompatibilityPixelOracle.pi4 - manifest-bound native oracle
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "RaspberryPi4/Lib/timer.pi4"
+XIncludeFile "RaspberryPi4/Lib/safety.pi4"
+XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
+#DSP_DMA_LINKED = 0
+XIncludeFile "RaspberryPi4/Lib/display.pi4"
+XIncludeFile "RaspberryPi4/Lib/v3dqpu.pi4"
+XIncludeFile "RaspberryPi4/Lib/v3d.pi4"
+XIncludeFile "RaspberryPi4/Lib/neon.pi4"
+
+XIncludeFile "Anvil/Hal/hal.pbi"
+
+Procedure.i Main(services.i)
+ Protected i.i,base.i,rc.i
+ For i=0 To 16383 : PokeA($E1C00000+i,$A5) : Next
+ base=$E1C00200+0*1024
+ rc=V3dShaderRecordBegin(base+64+0,1)
+ PokeI(base,Bool(rc=0))
+ V3dAttrRecord(0,305419896,16,2309737967,1,1)
+ PokeI(base+8,V3dShaderRecordOk())
+ base=$E1C00200+1*1024
+ rc=V3dShaderRecordBegin(base+64+0,4)
+ PokeI(base,Bool(rc=0))
+ V3dAttrRecord(3,4294967295,2147483648,4294967295,15,0)
+ PokeI(base+8,V3dShaderRecordOk())
+ base=$E1C00200+2*1024
+ rc=V3dShaderRecordBegin(base+64+0,31)
+ PokeI(base,Bool(rc=0))
+ V3dAttrRecord(30,1250999896491,-1,4886718345,0,15)
+ PokeI(base+8,V3dShaderRecordOk())
+ base=$E1C00200+3*1024
+ rc=V3dShaderRecordBegin(base+64+0,4)
+ PokeI(base,Bool(rc=0))
+ V3dAttrRecord(0,0,0,0,0,0)
+ PokeI(base+8,V3dShaderRecordOk())
+ base=$E1C00200+4*1024
+ rc=V3dShaderRecordBegin(base+64+0,4)
+ PokeI(base,Bool(rc=0))
+ V3dAttrRecord(-1,1,16,1,1,1)
+ PokeI(base+8,V3dShaderRecordOk())
+ base=$E1C00200+5*1024
+ rc=V3dShaderRecordBegin(base+64+0,4)
+ PokeI(base,Bool(rc=0))
+ V3dAttrRecord(4,1,16,1,1,1)
+ PokeI(base+8,V3dShaderRecordOk())
+ base=$E1C00200+6*1024
+ rc=V3dShaderRecordBegin(base+64+0,4)
+ PokeI(base,Bool(rc=0))
+ V3dAttrRecord(0,1,16,1,16,1)
+ PokeI(base+8,V3dShaderRecordOk())
+ base=$E1C00200+7*1024
+ rc=V3dShaderRecordBegin(base+64+0,4)
+ PokeI(base,Bool(rc=0))
+ V3dAttrRecord(0,1,16,1,1,-1)
+ PokeI(base+8,V3dShaderRecordOk())
+ base=$E1C00200+8*1024
+ rc=V3dShaderRecordBegin(base+64+0,0)
+ PokeI(base,Bool(rc=0))
+ V3dAttrRecord(0,1,16,1,1,1)
+ PokeI(base+8,V3dShaderRecordOk())
+ base=$E1C00200+9*1024
+ rc=V3dShaderRecordBegin(base+64+1,1)
+ PokeI(base,Bool(rc=0))
+ V3dAttrRecord(0,1,16,1,1,1)
+ PokeI(base+8,V3dShaderRecordOk())
+ PokeI($E1C00000,$41545231)
+ PokeI($E1C00008,10)
+ ProcedureReturn 0
+EndProcedure

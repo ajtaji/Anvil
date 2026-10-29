@@ -1,3 +1,5 @@
+XIncludeFile "Anvil/Hal/aarch64_counter.pbi"
+
 ; Returning build-145 UART proof: resident TrueType glyphs with UART pumps.
 ; The resident payload command arms the physical deadman before entry.
 ; pmf:target rockpi4c
@@ -118,12 +120,8 @@ Procedure ProofGlyph(x.i, target.i)
   Next
 EndProcedure
 
-ProcedureNaked.i LiveTicks()
-  ASM
-    isb
-    mrs x0, cntpct_el0
-    ret
-  ENDASM
+Procedure.i LiveTicks()
+  ProcedureReturn A64CounterReadOrdered()
 EndProcedure
 
 ProcedureNaked.i LiveKctl()

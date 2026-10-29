@@ -899,6 +899,10 @@ Procedure.i avkSpvIrDecorationKind(spvKind.i)
 EndProcedure
 
 Procedure.i avkSpvIrNodeKind(op.i)
+  If op=#SpvOpFOrdLessThan : ProcedureReturn #ANVIL_IR_OP_FORD_LESS : EndIf
+  If op=#SpvOpFOrdGreaterThan : ProcedureReturn #ANVIL_IR_OP_FORD_GREATER : EndIf
+  If op=#SpvOpLogicalOr : ProcedureReturn #ANVIL_IR_OP_LOGICAL_OR : EndIf
+  If op=#SpvOpSelect : ProcedureReturn #ANVIL_IR_OP_SELECT : EndIf
   If op = #SpvOpLoad : ProcedureReturn #ANVIL_IR_OP_LOAD : EndIf
   If op = #SpvOpAccessChain : ProcedureReturn #ANVIL_IR_OP_ACCESS_CHAIN : EndIf
   If op = #SpvOpCompositeExtract : ProcedureReturn #ANVIL_IR_OP_COMPOSITE_EXTRACT : EndIf
@@ -907,6 +911,10 @@ Procedure.i avkSpvIrNodeKind(op.i)
   If op = #SpvOpStore : ProcedureReturn #ANVIL_IR_OP_STORE : EndIf
   If op = #SpvOpReturn : ProcedureReturn #ANVIL_IR_OP_RETURN : EndIf
   If op = #SpvOpFAdd : ProcedureReturn #ANVIL_IR_OP_FADD : EndIf
+  If op = #SpvOpFSub : ProcedureReturn #ANVIL_IR_OP_FSUB : EndIf
+  If op = #SpvOpVectorTimesScalar : ProcedureReturn #ANVIL_IR_OP_VECTOR_SCALE : EndIf
+  If op = #SpvOpExtInst : ProcedureReturn #ANVIL_IR_OP_SIN : EndIf
+  If op = #SpvOpDot : ProcedureReturn #ANVIL_IR_OP_DOT : EndIf
   If op = #SpvOpFMul : ProcedureReturn #ANVIL_IR_OP_FMUL : EndIf
   ProcedureReturn 0
 EndProcedure
@@ -921,6 +929,9 @@ Procedure.i avkSpvIrType(*r.AvkSpvRecord, index.i)
   *t=@avkSpvIrScratch\types[n]
   *t\sourceId=*r\sourceId
   *t\sourceOpcode=*r\sourceOpcode
+  If *r\sourceOpcode = #SpvOpTypeBool
+    *t\kind = #ANVIL_IR_TYPE_BOOL
+  EndIf
   If *r\sourceOpcode = #SpvOpTypeVoid
     *t\kind = #ANVIL_IR_TYPE_VOID
   EndIf
@@ -987,6 +998,8 @@ Procedure.i avkSpvIrConstant(*r.AvkSpvRecord,index.i)
   *c\sourceId = *r\sourceId
   *c\sourceOpcode = *r\sourceOpcode
   *c\typeId = *r\resultType
+  If *r\sourceOpcode=#SpvOpConstantTrue : *c\word0=1 : EndIf
+  If *r\sourceOpcode=#SpvOpConstantFalse : *c\word0=0 : EndIf
   If *r\sourceOpcode = #SpvOpConstant
     *c\wordCount = 1
     *c\word0 = *r\literal0
@@ -1054,6 +1067,8 @@ Procedure.i avkSpvIrNode(*r.AvkSpvRecord,index.i)
   Protected *n.AvkIrNode
   Protected at.i=*m\nodeCount
   Protected kind.i=avkSpvIrNodeKind(*r\sourceOpcode)
+  If *r\sourceOpcode=#SpvOpExtInst And *r\literal0=49 : kind=#ANVIL_IR_OP_SMOOTHSTEP : EndIf
+  If *r\sourceOpcode=#SpvOpExtInst And *r\literal0=67 : kind=#ANVIL_IR_OP_DISTANCE : EndIf
   If at >= #ANVIL_IR_MAX_NODES
     ProcedureReturn avkSpvIrFail(#ANVIL_SPV_IR_ERR_RANGE, *r\sourceId, *r\sourceOpcode, index)
   EndIf
@@ -1073,6 +1088,24 @@ Procedure.i avkSpvIrNode(*r.AvkSpvRecord,index.i)
   *n\operand3 = *r\id3
   *n\literalCount = *r\literalCount
   *n\literal0 = *r\literal0
+  If kind=#ANVIL_IR_OP_SIN
+    If *r\idCount<>2 Or *r\literalCount<>1 Or *r\literal0<>13
+      ProcedureReturn avkSpvIrFail(#ANVIL_SPV_IR_ERR_RECORD,*r\sourceId,*r\sourceOpcode,index)
+    EndIf
+    *n\operandCount=1 : *n\operand0=*r\id1 : *n\operand1=0
+  EndIf
+  If kind=#ANVIL_IR_OP_DISTANCE
+    If *r\idCount<>3 Or *r\literalCount<>1 Or *r\literal0<>67
+      ProcedureReturn avkSpvIrFail(#ANVIL_SPV_IR_ERR_RECORD,*r\sourceId,*r\sourceOpcode,index)
+    EndIf
+    *n\operandCount=2 : *n\operand0=*r\id1 : *n\operand1=*r\id2 : *n\operand2=0
+  EndIf
+  If kind=#ANVIL_IR_OP_SMOOTHSTEP
+    If *r\idCount<>4 Or *r\literalCount<>1 Or *r\literal0<>49
+      ProcedureReturn avkSpvIrFail(#ANVIL_SPV_IR_ERR_RECORD,*r\sourceId,*r\sourceOpcode,index)
+    EndIf
+    *n\operandCount=3 : *n\operand0=*r\id1 : *n\operand1=*r\id2 : *n\operand2=*r\id3 : *n\operand3=0
+  EndIf
   *m\nodeCount=at+1
   ProcedureReturn 0
 EndProcedure
@@ -1153,7 +1186,9 @@ Procedure.i AnvilVkSpirvIrAdapt(*out.AvkSpirvIrStorage)
       *b\nodeCount = *m\nodeCount - *b\firstNode
     ElseIf r\section=#ANVIL_SPV_REC_ENVIRONMENT
       If r\sourceOpcode = #SpvOpExtInstImport
-        ProcedureReturn avkSpvIrFail(#ANVIL_IR_ERR_UNSUPPORTED, r\sourceId, r\sourceOpcode, i)
+        If r\literalCount<>1 Or r\literal0<>450
+          ProcedureReturn avkSpvIrFail(#ANVIL_IR_ERR_UNSUPPORTED, r\sourceId, r\sourceOpcode, i)
+        EndIf
       EndIf
     EndIf
     If rc <> 0

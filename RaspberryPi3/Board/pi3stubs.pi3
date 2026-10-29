@@ -79,8 +79,7 @@ Global pi3_screen_banner_phase.i
 Global pi3_screen_banner_pos.i
 Global pi3_screen_logo_row.i
 Global pi3_screen_font_boot.i
-Global pi3_screen_font_bytes.i
-Global pi3_screen_font_offset.i
+Global pi3_screen_font_token.i
 Global pi3_screen_font_path_bytes.i
 Global pi3_screen_font_auto_default.i
 Global Dim pi3_screen_font_path.a[1024]
@@ -270,13 +269,13 @@ Procedure Pi3ScreenFontBootTick()
   Protected *sizeValue
   Protected i.i
   Protected n.i
-  Protected got.i
-  Protected target.i
-  Protected take.i
   Protected path.i
   Protected initialPreload.i
   Protected Dim sizeText.a[16]
   If pi3_screen_font_boot=2 Or pi3_screen_fault<>0
+    If pi3_screen_font_token<>0
+      AnvilFontFileCancel(0,pi3_screen_font_token) : pi3_screen_font_token=0
+    EndIf
     ProcedureReturn
   EndIf
   initialPreload=Bool(pi3_screen_initialized=0 And pi3_screen_init_state=2 And pi3_screen_banner_phase=0)
@@ -336,7 +335,8 @@ Procedure Pi3ScreenFontBootTick()
       AnvilBuildCopy(@pi3_screen_font_path[0],path)
       pi3_screen_font_auto_default=1
     EndIf
-    If pi3_screen_font_path_bytes<1 Or pi3_screen_font_path_bytes>=1024 Or anvil_font_SlotAddress(0)=0
+    pi3_screen_font_token=AnvilFontFileBegin(0,@pi3_screen_font_path[0],pi3_screen_font_path_bytes,#PI3_SCREEN_FONT_MAX_BYTES)
+    If pi3_screen_font_token=0
       pi3_screen_font_boot=2
       ProcedureReturn
     EndIf
@@ -346,36 +346,18 @@ Procedure Pi3ScreenFontBootTick()
 
   If pi3_screen_font_boot=1
     pi3_screen_font_service_phase=2
-    If HwStorageUp()=0 Or HwFileOpen(@pi3_screen_font_path[0])=0
+    n=AnvilFontFileStep(0,pi3_screen_font_token,#PI3_SCREEN_FONT_READ_CHUNK)
+    If n=1 : ProcedureReturn : EndIf
+    pi3_screen_font_token=0
+    If n<>2
       pi3_screen_font_boot=2
-      ProcedureReturn
-    EndIf
-    n=HwFileSize()
-    If n<1 Or n>#PI3_SCREEN_FONT_MAX_BYTES Or (pi3_screen_font_bytes<>0 And n<>pi3_screen_font_bytes)
-      HwFileClose()
-      pi3_screen_font_boot=2
-      ProcedureReturn
-    EndIf
-    pi3_screen_font_bytes=n
-    take=pi3_screen_font_bytes-pi3_screen_font_offset
-    If take>#PI3_SCREEN_FONT_READ_CHUNK : take=#PI3_SCREEN_FONT_READ_CHUNK : EndIf
-    target=anvil_font_SlotAddress(0)+pi3_screen_font_offset
-    got=HwFileReadAt(pi3_screen_font_offset,target,take)
-    HwFileClose()
-    If got<>take
-      pi3_screen_font_boot=2
-      ProcedureReturn
-    EndIf
-    pi3_screen_font_offset=pi3_screen_font_offset+got
-    If pi3_screen_font_offset<pi3_screen_font_bytes
       ProcedureReturn
     EndIf
     pi3_screen_font_service_phase=3
-    If AnvilTrueTypeSlotLoad(0,anvil_font_SlotAddress(0),pi3_screen_font_bytes)=0 Or AnvilTrueTypeSlotSelect(0)=0
+    If AnvilTrueTypeSlotSelect(0)=0
       pi3_screen_font_boot=2
       ProcedureReturn
     EndIf
-    anvil_font_CopySlotPath(0,@pi3_screen_font_path[0],pi3_screen_font_path_bytes)
     AnvilTrueTypeSetDefaultSlot(0)
     If pi3_screen_font_auto_default<>0
       SettingsSet("font.default",@pi3_screen_font_path[0])
@@ -1753,12 +1735,7 @@ EndProcedure
 ; The general TCP service remains unavailable on this Pi 3 composition.
 ; The shared UDP console/DHCP path is linked separately; unknown TCP frames
 ; reach this explicit drop seam until a TCP backend is composed and proven.
-Procedure.i TcpInput()
-  ProcedureReturn 0
-EndProcedure
-
-Procedure TcpTick()
-EndProcedure
+XIncludeFile "Anvil/Network/tcp_service.pbi"
 
 Procedure WifiLinkTick()
   ; Automatic bring-up/join runs only in the idle prompt. A command may call

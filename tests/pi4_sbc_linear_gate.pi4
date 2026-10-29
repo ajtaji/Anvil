@@ -1,3 +1,5 @@
+XIncludeFile "Anvil/Hal/aarch64_counter.pbi"
+
 ; Physical exact encoder differential:1024 full frames, both channel modes,
 ; history continuity, extremes, impulses, ramps and pseudorandom samples.
 ; UART never opened. E1C00000 holds framecount/oldticks/newticks at54MHz.
@@ -8,9 +10,7 @@ Global Dim RefHistory.w(80)
 Global Dim RefSub.w(128)
 Global Dim RefEncoded.a(68)
 Procedure.i BenchTicks()
- ASM
-  mrs x0,cntpct_el0
- EndASM
+  ProcedureReturn A64CounterRead()
 EndProcedure
 Procedure SbcAnalyzeReference()
   Protected block.i,i.i,j.i,k.i,sum.i,v.i

@@ -1,3 +1,5 @@
+XIncludeFile "Anvil/Hal/aarch64_counter.pbi"
+
 ; EL3 timer event-stream idle for the polled recovery loop. The timer event
 ; wakes WFE without unmasking interrupts or installing an IRQ/FIQ handler.
 ; A return-only silicon proof established this CNTKCTL_EL1 path on RK3399.
@@ -35,20 +37,8 @@ ProcedureNaked RockIdleTimerWriteKctl()
   ENDASM
 EndProcedure
 
-ProcedureNaked.i RockIdleTimerWait()
-  ASM
-    ; Clear any latched local event first, then wait for the next timer event.
-    ; A verified SEVL encoding is used because PMF does not parse its mnemonic.
-    isb
-    mrs x9, cntpct_el0
-    .long $D50320BF ; SEVL
-    wfe
-    wfe
-    isb
-    mrs x0, cntpct_el0
-    sub x0, x0, x9
-    ret
-  ENDASM
+Procedure.i RockIdleTimerWait()
+  ProcedureReturn A64CounterWaitEventTicks()
 EndProcedure
 
 Procedure.i RockIdleTimerInit()

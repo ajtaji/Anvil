@@ -1,3 +1,5 @@
+XIncludeFile "Anvil/Hal/aarch64_counter.pbi"
+
 ; Returning EL3 generic-timer event-stream proof. It changes only the
 ; current PE's CNTKCTL_EL1, restores that register before returning, and
 ; leaves interrupts masked, the GIC, VBAR_EL3, and Anvil memory untouched.
@@ -26,19 +28,12 @@ ProcedureNaked.i IdleProofDaif()
   ENDASM
 EndProcedure
 
-ProcedureNaked.i IdleProofHz()
-  ASM
-    mrs x0, cntfrq_el0
-    ret
-  ENDASM
+Procedure.i IdleProofHz()
+  ProcedureReturn A64CounterFrequency()
 EndProcedure
 
-ProcedureNaked.i IdleProofTicks()
-  ASM
-    isb
-    mrs x0, cntpct_el0
-    ret
-  ENDASM
+Procedure.i IdleProofTicks()
+  ProcedureReturn A64CounterReadOrdered()
 EndProcedure
 
 ProcedureNaked.i IdleProofKctl()
@@ -66,17 +61,8 @@ ProcedureNaked.i IdleProofVbar()
   ENDASM
 EndProcedure
 
-ProcedureNaked.i IdleProofWait()
-  ASM
-    ; Prime and clear the local event latch. The second WFE then waits for
-    ; the next timer event, bounded by one configured event interval.
-    .long $D50320BF ; SEVL
-    wfe
-    wfe
-    isb
-    mrs x0, cntpct_el0
-    ret
-  ENDASM
+Procedure.i IdleProofWait()
+  ProcedureReturn A64CounterWaitEventSample()
 EndProcedure
 
 Procedure.i Main()

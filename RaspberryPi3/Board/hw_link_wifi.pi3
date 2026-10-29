@@ -59,22 +59,6 @@ Procedure.i HwLinkTxMax(kind.i)
   ProcedureReturn Cyw43DataMax()
 EndProcedure
 
-; Shared NTP/link-local code stages its reply in NetOutBuf. This is the
-; board's equivalent of the Pi 4 LinkTxStagedOn seam, restricted to the
-; single Wi-Fi interface actually implemented here.
-Procedure.i LinkTxMaxOn(kind.i)
-  ProcedureReturn HwLinkTxMax(kind)
-EndProcedure
-Procedure.i LinkTxStagedOn(kind.i)
-  Protected n.i
-  n = NetOutLen()
-  If n <= 0 Or n > LinkTxMaxOn(kind) : ProcedureReturn 0 : EndIf
-  ProcedureReturn HwLinkSend(kind, NetOutBuf(), n, 100)
-EndProcedure
-Procedure.i LinkTxStaged()
-  ProcedureReturn LinkTxStagedOn(NetIfPreferred())
-EndProcedure
-
 Procedure.i HwLinkSpeed(kind.i)
   ProcedureReturn #HW_LINK_SPEED_UNKNOWN
 EndProcedure
@@ -170,6 +154,8 @@ Procedure HwLinkAddressBound(kind.i, ip.i, mask.i, gw.i)
   p3HwWifiIp = ip
   p3HwWifiMask = mask
   p3HwWifiGateway = gw
+  ; Re-select after the address latch changes, before the console rearms.
+  LinkUseKind(NetIfPreferred())
 EndProcedure
 
 Procedure HwLinkConsoleArmed(kind.i, armed.i)

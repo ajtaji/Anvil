@@ -93,9 +93,9 @@ sys.path.insert(0, str(ROOT / "tools" / "a64"))
 from pmf_compiler import resolve_compiler  # noqa: E402
 
 LIB = ROOT / "RaspberryPi4" / "Lib"
-REC_SRC = LIB / "tls13_record.pi4"
-HS_SRC = LIB / "tls13_hs.pi4"
-GCM_SRC = LIB / "gcm.pi4"
+REC_SRC = ROOT / "Anvil" / "Crypto" / "tls13_record.pbi"
+HS_SRC = ROOT / "Anvil" / "Crypto" / "tls13_hs.pbi"
+GCM_SRC = ROOT / "Anvil" / "Crypto" / "gcm.pbi"
 
 LOAD, STACK, RETURN = 0x400000, 0x3000000, 0xDEAD0000
 H_ARGS = 0x0A000000
@@ -633,19 +633,18 @@ XIncludeFile "Anvil/Core/sha256.pbi"
 XIncludeFile "Anvil/Crypto/sha512.pbi"
 XIncludeFile "RaspberryPi4/Lib/hmac.pi4"
 XIncludeFile "RaspberryPi4/Lib/hkdf.pi4"
-XIncludeFile "RaspberryPi4/Lib/entropy.pi4"
-XIncludeFile "RaspberryPi4/Lib/drbg.pi4"
+XIncludeFile "Anvil/Crypto/drbg.pbi"
 XIncludeFile "Anvil/Crypto/aes.pbi"
 XIncludeFile "__GCM__"
-XIncludeFile "RaspberryPi4/Lib/bignum.pi4"
-XIncludeFile "RaspberryPi4/Lib/ec256.pi4"
-XIncludeFile "RaspberryPi4/Lib/x25519.pi4"
-XIncludeFile "RaspberryPi4/Lib/ecp.pi4"
-XIncludeFile "RaspberryPi4/Lib/ecdsa.pi4"
-XIncludeFile "RaspberryPi4/Lib/rsa.pi4"
-XIncludeFile "RaspberryPi4/Lib/t0vm.pi4"
-XIncludeFile "RaspberryPi4/Lib/x509_blob.pi4"
-XIncludeFile "RaspberryPi4/Lib/x509.pi4"
+XIncludeFile "Anvil/Crypto/bignum.pbi"
+XIncludeFile "Anvil/Crypto/ec256.pbi"
+XIncludeFile "Anvil/Crypto/x25519.pbi"
+XIncludeFile "Anvil/Crypto/ecp.pbi"
+XIncludeFile "Anvil/Crypto/ecdsa.pbi"
+XIncludeFile "Anvil/Crypto/rsa.pbi"
+XIncludeFile "Anvil/Crypto/t0vm.pbi"
+XIncludeFile "Anvil/Crypto/x509_blob.pbi"
+XIncludeFile "Anvil/Crypto/x509.pbi"
 XIncludeFile "__REC__"
 XIncludeFile "__HS__"
 """
@@ -772,7 +771,7 @@ def harness_text(rec_inc, hs_inc, gcm_inc):
 
 
 def build(compiler, work: Path, name, rec_inc="RaspberryPi4/Lib/tls13_record.pi4",
-          hs_inc="RaspberryPi4/Lib/tls13_hs.pi4", gcm_inc="RaspberryPi4/Lib/gcm.pi4"):
+          hs_inc="Anvil/Crypto/tls13_hs.pbi", gcm_inc="RaspberryPi4/Lib/gcm.pi4"):
     src, img = work / (name + ".pi4"), work / (name + ".img")
     src.write_text(harness_text(rec_inc, hs_inc, gcm_inc), encoding="utf-8")
     r = subprocess.run([str(compiler), "--compile", str(src), "-t", "pi4", "--entry-returns",

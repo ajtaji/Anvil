@@ -1,3 +1,4 @@
+XIncludeFile "Anvil/Hal/input_codes.pbi"
 ; ======================================================================
 ;  input_events.pbi - THE NORMALIZED INPUT DISPATCHER
 ;
@@ -128,37 +129,10 @@
 ; character and a named key are different things: 'a' is text, Home is
 ; not, and a consumer that had to tell them apart by inspecting the code
 ; would be guessing about codes 1..10.
-#AIE_TEXT     = 1
-#AIE_KEY_DOWN = 2
-#AIE_KEY_UP   = 3
-#AIE_CANCEL   = 4
 
-; The named keys. These numbers are the shared vocabulary of all three
-; lanes of this feature and they are not renumbered.
-#AIK_ENTER          = 1
-#AIK_BACKSPACE      = 2
-#AIK_DELETE         = 3
-#AIK_LEFT           = 4
-#AIK_RIGHT          = 5
-#AIK_HOME           = 6
-#AIK_END            = 7
-#AIK_TAB            = 8
-#AIK_ESC            = 9
-#AIK_CANCEL_COMMAND = 10          ; Ctrl+C semantics
-#AIK_MAX            = 10
-
-; Where an event came from. IT IS NOT DECORATION: the network console's
-; ownership rules key off it - a soft keystroke is LOCAL input and
-; claims the console the way a serial byte does, a byte that arrived
-; from the peer does not, and merely DRAWING a keyboard claims nothing.
-#AIS_PHYSICAL       = 1
-#AIS_NETWORK        = 2
-#AIS_TOUCH_KEYBOARD = 3
-#AIS_MAX            = 3
 
 ; Modifier bits, informational. The producer resolved the case already.
-#AIM_SHIFT = 1
-#AIM_CTRL  = 2
+
 
 ; ----------------------------------------------------------------------
 ;  THE RETURN CODES. Every one of them has a whole sentence in
@@ -183,15 +157,7 @@
 ;  gets a number so the sentence the operator reads names the actual
 ;  event rather than "input was reset".
 ; ----------------------------------------------------------------------
-#AIC_NONE          = 0
-#AIC_FOCUS_CHANGE  = 1
-#AIC_QUEUE_FULL    = 2
-#AIC_TOUCH_LOST    = 3
-#AIC_SCREEN_CHANGE = 4
-#AIC_LAYOUT_CHANGE = 5
-#AIC_CONTACT_LOST  = 6
-#AIC_PAYLOAD       = 7
-#AIC_MAX           = 7
+
 
 ; ----------------------------------------------------------------------
 ;  WHO CAN OWN A CONTACT. Zero is nobody, and it is not an owner id: a
@@ -218,6 +184,7 @@
 ; ----------------------------------------------------------------------
 #AIF_NONE         = 0
 #AIF_COMMAND_LINE = 1
+#AIF_PAYLOAD      = 2
 
 ; ======================================================================
 ;  THE ROUTED CONTACT RECORD - 40 BYTES
@@ -382,6 +349,8 @@ Procedure.i InputCancelText(reason.i)
       ProcedureReturn "input cancel 6: a touch contact disappeared without a release event, so it was released against the contacts the controller reports now; anything already typed is kept."
     Case #AIC_PAYLOAD
       ProcedureReturn "input cancel 7: the monitor handed the processor to a payload, so held contacts and modifiers were released before the hand-over; anything already typed is kept."
+    Case #AIC_DEVICE_LOST
+      ProcedureReturn "the input device stopped answering; active input was cancelled"
     Default
       ProcedureReturn "input cancel: a cancellation reason outside the documented set was recorded, which is a defect in the monitor rather than anything you did."
   EndSelect

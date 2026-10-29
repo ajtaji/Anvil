@@ -61,7 +61,7 @@ SAMPLES = os.path.join(REPO, "RaspberryPi4", "Reference")
 
 CURVE_ID = {"secp256r1": 23, "secp384r1": 24, "secp521r1": 25}
 
-# verdict codes (must match RaspberryPi4/Lib/x509.pi4 #X509ERR_*)
+# verdict codes (must match Anvil/Crypto/x509.pbi #X509ERR_*)
 OK, EXPIRED, DN_MISMATCH, BAD_SERVER_NAME, NOT_TRUSTED, SEAM = 32, 54, 55, 56, 62, 200
 
 

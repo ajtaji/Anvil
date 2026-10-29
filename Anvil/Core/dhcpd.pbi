@@ -535,6 +535,11 @@ Procedure.i DhcpdStart(kind.i)
   If kind <> #HW_LINK_WIRED
     ProcedureReturn 0
   EndIf
+  ; A valid interface number is not proof that this board has that link.
+  ; Refuse before reserving an alias or listener for nonexistent hardware.
+  If HwLinkHas(kind) = 0
+    ProcedureReturn 0
+  EndIf
   If dhcpd_on <> 0
     ProcedureReturn 1
   EndIf

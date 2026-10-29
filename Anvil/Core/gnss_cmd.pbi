@@ -72,9 +72,9 @@ Procedure.i GnssCmdOpen(src.i)
   EndIf
   Print("GNSS source: ") : UartWriteStr(GnssSourceName(src))
   If src = #GNSS_SRC_USB
-    Print(", ") : UartWriteStr(UsbSerKindText(UsbSerKind())) : Print(" ") : PutHexN(UsbSerVid(), 4) : Print(":") : PutHexN(UsbSerPid(), 4)
-    Print(" on USB slot ") : PrintDec(UsbSerSlot())
-    If UsbSerNeedsBaud() <> 0 : Print(", baud searched from 9600") : EndIf
+    Print(", ") : UartWriteStr(UsbSerialKindText(UsbSerialKind())) : Print(" ") : PutHexN(UsbSerialVid(), 4) : Print(":") : PutHexN(UsbSerialPid(), 4)
+    Print(" on USB slot ") : PrintDec(UsbSerialSlot())
+    If UsbSerialNeedsBaud() <> 0 : Print(", baud searched from 9600") : EndIf
   EndIf
   If src = #GNSS_SRC_NETWORK
     Print(", ") : PrintDec((GnssNetIp() >> 24) & 255) : Print(".") : PrintDec((GnssNetIp() >> 16) & 255) : Print(".")
@@ -91,11 +91,10 @@ Procedure GnssCmdWatch(seconds.i, raw.i)
   t0 = HwMicros() : tNext = t0 + 1000000
   Repeat
     If raw <> 0
-      ; the bytes themselves: the source's own read, shown as text
-      n = gnss_SrcRead(@b[0], 256)
+      ; Read and decode through the service; display the same bytes below.
+      n = GnssRead(@b[0], 256)
       For i = 0 To n - 1
         c = b[i]
-        gnss_Byte(c)
         If c = 10 Or c = 13 Or (c >= 32 And c < 127)
           If c <> 13 : UartWrite(c) : EndIf
         Else

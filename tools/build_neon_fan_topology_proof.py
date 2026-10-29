@@ -51,7 +51,7 @@ Procedure.i fanTopologyProof(phys.i,dev.i,queue.i,pool.i,renderPass.i,framebuffe
   For path=0 To 1
    SafetyWatchdogPet()
    quads=64
-   If path=1 : quads=2-mode : EndIf
+   If path=1 : quads=1 : EndIf
    rc=NeonVkChromeCreateWithCapacities(phys,dev,queue,pool,renderPass,framebuffer,800,1280,4,quads)
    If rc<>0 : ProcedureReturn 242 : EndIf
    If Bool(nvcFanPipeline<>0)<>mode : ProcedureReturn 243 : EndIf
@@ -74,7 +74,7 @@ Procedure.i fanTopologyProof(phys.i,dev.i,queue.i,pool.i,renderPass.i,framebuffe
     If rc=0 : rc=NeonVkChromeBoxBatchEnd() : EndIf
     If rc<>0 : NeonVkChromeAbort() : ProcedureReturn 247 : EndIf
     PokeI($E1C01018,nvcVertices)
-    If nvcVertices<>27-mode*4 Or nvcDrawCount<>3 : NeonVkChromeAbort() : ProcedureReturn 248 : EndIf
+    If nvcVertices<>23 Or nvcDrawCount<>3 : NeonVkChromeAbort() : ProcedureReturn 248 : EndIf
    Else
     verts=nvcVertices : draws=nvcDrawCount : freeRows=avkRecordedDrawFreeCount
     For i=0 To 15 : PokeA(nvcMapped+verts*24+i,$A5) : Next
@@ -86,7 +86,7 @@ Procedure.i fanTopologyProof(phys.i,dev.i,queue.i,pool.i,renderPass.i,framebuffe
      If PeekA(nvcMapped+verts*24+i)<>$A5 : NeonVkChromeAbort() : ProcedureReturn 250 : EndIf
     Next
     PokeI($E1C01020,verts) : PokeI($E1C01028,quads*6)
-    If verts<>9-mode*4 Or draws<>1 : NeonVkChromeAbort() : ProcedureReturn 251 : EndIf
+    If verts<>5 Or draws<>1 : NeonVkChromeAbort() : ProcedureReturn 251 : EndIf
    EndIf
    rc=NeonVkChromeEnd()
    If rc<>0 : ProcedureReturn 252 : EndIf
@@ -103,14 +103,14 @@ EndProcedure
 (d/'helper.pi4').write_text(helper,encoding='utf8')
 s=(r/'RaspberryPi4/Examples/Diagnostics/vulkanNeonWidgetAll15Proof.pi4').read_text(encoding='utf8').replace('#NW_PROOF_MODE        = 0','#NW_PROOF_MODE        = 1',1)
 if variant=='fallback':
- b=(r/'Anvil/Graphics/Vulkan/vk_v3d_backend.pi4').read_text(encoding='utf8');assert b.count(' | #ANVIL_VK_CAP_TRIANGLE_FAN')==1;b=b.replace(' | #ANVIL_VK_CAP_TRIANGLE_FAN','',1);f=d/'masked-backend.pi4';f.write_text(b,encoding='utf8');s=s.replace('Anvil/Graphics/Vulkan/vk_v3d_backend.pi4',f.resolve().as_posix(),1)
+ b=(r/'RaspberryPi4/Lib/Vulkan/vk_v3d_backend.pi4').read_text(encoding='utf8');assert b.count(' | #ANVIL_VK_CAP_TRIANGLE_FAN')==1;b=b.replace(' | #ANVIL_VK_CAP_TRIANGLE_FAN','',1);f=d/'masked-backend.pi4';f.write_text(b,encoding='utf8');s=s.replace('RaspberryPi4/Lib/Vulkan/vk_v3d_backend.pi4',f.resolve().as_posix(),1)
 if variant=='no-restore':
- adapter=(r/'Anvil/Graphics/Vulkan/neon_vk_chrome.pi4').read_text(encoding='utf8')
- needle='      If nvcFanPipeline <> 0 : vkCmdBindPipeline(nvcCommand, #VK_PIPELINE_BIND_POINT_GRAPHICS, nvcPipeline) : EndIf'
+ adapter=(r/'Anvil/Graphics/Vulkan/neon_vk_chrome.pbi').read_text(encoding='utf8')
+ needle='      vkCmdBindPipeline(nvcCommand, #VK_PIPELINE_BIND_POINT_GRAPHICS, nvcPipeline)'
  assert adapter.count(needle)==1
  adapter=adapter.replace(needle,'      ; Diagnostic control: deliberately omit topology restoration.',1)
  f=d/'no-restore-adapter.pi4';f.write_text(adapter,encoding='utf8')
- s=s.replace('Anvil/Graphics/Vulkan/neon_vk_chrome.pi4',f.resolve().as_posix(),1)
+ s=s.replace('Anvil/Graphics/Vulkan/neon_vk_chrome.pbi',f.resolve().as_posix(),1)
 at=s.index('Procedure.i Main()');s=s[:at]+helper+'\n'+s[at:];s=s.replace('Procedure.i Main()','Procedure.i FanDiagnosticMain()',1)
 s=s.replace('  ; Destroy the production adapter first:','  PokeI($E1C01000,fanTopologyProof(phys,dev,queue,pool,renderPass,framebuffer,imageBase,imagePitch))\n  ; Destroy the production adapter first:',1)
 s+='''

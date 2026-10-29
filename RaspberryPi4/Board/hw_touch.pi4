@@ -100,6 +100,7 @@ Global gTouchErr.i = 0            ; a whole sentence, or 0
 Global gTouchFlip.i = #SCR_TOUCH_ALIGNED   ; the axis correction in use
 Global gTouchTick.i = 0           ; Ticks() at the last controller read
 Global gTouchTicked.i = 0         ; 1 once gTouchTick means anything
+Global gTouchFrameSeq.i = 0
 Global gTouchPollSeq.i = 0        ; increments only when a bus poll is attempted
 
 Global Dim gTouchQ.a[#HW_TOUCH_QMAX * #HW_TOUCH_EVSZ]
@@ -618,6 +619,7 @@ Procedure.i HwTouchTick()
 
   TouchMapFrame()
   TouchEmitFrame()
+  gTouchFrameSeq=gTouchFrameSeq+1
   ProcedureReturn gTouchPrevN
 EndProcedure
 
@@ -789,4 +791,10 @@ Procedure TouchBoot()
   Print(" turned ")
   PrintDec(TouchRotation())
   PrintN(" degrees.")
+EndProcedure
+
+; Advances only for a validated controller frame, including an empty one.
+; A rate-limited/not-ready poll must not re-arm a UI over an old contact.
+Procedure.i HwTouchFrameSequence()
+  ProcedureReturn gTouchFrameSeq
 EndProcedure

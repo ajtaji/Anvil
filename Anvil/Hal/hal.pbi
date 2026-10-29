@@ -121,6 +121,20 @@
 ;  capability flags claim, and a clean "unsupported" path (via the gate)
 ;  for the ones they do not.
 ;
+;    Hardware entropy: callers supply a writable destination and positive byte
+;    count, serialize access, and never treat availability as a health result.
+;                 HwEntropyAvailable()  1 if a provider is compiled, otherwise 0.
+;                 HwEntropyRead(dst,n)  initialize if needed, bounded warm-up,
+;                                      health-checked collection. Return n only
+;                                      for a complete read; a negative provider
+;                                      status or short count is failure. Partial
+;                                      output may exist on failure; the caller
+;                                      must wipe it. Never substitute predictable
+;                                      data or restart a healthy warmed source.
+;    Providers own the hardware wait limits and preserve diagnostic statuses.
+;    A missing provider must return a negative unsupported status without writes.
+;    These are entropy-source operations, not a DRBG or TLS protocol interface.
+;
 ;    HwVkDma*  (Pi 4 Vulkan backend only) guarded coherent buffer copy and
 ;              fill into the registered offscreen heap. The board owns the
 ;              DMA write window, cache maintenance and display-bound restore.
@@ -1212,6 +1226,26 @@
 ;                                        this is an admission ABI: the common
 ;                                        payload reader compares it exactly
 ;                                        against v2 compiler provenance
+;                 HwPmfStackAllowed(lo, hi)
+;                                        admission of an inclusive initial
+;                                        payload stack interval. Return 1
+;                                        only if the complete interval is
+;                                        in board-owned payload stack space;
+;                                        return 0 otherwise, including a
+;                                        reversed interval. No allocation,
+;                                        memory access through lo/hi, or
+;                                        state change is permitted.
+;                                        Board policy may include a dedicated
+;                                        stack corridor as well as payload
+;                                        windows; monitor/device reservations
+;                                        must remain excluded. The common
+;                                        PMF reader separately checks ABI
+;                                        alignment and image/BSS overlap.
+;                                        PMF v2 supplies only the initial
+;                                        stack top, so this is not proof of
+;                                        safety for arbitrary later growth.
+;                                        Pi 3/Pi 4 memmap and Q qstubs own
+;                                        their respective implementations.
 ;                 HwIdEl()               the exception level, 0..3, READ
 ;                                        from the running processor. Never
 ;                                        a constant: it was one, and it was
@@ -1779,6 +1813,14 @@
 ;                                        Never Print() it - see the note
 ;                                        at the foot of this file.
 ;                 HwReboot()             reset the board. Does not return.
+;                 HwPet()                feed an armed payload deadman, if
+;                                        this board provides one; otherwise
+;                                        a no-op. Safe when disarmed. This
+;                                        is the existing backend of ABI
+;                                        slot 6 (SvcPet), not a new slot.
+;                                        Only a running caller pets for
+;                                        itself; the monitor must never
+;                                        feed on a payload's behalf.
 ;                 HwMmuState()           bit 0 MMU on, bit 1 D-cache on,
 ;                                        bit 2 I-cache on. THE PAYLOAD
 ;                                        ASKS RATHER THAN ASSUMING,
@@ -2665,10 +2707,7 @@ EndProcedure
 ; CONTACT - a palm, a reset, a wet screen - and it is NOT the same as
 ; _UP. A UI that treats it as _UP will fire a button the driver did not
 ; press, which on this product is a duty-status change nobody made.
-#HW_TOUCH_DOWN   = 0
-#HW_TOUCH_MOVE   = 1
-#HW_TOUCH_UP     = 2
-#HW_TOUCH_CANCEL = 3
+XIncludeFile "Anvil/Hal/touch_event.pbi"
 
 ; The quality of a satellite fix, as HwGnssFix() returns it.
 #HW_GNSS_NOFIX = 0
@@ -2815,3 +2854,93 @@ Procedure.i RequireCap(cap.i, *name, *reason)
   UartWriteNl()
   ProcedureReturn 0
 EndProcedure
+
+
+; ----------------------------------------------------------------------
+;  STATIC VULKAN EXECUTION SEAM
+;
+;  The shared Vulkan foundation declares this existing link-time contract.
+;  A composition chooses exactly one executor: absent, validation-only,
+;  software, or the board's GPU implementation. These are alternative
+;  implementations of one contract, never multiple executors in one image.
+;  All handles, command validation and public object lifetimes remain in
+;  Anvil/Graphics/Vulkan/vk_foundation.pbi and its shared modules.
+;
+;  The authoritative typed declarations, result meanings, job structures,
+;  asynchronous completion and GPU-lease ownership contracts are beside
+;  these names in vk_foundation.pbi. Listing the same exact names here makes
+;  their existing seam status visible to the common architecture gate.
+;  No namespace wildcard or implementation-specific helper is a contract.
+;
+;    avkBackendCaps()
+;    avkBackendName()
+;    avkBackendPrepare()
+;    avkBackendHeapBase()
+;    avkBackendHeapBytes()
+;    avkBackendMemoryTypeCount()
+;    avkBackendMemoryTypeFlags(index.i)
+;    avkBackendMemoryTypeHeap(index.i)
+;    avkBackendHeapCount()
+;    avkBackendHeapSizeOf(index.i)
+;    avkBackendHeapFlagsOf(index.i)
+;    avkBackendImageAlignment()
+;    avkBackendImageCopySourceAlignment()
+;    avkBackendRowPitchFor(width.i)
+;    avkBackendMaxImageDimension2D()
+;    avkBackendRenderAreaGranularity(*out.VkExtent2D)
+;    avkBackendSampledMaxDimension2D(tiling.i)
+;    avkBackendImagePlan(width.i, height.i, format.i, tiling.i, usage.i, *plan.AnvilVkBackendImagePlan)
+;    avkBackendImageCopyValidate(*copy.AnvilVkBackendImageCopy)
+;    avkBackendImageCopyBatchReady()
+;    avkBackendSubmitImageCopy(*copy.AnvilVkBackendImageCopy)
+;    avkBackendTiledImageCopyValidate(*copy.AnvilVkBackendTiledImageCopy)
+;    avkBackendSubmitTiledImageCopy(*copy.AnvilVkBackendTiledImageCopy)
+;    avkBackendTiledRectCopyValidate(*copy.AnvilVkBackendTiledRectCopy)
+;    avkBackendSubmitTiledRectCopy(*copy.AnvilVkBackendTiledRectCopy)
+;    avkBackendTiledEdgeTailCopyValidate(*copy.AnvilVkBackendTiledRectCopy)
+;    avkBackendSubmitTiledEdgeTailCopy(*copy.AnvilVkBackendTiledRectCopy)
+;    avkBackendTiledMicroCopyValidate(*copy.AnvilVkBackendTiledRectCopy)
+;    avkBackendSubmitTiledMicroCopy(*copy.AnvilVkBackendTiledRectCopy)
+;    avkBackendLinearTiledRectCopyValidate(*copy.AnvilVkBackendLinearTiledRectCopy)
+;    avkBackendSubmitLinearTiledRectCopy(*copy.AnvilVkBackendLinearTiledRectCopy)
+;    avkBackendLinearTiledMicroCopyValidate(*copy.AnvilVkBackendLinearTiledRectCopy)
+;    avkBackendSubmitLinearTiledMicroCopy(*copy.AnvilVkBackendLinearTiledRectCopy)
+;    avkBackendLinearTiledGridCopyValidate(*copy.AnvilVkBackendLinearTiledRectCopy)
+;    avkBackendSubmitLinearTiledGridCopy(*copy.AnvilVkBackendLinearTiledRectCopy)
+;    avkBackendTiledReadbackValidate(*copy.AnvilVkBackendTiledReadback)
+;    avkBackendSubmitTiledReadback(*copy.AnvilVkBackendTiledReadback)
+;    avkBackendTiledMicroReadbackValidate(*copy.AnvilVkBackendTiledReadback)
+;    avkBackendSubmitTiledMicroReadback(*copy.AnvilVkBackendTiledReadback)
+;    avkBackendSubmitBufferCopy(source.i, destination.i, bytes.i)
+;    avkBackendSubmitBufferCopyRows(source.i, sourcePitch.i, destination.i, destinationPitch.i, rowBytes.i, rows.i)
+;    avkBackendSubmitBufferFill(destination.i, bytes.i, data.i)
+;    avkBackendClearSupported(base.i, bytes.i, w.i, h.i, pitch.i)
+;    avkBackendSubmitClear(base.i, bytes.i, w.i, h.i, pitch.i, bgra.i, loadColor.i)
+;    avkBackendPoll()
+;    avkBackendLastNativeError()
+;    avkBackendTicksUs()
+;    avkBackendComputeCanLower(*ir)
+;    avkBackendComputeScratchBytes()
+;    avkBackendSubmitCompute(*job.AnvilVkBackendComputeJob, *result.AnvilVkBackendComputeResult)
+;    avkBackendGpuLeaseAcquire(owner.i)
+;    avkBackendGpuLeaseRelease(owner.i)
+;    avkBackendGpuLeaseQuarantine(owner.i)
+;    avkBackendGpuLeaseState()
+;    avkBackendGpuLeaseRequired()
+;    avkBackendPipelineBytes()
+;    avkBackendPipelineBuild(*build.AnvilVkBackendPipelineBuildInfo)
+;    avkBackendPipelineRelease(pipe.i)
+;    avkBackendDrawSupported(base.i, bytes.i, w.i, h.i, pitch.i)
+;    avkBackendSubmitDraw(*payload)
+
+
+; Neon native lifecycle provider. Shared policy is in neon_lifecycle.pbi;
+; exactly one provider is linked by its composition. The Pi 4 provider owns
+; GPU operations; controlled CPU diagnostic providers own no hardware. These
+; exact operations are the contract, not a wildcard over renderer internals.
+;    NeonHardwareLifecycleFlags() read-only OWNER=1 and hardware FRAME=2 bits
+;    NeonHardwareCoordinateReset() invalidate native coordinate caches only
+;    NeonHardwareInit() native initialization after the shared Init prelude
+;    NeonHardwareShutdown() native owner release and native state cleanup
+;    NeonHardwareFrameBegin(colour.i) begin native recording without dispatch
+;    NeonHardwareFrameEnd() finish native recording/execution without dispatch

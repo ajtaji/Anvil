@@ -13,7 +13,16 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--purebasic', required=True, help='Path to the host PureBasic compiler.')
 PB = pathlib.Path(parser.parse_args().purebasic).resolve()
-monitor = (ROOT/'Anvil/Services/Http/monitor.pbi').read_text()
+monitor = (ROOT/'Anvil/Services/Http/monitor.pbi').read_text(encoding='utf8')
+poll = (ROOT/'Anvil/Services/Http/poll.pbi').read_text(encoding='utf8')
+# Host PureBasic spells untyped indirect calls and procedure addresses
+# differently. The physical PMF fixture uses the unchanged target source.
+assert poll.count('gHttpPollCallback()') == 1
+poll = poll.replace('Global *gHttpPollCallback', 'Global gHttpPollCallback.i')
+poll = poll.replace('gHttpPollCallback()', 'CallFunctionFast(gHttpPollCallback)')
+monitor = monitor.replace('XIncludeFile "Anvil/Services/Http/poll.pbi"', poll)
+assert monitor.count('@http_MonitorPoll') == 1
+monitor = monitor.replace('@http_MonitorPoll', '@http_MonitorPoll()')
 source = (ROOT/'Anvil/Core/tcp_cmd.pbi').read_text()
 command = re.search(r'(?ms)^Procedure CmdHttp\(\).*?^EndProcedure',source).group()
 prefix = r'''
@@ -24,6 +33,7 @@ Global output.s,verb.s
 Global nextArg.i,argCount.i,opened.i,started.i,polled.i,enginePolled.i,stopped.i
 Global openResult.i=1,startResult.i=1,serviceResult.i=1,capResult.i=1
 Global checks.i,failures.i
+Global failureDetails.s
 Global Dim args.i(4)
 Procedure Capture(value.s)
   output+value
@@ -88,6 +98,7 @@ Procedure Check(actual.i,expected.i)
   If actual<>expected
     failures+1
     Capture("FAILED "+Str(checks))
+    failureDetails+"check "+Str(checks)+": actual "+Str(actual)+", expected "+Str(expected)+Chr(10)
   EndIf
 EndProcedure
 Procedure ResetCase(first.s,second.s="")
@@ -108,6 +119,7 @@ Procedure ResetCase(first.s,second.s="")
   enginePolled=0 : stopped=0 : ht_owned=0 : ht_port=0
   openResult=1 : startResult=1 : serviceResult=1 : capResult=1
 EndProcedure
+HttpServerInit()
 ResetCase("<absent>") : CmdHttp()
 Check(ht_port,8080) : Check(started,1) : Check(opened,1)
 Check(polled,1) : Check(enginePolled,1)
@@ -146,6 +158,7 @@ ResetCase("<absent>") : verb="unknown" : CmdHttp()
 Check(started,0) : Check(stopped,0)
 UndefineMacro PrintN
 PrintN(Str(checks)+" command checks; failures="+Str(failures))
+PrintN(failureDetails)
 End failures
 '''
 with tempfile.TemporaryDirectory(prefix='anvil-http-command-') as folder:

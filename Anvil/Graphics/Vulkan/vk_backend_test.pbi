@@ -32,6 +32,10 @@ Global avkTbClearH.i = 0
 Global avkTbHold.i = 0
 Global avkTbBusy.i = 0
 Global avkTbFail.i = 0
+; Draw-admission injectors are opt-in and one-shot. They model the portable
+; transaction contract only; this backend owns no GPU and writes no pixels.
+Global avkTbDrawRefusalArmed.i, avkTbDrawRefusalCode.i
+Global avkTbDrawRawResult.i, avkTbLeaseReleaseFail.i
 Global avkTbPollFail.i = 0
 Global avkTbTicks.i = 0
 Global avkTbCalls.i = 0
@@ -139,6 +143,19 @@ EndProcedure
 ; Make the next submission fail with this native code, as a device fault.
 Procedure AnvilVkTestBackendFailNext(code.i)
   avkTbFail = code
+EndProcedure
+
+Procedure AnvilVkTestBackendRefuseNextDraw(code.i)
+  avkTbDrawRefusalArmed = 1 : avkTbDrawRefusalCode = code
+EndProcedure
+
+Procedure AnvilVkTestBackendRawDrawResultNext(code.i)
+  If code >= 0 : code = -1 : EndIf
+  avkTbDrawRawResult = code
+EndProcedure
+
+Procedure AnvilVkTestBackendFailNextLeaseRelease()
+  avkTbLeaseReleaseFail = 1
 EndProcedure
 
 Procedure AnvilVkTestBackendObserveRetains(uboBuffer.i, uboMemory.i, sampleSampler.i, sampleView.i, sampleImage.i, sampleMemory.i, attachmentView.i, attachmentImage.i, attachmentMemory.i)
@@ -254,6 +271,10 @@ EndProcedure
 
 Procedure.i avkBackendGpuLeaseRelease(owner.i)
   If avkTbLeaseRequired = 0 Or owner < 1 Or avkTbLeaseOwner <> owner : ProcedureReturn 0 : EndIf
+  If avkTbLeaseReleaseFail <> 0
+    avkTbLeaseReleaseFail = 0
+    ProcedureReturn 0
+  EndIf
   avkTbLeaseOwner = 0
   ProcedureReturn 1
 EndProcedure
@@ -664,7 +685,9 @@ Procedure.i avkBackendClearSupported(base.i, bytes.i, w.i, h.i, pitch.i)
   ProcedureReturn #VK_SUCCESS
 EndProcedure
 
-Procedure.i avkBackendSubmitClear(base.i, bytes.i, w.i, h.i, pitch.i, bgra.i)
+Procedure.i avkBackendSubmitClear(base.i, bytes.i, w.i, h.i, pitch.i, bgra.i, loadColor.i)
+  ; This state-only backend does not advertise preservation.
+  If loadColor <> 0 : ProcedureReturn -1 : EndIf
   avkTbCalls = avkTbCalls + 1
   avkTbLastBase = base
   avkTbLastBytes = bytes
@@ -898,6 +921,7 @@ Procedure.i avkBackendSubmitDraw(*payload)
   Define tbk.i
   Define *tbb.AnvilVkBackendBinding
   Define *tbs.AnvilVkBackendSampledImage
+  Define admissionResult.i
   If *payload = 0 : ProcedureReturn -1 : EndIf
   If (avkTbCaps & #ANVIL_VK_CAP_DRAW_LIST) <> 0
     *list = *payload
@@ -925,6 +949,14 @@ Procedure.i avkBackendSubmitDraw(*payload)
     EndIf
     draw = draw + 1
   Wend
+  If avkTbDrawRefusalArmed <> 0
+    avkTbDrawRefusalArmed = 0
+    ProcedureReturn avkBackendRefuseBeforeLaunch(avkTbDrawRefusalCode)
+  EndIf
+  If avkTbDrawRawResult <> 0
+    admissionResult = avkTbDrawRawResult : avkTbDrawRawResult = 0
+    ProcedureReturn admissionResult
+  EndIf
   avkTbCalls = avkTbCalls + 1
   avkTbDraws = avkTbDraws + *list\drawCount
   draw = 0

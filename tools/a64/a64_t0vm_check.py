@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Executable gate for RaspberryPi4/Lib/t0vm.pi4 - the T0 threaded-bytecode
+"""Executable gate for Anvil/Crypto/t0vm.pbi - the T0 threaded-bytecode
 virtual machine on AArch64.
 
 WHY THIS FILE IS WRITTEN THE WAY IT IS
@@ -103,7 +103,7 @@ sys.path.insert(0, str(HERE))
 PMFC = os.environ.get("PMF_COMPILER") or "PureMetalForge.exe"  # rebound from --compiler
 # Every compile resolves includes from THIS tree only.
 BUILD_ENV = dict(os.environ, PMF_ROOT=str(ROOT))
-T0VM = ROOT / "RaspberryPi4" / "Lib" / "t0vm.pi4"
+T0VM = ROOT / "Anvil" / "Crypto" / "t0vm.pbi"
 WORK = ROOT / "_work"
 
 # The checked-in PEM decoder blob, and the BearSSL C it is lifted from.
@@ -1772,7 +1772,7 @@ def main(argv=None):
     s = build_script(pemdec, certs, K,
                      level="quick" if args.quick else "full")
     img = WORK / "t0harness.img"
-    src = render_harness("RaspberryPi4/Lib/t0vm.pi4", pemdec, certs, gen)
+    src = render_harness("Anvil/Crypto/t0vm.pbi", pemdec, certs, gen)
     size = build(src, WORK / "t0harness.pi4", img)
     print("[gate] PEM decoder blob %s: code %d, data %d, caddr %d, "
           "opmap %d, T0_INTERPRETED %d, entry %d"

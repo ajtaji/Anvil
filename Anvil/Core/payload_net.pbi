@@ -1,3 +1,4 @@
+XIncludeFile "Anvil/Services/wifi_maintenance.pbi"
 ; ======================================================================
 ;  payload_net.pbi - THE NETWORK A PAYLOAD REACHES. The engine behind the
 ;  service table's net group (base 72, Anvil/Hal/abi.pbi).
@@ -956,7 +957,7 @@ Procedure.i PayNetService(sliceMs.i)
   ; desk gate compares the two lists. Slots 0, 1 and 3 there are the
   ; mouse, touch, screen, fan and temperature - the payload's, or not the
   ; network's - and are deliberately absent.
-  WifiLinkTick()
+  WifiMaintenanceTick()
   NetDhcpTick()
   CompilerIf #CAP_NET = 1
     NtpServiceTick()
@@ -1090,7 +1091,7 @@ Procedure PayNetPayloadReturned()
   TcpUse(keep)
   paynet_DnsCancel()
   UartMessageBegin()
-  WifiLinkCheckNow()
-  WifiLinkTick()
+  WifiMaintenanceCheckNow()
+  WifiMaintenanceTick()
   UartMessageEnd()
 EndProcedure

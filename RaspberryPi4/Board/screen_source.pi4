@@ -724,6 +724,8 @@ EndProcedure
 ;
 ; w/h are logical capture dimensions; panelW/panelH/pitch describe the physical
 ; raster beneath them. ScrCapturePixel applies the one common rotation map.
+XIncludeFile "RaspberryPi4/Board/screen_frame_present.pi4"
+
 Procedure.i ScrCaptureSnapshot(*base, *w, *h, *pitch, *rot, *panelW, *panelH, *bpp)
   If DisplayMemorySafe() = 0 : ProcedureReturn 0 : EndIf
   Define fb.i
@@ -737,7 +739,12 @@ Procedure.i ScrCaptureSnapshot(*base, *w, *h, *pitch, *rot, *panelW, *panelH, *b
     If gScrDsiUp = 0
       ProcedureReturn 0
     EndIf
-    fb = #MON_FB_SCAN
+    CompilerIf #PMF_CHIP = 2711
+      fb = ScrFrameFront()
+    CompilerElse
+      ; Other controllers retain their existing capture source and format.
+      fb = #MON_FB_SCAN
+    CompilerEndIf
     pw = #MON_FB_PANEL_W
     ph = #MON_FB_PANEL_H
     p = pw * 4

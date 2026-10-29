@@ -1,3 +1,5 @@
+XIncludeFile "Anvil/Hal/aarch64_counter.pbi"
+
 ; Arm architectural timer access shared by every RK3399 core.
 ; No board MMIO clock is guessed. Every wait has both a timer deadline and an
 ; instruction ceiling so a trapped or frozen counter cannot wedge cold boot.
@@ -5,19 +7,12 @@ Global rock_timer_frequency.i
 Global rock_timer_error.i
 #ROCK_TIMER_FREQUENCY_EXPECTED = 24000000
 
-ProcedureNaked.i RockTimerFrequencyRaw()
-  ASM
-    mrs x0, cntfrq_el0
-    ret
-  ENDASM
+Procedure.i RockTimerFrequencyRaw()
+  ProcedureReturn A64CounterFrequency()
 EndProcedure
 
-ProcedureNaked.i RockTimerTicks()
-  ASM
-    isb
-    mrs x0, cntpct_el0
-    ret
-  ENDASM
+Procedure.i RockTimerTicks()
+  ProcedureReturn A64CounterReadOrdered()
 EndProcedure
 
 ; Portable Anvil wallclock seam for the shared HwFile timestamp path.

@@ -4,8 +4,8 @@
 ; SPDX-License-Identifier: MIT
 ;
 ; This file is deliberately NOT included by vk_api.pbi, advertised as an
-; extension, or connected to a display driver.  It is the object, ownership
-; and transaction layer a future HDMI/DSI WSI provider can call.  A provider
+; extension, or itself a display driver. It is the object, ownership
+; and transaction layer used by the private DSI source provider. A provider
 ; completion is explicit: this module never claims a scanout or asynchronous
 ; presentation happened merely because state was queued.
 ;
@@ -294,6 +294,31 @@ Procedure.i avkWsiProviderInfoValid(*info.AnvilVkWsiProviderInfo)
   ProcedureReturn 1
 EndProcedure
 
+; Core owns parent destruction; WSI supplies read-only extension-child checks.
+Procedure.i avkWsiGuardDeviceChildren(device.i)
+  Define d.i, n.i
+  d = avkDevSlot(device)
+  If d = 0 : ProcedureReturn #ANVIL_VK_ERR_HANDLE : EndIf
+  For n = 1 To #ANVIL_VK_WSI_MAX_SWAPCHAINS
+    If avkWsiSwapLive[n] <> 0 And avkWsiSwapDev[n] = d And avkWsiSwapDevGen[n] = avkTokenGen(device)
+      ProcedureReturn avkFault(#ANVIL_VK_ERR_STATE, "vkDestroyDevice still owns a WSI swapchain; release its images and destroy the chain first. No child or parent was changed.")
+    EndIf
+  Next
+  ProcedureReturn #VK_SUCCESS
+EndProcedure
+
+Procedure.i avkWsiGuardInstanceChildren(instance.i)
+  Define inst.i, n.i
+  inst = avkInstSlot(instance)
+  If inst = 0 : ProcedureReturn #ANVIL_VK_ERR_HANDLE : EndIf
+  For n = 1 To #ANVIL_VK_WSI_MAX_SURFACES
+    If avkWsiSurfLive[n] <> 0 And avkWsiSurfInst[n] = inst And avkWsiSurfInstGen[n] = avkTokenGen(instance)
+      ProcedureReturn avkFault(#ANVIL_VK_ERR_STATE, "vkDestroyInstance still owns a WSI surface; destroy the surface first. No child or parent was changed.")
+    EndIf
+  Next
+  ProcedureReturn #VK_SUCCESS
+EndProcedure
+
 Procedure.i avkWsiProviderRegister(*info.AnvilVkWsiProviderInfo, *out)
   Define p.i
   Define i.i
@@ -305,6 +330,9 @@ Procedure.i avkWsiProviderRegister(*info.AnvilVkWsiProviderInfo, *out)
   p = 1
   While p <= #ANVIL_VK_WSI_MAX_PROVIDERS And avkWsiProvLive[p] <> 0 : p = p + 1 : Wend
   If p > #ANVIL_VK_WSI_MAX_PROVIDERS : ProcedureReturn #VK_ERROR_TOO_MANY_OBJECTS : EndIf
+  ; Install before publishing any provider that can create extension children.
+  *avkDeviceChildGuard = @avkWsiGuardDeviceChildren
+  *avkInstanceChildGuard = @avkWsiGuardInstanceChildren
   avkWsiProvGen[p] = avkNextGen(avkWsiProvGen[p])
   avkWsiProvLive[p] = 1
   avkWsiProvCookie[p] = *info\cookie
@@ -613,6 +641,19 @@ Procedure.i avkWsiImageState(device.i, swapchain.i, imageIndex.i)
   ProcedureReturn avkWsiSwapImageState[avkWsiImageIndex(s, imageIndex)]
 EndProcedure
 
+ ; A held image remains releasable after loss/resize, but is no longer writable.
+; Retirement alone does not invalidate an image acquired before retirement.
+Procedure.i avkWsiAcquiredValidate(device.i,swapchain.i,imageIndex.i,imageKey.i)
+  Define s.i,surf.i
+  If imageKey=0 Or avkWsiImageKey(device,swapchain,imageIndex)<>imageKey : ProcedureReturn #ANVIL_VK_ERR_HANDLE : EndIf
+  s=avkWsiSwapchainSlot(swapchain)
+  surf=avkWsiSurfaceSlot(avkWsiSwapSurface[s])
+  If surf=0 Or surf<>avkWsiSwapSurfSlot[s] : ProcedureReturn #VK_ERROR_SURFACE_LOST_KHR : EndIf
+  If avkWsiSurfLost[surf]<>0 : ProcedureReturn #VK_ERROR_SURFACE_LOST_KHR : EndIf
+  If avkWsiSwapOutOfDate[s]<>0 Or avkWsiSurfSerial[surf]<>avkWsiSwapSerial[s] : ProcedureReturn #VK_ERROR_OUT_OF_DATE_KHR : EndIf
+  If avkWsiSwapImageState[avkWsiImageIndex(s,imageIndex)]<>#ANVIL_VK_WSI_IMAGE_ACQUIRED : ProcedureReturn #ANVIL_VK_ERR_STATE : EndIf
+  ProcedureReturn #VK_SUCCESS
+EndProcedure
 Procedure.i avkWsiMarkRenderReady(device.i, swapchain.i, imageIndex.i)
   Define s.i
   If avkWsiImageKey(device, swapchain, imageIndex) = 0 : ProcedureReturn #ANVIL_VK_ERR_HANDLE : EndIf
@@ -706,6 +747,7 @@ Procedure.i avkWsiPresentCommit(ticket.i)
   Define t.i
   Define i.i
   Define s.i
+  Define surf.i
   Define index.i
   t = avkWsiPresentSlot(ticket)
   If t = 0 : ProcedureReturn #ANVIL_VK_ERR_HANDLE : EndIf
@@ -718,6 +760,13 @@ Procedure.i avkWsiPresentCommit(ticket.i)
     index = avkWsiPresentImage[avkWsiPresentIndex(t, i)]
     If s = 0 Or s <> avkWsiPresentSwapSlot[avkWsiPresentIndex(t, i)] : ProcedureReturn #ANVIL_VK_ERR_STATE : EndIf
     If avkWsiSwapDev[s] <> avkWsiPresentDev[t] Or avkWsiSwapDevGen[s] <> avkWsiPresentDevGen[t] : ProcedureReturn #ANVIL_VK_ERR_STATE : EndIf
+    ; Reservation does not pin the provider's surface epoch. Revalidate every
+    ; item before the mutation pass, so one stale item cannot partially commit
+    ; the batch. Retirement alone still permits already-acquired images.
+    surf = avkWsiSurfaceSlot(avkWsiSwapSurface[s])
+    If surf = 0 Or surf <> avkWsiSwapSurfSlot[s] : ProcedureReturn #VK_ERROR_SURFACE_LOST_KHR : EndIf
+    If avkWsiSurfLost[surf] <> 0 : ProcedureReturn #VK_ERROR_SURFACE_LOST_KHR : EndIf
+    If avkWsiSwapOutOfDate[s] <> 0 Or avkWsiSurfSerial[surf] <> avkWsiSwapSerial[s] : ProcedureReturn #VK_ERROR_OUT_OF_DATE_KHR : EndIf
     If avkWsiSwapImageState[avkWsiImageIndex(s, index)] <> #ANVIL_VK_WSI_IMAGE_RENDER_READY : ProcedureReturn #ANVIL_VK_ERR_STATE : EndIf
     i = i + 1
   Wend
@@ -729,6 +778,33 @@ Procedure.i avkWsiPresentCommit(ticket.i)
     i = i + 1
   Wend
   avkWsiPresentStage[t] = #ANVIL_VK_WSI_PRESENT_COMMITTED
+  ProcedureReturn #VK_SUCCESS
+EndProcedure
+
+; Read-only freshness query for a display owner before accepting a completed
+; transaction. Rollback/completion remain available after invalidation to return
+; ownership; a stale presentation must not be made successful by this query.
+Procedure.i avkWsiPresentValidate(ticket.i)
+  Define t.i, i.i, s.i, surf.i, index.i
+  t = avkWsiPresentSlot(ticket)
+  If t = 0 : ProcedureReturn #ANVIL_VK_ERR_HANDLE : EndIf
+  If avkWsiPresentStage[t] <> #ANVIL_VK_WSI_PRESENT_COMMITTED : ProcedureReturn #ANVIL_VK_ERR_STATE : EndIf
+  If avkWsiPresentDev[t] < 1 Or avkWsiPresentDev[t] > #ANVIL_VK_MAX_DEVICES : ProcedureReturn #ANVIL_VK_ERR_OWNER : EndIf
+  If avkDevLive[avkWsiPresentDev[t]] = 0 Or avkDevGen[avkWsiPresentDev[t]] <> avkWsiPresentDevGen[t] : ProcedureReturn #ANVIL_VK_ERR_OWNER : EndIf
+  i = 0
+  While i < avkWsiPresentCount[t]
+    s = avkWsiSwapchainSlot(avkWsiPresentSwap[avkWsiPresentIndex(t, i)])
+    index = avkWsiPresentImage[avkWsiPresentIndex(t, i)]
+    If s = 0 Or s <> avkWsiPresentSwapSlot[avkWsiPresentIndex(t, i)] : ProcedureReturn #ANVIL_VK_ERR_STATE : EndIf
+    If avkWsiSwapDev[s] <> avkWsiPresentDev[t] Or avkWsiSwapDevGen[s] <> avkWsiPresentDevGen[t] : ProcedureReturn #ANVIL_VK_ERR_OWNER : EndIf
+    surf = avkWsiSurfaceSlot(avkWsiSwapSurface[s])
+    If surf = 0 Or surf <> avkWsiSwapSurfSlot[s] : ProcedureReturn #VK_ERROR_SURFACE_LOST_KHR : EndIf
+    If avkWsiSurfLost[surf] <> 0 : ProcedureReturn #VK_ERROR_SURFACE_LOST_KHR : EndIf
+    If avkWsiSwapOutOfDate[s] <> 0 Or avkWsiSurfSerial[surf] <> avkWsiSwapSerial[s] : ProcedureReturn #VK_ERROR_OUT_OF_DATE_KHR : EndIf
+    If index < 0 Or index >= avkWsiSwapImageCount[s] : ProcedureReturn #ANVIL_VK_ERR_STATE : EndIf
+    If avkWsiSwapImageState[avkWsiImageIndex(s, index)] <> #ANVIL_VK_WSI_IMAGE_PRESENT_PENDING : ProcedureReturn #ANVIL_VK_ERR_STATE : EndIf
+    i = i + 1
+  Wend
   ProcedureReturn #VK_SUCCESS
 EndProcedure
 

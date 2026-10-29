@@ -7,8 +7,8 @@ import pathlib as _pmfpath
 from pmf_compiler import resolve_compiler
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-GATE = ROOT / "Anvil/Graphics/Vulkan/Tests/vulkan_v3d_backend_list_gate.pi4"
-BACKEND = ROOT / "Anvil/Graphics/Vulkan/vk_v3d_backend.pi4"
+GATE = ROOT / "RaspberryPi4/Tests/Vulkan/vulkan_v3d_backend_list_gate.pi4"
+BACKEND = ROOT / "RaspberryPi4/Lib/Vulkan/vk_v3d_backend.pi4"
 COMPILER = pathlib.Path(r"C:\Embedded Compiler\PureBasicCode\OpenGl Work\ArduinoBasic\PureMetalForge.exe")
 LOAD, STACK, LR, OUT = 0x400000, 0x3000000, 0xDEAD0000, 0x7000000
 MAGIC = 0x564C3344

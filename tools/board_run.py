@@ -78,7 +78,7 @@ the flow the firewall keeps. See docs/BOARD_RUN.md. A record that also
 carries a `finished` timestamp is one this tool wrote the ending of; a
 record without one was killed where its `stage` says.
 
-PRE-FLIGHT UDP LOSS. `version` and `map` are read-only. If either has no
+PRE-FLIGHT UDP LOSS. `version`, `map` and `shot status` are read-only. If one has no
 complete echo-anchored reply, this tool records received-byte/echo evidence,
 opens a fresh console, confirms its prompt, and retries that command once.
 `net recv` and `boot mem` remain single-shot. A timed-out deadman arm is
@@ -1128,16 +1128,17 @@ class NetConsole:
 
 
 def read_only_command_with_recovery(
-        console: NetConsole, line: str, seconds: float
+        console: NetConsole, line: str, seconds: float, *, preserve_console: bool = False
         ) -> tuple[NetConsole, str, dict | None]:
-    """Retry only version/map once after an incomplete UDP response.
+    """Retry exact read-only identity/capture/run/health queries after UDP loss.
 
     A fresh socket gets a new peer claim and firewall flow. A prompt probe
     must complete before the second send; if it cannot, leave the original
     timeout as a failure. Upload, deadman and boot never enter this helper.
     """
-    if line not in ("version", "map"):
-        raise ValueError("recovery is restricted to read-only version/map")
+    if line not in ("version", "map", "shot status", "last run",
+                    "info", "net", "font info", "vkstat", "deadman"):
+        raise ValueError("recovery is restricted to exact read-only identity, capture, run and health queries")
     try:
         return console, console.command(line, seconds), None
     except CommandTimeout as first:
@@ -1172,6 +1173,14 @@ def read_only_command_with_recovery(
                              f"{'seen' if first.echo_seen else 'not seen'}; "
                              "retrying once on a fresh console]\n"] +
                             fresh.transcript)
+        if preserve_console:
+            # A status-only caller may still own the original connection.
+            # Merge evidence, close the temporary query socket and leave that
+            # caller's object/socket alive. Its next send reclaims the peer.
+            console.transcript = fresh.transcript
+            console.accepted_datagrams.extend(fresh.accepted_datagrams)
+            fresh.close()
+            return console, answer, detail
         console.close()
         return fresh, answer, detail
 
@@ -1269,10 +1278,17 @@ def verified_ram_upload(console: NetConsole, board_ip: str, port: int,
         for offset in range(0, len(data), RAM_UPLOAD_CHUNK_BYTES):
             part = data[offset:offset + RAM_UPLOAD_CHUNK_BYTES]
             def chunk_stage(name, detail, at=offset):
-                stage(name, {**detail, "chunk_offset": at, "total_bytes": len(data)})
-            report = verified_ram_upload(console, board_ip, port, address + offset,
-                                         part, hashlib.sha256(part).hexdigest(),
-                                         label=f"{label} chunk at +{offset:X}", on_stage=chunk_stage)
+                stage(name, {**detail, "chunk_offset": at,
+                             "verified_prefix_bytes": at, "total_bytes": len(data)})
+            try:
+                report = verified_ram_upload(console, board_ip, port, address + offset,
+                                             part, hashlib.sha256(part).hexdigest(),
+                                             label=f"{label} chunk at +{offset:X}", on_stage=chunk_stage)
+            except StreamError as error:
+                raise StreamError(
+                    f"RAM upload stopped with {offset} previously verified prefix bytes "
+                    f"at {address:08X}; current chunk starts at {address + offset:08X}. "
+                    f"Nothing was booted. {error}") from error
             chunks.append({"offset": offset, **report})
         # Per-chunk checks alone cannot authorize boot: re-read the complete
         # contiguous destination after every piece has been written.
@@ -1300,7 +1316,7 @@ def verified_ram_upload(console: NetConsole, board_ip: str, port: int,
         stage("listener armed" if why == "needle" else "listener unconfirmed",
               {"listener_observation": observation})
         if why != "needle":
-            raise StreamError("No image was sent and nothing was booted. " +
+            raise StreamError("No bytes were sent in this transfer attempt and nothing was booted. " +
                               listener_failure(why, listen, line, observation["reply_datagrams"]))
         send_started = time.monotonic()
         try:
@@ -1461,8 +1477,18 @@ def arm_deadman_with_recovery(
 def capture_fatal_exception(console: NetConsole, initial: str,
                             datagram_start: int, deadman_seconds: int,
                             record: dict, failures: list[str]) -> None:
-    """Finish and publish one terminal exception without transmitting."""
-    reset_wait = float(deadman_seconds + 5) if deadman_seconds > 0 else 0.0
+    """Preserve a failed run, then allow its watchdog reboot to finish.
+
+    A watchdog expiry is not a boot-complete event. Allow another 90 seconds
+    before one fresh, read-only identity query if no prompt was observed.
+    This never retries the payload or turns its exception into a passing run.
+    """
+    boot_grace = 90.0 if deadman_seconds > 0 else 0.0
+    reset_wait = float(deadman_seconds + 5) + boot_grace if deadman_seconds > 0 else 0.0
+    if reset_wait:
+        print(f"  processor exception: preserving the report and allowing "
+              f"{reset_wait:.0f} s for the watchdog and reboot; no payload retry",
+              flush=True)
     evidence, boundary = console.collect_exception(
         initial, cap=max(30.0, reset_wait + 5.0), reset_wait=reset_wait)
     try:
@@ -1477,7 +1503,27 @@ def capture_fatal_exception(console: NetConsole, initial: str,
         "boundary": boundary, "complete": complete,
         "fields": fields, "text": evidence,
         "datagrams": [{"bytes": len(data), "hex": data.hex()} for data in raw],
+        "boot_grace_seconds": boot_grace,
     }
+    if reset_wait and boundary != "prompt+quiet":
+        fresh = None
+        recovery = {"ready": False, "command": "version", "attempts": 1}
+        try:
+            fresh = NetConsole(console.addr[0], console.addr[1])
+            answer = fresh.command("version", 10.0)
+            if not re.search(r"(?m)^build \d+ date \d{8} time \d{6}$",
+                             answer.replace("\r", "")):
+                raise StreamError("recovery reply lacks a complete monitor build identity")
+            recovery.update(ready=True, version=answer)
+            print("  monitor answered after the boot window; the payload still failed",
+                  flush=True)
+        except (StreamError, OSError) as error:
+            recovery["error"] = str(error)
+        finally:
+            if fresh is not None:
+                console.transcript.extend(fresh.transcript)
+                fresh.close()
+        record["exception"]["recovery"] = recovery
     if complete:
         failures.append(
             "the payload stopped at a complete processor-exception record; "
@@ -1530,7 +1576,10 @@ def ask_after_silence(console: NetConsole, args: argparse.Namespace,
         # A MONITOR WITHOUT THE RECORD. The capture on return is the one other
         # thing that is written only by a payload coming back, so when it was
         # armed and its number moved it is still evidence of a return.
-        status = console.command("shot status", 10)
+        _, status, retry = read_only_command_with_recovery(
+            console, "shot status", 10, preserve_console=True)
+        if retry is not None:
+            record.setdefault("console_retries", []).append(retry)
         seq = parse_shot_status_seq(status)
         shot_x0 = parse_shot_status_x0(status)
         if not args.no_shot and seq > seq_before and shot_x0 is not None:
@@ -1913,8 +1962,16 @@ def run(args: argparse.Namespace) -> int:
         # sequence to compare and need not spend a UDP command on this.
         before = 0
         if not args.no_shot:
-            before = parse_shot_status_seq(console.command("shot status", 10))
+            journal.step("capture baseline")
+            console, status, retry = read_only_command_with_recovery(
+                console, "shot status", 10)
+            journal.console = console
+            if retry is not None:
+                record.setdefault("console_retries", []).append(retry)
+                print("  shot status: recovered one incomplete UDP reply on a fresh console")
+            before = parse_shot_status_seq(status)
             record["shot_seq_before"] = before
+            journal.step("capture baseline")
 
         # ---- the transfer -------------------------------------------------
         # THE LISTENER IS ARMED WITHOUT WAITING FOR A PROMPT, because the
@@ -1968,7 +2025,22 @@ def run(args: argparse.Namespace) -> int:
         # the jump and at nothing else, so if the return line goes missing
         # and this number has not moved, nothing was entered. A monitor
         # without `last run` refuses the word, and that is recorded as None.
-        before_run = parse_last_run(console.command("last run", 10))
+        record["boot_attempted"] = False
+        journal.step("pre-boot run status")
+        try:
+            console, status, recovery = read_only_command_with_recovery(
+                console, "last run", 10)
+        except (StreamError, OSError) as error:
+            failures.append(
+                f"pre-boot last-run status could not be confirmed; "
+                f"nothing was booted. {error}")
+            journal.step("pre-boot run status refused")
+            raise RunStopped()
+        journal.console = console
+        if recovery is not None:
+            record["last_run_before_recovery"] = recovery
+            print("  last run: recovered one incomplete read-only UDP reply on a fresh console")
+        before_run = parse_last_run(status)
         record["last_run_before"] = before_run
 
         # ---- the run --------------------------------------------------------
@@ -1977,6 +2049,7 @@ def run(args: argparse.Namespace) -> int:
         console.settle(quiet=0.3, cap=3.0)
         started = time.monotonic()
         exception_datagram_start = len(console.accepted_datagrams)
+        record["boot_attempted"] = True
         journal.step("boot")
         console.send(line)
         # THE PROMPT ENDS THIS STEP AS SURELY AS THE RETURN LINE DOES, and

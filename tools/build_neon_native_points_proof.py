@@ -69,9 +69,12 @@ Procedure.i pointProof(phys.i,dev.i,queue.i,pool.i,rp.i,fb.i,base.i,pitch.i)
  If rc<>0 Or NeonVkChromePresentConsume()<>1 : ProcedureReturn 390 : EndIf
  For i=0 To 4095 : PokeL($E2400000+i*4,PeekL(base+(i/64)*pitch+(i%64)*4)) : Next
  If mode<>0
-  ; The same staging boundary applies to native two-point line inputs.
-  ; Retain the separate, still-open expansion refusal as explicit evidence.
+  ; Check the same line staging boundary with a deliberately small output
+  ; buffer. Production compact lines now fit the normal full-size buffer.
   SafetyWatchdogPet()
+  NeonVkChromeDestroy()
+  rc=NeonVkChromeCreateWithCapacities(phys,dev,queue,pool,rp,fb,800,1280,4,1)
+  If rc<>0 : ProcedureReturn 396 : EndIf
   rc=NeonVkChromeBegin(@nwClear[0])
   If rc=0 : rc=NeonLinesBegin() : EndIf
   If rc<>0 : ProcedureReturn 391 : EndIf
@@ -88,6 +91,7 @@ Procedure.i pointProof(phys.i,dev.i,queue.i,pool.i,rp.i,fb.i,base.i,pitch.i)
    If PeekA(nvcMapped+i)<>$A5 : NeonVkChromeAbort() : ProcedureReturn 394 : EndIf
   Next
   PokeI($E1C01088,1)
+  PokeI($E1C01090,nvcMaxVertexQuads*6) : PokeI($E1C01098,2)
   rc=NeonVkChromeAbort()
   If rc<>0 : ProcedureReturn 395 : EndIf
  EndIf

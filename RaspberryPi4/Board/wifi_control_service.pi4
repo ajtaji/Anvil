@@ -1,0 +1,15 @@
+; Composition provider for explicit Wi-Fi command actions and incident events.
+; Included after the Pi driver; this adapter owns no radio state or protocol.
+XIncludeFile "Anvil/Services/wifi_control.pbi"
+Procedure.i HwWifiControlDispatch(operation.i,first.i,second.i)
+  Select operation
+    Case #WIFI_CONTROL_MANUAL_BEGIN : WifiEpManualBegin(first)
+    Case #WIFI_CONTROL_MANUAL_FAILED : WifiEpManualFailed(first,second)
+    Case #WIFI_CONTROL_RECOVERED : WifiEpisodeRecovered()
+    Case #WIFI_CONTROL_DEAF : WifiDeaf(first,second)
+    Case #WIFI_CONTROL_REKEY : ProcedureReturn WifiRekeyAsk(first)
+    Default : ProcedureReturn #WIFI_CONTROL_UNAVAILABLE
+  EndSelect
+  ProcedureReturn 0
+EndProcedure
+WifiControlBind(@HwWifiControlDispatch)

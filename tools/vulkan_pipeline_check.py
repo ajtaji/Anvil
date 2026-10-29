@@ -43,9 +43,9 @@ sys.path.insert(0, str(HERE))
 import vulkan_spirv_check as spv  # noqa: E402  - the SPIR-V assembler lives there
 from pmf_compiler import resolve_compiler as _pmf_resolve_compiler  # noqa: E402
 
-GATE = ROOT / "Anvil" / "Graphics" / "Vulkan" / "Tests" / "vulkan_pipeline_gate.pi4"
-EMITTER = ROOT / "Anvil" / "Graphics" / "Vulkan" / "vk_v3d_shader.pi4"
-LOWERER = ROOT / "Anvil" / "Graphics" / "Vulkan" / "vk_ir_v3d42.pi4"
+GATE = ROOT / 'RaspberryPi4/Tests/Vulkan/vulkan_pipeline_gate.pi4'
+EMITTER = ROOT / 'RaspberryPi4/Lib/Vulkan/vk_v3d_shader.pi4'
+LOWERER = ROOT / 'Anvil/Graphics/Vulkan/vk_ir_v3d42.pbi'
 PIPELINE = ROOT / "Anvil" / "Graphics" / "Vulkan" / "vk_pipeline.pbi"
 # The board diagnostic is not executed here - it needs the GPU - but it is
 # BUILT, so it cannot rot silently between slots. A diagnostic that no

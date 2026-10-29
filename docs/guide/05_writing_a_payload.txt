@@ -582,3 +582,65 @@ btu_txTimeout and records BtuWhy(). Close always restores the console and
 clears the queue even when draining fails. Startup/open resets the mode;
 other boards and existing clients retain their previous blocking behavior.
 Queue peak occupancy is available as btu_txPeak for bounded diagnostics.
+
+
+@SECTION Streaming web requests
+
+An application can include Anvil/Network/web_payload.pbi and bind its service
+table with WebPayloadBind. The composition requires the existing ABI 1.6 DNS,
+TCP, TLS and network-service slots. It adds caller-owned HTTP request, response,
+redirect and content-decoding contexts; it does not install a second network
+stack or change the resident service table. The kernel composition uses the
+same client algorithms through direct service calls.
+
+Parse the URL into separate host and target buffers, finalize a WebRequest,
+initialize a WebResponse, and start a WebClient. Pump WebPayloadService from
+the application loop and call WebClientStep. A step reports consumed upload
+bytes and written response bytes. Keep unsent input and unread output until
+they have been consumed. Zero output capacity applies backpressure. Close the
+client when finished or cancel it explicitly; use one total deadline for the
+exchange rather than restarting a timeout after every packet.
+
+Requests can stream a known byte count or chunked input. A known-length body
+must contain exactly its declared number of bytes. Responses handle interim
+status lines, length-delimited or chunked bodies, trailers, HEAD and bodyless
+statuses. Conflicting lengths, unsupported transfer framing, premature EOF and
+invalid headers fail explicitly. Body bytes can be binary. A completed response
+may permit a subsequent request on the same connection, but unread bytes or an
+unfinished upload prevent reuse.
+
+@NOTE The HTTP step has bounded parsing and transport operations. The existing TLS provider still performs key-share and certificate arithmetic synchronously and has one global TLS connection. Multiple HTTP contexts do not remove those limits, and a successful network test is not proof of a display-frame budget. Keep certificate, hostname and date verification enabled; TLS requires a trusted clock and root store.
+
+@SECTION Redirects and compressed responses
+
+WebClientFollowRedirect continues a completed, drained redirect response using
+separate next URL, request and response contexts. It resolves relative Location
+values, rebuilds Host and framing, and keeps the original total deadline across
+all hops. Configure a maximum hop count. HTTPS downgrade is refused unless
+explicitly allowed. POST 301/302 and non-HEAD 303 can become GET; preserving an
+upload requires replayable input, and replaying an unsafe method requires an
+explicit option. Authorization, Cookie and arbitrary custom credentials are
+not copied to another origin. Keep the current buffers alive until the helper
+has finished, then rotate the two context sets.
+
+For decoded content, initialize a separate WebContent context from the completed
+response headers with WebContentFromResponse. Identity, gzip and zlib-wrapped
+deflate are supported. Supply a 32 KiB history buffer, an 11,008-byte table
+workspace aligned to eight bytes, and a decoded-output limit. Feed transfer
+body bytes to WebContentFeed, retaining any unconsumed bytes before requesting
+more from WebClientStep. Set endInput only after the HTTP body has completed,
+and continue draining until the decoder reports verified completion.
+
+Gzip checks optional headers, per-member CRC32 and size, and supports concatenated
+members. Deflate checks its zlib header, window size and Adler-32. Invalid coding,
+bad checksums, missing final bytes, metadata limits and output-limit violations
+are errors. Unknown or stacked content encodings and preset dictionaries are
+refused. Decoded bytes can be delivered before their checksum is known, so a
+partial file must not be treated as a verified download.
+
+The detailed API and ownership rules are in docs/WEB_CLIENT.md. Physical Pi 4
+qualification covers fragmented input, output backpressure, binary upload
+encoding, redirects, reusable HTTPS connections and live compressed responses.
+Other boards use the shared code but need their own physical qualification.
+IPv6 and international host conversion, HTTP/2 and HTTP/3, WebSocket upgrades,
+Brotli, Zstandard and managed authentication/cookies remain separate work.

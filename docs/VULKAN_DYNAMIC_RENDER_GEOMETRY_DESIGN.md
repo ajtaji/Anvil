@@ -209,3 +209,30 @@ The focused desk gate executes 84 properties over 108,668 emitted A64
 instructions without one MMIO access, compiles all three board diagnostics,
 and rejects all sixteen independently injected errors.  The silicon record
 above supplies the one rule that cannot be reached with the engine down.
+
+
+## Positive render-target extents - 28 October 2026
+
+The Pi4 backend and native Neon surface/rebind validation now accept positive
+width and height down to one pixel, matching the existing V3D planner. Capacity,
+mapped extent, pitch, output-format and display-ownership guards are retained.
+For a one-pixel axis the native integer coordinate transform uses centre/scale
+one instead of zero. That enclosing viewport still maps pixel coordinates
+identically; the actual framebuffer extent, clipping and tile-store limits
+remain one pixel. Larger geometries retain their previous transform.
+
+A physical returning candidate on Anvil 388 passes 45 target/filter checks,
+142 idle-scope checks, 164 target-pool checks and 297 scripted UI checks. It
+renders and samples a 2x2 red/blue attachment with both nearest and linear
+filtering, then renders a 1x1 green attachment and samples two magnified pixels.
+All expected colors pass, including exact green FF00FF00 for the 1x1 image.
+The existing 24,511 retained-parent pixels and 4,096,000-byte scanout equality
+also pass. Capture 35 returns zero in 13.3 seconds with healthy monitor state,
+zero display timeouts and watchdog off. All 141 corrupted trace/pixel controls
+are rejected. The original 2x2 refusal remains in the previous evidence archive.
+
+This changes the Pi4 hardware adapter and its native engine; the portable
+Vulkan planner already accepted positive extents. Other hardware backends are
+not changed or execution-qualified. The installed 388 image still predates
+this candidate. This does not establish every format, extent, rotation or
+presentation path, or full engine/Vulkan conformance.

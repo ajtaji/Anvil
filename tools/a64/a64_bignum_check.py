@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Executable gate for RaspberryPi4/Lib/bignum.pi4 - the i15 big-integer
+"""Executable gate for Anvil/Crypto/bignum.pbi - the i15 big-integer
 core on AArch64.
 
 WHY THIS FILE IS WRITTEN THE WAY IT IS
@@ -88,7 +88,7 @@ PMFC = os.environ.get("PMF_COMPILER") or "PureMetalForge.exe"  # rebound from --
 BUILD_ENV = dict(os.environ, PMF_ROOT=str(ROOT))
 # --jobs, remembered for the pools that are not handed it directly.
 JOBS_CAP = None
-BIGNUM = ROOT / "RaspberryPi4" / "Lib" / "bignum.pi4"
+BIGNUM = ROOT / "Anvil" / "Crypto" / "bignum.pbi"
 WORK = ROOT / "_work"
 
 LOAD = 0x00400000
@@ -1129,7 +1129,7 @@ def mutate_source(idx, which, find, replace, harness_text):
         if harness_text.count(find) != 1:
             raise SystemExit("mutation anchor not unique in the harness:\n%r"
                              % find)
-        return "RaspberryPi4/Lib/bignum.pi4", harness_text.replace(
+        return "Anvil/Crypto/bignum.pbi", harness_text.replace(
             find, replace, 1)
     text = BIGNUM.read_text(encoding="utf-8")
     if text.count(find) != 1:
@@ -1381,7 +1381,7 @@ def main(argv=None):
 
     s = build_script(g, subset=args.quick)
     img = WORK / "bnharness.img"
-    size = build("RaspberryPi4/Lib/bignum.pi4", WORK / "bnharness.pi4", img)
+    size = build("Anvil/Crypto/bignum.pbi", WORK / "bnharness.pi4", img)
     print("[gate] image %d bytes, %d jobs" % (size, len(s)))
     t0 = time.time()
     bad, steps = run_all(img, s, jobs=args.jobs)

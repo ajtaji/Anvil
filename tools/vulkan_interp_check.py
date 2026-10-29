@@ -36,7 +36,7 @@ ROOT = HERE.parent
 sys.path.insert(0, str(HERE))
 from pmf_compiler import resolve_compiler as _pmf_resolve_compiler  # noqa: E402
 
-GATE = ROOT / "Anvil" / "Graphics" / "Vulkan" / "Tests" / "vulkan_interp_gate.pi4"
+GATE = ROOT / 'RaspberryPi4/Tests/Vulkan/vulkan_interp_gate.pi4'
 EXPECT = ROOT / "Anvil" / "Graphics" / "Vulkan" / "vk_interp_expect.pbi"
 # THE BOARD DIAGNOSTIC IS NOT BUILT HERE, and that is deliberate: it pulls in
 # the SPIR-V front end and the whole pipeline layer, which tools/vulkan_spirv_check.py

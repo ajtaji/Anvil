@@ -2736,6 +2736,76 @@ Procedure.i DmaFill32(dst.i, pitch.i, widthPixels.i, rows.i, colour.i)
 EndProcedure
 
 ; ----------------------------------------------------------------------
+; DmaCopy - one contiguous run of bytes. LINEAR, not 2D.
+;
+; TDMODE clear, so TXFR_LEN is read as a single transfer of the full
+; thirty-bit length {YLENGTH, XLENGTH} (:3391-3400) - up to a gigabyte
+; in one control block, with no 65535-byte row limit and no stride
+; arithmetic to get wrong.
+;
+; THIS IS THE PRESENT PATH and it is why the linear case is a separate
+; entry point rather than "DmaCopy2D with one row". Pushing a whole
+; shadow buffer to a framebuffer whose pitch equals width*bpp is one
+; contiguous 8.29 MB run; expressing it as 1080 rows of 7680 bytes
+; would ask the engine to re-evaluate a stride 1080 times for no
+; reason. display.pi4's DspFlushSpan (:2316-2331) carves out the same
+; special case on the cache side, for the same reason and with the same
+; warning: this is ONLY correct when the region really is contiguous,
+; which for a surface means whole rows AND pitch = width * bpp.
+;
+; The overlap rule is DmaCopy2D's.
+; ----------------------------------------------------------------------
+Procedure.i DmaCopy(dst.i, src.i, bytes.i)
+  If dma_quarantined <> 0 : dma_err = #DMA_ERR_UNSAFE : ProcedureReturn 0 : EndIf
+  Protected ti.i
+
+  dma_err = #DMA_ERR_NONE
+
+  If dma_ready = 0
+    dma_err = #DMA_ERR_NOTREADY
+    ProcedureReturn 0
+  EndIf
+  If bytes < 1
+    dma_err = #DMA_ERR_ARGS
+    ProcedureReturn 0
+  EndIf
+  ; The whole of TXFR_LEN is thirty bits when TDMODE is clear.
+  If bytes > $3FFFFFFF
+    dma_err = #DMA_ERR_ARGS
+    ProcedureReturn 0
+  EndIf
+  If DmaDestOk(dst, bytes, bytes, 1) = 0
+    ProcedureReturn 0
+  EndIf
+  If DmaAddrOk(src, bytes) = 0
+    dma_err = #DMA_ERR_REACH
+    ProcedureReturn 0
+  EndIf
+
+  If dst < (src + bytes)
+    If src < (dst + bytes)
+      If dst > src
+        dma_err = #DMA_ERR_OVERLAP
+        ProcedureReturn 0
+      EndIf
+    EndIf
+  EndIf
+
+CompilerIf #PMF_CHIP = 2712
+  ProcedureReturn dma40_Rect(DmaBusAddr(dst), bytes, DmaBusAddr(src), bytes, 1, bytes, 1)
+CompilerEndIf
+  ti = 0
+  ti = ti | #DMA_TI_SRC_WIDTH
+  ti = ti | #DMA_TI_SRC_INC
+  ti = ti | #DMA_TI_DEST_WIDTH
+  ti = ti | #DMA_TI_DEST_INC
+  ti = ti | ((dma_burst & $F) << #DMA_TI_BURST_SHIFT)
+  ; TDMODE deliberately CLEAR, and the STRIDE word therefore unused.
+
+  ProcedureReturn DmaSubmit(ti, DmaBusAddr(src), DmaBusAddr(dst), bytes & $3FFFFFFF, 0)
+EndProcedure
+
+; ----------------------------------------------------------------------
 ; DmaCopy2D - copy a rectangle from one surface to another.
 ;
 ;   dst, dstPitch   where it goes, and that surface's row spacing
@@ -2821,6 +2891,13 @@ Procedure.i DmaCopy2D(dst.i, dstPitch.i, src.i, srcPitch.i, rowBytes.i, rows.i)
     EndIf
   EndIf
 
+  ; Equal source/destination pitch and row width describe one contiguous run.
+  ; Keep rectangular validation/error ordering above, then use the checked
+  ; linear engine path. Padded rows must retain the two-dimensional transfer.
+  If dstPitch = rowBytes And srcPitch = rowBytes
+    ProcedureReturn DmaCopy(dst, src, rowBytes * rows)
+  EndIf
+
 CompilerIf #PMF_CHIP = 2712
   ProcedureReturn dma40_Rect(DmaBusAddr(dst), dstPitch, DmaBusAddr(src), srcPitch, 1, rowBytes, rows)
 CompilerEndIf
@@ -2839,75 +2916,7 @@ CompilerEndIf
   ProcedureReturn DmaSubmit(ti, DmaBusAddr(src), DmaBusAddr(dst), lenWord, strideWord)
 EndProcedure
 
-; ----------------------------------------------------------------------
-; DmaCopy - one contiguous run of bytes. LINEAR, not 2D.
-;
-; TDMODE clear, so TXFR_LEN is read as a single transfer of the full
-; thirty-bit length {YLENGTH, XLENGTH} (:3391-3400) - up to a gigabyte
-; in one control block, with no 65535-byte row limit and no stride
-; arithmetic to get wrong.
-;
-; THIS IS THE PRESENT PATH and it is why the linear case is a separate
-; entry point rather than "DmaCopy2D with one row". Pushing a whole
-; shadow buffer to a framebuffer whose pitch equals width*bpp is one
-; contiguous 8.29 MB run; expressing it as 1080 rows of 7680 bytes
-; would ask the engine to re-evaluate a stride 1080 times for no
-; reason. display.pi4's DspFlushSpan (:2316-2331) carves out the same
-; special case on the cache side, for the same reason and with the same
-; warning: this is ONLY correct when the region really is contiguous,
-; which for a surface means whole rows AND pitch = width * bpp.
-;
-; The overlap rule is DmaCopy2D's.
-; ----------------------------------------------------------------------
-Procedure.i DmaCopy(dst.i, src.i, bytes.i)
-  If dma_quarantined <> 0 : dma_err = #DMA_ERR_UNSAFE : ProcedureReturn 0 : EndIf
-  Protected ti.i
 
-  dma_err = #DMA_ERR_NONE
-
-  If dma_ready = 0
-    dma_err = #DMA_ERR_NOTREADY
-    ProcedureReturn 0
-  EndIf
-  If bytes < 1
-    dma_err = #DMA_ERR_ARGS
-    ProcedureReturn 0
-  EndIf
-  ; The whole of TXFR_LEN is thirty bits when TDMODE is clear.
-  If bytes > $3FFFFFFF
-    dma_err = #DMA_ERR_ARGS
-    ProcedureReturn 0
-  EndIf
-  If DmaDestOk(dst, bytes, bytes, 1) = 0
-    ProcedureReturn 0
-  EndIf
-  If DmaAddrOk(src, bytes) = 0
-    dma_err = #DMA_ERR_REACH
-    ProcedureReturn 0
-  EndIf
-
-  If dst < (src + bytes)
-    If src < (dst + bytes)
-      If dst > src
-        dma_err = #DMA_ERR_OVERLAP
-        ProcedureReturn 0
-      EndIf
-    EndIf
-  EndIf
-
-CompilerIf #PMF_CHIP = 2712
-  ProcedureReturn dma40_Rect(DmaBusAddr(dst), bytes, DmaBusAddr(src), bytes, 1, bytes, 1)
-CompilerEndIf
-  ti = 0
-  ti = ti | #DMA_TI_SRC_WIDTH
-  ti = ti | #DMA_TI_SRC_INC
-  ti = ti | #DMA_TI_DEST_WIDTH
-  ti = ti | #DMA_TI_DEST_INC
-  ti = ti | ((dma_burst & $F) << #DMA_TI_BURST_SHIFT)
-  ; TDMODE deliberately CLEAR, and the STRIDE word therefore unused.
-
-  ProcedureReturn DmaSubmit(ti, DmaBusAddr(src), DmaBusAddr(dst), bytes & $3FFFFFFF, 0)
-EndProcedure
 
 
 ; ======================================================================

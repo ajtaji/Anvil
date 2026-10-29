@@ -206,7 +206,8 @@
 ;                         THE ETHERNET RECEIVE REGION under THE NETWORK.
 ;   $08200000..$0BFFFFFF  named DSI framebuffer, module arena, V3D arena
 ;                         and screenshot reservations (see memmap.pi4)
-;   $0C000000..$0CFFFFFF  monitor Vulkan device-memory heap
+;   $10000000..$13FFFFFF  Pi 4 monitor Vulkan device-memory heap
+;   $0C000000..$0CFFFFFF  Pi 5 reserved Vulkan heap (backend unqualified)
 ;   $0D000000..$0DFFFFFF  #MON_DATA_LO..#MON_DATA_HI - 16 MiB monitor BSS
 ;                         reservation, checked against the linker map.
 ;                         It follows the Vulkan heap and is protected by
@@ -1184,7 +1185,7 @@ StackAddress $8000000
 ;      #ANVIL_BUILD = 1        ; pmf:build off
 ;  The IDE's Compiler > Build Number... window writes that word for you.
 ; ======================================================================
-#ANVIL_BUILD = 338        ; pmf:build
+#ANVIL_BUILD = 416        ; pmf:build
 
 ;  The two optional siblings, written by the same successful build. They
 ;  are INTEGERS because `#NAME = <literal>` takes a number and nothing
@@ -1192,8 +1193,8 @@ StackAddress $8000000
 ;  constant, and inventing one would be a language change nobody asked
 ;  for. YYYYMMDD and HHMMSS read correctly as decimal numbers anyway, and
 ;  CmdVersion() prints them with their separators put back.
-#ANVIL_BUILD_DATE = 20261026   ; pmf:builddate
-#ANVIL_BUILD_TIME = 042351     ; pmf:buildtime
+#ANVIL_BUILD_DATE = 20261029   ; pmf:builddate
+#ANVIL_BUILD_TIME = 112855     ; pmf:buildtime
 
 ; ======================================================================
 ;  THE LIBRARIES. A library never includes a library - the main file
@@ -1481,7 +1482,8 @@ XIncludeFile "RaspberryPi4/Lib/usbmsc.pi4"
 ; linked above for the boot stick, so this costs one library and no new
 ; hardware bring-up.
 XIncludeFile "RaspberryPi4/Lib/hid.pi4"
-XIncludeFile "RaspberryPi4/Lib/usbserial.pi4"      ; a GNSS receiver on USB: CDC-ACM and the bridge chips
+XIncludeFile "RaspberryPi4/Lib/usbserial.pi4"
+XIncludeFile "RaspberryPi4/Board/usb_serial_service.pi4"      ; a GNSS receiver on USB: CDC-ACM and the bridge chips
 XIncludeFile "RaspberryPi4/Lib/emmc.pi4"
 XIncludeFile "RaspberryPi4/Lib/fat.pi4"
 ; THE HAL FOUNDATION - the capability gate (RequireCap) and the portable
@@ -1588,6 +1590,8 @@ XIncludeFile "RaspberryPi4/Lib/entropy.pi4"
 XIncludeFile "RaspberryPi4/Lib/drbg.pi4"
 XIncludeFile "Anvil/Net/wpa2sup.pbi"
 XIncludeFile "RaspberryPi4/Lib/wifi.pi4"
+XIncludeFile "RaspberryPi4/Board/wifi_maintenance_service.pi4"
+XIncludeFile "RaspberryPi4/Board/wifi_control_service.pi4"
 ; THE LINK SEAM AND TCP. hw_link.pi4 is the BOARD's side of the HwLink*
 ; seam and must come after BOTH drivers, because it is now the only file
 ; in this build that names them; link.pi4 is portable policy over that
@@ -1957,6 +1961,8 @@ XIncludeFile "Anvil/Core/crc.pbi"
 ; ReadLine. Both must follow state.pbi (gLine, #LINE_MAX) and
 ; display_globals.pi4 (gLastCR), and both must precede parse.pbi.
 XIncludeFile "Anvil/Core/input_events.pbi"
+XIncludeFile "Anvil/Core/input_ui.pbi"
+XIncludeFile "Anvil/Hal/input_service.pbi"
 XIncludeFile "Anvil/Core/text_edit.pbi"
 ; The touch keyboard's model - what the keys MEAN. It is portable Anvil
 ; code with no coordinates in it, and it belongs HERE, beside the
@@ -2072,6 +2078,7 @@ XIncludeFile "RaspberryPi4/Board/display.pi4"
 ; renderers and the input loop that pump it.
 XIncludeFile "RaspberryPi4/Board/console.pi4"
 XIncludeFile "RaspberryPi4/Board/cursor_input.pi4"
+XIncludeFile "RaspberryPi4/Board/native_input.pi4"
 ; The V3D/NeonArcade console backend, after the DMA console layer it draws
 ; alongside (it reuses DrawBanner/DisplayConsole to hand the screen back)
 ; and before screen_cmd.pi4, whose ScreenPump delegates to it and whose
@@ -2089,13 +2096,21 @@ CompilerIf #ANVIL_VULKAN_CONSOLE = 1 And #ANVIL_V3D_CONSOLE = 0
 CompilerError "#ANVIL_VULKAN_CONSOLE requires #ANVIL_V3D_CONSOLE"
 CompilerEndIf
 CompilerIf #ANVIL_VULKAN_CONSOLE = 1
+EnableFloatingPoint
 #ANVIL_VULKAN_BACKEND = 1
+XIncludeFile "Anvil/Hal/neon_service_api.pbi"
+XIncludeFile "Anvil/Hal/graphics_service.pbi"
 XIncludeFile "Anvil/Graphics/Vulkan/vk_api.pbi"
 XIncludeFile "Anvil/Graphics/Vulkan/vk_spirv_fixtures.pbi"
-XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_shader.pi4"
+XIncludeFile "RaspberryPi4/Lib/Vulkan/vk_v3d_shader.pi4"
 XIncludeFile "RaspberryPi4/Board/vulkan_dma.pi4"
+XIncludeFile "RaspberryPi4/Lib/Vulkan/vk_v3d_backend.pi4"
 XIncludeFile "Anvil/Graphics/Vulkan/vk_backend_select.pbi"
-XIncludeFile "Anvil/Graphics/Vulkan/neon_vk_chrome.pi4"
+XIncludeFile "Anvil/Graphics/Vulkan/neon_vk_chrome.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/neon_vk_port.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/neon_vk_sprite_port.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/neon_vk_font_port.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/neon_vk_prepared_lifecycle.pbi"
 XIncludeFile "RaspberryPi4/Board/vulkan_banner.pi4"
 XIncludeFile "Anvil/Graphics/truetype_renderer.pbi"
 XIncludeFile "Anvil/Graphics/truetype_raster_neon.pbi"
@@ -2351,6 +2366,7 @@ IncludeFile "Anvil/Graphics/truetype_renderer.pbi"
 CompilerEndIf
 XIncludeFile "Anvil/Graphics/truetype_renderer.pbi"
 XIncludeFile "Anvil/Core/font_cmd.pbi"
+XIncludeFile "Anvil/Core/font_boot_embedded.pbi"
 XIncludeFile "Anvil/Core/help.pbi"
 XIncludeFile "RaspberryPi4/Board/boot.pi4"
 XIncludeFile "Anvil/Kernel/exceptions.pbi"
@@ -2562,6 +2578,7 @@ Procedure Main()
   ; Capture synchronous failures from the earliest driver initialization.
   ; This installs only the current EL's vectors; it never unmasks IRQs.
   HwExceptionPrepare()
+  HttpServerInit()
   UartInit(115200)
   CompilerIf #PMF_CHIP = 2712
     If gPi5LoadWrong <> 0

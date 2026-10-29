@@ -5,8 +5,8 @@ from __future__ import annotations
 import argparse, contextlib, hashlib, importlib.util, os, pathlib, shutil, subprocess, sys, tempfile
 
 HERE=pathlib.Path(__file__).resolve().parent; ROOT=HERE.parent
-MODULE=ROOT/'Anvil/Graphics/Vulkan/vk_ir_v3d42.pi4'
-GATE=ROOT/'Anvil/Graphics/Vulkan/Tests/vulkan_ir_v3d42_gate.pi4'
+MODULE=ROOT/'Anvil/Graphics/Vulkan/vk_ir_v3d42.pbi'
+GATE=ROOT/'RaspberryPi4/Tests/Vulkan/vulkan_ir_v3d42_gate.pi4'
 LOAD=0x400000; STACK=0x3000000; LR=0xDEAD0000; MMIO=0xFC000000
 MAGIC=0x49523432; STEP_LIMIT=40_000_000
 

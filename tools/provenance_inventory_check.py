@@ -49,6 +49,7 @@ Exit status is 0 when every check passes and 1 when any fails.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 import subprocess
@@ -60,13 +61,22 @@ MANIFEST = ROOT / "PROVENANCE.json"
 INVENTORY = ROOT / "docs" / "PROVENANCE_INVENTORY.md"
 NOTICES = ROOT / "docs" / "THIRD_PARTY_NOTICES.md"
 
-SOURCE_SUFFIXES = (".pi4", ".pbi", ".unoq", ".asm", ".def")
+# Match compiler source forms inspected by layering_check, plus assembler and
+# intrinsic descriptions. A target's entrypoint must not escape citation review.
+SOURCE_SUFFIXES = (".pbi", ".pi4", ".pi3", ".unoq", ".rockpi4c", ".pb", ".asm", ".def")
 
 CONSULTED = "consulted"
 LICENSED_ADAPTATION = "licensed-adaptation"
+LICENSED_ASSET = "licensed-font-asset"
+LICENSED_FONT_ASSETS = {
+    ("RaspberryPi4/Monitor/anvil_boot_ttf.pi4", "dejavu-fonts"),
+    ("RaspberryPi4/Monitor/anvil_fonts.pi4", "dejavu-fonts"),
+}
 LICENSED_ADAPTATIONS = {
     ("RaspberryPi3/Board/armstub8.asm", "rpi-armstub8"),
     ("RaspberryPi4/Board/armstub8.asm", "rpi-armstub8"),
+    ("RaspberryPi5/Board/armstub8-2712.asm", "rpi-armstub8"),
+    ("RaspberryPi5/Board/armstub8-2712.asm", "rpi-tfa-bcm2712"),
 }
 REFUSED_CLASSES = ("derived", "verbatim")
 REFUSAL = (
@@ -101,16 +111,19 @@ def _git(*args: str) -> list[str]:
     return [p.strip() for p in out if p.strip()]
 
 
+class SourceInventoryError(RuntimeError):
+    """The authoritative Git source inventory could not be obtained."""
+
+
 def tracked_sources() -> list[str]:
     """Every Git-tracked source file, or every file on disk if Git is absent."""
     try:
         paths = _git("ls-files")
-    except (OSError, subprocess.CalledProcessError):
-        paths = [
-            str(p.relative_to(ROOT)).replace("\\", "/")
-            for p in ROOT.rglob("*")
-            if p.is_file() and ".git" not in p.parts
-        ]
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise SourceInventoryError(
+            "Git could not supply the tracked source inventory; citation review "
+            "was not run. No filesystem enumeration was attempted."
+        ) from error
     return sorted(p for p in paths if p.endswith(SOURCE_SUFFIXES))
 
 
@@ -125,8 +138,11 @@ def untracked_sources() -> list[str]:
     """
     try:
         paths = _git("ls-files", "--others", "--exclude-standard")
-    except (OSError, subprocess.CalledProcessError):
-        return []
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise SourceInventoryError(
+            "Git could not supply the untracked source inventory; publication "
+            "review is incomplete. No filesystem enumeration was attempted."
+        ) from error
     return sorted(p for p in paths if p.endswith(SOURCE_SUFFIXES))
 
 
@@ -147,6 +163,61 @@ def heading_anchors(text: str) -> set[str]:
     return anchors
 
 
+def font_asset_identity(text: str) -> dict:
+    """Decode only constant declarations and byte data; executable code refuses."""
+    canonical = []
+    data = bytearray()
+    active = False
+    sections = 0
+    for number, raw in enumerate(text.splitlines(), 1):
+        line = raw.split(";", 1)[0].strip()
+        if not line:
+            continue
+        canonical.append(line)
+        if line.lower() == "datasection" and not active:
+            active = True
+            sections += 1
+        elif line.lower() == "enddatasection" and active:
+            active = False
+        elif active and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*:", line):
+            pass
+        elif not active and re.fullmatch(r"#[A-Za-z_][A-Za-z0-9_]*\s*=\s*(?:[0-9]+|\$[0-9A-Fa-f]+)", line):
+            pass
+        elif active and re.fullmatch(r"Data\.[ab]\s+\$[0-9A-Fa-f]{2}(?:\s*,\s*\$[0-9A-Fa-f]{2})*", line, re.IGNORECASE):
+            data.extend(int(x, 16) for x in re.findall(r"\$([0-9A-Fa-f]{2})", line))
+        else:
+            raise ValueError(f"line {number} is not font byte data or a constant declaration")
+    if active or not sections or not data:
+        raise ValueError("font data sections must be nonempty and closed")
+    return {
+        "bytes": len(data),
+        "sha256": hashlib.sha256(data).hexdigest(),
+        "declarations_sha256": hashlib.sha256("\n".join(canonical).encode("utf-8")).hexdigest(),
+    }
+
+
+def check_font_asset(path: str, src: str, third_party: dict, report: Report) -> None:
+    if (path, src) not in LICENSED_FONT_ASSETS:
+        report.fail(f"{path}: licensed-font-asset is restricted to the two retained DejaVu data files")
+        return
+    record = third_party.get("licensed_font_assets", {}).get(path, {})
+    try:
+        actual = font_asset_identity((ROOT / path).read_text(encoding="utf-8"))
+        if actual != {key: record.get(key) for key in actual}:
+            raise ValueError("font bytes or declarations differ from the reviewed identity")
+        meta = third_party["sources"][src]
+        if record.get("source") != src or not meta.get("license_text"):
+            raise ValueError("font source or retained license reference is missing")
+        # Git checkouts may use LF or CRLF; the complete notice text must match.
+        license_bytes = (ROOT / meta["license_text"]).read_text(encoding="utf-8").encode("utf-8")
+        if hashlib.sha256(license_bytes).hexdigest() != record.get("license_sha256"):
+            raise ValueError("retained font license differs from the reviewed identity")
+    except (OSError, UnicodeError, ValueError, KeyError) as error:
+        report.fail(f"{path}: invalid licensed font asset: {error}")
+        return
+    report.ok()
+
+
 def check_classes(third_party: dict, report: Report) -> None:
     """1. Every pair is a permitted class, and every consulted pair cites."""
     sources = third_party["sources"]
@@ -158,6 +229,19 @@ def check_classes(third_party: dict, report: Report) -> None:
         )
         return
     anchors = heading_anchors(notices_text)
+
+    for path, src in LICENSED_ADAPTATIONS:
+        cls = third_party["classified_files"].get(path, {}).get(src)
+        if cls is not None and cls != LICENSED_ADAPTATION:
+            report.fail(f"{path}: reviewed boot-stub adaptation must remain classified {LICENSED_ADAPTATION}, not {cls}")
+    for path, src in LICENSED_FONT_ASSETS:
+        cls = third_party["classified_files"].get(path, {}).get(src)
+        if cls is not None and cls != LICENSED_ASSET:
+            report.fail(f"{path}: retained font data must be classified {LICENSED_ASSET}, not {cls}")
+    for path, record in third_party.get("licensed_font_assets", {}).items():
+        src = record.get("source")
+        if (path, src) not in LICENSED_FONT_ASSETS or third_party["classified_files"].get(path, {}).get(src) != LICENSED_ASSET:
+            report.fail(f"{path}: stale or unsupported licensed font asset record")
 
     cited_pairs: list[tuple[str, str, str]] = []
     for path, entry in third_party["classified_files"].items():
@@ -175,9 +259,11 @@ def check_classes(third_party: dict, report: Report) -> None:
                     f"{path}: classified '{cls}' against '{src}', which is not one of "
                     f"the classes PROVENANCE.json defines: {sorted(classifications)}"
                 )
-            elif cls in (CONSULTED, LICENSED_ADAPTATION):
+            elif cls in (CONSULTED, LICENSED_ADAPTATION, LICENSED_ASSET):
                 if cls == LICENSED_ADAPTATION and (path, src) not in LICENSED_ADAPTATIONS:
-                    report.fail(f"{path}: licensed-adaptation is reserved for the two Raspberry Pi armstubs")
+                    report.fail(f"{path}: licensed-adaptation is restricted to the reviewed Raspberry Pi boot-stub/source pairs")
+                if cls == LICENSED_ASSET:
+                    check_font_asset(path, src, third_party, report)
                 cited_pairs.append((path, src, cls))
 
     if not cited_pairs:
@@ -222,12 +308,25 @@ def check_classes(third_party: dict, report: Report) -> None:
                 f"on disk"
             )
             continue
-        if cls == LICENSED_ADAPTATION and not text:
-            report.fail(f"{path}: licensed adaptation has no retained license text")
+        if cls in (LICENSED_ADAPTATION, LICENSED_ASSET) and not text:
+            report.fail(f"{path}: {cls} has no retained license text")
             continue
-        if cls == LICENSED_ADAPTATION and not ref:
-            report.fail(f"{path}: licensed adaptation has no acknowledgment reference")
+        if cls in (LICENSED_ADAPTATION, LICENSED_ASSET) and not ref:
+            report.fail(f"{path}: {cls} has no acknowledgment reference")
             continue
+        if cls == LICENSED_ADAPTATION:
+            required = meta.get("required_copyright_notices", [])
+            if not required:
+                report.fail(f"{path}: licensed adaptation has no required copyright notices")
+                continue
+            body = (ROOT / path).read_text(encoding="utf-8")
+            retained = (ROOT / text).read_text(encoding="utf-8")
+            if any(notice not in body or notice not in retained for notice in required):
+                report.fail(f"{path}: licensed adaptation omits a required copyright notice")
+                continue
+            if hashlib.sha256(retained.encode("utf-8")).hexdigest() != meta.get("retained_license_sha256"):
+                report.fail(f"{path}: retained adaptation license differs from the reviewed text")
+                continue
         if ref:
             anchor = anchor_of(ref)
             if anchor and anchor not in anchors:
@@ -240,11 +339,13 @@ def check_classes(third_party: dict, report: Report) -> None:
 
     consulted_pairs = [(path, src) for path, src, cls in cited_pairs if cls == CONSULTED]
     adapted_pairs = [(path, src) for path, src, cls in cited_pairs if cls == LICENSED_ADAPTATION]
+    asset_pairs = [(path, src) for path, src, cls in cited_pairs if cls == LICENSED_ASSET]
     by_source = sorted({src for _, src, _ in cited_pairs})
     report.note(
         f"{len(consulted_pairs)} consulted pair(s) across {len(by_source)} source(s): "
         f"{', '.join(by_source)}; {len(adapted_pairs)} licensed adaptation(s) retain "
-        f"their license text and notice."
+        f"their license text and notice; {len(asset_pairs)} licensed font asset(s) "
+        f"check exact data, declarations and retained license bytes."
     )
 
 
@@ -450,7 +551,11 @@ def main() -> int:
         return 1
 
     check_classes(third_party, report)
-    files, uncited = check_citations(third_party, report)
+    try:
+        files, uncited = check_citations(third_party, report)
+    except SourceInventoryError as error:
+        print(f"Provenance inventory check FAILED: {error}")
+        return 1
     check_document(third_party, report)
     check_device_tree_pattern_selftest(third_party, report)
 

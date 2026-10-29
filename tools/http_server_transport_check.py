@@ -33,7 +33,7 @@ def main():
             assert (c.load(0x6000000,8),c.load(0x6000008,8))==(expected,0),(name,c.load(0x6000000,8),c.load(0x6000008,8))
             print(f'PASS: {name}: {expected} assertions, {steps} emitted instructions.')
         run(ROOT/'Anvil/Services/Http/Tests/transport.pi4','adapter',35)
-        text=(ROOT/'RaspberryPi4/Lib/tcp.pi4').read_text()
+        text=(ROOT/'Anvil/Network/tcp.pbi').read_text()
         start=text.index('Global Dim tcp_generation.i[#TCP_SOCKETS]')
         stop=text.index('  tcp_state = #TCP_CLOSED',start)
         prefix=text[start:stop]+'EndProcedure\n'

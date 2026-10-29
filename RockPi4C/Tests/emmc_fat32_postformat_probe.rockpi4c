@@ -1,5 +1,8 @@
 ; Independent read-only check of the eMMC user-area FAT32 metadata.
 ; pmf:target rockpi4c
+; Shared IEEE CRC owner; sector checksum includes the final inversion.
+#CRC_POLY = $EDB88320
+XIncludeFile "Anvil/Core/crc.pbi"
 XIncludeFile "RockPi4C/Lib/soc.pbi"
 XIncludeFile "RockPi4C/Lib/arch_timer.pbi"
 XIncludeFile "RockPi4C/Lib/uart2.pbi"
@@ -18,24 +21,10 @@ EndProcedure
 XIncludeFile "RockPi4C/Lib/cru.pbi"
 XIncludeFile "RockPi4C/Lib/emmc.pbi"
 
-Global Dim post_sector.a[511]
+Global Dim post_sector.a[512]
 
 Procedure.i PostCrc(*buffer)
-  Protected crc.i=$FFFFFFFF
-  Protected index.i
-  Protected bit.i
-  For index=0 To 511
-    crc=crc ! (PeekA(*buffer+index) & 255)
-    For bit=0 To 7
-      If (crc & 1)<>0
-        crc=(crc >> 1) ! $EDB88320
-      Else
-        crc=crc >> 1
-      EndIf
-    Next
-    crc=crc & $FFFFFFFF
-  Next
-  ProcedureReturn (crc ! $FFFFFFFF) & $FFFFFFFF
+  ProcedureReturn Crc32(*buffer,512)
 EndProcedure
 
 Procedure PostHex(value.i)

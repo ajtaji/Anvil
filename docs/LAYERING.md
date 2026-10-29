@@ -101,11 +101,12 @@ written in an expression is an implementation.
 | `dtb-magic` — `$D00DFEED` | `Anvil/Core/boot_cmd.pbi` | 4 |
 | `fat-dirent-longname` — the attribute byte against `$0F` | `Anvil/Storage/fat32.pbi` | 1 |
 | `pmfboot-container-magic` — PMFBOOT / P3SLOT as a raw word | `Anvil/Core/pmfboot.pbi`, `Anvil/Storage/ab_record.pbi` | 2 |
-| `generic-timer-read` — `mrs …, cntpct_el0` / `cntfrq_el0` | `RaspberryPi4/Lib/timer.pi4` | 47 in 25 files |
+| `generic-timer-read` — `mrs …, cntpct_el0` / `cntfrq_el0` | `Anvil/Hal/aarch64_counter.pbi` | migration in progress; legacy sites remain ratcheted |
 | `aarch64-mmu-attributes` — MAIR `$FF440C0400`, `$401`, `$70D`, `$711` | `RaspberryPi4/Lib/mmu.pi4` | 5 |
 
-`crc.pbi` takes `#CRC_POLY` from the includer on purpose and says so in its
-header, so a line that defines exactly `#CRC_POLY` is exempt. Any other
+`crc.pbi` includes the portable `crc_constants.pbi` owner of `#CRC_POLY`;
+monitor state includes that same owner. A line defining exactly `#CRC_POLY`
+is exempt. Any other
 spelling of the polynomial — `#CRC32_POLY`, or the value folded straight into
 a shift loop — is a second implementation and is counted.
 
@@ -132,6 +133,11 @@ exactly **10** times.
 A namespace that is meant to be public is in the wrong clothes: rename it
 with a capital, or declare it as a seam.
 
+An exact declared seam also permits a compiler-fixed legacy name such as
+`str_print_at`. That permits calls and addresses of that name, not other
+helpers with the same underscore prefix. The self-test includes both cases
+and verifies that mentioning a name in prose does not declare a seam.
+
 ### 5. One definition per name
 
 Two files that can be linked into the same image may not both define a name.
@@ -141,17 +147,38 @@ composition, which is its own program. Neither is a pair of definitions in
 exclusive `CompilerIf` branches — the gate tracks compiler-conditional
 definitions and does not count them against each other.
 
-45 names remain, and they fall into three classes:
+The original baseline recorded 45 names in three classes. The Vulkan seam
+is now explicitly declared; the remaining baseline classes still need review:
 
-- **28 `avkBackend*`** — the Vulkan link-time backend seam, three
-  implementations, one chosen per image. This is the model seam and it is
-  working as designed.
+- **The `avkBackend` contract** — Vulkan's link-time executor seam, with
+  absent, validation-only, software and hardware alternatives. Exactly one
+  is selected per image. Its exact typed declarations are in
+  `vk_foundation.pbi`; the names are now also explicitly documented in
+  `hal.pbi`, so the gate recognizes these alternatives as a seam rather
+  than counting them as duplicate implementations. No wildcard exemption
+  covers backend-private helpers.
 - **13 `NetConsole*`, `NetDhcpTick` and `HwDir*`** — a shared implementation
   and the board stub sets that replace it. Legal alternatives; they are here
   because the seam is not fully named in `hal.pbi` yet.
 - **4 genuine duplicates inside one board**: `Pi3ReadBe32`, `Pi3Park`,
   `Pi3BootMemory` and `Pi3BootMaxCoreClock`, each written twice in
   `RaspberryPi3/Board/`. These are real and should go.
+
+## Shared binary32 math owner, 26 October 2026
+
+`Anvil/Math/float32.pbi` owns the binary32 math used by the Neon float adapter.
+It contains no board calls or hardware accesses. The old Pi4 math path remains
+a compatibility include; shared code includes the shared owner directly. The
+caller still opts in with `EnableFloatingPoint`. All 52 procedure bodies and
+implementation data are unchanged. A complete Pi4 Neon/Vulkan float UI composition
+has identical raw and PMF bytes before and after. Including both paths emits the
+same probe as the shared path alone. Four AArch64 target interface probes compile;
+this is not a new numeric, performance or GPU runtime measurement. Evidence:
+`docs/evidence/neon-shared-float-math-20261026/`.
+
+The explicit review-index architecture result falls from 261 to 254 refused keys
+through ownership changes. The remaining refusal is not waived; the ratchet and
+gate are unchanged.
 
 ## What the parser does not see
 
@@ -269,3 +296,243 @@ run the gate is told their own commit caused them.
   compiler.
 - `Anvil/Hal/hal.pbi` — where a seam is declared, and the only place the gate
   reads one from.
+
+
+## Shared Neon ownership
+
+Renderer-neutral code has a shared implementation rather than a new seam
+exemption. `Anvil/Graphics/neon_frontend.pbi` owns callback binding, logical
+query routing and fallback counter declarations; `neon_colour.pbi` owns packed
+colour arithmetic, and `neon_bitmap_font.pbi` owns fixed bitmap state/metrics.
+The native renderer includes those implementations and retains hardware
+lifecycle guards, GPU ownership, packet emission and physical-resource queries.
+Compatibility wrappers delegate to the shared code.
+
+The frontend's private unbound callback targets use `nfc_`, not the native
+renderer's `neon_` prefix. Moving a module must not make it an owner of every
+unrelated native private helper merely by sharing that prefix. Tests exercise
+typed fallback behavior or provide fixture-owned callbacks; they do not rely
+on those private target names. No wildcard Neon seam or ratchet growth was
+introduced by these moves. Other unresolved findings still fail the gate.
+
+
+## Neon lifecycle native-provider boundary
+
+The shared lifecycle owner selects native or external dispatch and owns logical
+frame/prepared-return state. Exactly one provider supplies six concrete typed
+operations: read-only native ownership/hardware-frame flags, coordinate-cache
+reset, native initialization/shutdown and native frame begin/end. Their exact
+declarations and contracts are in `neon_lifecycle.pbi` and `hal.pbi`. Native
+initialization/shutdown tails and frame methods retain their previous bodies;
+shared policy reads no board-private ownership or coordinate-cache field.
+The two flag bits describe the existing owner and hardware-frame guards, not a
+claim that all asynchronous-job or GPU-fault recovery cases are implemented.
+
+A controlled CPU provider exercises the shared policy without GPU code, including
+the guard matrix, partial-family refusal, failed callback/rollback retention and
+native handback. A separate Pi 4 proof uses the real Vulkan prepared lifecycle.
+This narrow provider boundary is not a wildcard over native renderer helpers.
+Other-target controlled-provider compilation does not implement a hardware driver.
+The mandatory gate still fails at 270 new or grown keys; its algorithm and
+ratchet are unchanged. Current proof and boot-status scope are recorded in
+`docs/evidence/neon-lifecycle-shared-pi4-20261026/`.
+
+
+## Shared test bodies and target entry ownership
+
+The AArch64 Vulkan ABI probe has one shared body at
+`Anvil/Graphics/Vulkan/Tests/vulkan_alignc_abi.pbi`; the Pi 3, Pi 4, Arduino Q
+and Rock Pi 4C entries are in their respective board test folders. Their target
+markers and twelve checks are preserved, and the four complete compiled
+containers are unchanged. Shared CPU templates use `.pbi`; a composition that
+imports the native Pi libraries belongs under `RaspberryPi4/Tests/`.
+
+The ownership move removes six new/grown keys, leaving 264 still refused.
+It does not change the gate, ratchet or seam vocabulary. Compiled preservation
+and the absence of provenance findings for these moved files do not establish
+full runtime acceptance or publication clearance. Exact scope and path mapping:
+`docs/evidence/neon-shared-owner-placement-20261026/`.
+
+
+Public `Neon_LineHeight` and `Neon_TextWidth` now share the frontend owner with
+their optional callbacks. Bitmap fallback uses the existing public raw-height
+and character-width getters; shared queries read no board-private fields.
+The width body and remaining native procedures are preserved. The shared-only
+four-target compile proof demonstrates linkage without a native renderer,
+while runtime/GPU acceptance remains pending. See
+`docs/evidence/neon-shared-text-metrics-20261026/`.
+
+
+The Vulkan lifecycle binder now has one renderer-neutral implementation in
+`Anvil/Graphics/Vulkan/neon_vk_lifecycle.pbi`. Its preceding Pi4 path remains
+an implementation-free compatibility include; its board-extension finding
+is deliberately still counted. The controlled binder proof links shared
+frontend/lifecycle/colour/float owners and controlled native callbacks rather
+than the full Pi renderer. Public float conversion calls remove one downward
+and two private keys across two graphics proofs. Publication still refuses
+261 keys; see `docs/evidence/neon-shared-graphics-proof-20261026/`.
+
+
+## Vulkan board test ownership - 26 October 2026
+
+The unchanged gate/ratchet now sees board-specific Vulkan tests in their actual
+board trees. This move covers 61 exact sources: 58 Pi4 compositions/fixtures and
+one absent-backend program each for Pi3, UnoQ and Rock. Shared portable state
+fixtures remain in the shared tree. The scope comes from exact gate findings,
+existing ratchet paths, named docs/tools and literal source/import dependencies;
+no directory enumeration is used for this review.
+
+Five representative programs compile to identical raw bytes across all four
+targets. Fifty-six sources were byte-identical at relocation; five only needed
+relative include paths changed to root paths. Two old spy fixtures were then
+updated separately for the current native-capacity and mapped-bitmap contracts.
+The stale fixture's failed compile and failed physical assertion are retained;
+the corrected standalone spy returned zero on Pi4.
+
+New/grown findings fall from 254 to 199, with downward includes removed and new board
+extension findings falling from 51 to 12. Downward-call keys rise from 75 to 118 because moving
+test stubs removes false shared owners and reveals unchanged production coupling.
+This is a corrected ownership observation, not a new runtime dependency or a gate
+exception. The remaining dependencies still need real ownership/seam work. No
+gate, ratchet, protocol, private namespace or licensing rule was weakened.
+
+
+## Pi4 runtime and shared lowering - 27 October 2026
+
+The Pi4 Vulkan backend, shader-record emitter, texture transfers and optional
+CSD producer/canvas bridge now have a board library owner. Typed IR lowering
+remains in the shared tree as .pbi because it uses only the shared pure encoder.
+The shared selection header validates a program-supplied implementation identity
+instead of importing a board driver. Its actual Pi4 and software callers were
+updated, and the portable software smoke now belongs to the shared Tests tree.
+
+No gate or ratchet was changed. Current new/grown keys fall from 199 to 140
+(62 downward calls, 30 protocol, 32 private, 9 board extensions, 7 duplicates),
+with no downward include. The remaining findings are still refusals. Provenance
+retains its existing classifications and reasons with only source paths moved;
+98 omissions across 991 sources remain. Evidence and exact scope are recorded in
+docs/evidence/vulkan-gpu-owner-20261027/.
+
+
+## Shared Neon primitive dispatch - 27 October 2026
+
+The twelve public drawing wrappers now belong to neon_frontend.pbi. A complete,
+immutable typed native callback family is bound by the Pi4 library before Main;
+the optional external family retains its independent install/clear lifecycle.
+Native clip mirroring precedes external scissor notification. Native bodies keep
+their exact geometry/state work after the optional external branch is removed.
+This removes ten real downward-call keys, taking current new/grown findings from
+140 to 130 (52 calls, 30 protocol, 32 private, 9 board extension, 7 duplicate).
+No gate, ratchet or blanket Neon-name exception changed. Publication still
+refuses those findings and the remaining provenance omissions. Physical dispatch,
+native/Vulkan/native and current scene evidence is in
+`docs/evidence/neon-primitive-dispatch-20261027/`.
+
+
+## Shared renderer and adapter modules - 27 October 2026
+
+Eight pure Neon renderer/adapter implementations now use shared .pbi owners.
+The redundant lifecycle .pi4 include is removed. A remaining optional native
+prepared-lifecycle installer moved unchanged out of core Chrome into an explicit
+shared integration header; canonical Pi4 compositions preserve its availability.
+The actual UnoQ core/file composition now compiles core Chrome with the absent
+backend. No mock hardware, native fallback removal or gate exception was added.
+The named audit expanded through literal paths recorded in the one task vault
+note to 738 files and found/corrected two additional callers. All old references
+within that scope are resolved; historical missing paths are retained in the
+report. Current new/grown findings fall from130 to122:52 downward calls,30
+protocol,32 private,one board extension and seven duplicate keys. Publication
+still refuses those findings and98 provenance omissions. Evidence:
+`docs/evidence/neon-shared-modules-20261027/`.
+
+
+## Read-status names and native keyboard keys - 28 October 2026
+
+The Wi-Fi protocol library's local/read-result parameter name `ok` collided
+with the monitor procedure `Ok` in the gate's conservative name inventory.
+Those 60 code tokens now use `readSucceeded`; inverse-token comparison leaves
+all code identical, and comments/strings are preserved. No procedure call,
+argument type/order, branch or wire operation changes. This removes one
+downward-call key (24 reported sites), taking new/grown findings from 107 to
+106 without changing the gate or ratchet. The other findings remain refusals.
+
+The native renderer's unchanged legacy key constants now have one shared
+header and an explicit normalized-native-key conversion. The actual Pi4
+Vulkan text-field proof and UnoQ composition qualify that bridge. This is
+separate from the shared editor command domain and introduces no board
+dependency into the shared input owner. Evidence:
+`docs/evidence/neon-canvas-keyboard-20261028/`.
+
+## Intrinsic declarations and test recorders - 28 October 2026
+
+Private-name resolution distinguishes compiler intrinsics from test recorders
+that deliberately use the same spelling. The checker reads complete intrinsic
+ASM declarations from the exact compiler registry for each of the four targets
+and checks its target marker. A board production caller does not acquire a
+private-library dependency merely because all procedure definitions of that
+builtin are test doubles in that same board's Tests directory.
+
+This correction is deliberately narrow. Ordinary private names, any production
+procedure definition with the same name, definitions in another board, test
+callers and shared callers retain the existing checks. Missing, incomplete or
+mismatched registries grant no exception. Shared code still needs a declared
+HAL seam. The checker does not scan directories or infer builtins from names.
+
+The controls cover 36 cases across all four target registries, and the existing
+architecture self-test remains passing. No runtime barrier, test recorder,
+intrinsic instruction, seam or ratchet baseline was changed. Forum 1501 records
+the false dependency between HDMI and the keyboard barrier recorders.
+## Shared EDID fixture composition - 28 October 2026
+
+The EDID dispatch fixture is a shared .pbi module with caller-supplied control
+and input addresses. Test compositions own the parser include, entry point and
+storage. The existing driver retains explicit Pi 3 targeting and addresses;
+the returning proof compiles for Pi 4 and UnoQ. Physical Pi 4 execution passed
+65 parser/dispatch checks; Pi 3 and UnoQ claims are compile-only. No interpreter
+was loaded or run. The production parser is unchanged. Removing the shared-tree
+board extension takes remaining architecture findings from 102 to 101, without
+a ratchet waiver. Forum 1504 is resolved for fixture portability, not physical
+EDID transport or hotplug. Installed Anvil 387 is unchanged.
+
+## USB serial service boundary
+
+`Anvil/Services/usb_serial.pbi` owns the shared serial API. A board installs
+one synchronous `(operation, argument, count)` provider with `UsbSerialBind`
+before consumers open a device. Bind zero to remove it only after stopping
+existing consumers. This is a monitor-internal contract, not a payload ABI.
+The Pi host composition supplies `RaspberryPi4/Board/usb_serial_service.pi4`,
+which delegates to its existing USB host driver. Other compositions may
+provide their own adapter without adding a board dependency to GNSS.
+
+Kind zero means no current device; nonzero kinds are provider identifiers.
+Kind text is a borrowed NUL-terminated provider string. Reads and writes
+return counts or -1; null buffers and nonpositive lengths are refused before
+dispatch. An unbound service reports unavailable, no device, failed open,
+and failed I/O. The existing GNSS error mapping and baud-search order are
+unchanged. GNSS and its command now call this service instead of UsbSer*.
+
+Pi capture 145 executes 47 checks against the production service and adapter
+with driver doubles. It covers initial binding, absence, all operations,
+argument routing, read failure, refusal without dispatch, untouched buffer
+tail, replacement and removal. The host oracle rejects 102 damaged reports.
+It does not exercise a physical receiver or qualify its USB transfers.
+The architecture gate has 55 remaining findings, down from 67; no exemptions
+or ratchet limits changed. It remains a publication blocker.
+
+## Wi-Fi maintenance service boundary
+
+`Anvil/Services/wifi_maintenance.pbi` owns the shared maintenance dispatch used
+by the prompt and payload network service. A composition binds one synchronous
+provider before either starts, and replaces or removes it only with callers
+stopped. Tick advances the existing driver maintenance step; CheckNow schedules
+its health check. Neither promises a connected radio or successful recovery.
+An unbound service does nothing, matching compositions without radio maintenance.
+
+The Pi adapter binds after its existing Wi-Fi driver. Polling order, message
+brackets, recovery cadence and driver work remain unchanged. There is no new
+payload ABI slot or blanket exemption for Wi-Fi names. Physical Pi capture166
+checks binding, replacement, removal, operation routing and the existing payload
+network regression fixture. All 4096 report bytes match, including guards;
+21 damaged reports are rejected. Radio calls in this CPU proof are counted
+doubles, not a Wi-Fi interruption experiment. Architecture findings fall from
+44 to 42; publication remains blocked by the remaining findings.

@@ -6,7 +6,7 @@ Backend choice is **static at build time**. Exactly one backend file is included
 
 | Board/build | Current backend or monitor composition | GPU capability and proven scope |
 |---|---|---|
-| Raspberry Pi 4 | `Anvil/Graphics/Vulkan/vk_v3d_backend.pi4` | Real V3D 4.2 backend; reports device, clear, GPU, draw, source-over blend, and draw-list capabilities. Pi 4 silicon proofs cover bounded clears, graphics, uploads/copies/readbacks, and presentation via the display DMA path. The bounded UINT16 and UINT32 indexed-draw diagnostics have both passed on Pi 4; the UINT32 report, BCL and index-buffer evidence is in `docs/evidence/vulkan-indexed-uint32-pi4-20261001/README.md`. A one-sample zero-`pSampleMask` draw also passed a full-image Pi 4 proof: the backend validates then omits the zero-coverage primitive, without a V3D sample-mask packet. See `docs/evidence/vulkan-sample-mask-pi4-20261001/README.md`. Partial attachment clears support one in-bounds color rectangle on even-sized framebuffers and remain ordered with draws in one bin/render transaction; full pre-draw load clears also work on odd-sized targets. This is not Vulkan 1.0 conformance or WSI. See `docs/evidence/vulkan-clear-attachments-pi4-20260930/README.md`. |
+| Raspberry Pi 4 | `RaspberryPi4/Lib/Vulkan/vk_v3d_backend.pi4` | Real V3D 4.2 backend; reports device, clear, GPU, draw, source-over blend, and draw-list capabilities. Pi 4 silicon proofs cover bounded clears, graphics, uploads/copies/readbacks, and presentation via the display DMA path. The bounded UINT16 and UINT32 indexed-draw diagnostics have both passed on Pi 4; the UINT32 report, BCL and index-buffer evidence is in `docs/evidence/vulkan-indexed-uint32-pi4-20261001/README.md`. A one-sample zero-`pSampleMask` draw also passed a full-image Pi 4 proof: the backend validates then omits the zero-coverage primitive, without a V3D sample-mask packet. See `docs/evidence/vulkan-sample-mask-pi4-20261001/README.md`. Partial attachment clears support one in-bounds color rectangle on even-sized framebuffers and remain ordered with draws in one bin/render transaction; full pre-draw load clears also work on odd-sized targets. This is not Vulkan 1.0 conformance or WSI. See `docs/evidence/vulkan-clear-attachments-pi4-20260930/README.md`. |
 | UNO Q monitor | `ArduinoQ/Board/board.unoq` | The monitor composition includes neither the Vulkan API nor a Vulkan backend. The generic `vk_backend_none.pbi` is available for a separate no-GPU test/probe composition; it does not establish Vulkan inclusion in the monitor. |
 | Pi 3 monitor | `RaspberryPi3/Board/board.pi3` | The composition root does not include a Vulkan API/backend; the Pi 3 guide says Pi 3 Vulkan is not yet provided. |
 | ROCK Pi 4C monitor | `RockPi4C/Board/board.rockpi4c` | The EL3 monitor root does not include a Vulkan API/backend. Guarded Mali-T860 fragment payloads have rendered bounded images, but production console drawing uses RGA2/PL330 and no Vulkan/Mali driver is installed. |
@@ -123,3 +123,18 @@ A separate Pi 4 bottom-edge-only `4×5` proof copied from source `(4,8)` to dest
 ## Direct buffer fill evidence
 
 The Pi 4 Vulkan backend passed a 256-byte `vkCmdFillBuffer` diagnostic: 16 words changed, 48 remained unchanged, and the reported 4,096-byte memory alignment was honored by the bound allocation and guards. The valid fill added one guarded DMA operation and backend job; TFU, V3D bin/render and display counters did not change. An offset-2 request was refused with `-20001` before further DMA. The report and checks are documented at `docs/evidence/vulkan-buffer-fill-pi4-20261001/README.md`. No other board backend is implied.
+
+
+## GPU runtime ownership and explicit composition - 27 October 2026
+
+The five Pi4 runtime modules live in RaspberryPi4/Lib/Vulkan: vk_v3d_backend.pi4,
+vk_v3d_shader.pi4, vk_v3d_texture.pi4, neon_vk_particle_csd.pi4 and its canvas
+CSD port. The pure typed-IR lowerer remains shared as vk_ir_v3d42.pbi and now
+compiles for UnoQ as well; it produces V3D4.2 code, not an Adreno backend.
+
+Programs include their backend explicitly. vk_backend_select.pbi compares the
+selected kind with a compile-time identity supplied by the implementation;
+it imports no board code. The board root chooses its GPU implementation, while
+the shared software smoke explicitly chooses the CPU implementation and checks
+that it does not advertise GPU execution. Other board hardware coverage is
+unchanged. Evidence: docs/evidence/vulkan-gpu-owner-20261027/README.md.

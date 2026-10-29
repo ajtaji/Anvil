@@ -1,0 +1,264 @@
+; SPDX-License-Identifier: MIT
+; Resident adapter over existing device drivers. No enumeration or bus reset.
+XIncludeFile "Anvil/Core/input_hid_keys.pbi"
+Global niOwned.i,niEpoch.i,niCaps.i,niOpenedCaps.i,niW.i,niH.i,niGeneration.i,niResize.i
+Global niKeyboard.i,niKeyTick.i,niKeyMiss.i,niMods.i,niBlockedMods.i
+Global Dim niBlockedKeys.a[256]
+Global niMouseBlocked.i,niMouseButtons.i,niMouseX.i,niMouseY.i
+Global niTouchArmed.i,niTouchFrame.i,niTouchLost.i,niTouchMiss.i
+Global niRepeatUsage.i,niRepeatAt.i
+
+Procedure.i niRequestValid(request.i,bytes.i,want.i)
+  If bytes<>want : ProcedureReturn 0 : EndIf
+  If want=0 : ProcedureReturn Bool(request=0) : EndIf
+  If request<=0 Or (request & 7)<>0 Or request+want<=request : ProcedureReturn 0 : EndIf
+  ProcedureReturn InPayload(request,request+want-1)
+EndProcedure
+
+Procedure.i niModifiers(raw.i)
+  Protected mods.i=0
+  If raw & $22 : mods=mods | #AIM_SHIFT : EndIf
+  If raw & $11 : mods=mods | #AIM_CTRL : EndIf
+  If raw & $44 : mods=mods | #AIM_ALT : EndIf
+  If raw & $88 : mods=mods | #AIM_GUI : EndIf
+  ProcedureReturn mods
+EndProcedure
+
+Procedure niBaseline()
+  Protected i.i
+  niGeneration=InputFocusGeneration()
+  For i=0 To 255
+    niBlockedKeys[i]=0
+    If niKeyboard>0 : niBlockedKeys[i]=HidKeyIsHeld(niKeyboard,i) : EndIf
+  Next
+  niMods=0
+  If niKeyboard>0 : niMods=HidModifiers(niKeyboard) : EndIf
+  niBlockedMods=niMods
+  niRepeatUsage=0 : niRepeatAt=0
+  niMouseBlocked=HidMouseButtons() & 7 : niMouseButtons=0
+  niMouseX=PointerX() : niMouseY=PointerY() : gPtrWheel=0
+  niTouchArmed=0 : niTouchFrame=HwTouchFrameSequence() : niTouchLost=HwTouchLost()
+  HwTouchFlush()
+EndProcedure
+
+Procedure.i NativeInputReset()
+  If niOwned<>0
+    If niOpenedCaps & #NUI_KEYBOARD : KeyboardInputReturnFence() : EndIf
+    If niOpenedCaps & #NUI_MOUSE : MouseInputReturnFence() : EndIf
+    If niOpenedCaps & #NUI_TOUCH : TouchInputReturnFence() : EndIf
+    InputUiEnd()
+  EndIf
+  niOwned=0 : niCaps=0 : niOpenedCaps=0 : niKeyboard=0 : niResize=0
+  ProcedureReturn 0
+EndProcedure
+
+Procedure niDeviceLost(capability.i)
+  niCaps=niCaps & (7-capability)
+  InputUiFlush(#AIC_DEVICE_LOST)
+EndProcedure
+
+Procedure niTyped(kind.i,code.i,mods.i)
+  Dim event.q[4]
+  InputEventInit(@event[0],kind,#AIS_PHYSICAL,code,mods)
+  InputEventsPush(@event[0])
+EndProcedure
+
+Procedure niKeyboardRepeat()
+  Protected named.i,ch.i,mods.i
+  If niRepeatUsage=0 : ProcedureReturn : EndIf
+  If HidKeyIsHeld(niKeyboard,niRepeatUsage)=0
+    niRepeatUsage=0 : ProcedureReturn
+  EndIf
+  If Ticks()<niRepeatAt : ProcedureReturn : EndIf
+  niRepeatAt=Ticks()+TickHz()/20
+  mods=niModifiers(niMods & (255-niBlockedMods))
+  If (mods & (#AIM_CTRL | #AIM_ALT | #AIM_GUI))<>0 : ProcedureReturn : EndIf
+  named=InputHidNamedKey(niRepeatUsage,HidNumLock())
+  If named>0
+    niTyped(#AIE_KEY_DOWN,named,mods)
+  Else
+    ch=HidKeyChar(niRepeatUsage,niMods,HidCapsLock(),HidNumLock())
+    If ch>=32 And ch<=126 : niTyped(#AIE_TEXT,ch,mods) : EndIf
+  EndIf
+EndProcedure
+
+Procedure niKeyboardPump()
+  Protected n.i,i.i,usage.i,down.i,raw.i,bit.i,mods.i,named.i,ch.i
+  If (niCaps & #NUI_KEYBOARD)=0 : ProcedureReturn : EndIf
+  If Ticks()-niKeyTick<TickHz()/125 : ProcedureReturn : EndIf
+  niKeyTick=Ticks() : n=HidKeyboardPoll(niKeyboard)
+  If n<0
+    niKeyMiss=niKeyMiss+1
+    If niKeyMiss>=3 : niDeviceLost(#NUI_KEYBOARD) : EndIf
+    ProcedureReturn
+  EndIf
+  niKeyMiss=0 : raw=HidModifiers(niKeyboard) : mods=niModifiers(raw & (255-niBlockedMods))
+  ; Modifier-only changes are absent from the driver's ordinary key lane.
+  For down=0 To 1
+    For i=0 To 7
+      If niGeneration<>InputFocusGeneration() : ProcedureReturn : EndIf
+      bit=1 << i
+      If (raw & bit)<>(niMods & bit) And Bool(raw & bit)=down
+        If (niBlockedMods & bit)=0
+          InputUiDevicePush(#NUI_PHYSICAL_KEY,#AIS_PHYSICAL,224+i,mods,-1,-1,0,down,Ticks())
+        EndIf
+      EndIf
+    Next
+  Next
+  niBlockedMods=niBlockedMods & raw : niMods=raw
+  For i=0 To HidKeyEventCount()-1
+    If niGeneration<>InputFocusGeneration() : ProcedureReturn : EndIf
+    usage=HidKeyUsage(i) : down=HidKeyDown(i)
+    If usage>0 And usage<256
+      If niBlockedKeys[usage]<>0
+        If down=0 : niBlockedKeys[usage]=0 : EndIf
+      Else
+        If down=0 And niRepeatUsage=usage : niRepeatUsage=0 : EndIf
+        InputUiDevicePush(#NUI_PHYSICAL_KEY,#AIS_PHYSICAL,usage,mods,-1,-1,0,down,Ticks())
+        If niGeneration<>InputFocusGeneration() : ProcedureReturn : EndIf
+        named=InputHidNamedKey(usage,HidNumLock())
+        If named>0
+          If down<>0 : niTyped(#AIE_KEY_DOWN,named,mods) : Else : niTyped(#AIE_KEY_UP,named,mods) : EndIf
+        ElseIf down<>0 And (mods & (#AIM_CTRL | #AIM_ALT | #AIM_GUI))=0
+          ch=HidKeyCharAt(i)
+          If ch>=32 And ch<=126 : niTyped(#AIE_TEXT,ch,mods) : EndIf
+        EndIf
+        If down<>0
+          If named=#AIK_BACKSPACE Or named=#AIK_DELETE Or (named>=#AIK_LEFT And named<=#AIK_END) Or (named>=#AIK_UP And named<=#AIK_PAGE_DOWN) Or (named=0 And ch>=32 And ch<=126)
+            niRepeatUsage=usage : niRepeatAt=Ticks()+TickHz()/2
+          EndIf
+        EndIf
+      EndIf
+    EndIf
+  Next
+  If niGeneration=InputFocusGeneration() : niKeyboardRepeat() : EndIf
+EndProcedure
+
+Procedure niMousePump()
+  Protected buttons.i,state.i,wheel.i
+  If (niCaps & #NUI_MOUSE)=0 : ProcedureReturn : EndIf
+  MouseTick()
+  If gMouseOk=0 : niDeviceLost(#NUI_MOUSE) : ProcedureReturn : EndIf
+  niMouseBlocked=niMouseBlocked & gPtrBtnMouse
+  buttons=gPtrBtnMouse & (7-niMouseBlocked)
+  If buttons<>niMouseButtons Or PointerX()<>niMouseX Or PointerY()<>niMouseY
+    state=#NUI_HOVER
+    If buttons<>0
+      state=1
+      If niMouseButtons=0 : state=0 : EndIf
+    ElseIf niMouseButtons<>0
+      state=2
+    EndIf
+    niMouseX=PointerX() : niMouseY=PointerY() : niMouseButtons=buttons
+    InputUiDevicePush(#NUI_POINTER,#NUI_SOURCE_MOUSE,0,niModifiers(niMods & (255-niBlockedMods)),niMouseX,niMouseY,buttons,state,Ticks())
+  EndIf
+  If niGeneration<>InputFocusGeneration() : ProcedureReturn : EndIf
+  wheel=gPtrWheel : gPtrWheel=0
+  If wheel<>0
+    If wheel< -32768 : wheel=-32768 : EndIf
+    If wheel>32767 : wheel=32767 : EndIf
+    InputUiDevicePush(#NUI_WHEEL,#NUI_SOURCE_MOUSE,0,niModifiers(niMods & (255-niBlockedMods)),PointerX(),PointerY(),buttons,wheel,Ticks())
+  EndIf
+EndProcedure
+
+Procedure niTouchPump()
+  Protected seq.i,n.i,id.i,state.i,x.i,y.i,buttons.i,count.i
+  Dim ev.q[4]
+  If (niCaps & #NUI_TOUCH)=0 : ProcedureReturn : EndIf
+  seq=gTouchPollSeq : n=HwTouchTick()
+  If seq=gTouchPollSeq : ProcedureReturn : EndIf
+  If n<0
+    niTouchMiss=niTouchMiss+1
+    If niTouchMiss>=3 : niDeviceLost(#NUI_TOUCH) : EndIf
+    ProcedureReturn
+  EndIf
+  niTouchMiss=0
+  If HwTouchLost()<>niTouchLost
+    niTouchLost=HwTouchLost() : InputUiFlush(#AIC_TOUCH_LOST) : HwTouchFlush() : ProcedureReturn
+  EndIf
+  If niTouchArmed=0
+    If HwTouchFrameSequence()<>niTouchFrame And n=0 : niTouchArmed=1 : EndIf
+    niTouchFrame=HwTouchFrameSequence() : HwTouchFlush() : ProcedureReturn
+  EndIf
+  For count=1 To 32
+    If niGeneration<>InputFocusGeneration() : ProcedureReturn : EndIf
+    If HwTouchPoll(@ev[0])<>1 : Break : EndIf
+    id=PeekL(@ev[0]+#HW_TOUCH_EV_ID)
+    state=PeekL(@ev[0]+#HW_TOUCH_EV_ST)
+    x=PeekL(@ev[0]+#HW_TOUCH_EV_X) : y=PeekL(@ev[0]+#HW_TOUCH_EV_Y)
+    buttons=0
+    If state=0 Or state=1 : buttons=1 : EndIf
+    If id>=0 : id=id+1 : EndIf
+    If state=3 : x=-1 : y=-1 : EndIf
+    InputUiDevicePush(#NUI_POINTER,#NUI_SOURCE_TOUCH,id,niModifiers(niMods & (255-niBlockedMods)),x,y,buttons,state,PeekI(@ev[0]+#HW_TOUCH_EV_TICK))
+  Next
+EndProcedure
+
+Procedure.i NativeInputDispatch(op.i,context.i,request.i,bytes.i)
+  Protected *api.NativeInputApi,*open.NativeInputOpenRequest
+  Protected caps.i,keyboard.i,mouse.i,rc.i,required.i
+  Select op
+    Case #NUI_QUERY
+      If niRequestValid(request,bytes,SizeOf(NativeInputApi))=0 : ProcedureReturn #NUI_ERR_ARGS : EndIf
+      *api=request : *api\magic=#NUI_MAGIC : *api\major=#NUI_MAJOR : *api\minor=#NUI_MINOR
+      *api\bytes=SizeOf(NativeInputApi) : *api\flags=#NUI_KEYBOARD | #NUI_MOUSE
+      If #CAP_TOUCH<>0 : *api\flags=*api\flags | #NUI_TOUCH : EndIf
+      *api\dispatch=@InputServiceCall
+      ProcedureReturn 0
+    Case #NUI_OPEN
+      If niRequestValid(request,bytes,SizeOf(NativeInputOpenRequest))=0 : ProcedureReturn #NUI_ERR_ARGS : EndIf
+      If niOwned<>0 : ProcedureReturn #NUI_ERR_BUSY : EndIf
+      *open=request : required=*open\required
+      If required<0 Or required>7 : ProcedureReturn #NUI_ERR_ARGS : EndIf
+      If niEpoch>=2147483647 : ProcedureReturn #NUI_ERR_STATE : EndIf
+      keyboard=HidFind(#HID_PROTO_KEYBOARD) : mouse=HidFind(#HID_PROTO_MOUSE)
+      caps=0
+      If keyboard>0 : caps=caps | #NUI_KEYBOARD : EndIf
+      niW=0 : niH=0
+      If gScreen<>0
+        niW=DisplayWidth() : niH=DisplayHeight()
+        If mouse>0 : caps=caps | #NUI_MOUSE : EndIf
+        If gScrSrc=#SCR_SRC_DSI
+          If HwTouchReady()=0 : HwTouchUp() : EndIf
+          If HwTouchReady()<>0 : caps=caps | #NUI_TOUCH : EndIf
+        EndIf
+      EndIf
+      If caps=0 Or (caps & required)<>required : ProcedureReturn #NUI_ERR_CAPABILITY : EndIf
+      rc=InputUiBegin()
+      If rc<>0 : ProcedureReturn rc : EndIf
+      niOwned=1 : niCaps=caps : niOpenedCaps=caps : niKeyboard=keyboard : niEpoch=niEpoch+1
+      niResize=0 : niKeyMiss=0 : niTouchMiss=0 : niKeyTick=Ticks()
+      If caps & #NUI_MOUSE
+        gMouseH=mouse : gMouseOk=1 : gMouseTried=1 : gMouseMiss=0
+      EndIf
+      niBaseline()
+      *open\capabilities=caps : *open\width=niW : *open\height=niH : *open\generation=niGeneration
+      ProcedureReturn niEpoch
+    Case #NUI_POLL
+      If niRequestValid(request,bytes,SizeOf(NativeInputEvent))=0 : ProcedureReturn #NUI_ERR_ARGS : EndIf
+      If niOwned=0 Or context<>niEpoch : ProcedureReturn #NUI_ERR_STATE : EndIf
+      If niResize=0 And (DisplayWidth()<>niW Or DisplayHeight()<>niH)
+        niResize=1 : InputUiFlush(#AIC_SCREEN_CHANGE)
+      EndIf
+      rc=InputUiPop(request)
+      If rc=1 And PeekL(request)=#AIE_CANCEL And InputUiActive()<>0 : niBaseline() : EndIf
+      If rc<>0 : ProcedureReturn rc : EndIf
+      If niResize<>0 : ProcedureReturn #NUI_ERR_STATE : EndIf
+      If niGeneration<>InputFocusGeneration() : niBaseline() : EndIf
+      niKeyboardPump()
+      If niGeneration=InputFocusGeneration() : niMousePump() : EndIf
+      If niGeneration=InputFocusGeneration() : niTouchPump() : EndIf
+      ProcedureReturn InputUiPop(request)
+    Case #NUI_FLUSH
+      If niRequestValid(request,bytes,0)=0 : ProcedureReturn #NUI_ERR_ARGS : EndIf
+      If niOwned=0 Or context<>niEpoch : ProcedureReturn #NUI_ERR_STATE : EndIf
+      ProcedureReturn InputUiFlush(#AIC_PAYLOAD)
+    Case #NUI_CLOSE
+      If niRequestValid(request,bytes,0)=0 : ProcedureReturn #NUI_ERR_ARGS : EndIf
+      If niOwned=0 Or context<>niEpoch : ProcedureReturn #NUI_ERR_STATE : EndIf
+      ProcedureReturn NativeInputReset()
+  EndSelect
+  ProcedureReturn #NUI_ERR_ARGS
+EndProcedure
+
+InputServiceBind(@NativeInputDispatch,@NativeInputReset)

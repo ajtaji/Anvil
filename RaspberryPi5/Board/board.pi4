@@ -1,3 +1,5 @@
+XIncludeFile "Anvil/Hal/aarch64_counter.pbi"
+
 ; ======================================================================
 ;  board.pi4 - THE RASPBERRY PI 5 COMPILE TARGET, first composition.
 ;
@@ -56,12 +58,7 @@ Global gP5DepthTag.q
 
 ; The architectural counter, 54 MHz (the EL3 stub sets CNTFRQ_EL0).
 Procedure.q P5Ticks()
-  ASM
-    mrs  x2, cntpct_el0
-    adrp x1, global_gp5ticks
-    add  x1, x1, #:lo12:global_gp5ticks
-    str  x2, [x1]
-  EndASM
+  gP5Ticks=A64CounterRead()
   ProcedureReturn gP5Ticks
 EndProcedure
 Global gP5Col.q

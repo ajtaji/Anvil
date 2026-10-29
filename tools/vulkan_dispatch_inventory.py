@@ -115,7 +115,7 @@ def _dispatch(name: str, params: tuple[Parameter, ...]) -> str:
     return "device"
 
 
-def registry_commands(data: bytes) -> dict[str, Command]:
+def registry_commands(data: bytes, extension: str | None = None) -> dict[str, Command]:
     root = ET.fromstring(data)
     nodes: dict[str, ET.Element] = {}
     for node in root.findall("./commands/command"):
@@ -127,8 +127,11 @@ def registry_commands(data: bytes) -> dict[str, Command]:
     required: list[str] = []
     features = [f for f in root.findall("./feature")
                 if f.get("number") == "1.0" and "vulkan" in (f.get("api") or "").split(",")]
+    if extension is not None:
+        features = [e for e in root.findall("./extensions/extension")
+                    if e.get("name") == extension and "vulkan" in (e.get("supported") or "").split(",")]
     if not features:
-        raise InventoryError("registry has no Vulkan VK_VERSION_1_0 feature")
+        raise InventoryError("registry lacks the requested Vulkan feature/extension")
     for feature in features:
         for req in feature.findall("require"):
             if not _api_vulkan(req):
@@ -199,8 +202,17 @@ def public_procedures(root: pathlib.Path = VK_ROOT) -> dict[str, PublicProcedure
     return result
 
 
-def classify(commands: dict[str, Command], procedures: dict[str, PublicProcedure]) -> dict[str, Command]:
-    extra = sorted(set(procedures) - set(commands))
+def classify(commands: dict[str, Command], procedures: dict[str, PublicProcedure],
+             extensions: dict[str, Command] | None = None) -> dict[str, Command]:
+    extensions = extensions or {}
+    absent = set(extensions) - set(procedures)
+    if absent:
+        raise InventoryError("incomplete audited extension: " + ", ".join(sorted(absent)))
+    for name, cmd in extensions.items():
+        proc = procedures[name]
+        if proc.unsupported or len(proc.parameters) != len(cmd.parameters) or proc.returns_value != (cmd.return_type != "void"):
+            raise InventoryError("extension prototype or callable status differs: " + name)
+    extra = sorted(set(procedures) - set(commands) - set(extensions))
     if extra:
         raise InventoryError("public non-core or misspelled Procedures: " + ", ".join(extra))
     out = {}
@@ -247,7 +259,7 @@ def procaddr(command: Command | None, query: str, exposed: bool = False,
 
 def inventory(registry: pathlib.Path, source_root: pathlib.Path = VK_ROOT):
     data, transport = pinned_registry_bytes(registry)
-    commands = classify(registry_commands(data), public_procedures(source_root))
+    commands = classify(registry_commands(data), public_procedures(source_root), registry_commands(data, "VK_KHR_surface"))
     return commands, transport
 
 

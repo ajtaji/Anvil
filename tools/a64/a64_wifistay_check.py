@@ -348,7 +348,7 @@ def borrow_stubs() -> str:
     wanted = set()
     for rel in ("RaspberryPi4/Lib/wifi.pi4",
                 "RaspberryPi4/Board/hw_link.pi4",
-                "RaspberryPi4/Lib/link.pi4",
+                "Anvil/Network/link.pbi",
                 "Anvil/Network/net.pbi",
                 "Anvil/Core/netfmt.pbi"):
         text = (ROOT / rel).read_text(encoding="utf-8", errors="ignore")
@@ -362,7 +362,7 @@ def borrow_stubs() -> str:
     # themselves is not external.
     for rel in ("RaspberryPi4/Lib/wifi.pi4",
                 "RaspberryPi4/Board/hw_link.pi4",
-                "RaspberryPi4/Lib/link.pi4",
+                "Anvil/Network/link.pbi",
                 "Anvil/Network/net.pbi",
                 "Anvil/Core/netfmt.pbi",
                 "Anvil/Net/wpa2sup.pbi",
@@ -662,7 +662,7 @@ XIncludeFile "Anvil/Core/netif.pbi"
 XIncludeFile "Anvil/Network/dhcp.pbi"
 XIncludeFile "__LIB__"
 XIncludeFile "__HWLINK__"
-XIncludeFile "RaspberryPi4/Lib/link.pi4"
+XIncludeFile "Anvil/Network/link.pbi"
 ; AND THE DHCP SERVER the console's pump feeds. It is in this image for
 ; the same reason the console is: the radio's own receive pump stands
 ; down only while the console is reading that radio's frames, and the
@@ -676,7 +676,7 @@ XIncludeFile "Anvil/Core/dhcpd.pbi"
 ; FOUR NAMES THE CONSOLE REACHES THAT ARE NOT IN THIS IMAGE. The lease
 ; worker binds and drops an address through Anvil/Core/netcfg.pbi, and
 ; the dispatcher offers a datagram to Anvil/Core/ntp_service.pbi and a
-; segment to RaspberryPi4/Lib/tcp.pi4 before the console sees it. Each
+; segment to Anvil/Network/tcp.pbi before the console sees it. Each
 ; brings the settings store or a transport with it; no datagram in this
 ; script is SNTP and no frame is TCP. The address a DHCP exchange binds
 ; on the radio is graded through wifi.pi4's own path, not these.

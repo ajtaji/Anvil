@@ -1,3 +1,4 @@
+XIncludeFile "Anvil/Network/byte_order.pbi"
 ; ======================================================================
 ;  dns.pi4 - a DNS client, RFC 1035, the query-and-parse half only.
 ;
@@ -34,7 +35,7 @@
 ;  is a malformed reply, not a read into the next buffer.
 ;
 ;  ENDIANNESS: the 16- and 32-bit fields are big-endian on the wire and
-;  are touched only through net.pi4's net_GetBE16/net_GetBE32, which read
+;  use the shared byte_order.pbi NetReadBE16/NetReadBE32 API, which reads
 ;  one byte at a time most-significant first. An IPv4 address is held the
 ;  way the rest of this stack holds one - first octet in the most
 ;  significant byte - so DnsResultIp() feeds straight into PutIp().
@@ -112,12 +113,12 @@ Procedure.i DnsBuildQuery(name.i, qid.i)
   EndIf
 
   ; ---- the 12-byte header ----
-  net_PutBE16(@dns_out[0], qid & $FFFF)
-  net_PutBE16(@dns_out[2], #DNS_FLAG_RD)   ; RD, everything else zero
-  net_PutBE16(@dns_out[4], 1)              ; QDCOUNT, exactly one question
-  net_PutBE16(@dns_out[6], 0)              ; ANCOUNT
-  net_PutBE16(@dns_out[8], 0)              ; NSCOUNT
-  net_PutBE16(@dns_out[10], 0)             ; ARCOUNT
+  NetWriteBE16(@dns_out[0], qid & $FFFF)
+  NetWriteBE16(@dns_out[2], #DNS_FLAG_RD)   ; RD, everything else zero
+  NetWriteBE16(@dns_out[4], 1)              ; QDCOUNT, exactly one question
+  NetWriteBE16(@dns_out[6], 0)              ; ANCOUNT
+  NetWriteBE16(@dns_out[8], 0)              ; NSCOUNT
+  NetWriteBE16(@dns_out[10], 0)             ; ARCOUNT
 
   ; ---- the QNAME, one length-prefixed label at a time ----
   p = #DNS_HDR
@@ -139,6 +140,9 @@ Procedure.i DnsBuildQuery(name.i, qid.i)
             dns_err = #DNS_E_ARG
             ProcedureReturn 0
           EndIf
+          ; The final dot already reserved the root's length byte. Reuse
+          ; it, rather than adding a second root and shifting QTYPE/QCLASS.
+          p = labelStart
           Break
         EndIf
         ; c = 46 with no letters since the last dot: "a..b" or a leading
@@ -173,9 +177,9 @@ Procedure.i DnsBuildQuery(name.i, qid.i)
 
   dns_out[p] = 0                            ; the root label ends the name
   p = p + 1
-  net_PutBE16(@dns_out[p], #DNS_QTYPE_A)
+  NetWriteBE16(@dns_out[p], #DNS_QTYPE_A)
   p = p + 2
-  net_PutBE16(@dns_out[p], #DNS_QCLASS_IN)
+  NetWriteBE16(@dns_out[p], #DNS_QCLASS_IN)
   p = p + 2
 
   dns_outLen = p
@@ -253,11 +257,11 @@ Procedure.i DnsParseReply(*p, n.i, qid.i)
     dns_err = #DNS_E_SHORT
     ProcedureReturn #DNS_E_SHORT
   EndIf
-  If net_GetBE16(*p + 0) <> (qid & $FFFF)
+  If NetReadBE16(*p + 0) <> (qid & $FFFF)
     dns_err = #DNS_E_ID
     ProcedureReturn #DNS_E_ID
   EndIf
-  flags = net_GetBE16(*p + 2)
+  flags = NetReadBE16(*p + 2)
   If (flags & #DNS_FLAG_QR) = 0
     dns_err = #DNS_E_NOT_REPLY
     ProcedureReturn #DNS_E_NOT_REPLY
@@ -268,8 +272,8 @@ Procedure.i DnsParseReply(*p, n.i, qid.i)
     ProcedureReturn #DNS_E_RCODE
   EndIf
 
-  qd = net_GetBE16(*p + 4)
-  an = net_GetBE16(*p + 6)
+  qd = NetReadBE16(*p + 4)
+  an = NetReadBE16(*p + 6)
   pos = #DNS_HDR
 
   ; ---- step over the questions ----
@@ -300,10 +304,10 @@ Procedure.i DnsParseReply(*p, n.i, qid.i)
       dns_err = #DNS_E_MALFORMED
       ProcedureReturn #DNS_E_MALFORMED
     EndIf
-    rtype  = net_GetBE16(*p + pos + 0)
-    rclass = net_GetBE16(*p + pos + 2)
+    rtype  = NetReadBE16(*p + pos + 0)
+    rclass = NetReadBE16(*p + pos + 2)
     ; TTL is *p+pos+4 for four bytes - not needed here
-    rdlen  = net_GetBE16(*p + pos + 8)
+    rdlen  = NetReadBE16(*p + pos + 8)
     pos = pos + 10
     If (pos + rdlen) > n
       dns_err = #DNS_E_MALFORMED
@@ -311,7 +315,7 @@ Procedure.i DnsParseReply(*p, n.i, qid.i)
     EndIf
     If rtype = #DNS_TYPE_A And rclass = #DNS_QCLASS_IN And rdlen = 4
       If dns_count < #DNS_MAX_RESULTS
-        dns_ip[dns_count] = net_GetBE32(*p + pos)
+        dns_ip[dns_count] = NetReadBE32(*p + pos)
         dns_count = dns_count + 1
       EndIf
     EndIf

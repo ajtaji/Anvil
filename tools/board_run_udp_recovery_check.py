@@ -92,7 +92,8 @@ def no_stateful_retry() -> None:
     board_run.NetConsole._bound_socket = staticmethod(lambda _ip: sock)
     try:
         console = board_run.NetConsole(*PEER)
-        for line in ("net recv 5001 800000", "deadman 15", "boot mem 800000"):
+        for line in ("net recv 5001 800000", "deadman 15", "boot mem 800000",
+                     "font select 1", "net address 192.0.2.1", "vkstat clear"):
             try:
                 board_run.read_only_command_with_recovery(console, line, 0.04)
             except ValueError:
@@ -138,6 +139,8 @@ def retry_is_bounded() -> None:
 def main() -> None:
     scenario("version", "drop", False, False)
     scenario("map", "echo-only", True, True)
+    for line in ("info", "net", "font info", "vkstat", "deadman"):
+        scenario(line, "echo-only", True, True)
     retry_is_bounded()
     no_stateful_retry()
     print("board_run UDP recovery: PASS")

@@ -1,0 +1,102 @@
+; Returning RAM-only comparison of full-frame linear and rectangular DMA.
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "RaspberryPi4/Lib/timer.pi4"
+XIncludeFile "RaspberryPi4/Lib/mmu.pi4"
+XIncludeFile "RaspberryPi4/Lib/dma.pi4"
+#CP_REPORT=$E1C00000
+#CP_SRC=$03000000
+#CP_DST=$03400000
+#CP_BYTES=4096000
+#CP_SCRATCH=$03800000
+Procedure.i CpReturn(rc.i)
+ MmuDisableCachedFlushed()
+ PokeI(#CP_REPORT+224,MmuSctlr() & $1005)
+ ProcedureReturn rc
+EndProcedure
+Procedure.i Main(services.i)
+ Protected i.i,j.i,kind.i,t.i,rc.i,pattern.i,errors.i,sp.i,dp.i,row.i,expected.i
+ For i=0 To 511 : PokeA(#CP_REPORT+i,0) : Next
+ PokeI(#CP_REPORT,$4350444D)
+ PokeI(#CP_REPORT+8,TickHz())
+ PokeI(#CP_REPORT+16,MmuSctlr() & $1005)
+ If (MmuSctlr() & $1005)<>0 : ProcedureReturn 1 : EndIf
+ If DmaSetScratch(#CP_SCRATCH,512)=0 : ProcedureReturn 2 : EndIf
+ If DmaSetBounds(#CP_SRC,$800000)=0 : ProcedureReturn 3 : EndIf
+ If DmaInit()=0 : ProcedureReturn 4 : EndIf
+ MmuClearNc()
+ MmuAddNc($03000000,$03A00000)
+ rc=MmuBuildTables($E2530000)
+ If rc<>0 : ProcedureReturn rc : EndIf
+ MmuEnableCached()
+ PokeI(#CP_REPORT+216,MmuSctlr() & $1005)
+ If (MmuSctlr() & $1005)<>$1005 : ProcedureReturn CpReturn(9) : EndIf
+ DmaAddUncached($03000000,$03A00000)
+ ; Different source pattern every row, and distinct guard words outside it.
+ For i=0 To 1279
+   pattern=$12340000+i
+   For j=0 To 799 : PokeL(#CP_SRC+i*3200+j*4,pattern) : Next
+ Next
+ PokeI(#CP_DST-8,$3456789A)
+ PokeI(#CP_DST+#CP_BYTES,$56789ABC)
+ DmaCacheRange(#CP_SRC,#CP_BYTES)
+ For kind=0 To 1
+   ; Different poison ensures both methods actually replace the destination.
+   If DmaFillPattern32(#CP_DST,3200,3200,1280,$87654321+kind)=0 : ProcedureReturn CpReturn(5) : EndIf
+   For i=0 To 3
+     t=Ticks()
+     If kind=0
+       rc=DmaCopy2D(#CP_DST,3200,#CP_SRC,3200,3200,1280)
+     Else
+       rc=DmaCopy(#CP_DST,#CP_SRC,#CP_BYTES)
+     EndIf
+     PokeI(#CP_REPORT+64+kind*64+i*8,Ticks()-t)
+     If rc=0 : ProcedureReturn CpReturn(6) : EndIf
+   Next
+   DmaCacheRange(#CP_DST,#CP_BYTES)
+   errors=0
+   For i=0 To 1279
+     pattern=$12340000+i
+     For j=0 To 799
+       If PeekL(#CP_DST+i*3200+j*4)<>pattern : errors=errors+1 : EndIf
+     Next
+   Next
+   PokeI(#CP_REPORT+192+kind*8,errors)
+   If errors<>0 : ProcedureReturn CpReturn(7) : EndIf
+   If PeekI(#CP_DST-8)<>$3456789A Or PeekI(#CP_DST+#CP_BYTES)<>$56789ABC : ProcedureReturn CpReturn(8) : EndIf
+ Next
+ ; Three non-contiguous cases must keep both row skips and padding intact.
+ For kind=0 To 2
+   sp=48 : dp=64
+   If kind=1 : sp=32 : EndIf
+   If kind=2 : dp=32 : EndIf
+   For i=0 To 127 : PokeL(#CP_SRC+i*4,$33445566) : Next
+   For i=0 To 3
+     For j=0 To 7 : PokeL(#CP_SRC+i*sp+j*4,$11223300+i) : Next
+   Next
+   DmaCacheRange(#CP_SRC,512)
+   If DmaFillPattern32(#CP_DST,64,64,8,$55667788)=0 : ProcedureReturn CpReturn(10) : EndIf
+   If DmaCopy2D(#CP_DST,dp,#CP_SRC,sp,32,4)=0 : ProcedureReturn CpReturn(11) : EndIf
+   DmaCacheRange(#CP_DST,512)
+   errors=0
+   For i=0 To 127
+     expected=$55667788
+     For row=0 To 3
+       If i*4>=row*dp And i*4<row*dp+32 : expected=$11223300+row : EndIf
+     Next
+     If PeekL(#CP_DST+i*4)<>expected : errors=errors+1 : EndIf
+   Next
+   PokeI(#CP_REPORT+256+kind*8,errors)
+   If errors<>0 : ProcedureReturn CpReturn(12) : EndIf
+ Next
+ ; Invalid zero width/rows must refuse even when both pitches match it.
+ PokeI(#CP_REPORT+280,DmaCopy2D(#CP_DST,0,#CP_SRC,0,0,4))
+ PokeI(#CP_REPORT+288,DmaCopy2D(#CP_DST,32,#CP_SRC,32,32,0))
+ If PeekI(#CP_REPORT+280)<>0 Or PeekI(#CP_REPORT+288)<>0 : ProcedureReturn CpReturn(13) : EndIf
+ PokeI(#CP_REPORT+296,$50414433)
+ PokeI(#CP_REPORT+24,DmaChannel())
+ PokeI(#CP_REPORT+32,DmaBurst())
+ PokeI(#CP_REPORT+40,DmaQuiescent())
+ PokeI(#CP_REPORT+48,#CP_BYTES)
+ PokeI(#CP_REPORT+56,$454E4421)
+ ProcedureReturn CpReturn(0)
+EndProcedure

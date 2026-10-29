@@ -34,7 +34,7 @@ from pmf_compiler import resolve_compiler
 HERE = pathlib.Path(__file__).resolve().parent
 ROOT = HERE.parent
 GATE = ROOT / "RaspberryPi4" / "Tests" / "vulkan_v3d_backend_emitted_gate.pi4"
-BACKEND = ROOT / "Anvil" / "Graphics" / "Vulkan" / "vk_v3d_backend.pi4"
+BACKEND = ROOT / 'RaspberryPi4/Lib/Vulkan/vk_v3d_backend.pi4'
 V3D_CORE = ROOT / "RaspberryPi4" / "Lib" / "v3d.pi4"
 NEON_CORE = ROOT / "RaspberryPi4" / "Lib" / "neon.pi4"
 # The board diagnostic is not executed here - it needs the GPU - but it is

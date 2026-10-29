@@ -326,7 +326,7 @@ CompilerEndIf
 ;  anchor's value is never read. MonDataEnd measures __noclear_end__, not
 ;  the earlier zeroing boundary. HwMonRegionHi(1) protects the entire span.
 ; ----------------------------------------------------------------------
-#MON_DATA_LO    = $0D000000    ; monitor BSS follows the Vulkan heap
+#MON_DATA_LO    = $0D000000    ; monitor BSS has its own measured reservation
 #MON_DATA_BYTES = $01000000    ; minimum reservation; Pi 4 grows from linked extent
 #MON_DATA_HI    = $0DFFFFFF
 
@@ -441,12 +441,12 @@ CompilerEndIf
 ; ----------------------------------------------------------------------
 #MON_FB_LO      = $08A00000    ; the DSI framebuffer window, 8 MiB
 #MON_FB_HI      = $091FFFFF
-#MON_FB_SCAN    = $08A00000    ; what the HVS scans out - always the
-                               ; panel's native 800 x 1280 portrait
-#MON_FB_DRAW    = $08E00000    ; what the console draws into when the
-                               ; rotation makes the two differ. The scan
-                               ; buffer ends $08DE7FFF; this is the next
-                               ; round megabyte above it.
+#MON_FB_SCAN    = $08A00000    ; ordinary HVS front, native 800 x 1280.
+                               ; Completed-frame presentation may alternate
+                               ; this pair until checked renderer handoff.
+#MON_FB_DRAW    = $08E00000    ; CPU logical draw buffer when rotation needs
+                               ; one; inactive physical peer in frame mode.
+                               ; The first surface ends $08DE7FFF.
 #MON_FB_PANEL_W = 800          ; the panel's own scan geometry
 #MON_FB_PANEL_H = 1280
 #MON_FB_BYTES   = 4096000      ; 800 * 1280 * 4, one screen
@@ -694,13 +694,19 @@ CompilerEndIf
 #MON_SHOT_MAGIC     = $414E5653484F5431   ; "ANVSHOT1", positive in a signed .i
 #MON_REGION_SHOT    = 7
 
-; Dedicated monitor-owned Vulkan heap. This 16 MiB page-aligned window is
-; above the screenshot reservation (ending at $0BBFFFFF), below payload bank
-; 1 (starting at $40000000), and disjoint from monitor BSS, DSI framebuffers,
-; module staging, and the V3D arena. It is separately mapped by NeonGpuExtraMap.
+; Dedicated monitor-owned Vulkan heap, separately mapped by NeonGpuExtraMap.
+; Pi 4 keeps the complete application target/texture/staging working set above
+; monitor BSS and below payload bank 1. The earlier 16 MiB window could not
+; create an 800x600 canvas alongside the resident console's own resources.
+; Other board maps retain their existing allocation until their GPU is proved.
+CompilerIf #PMF_CHIP = 2711
+#MON_VK_HEAP_LO      = $10000000
+#MON_VK_HEAP_BYTES   = $04000000
+CompilerElse
 #MON_VK_HEAP_LO      = $0C000000
 #MON_VK_HEAP_BYTES   = $01000000
-#MON_VK_HEAP_HI      = $0CFFFFFF
+CompilerEndIf
+#MON_VK_HEAP_HI      = #MON_VK_HEAP_LO + #MON_VK_HEAP_BYTES - 1
 #MON_REGION_VK_HEAP  = 8
 
 ; The header's words. LOGICAL width and height are what the picture is

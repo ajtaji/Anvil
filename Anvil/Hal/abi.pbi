@@ -215,6 +215,10 @@
 ;
 ;  Total at 1.0: 16 + 184*8 = 1488 bytes.
 ; ----------------------------------------------------------------------
+XIncludeFile "Anvil/Hal/neon_service_api.pbi"
+XIncludeFile "Anvil/Hal/graphics_service.pbi"
+XIncludeFile "Anvil/Hal/input_service.pbi"
+
 #SVC_MAGIC       = $53564E41   ; 'ANVS' little-endian: bytes 41 4E 56 53
 ; #SVC_ABI_MAJOR / #SVC_ABI_MINOR live in Anvil/Hal/abi_version.pbi, included
 ; ahead of this file, so a probe with no service table reads the same number.
@@ -1051,6 +1055,40 @@ Procedure.i SvcSeamGet(seam.i, index.i)
   ProcedureReturn ModSeamFn(seam, index)
 EndProcedure
 
+; Slot38, appended inside the console group's spare slots at ABI1.8.
+; Renderer/driver ownership stays resident. The request contract is pure;
+; absent targets expose an unavailable service instead of a dummy device.
+Procedure.i SvcNeonGraphics(op.i,context.i,request.i,bytes.i)
+  Define rc.i
+  If GraphicsServiceAvailable()=0
+    gSvcDetail="this Anvil has no resident Neon graphics provider"
+    ProcedureReturn #SVC_ENOSYS
+  EndIf
+  rc=GraphicsServiceCall(op,context,request,bytes)
+  If rc<0
+    gSvcDetail="the resident Neon graphics provider refused the request; its returned status identifies the failure"
+  Else
+    gSvcDetail=0
+  EndIf
+  ProcedureReturn rc
+EndProcedure
+
+; Slot39. The provider and its lifetime owner remain in the kernel.
+Procedure.i SvcNativeInput(op.i,context.i,request.i,bytes.i)
+  Define rc.i
+  If InputServiceAvailable()=0
+    gSvcDetail="this Anvil has no registered native input provider"
+    ProcedureReturn #SVC_ENOSYS
+  EndIf
+  rc=InputServiceCall(op,context,request,bytes)
+  If rc<0
+    gSvcDetail="the resident input provider refused the request; the returned status identifies the failure"
+  Else
+    gSvcDetail=0
+  EndIf
+  ProcedureReturn rc
+EndProcedure
+
 ; ======================================================================
 ;  GROUP 1 - CLOCK, base 16
 ;
@@ -1436,6 +1474,10 @@ Procedure.i SvcTouchPoll(*ev)
   ; that only fills while somebody is typing is a queue that is always
   ; empty. HwTouchTick rate-limits itself, so a payload draining in a
   ; tight loop still costs one I2C frame every 17 ms.
+  If InputServiceClaimed()<>0
+    gSvcDetail="native input owns the touch stream; close it before using the raw touch queue"
+    ProcedureReturn #SVC_EBUSY
+  EndIf
   HwTouchTick()
   r = HwTouchPoll(*ev)
   If r < 0
@@ -1449,6 +1491,10 @@ Procedure.i SvcTouchQueued()
   If SvcRequireCap(#CAP_TOUCH, "touch", "this board has no touch surface Anvil can reach") = 0
     ProcedureReturn #SVC_ENOCAP
   EndIf
+  If InputServiceClaimed()<>0
+    gSvcDetail="native input owns the touch stream; close it before using the raw touch queue"
+    ProcedureReturn #SVC_EBUSY
+  EndIf
   HwTouchTick()
   ProcedureReturn HwTouchQueued()
 EndProcedure
@@ -1459,6 +1505,10 @@ EndProcedure
 Procedure.i SvcTouchFlush()
   If SvcRequireCap(#CAP_TOUCH, "touch", "this board has no touch surface Anvil can reach") = 0
     ProcedureReturn #SVC_ENOCAP
+  EndIf
+  If InputServiceClaimed()<>0
+    gSvcDetail="native input owns the touch stream; close it before using the raw touch queue"
+    ProcedureReturn #SVC_EBUSY
   EndIf
   HwTouchFlush()
   ProcedureReturn #SVC_OK
@@ -2795,6 +2845,8 @@ Procedure BuildServiceTable()
   gSvcTab[#SVC_HDR_WORDS + #SVC_BASE_CONSOLE + 12] = @SvcTextHeight
   gSvcTab[#SVC_HDR_WORDS + #SVC_BASE_CONSOLE + 13] = @SvcScreenCapture
   CompilerEndIf
+  gSvcTab[#SVC_HDR_WORDS + #NEON_SERVICE_SLOT] = @SvcNeonGraphics
+  gSvcTab[#SVC_HDR_WORDS + #NUI_SERVICE_SLOT] = @SvcNativeInput
 
   ; --- touch, base 40 -------------------------------------------------
   gSvcTab[#SVC_HDR_WORDS + #SVC_BASE_TOUCH + 0] = @SvcTouchPoll

@@ -231,6 +231,11 @@ class FakeConsole:
     def settle(self, quiet=0.6, cap=8.0):
         return ""
 
+    def keepalive(self):
+        # stream_file accepts the live transport's optional progress callback.
+        # The scripted upload completes synchronously and needs no datagram.
+        pass
+
     def send(self, line):
         self.sent.append(line)
         self.last = line

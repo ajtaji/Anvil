@@ -2173,10 +2173,10 @@ EndProcedure
 ;  is a legal EMPTY descriptor and a bus failure is not.
 ; ----------------------------------------------------------------------
 Procedure.i Cyw43Read32(addr.i)
-  Define ok.l
+  Define readSucceeded.l
   Define v.i
-  v = cyw43_Read32Raw(addr, @ok)
-  If ok = 0
+  v = cyw43_Read32Raw(addr, @readSucceeded)
+  If readSucceeded = 0
     ProcedureReturn 0
   EndIf
   ProcedureReturn v
@@ -2306,11 +2306,11 @@ EndProcedure
 ;  perfectly well-formed SOCI_SB part with id 0 and no cores.
 ; ======================================================================
 Procedure.i cyw43_ReadChipId()
-  Define ok.l
+  Define readSucceeded.l
   Define v.i
 
-  v = cyw43_Read32Raw(#CYW43_ENUM_BASE + #CYW43_CC_CHIPID, @ok)
-  If ok = 0
+  v = cyw43_Read32Raw(#CYW43_ENUM_BASE + #CYW43_CC_CHIPID, @readSucceeded)
+  If readSucceeded = 0
     ProcedureReturn 0
   EndIf
   If v = 0 Or v = $FFFFFFFF
@@ -2355,12 +2355,12 @@ EndProcedure
 Procedure.i cyw43_Erom(*cursor, *typeOut, *okOut)
   Define a.i
   Define v.i
-  Define ok.l
+  Define readSucceeded.l
   Define t.i
 
   a = PeekI(*cursor)
-  v = cyw43_Read32Raw(a, @ok)
-  If ok = 0
+  v = cyw43_Read32Raw(a, @readSucceeded)
+  If readSucceeded = 0
     PokeL(*okOut, 0)
     ProcedureReturn 0
   EndIf
@@ -2413,7 +2413,7 @@ EndProcedure
 Procedure.i cyw43_EromRegAddr(*cursor, *baseOut, *wrapOut)
   Define v.i
   Define t.i
-  Define ok.l
+  Define readSucceeded.l
   Define sztype.i
   Define stype.i
   Define szdesc.i
@@ -2431,8 +2431,8 @@ Procedure.i cyw43_EromRegAddr(*cursor, *baseOut, *wrapOut)
       ProcedureReturn cyw43_Fail(#CYW43_ERR_EROM)
     EndIf
 
-    v = cyw43_Erom(*cursor, @t, @ok)
-    If ok = 0
+    v = cyw43_Erom(*cursor, @t, @readSucceeded)
+    If readSucceeded = 0
       ProcedureReturn cyw43_Fail(#CYW43_ERR_EROM)
     EndIf
 
@@ -2457,8 +2457,8 @@ Procedure.i cyw43_EromRegAddr(*cursor, *baseOut, *wrapOut)
     ; A 64-bit address descriptor carries its top half in the NEXT word.
     ; Consume it, or the stream is off by one for ever after.
     If (v & #CYW43_DMP_ADDRSIZE_GT32) <> 0
-      cyw43_Erom(*cursor, @t, @ok)
-      If ok = 0
+      cyw43_Erom(*cursor, @t, @readSucceeded)
+      If readSucceeded = 0
         ProcedureReturn cyw43_Fail(#CYW43_ERR_EROM)
       EndIf
     EndIf
@@ -2466,13 +2466,13 @@ Procedure.i cyw43_EromRegAddr(*cursor, *baseOut, *wrapOut)
     sztype = (v & #CYW43_DMP_SLAVE_SIZE_TYPE) >> #CYW43_DMP_SLAVE_SIZE_TYPE_S
 
     If sztype = #CYW43_DMP_SLAVE_SIZE_DESC
-      szdesc = cyw43_Erom(*cursor, @t, @ok)
-      If ok = 0
+      szdesc = cyw43_Erom(*cursor, @t, @readSucceeded)
+      If readSucceeded = 0
         ProcedureReturn cyw43_Fail(#CYW43_ERR_EROM)
       EndIf
       If (szdesc & #CYW43_DMP_ADDRSIZE_GT32) <> 0
-        cyw43_Erom(*cursor, @t, @ok)
-        If ok = 0
+        cyw43_Erom(*cursor, @t, @readSucceeded)
+        If readSucceeded = 0
           ProcedureReturn cyw43_Fail(#CYW43_ERR_EROM)
         EndIf
       EndIf
@@ -2520,7 +2520,7 @@ Procedure.i Cyw43EnumerateCores()
   Define cursor.i
   Define v.i
   Define t.i
-  Define ok.l
+  Define readSucceeded.l
   Define id.i
   Define rev.i
   Define nmw.i
@@ -2543,8 +2543,8 @@ Procedure.i Cyw43EnumerateCores()
     ProcedureReturn cyw43_Fail(#CYW43_ERR_SOCI)
   EndIf
 
-  cursor = cyw43_Read32Raw(#CYW43_ENUM_BASE + #CYW43_CC_EROMPTR, @ok)
-  If ok = 0
+  cursor = cyw43_Read32Raw(#CYW43_ENUM_BASE + #CYW43_CC_EROMPTR, @readSucceeded)
+  If readSucceeded = 0
     ProcedureReturn cyw43_Fail(#CYW43_ERR_EROM)
   EndIf
   ; An EROM pointer of zero or all-ones is not a pointer. brcmfmac does
@@ -2563,8 +2563,8 @@ Procedure.i Cyw43EnumerateCores()
       ProcedureReturn cyw43_Fail(#CYW43_ERR_EROM)
     EndIf
 
-    v = cyw43_Erom(@cursor, @t, @ok)
-    If ok = 0
+    v = cyw43_Erom(@cursor, @t, @readSucceeded)
+    If readSucceeded = 0
       ProcedureReturn cyw43_Fail(#CYW43_ERR_EROM)
     EndIf
 
@@ -2584,8 +2584,8 @@ Procedure.i Cyw43EnumerateCores()
     ; The SECOND component word. chip.c lines 934-937 warn and bail if
     ; it is not another component descriptor, and so does this: the
     ; stream is malformed and everything after it is meaningless.
-    v = cyw43_Erom(@cursor, @t, @ok)
-    If ok = 0
+    v = cyw43_Erom(@cursor, @t, @readSucceeded)
+    If readSucceeded = 0
       ProcedureReturn cyw43_Fail(#CYW43_ERR_EROM)
     EndIf
     If t <> #CYW43_DMP_COMPONENT
@@ -3519,7 +3519,7 @@ Procedure.i cyw43_CoreDisable(idx.i, prereset.i, reset.i)
   Define t0.i
   Define budget.i
   Define v.i
-  Define ok.l
+  Define readSucceeded.l
 
   If idx < 0 Or idx >= cyw43_ncores
     ProcedureReturn cyw43_Fail(#CYW43_ERR_NO_CORE)
@@ -3529,8 +3529,8 @@ Procedure.i cyw43_CoreDisable(idx.i, prereset.i, reset.i)
     ProcedureReturn cyw43_Fail(#CYW43_ERR_NO_WRAPPER)
   EndIf
 
-  v = cyw43_Read32Raw(wrap + #CYW43_BCMA_RESET_CTL, @ok)
-  If ok = 0
+  v = cyw43_Read32Raw(wrap + #CYW43_BCMA_RESET_CTL, @readSucceeded)
+  If readSucceeded = 0
     ProcedureReturn 0
   EndIf
 
@@ -3564,8 +3564,8 @@ Procedure.i cyw43_CoreDisable(idx.i, prereset.i, reset.i)
     EndIf
     t0 = cyw43_Ticks()
     While (cyw43_Ticks() - t0) < budget
-      v = cyw43_Read32Raw(wrap + #CYW43_BCMA_RESET_CTL, @ok)
-      If ok = 0
+      v = cyw43_Read32Raw(wrap + #CYW43_BCMA_RESET_CTL, @readSucceeded)
+      If readSucceeded = 0
         ProcedureReturn 0
       EndIf
       If v = #CYW43_BCMA_RESET_ACTIVE
@@ -3610,7 +3610,7 @@ Procedure.i cyw43_CoreReset(idx.i, prereset.i, reset.i, postreset.i)
   Define wrap.i
   Define tries.i
   Define v.i
-  Define ok.l
+  Define readSucceeded.l
 
   If cyw43_CoreDisable(idx, prereset, reset) = 0
     ProcedureReturn 0
@@ -3619,8 +3619,8 @@ Procedure.i cyw43_CoreReset(idx.i, prereset.i, reset.i, postreset.i)
 
   tries = 0
   Repeat
-    v = cyw43_Read32Raw(wrap + #CYW43_BCMA_RESET_CTL, @ok)
-    If ok = 0
+    v = cyw43_Read32Raw(wrap + #CYW43_BCMA_RESET_CTL, @readSucceeded)
+    If readSucceeded = 0
       ProcedureReturn 0
     EndIf
     If (v & #CYW43_BCMA_RESET_ACTIVE) = 0
@@ -3652,7 +3652,7 @@ EndProcedure
 Procedure.i Cyw43CoreIsUp(idx.i)
   Define wrap.i
   Define v.i
-  Define ok.l
+  Define readSucceeded.l
 
   If idx < 0 Or idx >= cyw43_ncores
     ProcedureReturn cyw43_Fail(#CYW43_ERR_NO_CORE)
@@ -3662,16 +3662,16 @@ Procedure.i Cyw43CoreIsUp(idx.i)
     ProcedureReturn cyw43_Fail(#CYW43_ERR_NO_WRAPPER)
   EndIf
 
-  v = cyw43_Read32Raw(wrap + #CYW43_BCMA_IOCTL, @ok)
-  If ok = 0
+  v = cyw43_Read32Raw(wrap + #CYW43_BCMA_IOCTL, @readSucceeded)
+  If readSucceeded = 0
     ProcedureReturn 0
   EndIf
   If (v & (#CYW43_BCMA_IOCTL_FGC | #CYW43_BCMA_IOCTL_CLK)) <> #CYW43_BCMA_IOCTL_CLK
     ProcedureReturn 0
   EndIf
 
-  v = cyw43_Read32Raw(wrap + #CYW43_BCMA_RESET_CTL, @ok)
-  If ok = 0
+  v = cyw43_Read32Raw(wrap + #CYW43_BCMA_RESET_CTL, @readSucceeded)
+  If readSucceeded = 0
     ProcedureReturn 0
   EndIf
   If (v & #CYW43_BCMA_RESET_ACTIVE) <> 0
@@ -3729,7 +3729,7 @@ Procedure.i Cyw43ReadRamInfo()
   Define bankSize.i
   Define memrev.i
   Define lss.i
-  Define ok.l
+  Define readSucceeded.l
 
   If cyw43_RxIrqGenerationOwned() <> 0
     ProcedureReturn cyw43_Fail(#CYW43_ERR_RXIRQ_OWNED)
@@ -3742,16 +3742,16 @@ Procedure.i Cyw43ReadRamInfo()
     ; CR4 TCM banks; the published RAM base is a chip-ID lookup.
     base = cyw43_coreBase[idx]
     If base = 0 : ProcedureReturn cyw43_Fail(#CYW43_ERR_NO_CORE) : EndIf
-    cap = cyw43_Read32Raw(base + #CYW43_ARMCR4_CAP, @ok)
-    If ok = 0 : ProcedureReturn 0 : EndIf
+    cap = cyw43_Read32Raw(base + #CYW43_ARMCR4_CAP, @readSucceeded)
+    If readSucceeded = 0 : ProcedureReturn 0 : EndIf
     nab = (cap & #CYW43_ARMCR4_TCBANB_MASK) >> #CYW43_ARMCR4_TCBANB_S
     nbb = (cap & #CYW43_ARMCR4_TCBBNB_MASK) >> #CYW43_ARMCR4_TCBBNB_S
     totb = nab + nbb
     total = 0
     For i = 0 To totb - 1
       If Cyw43Write32(base + #CYW43_ARMCR4_BANKIDX, i) = 0 : ProcedureReturn 0 : EndIf
-      bx = cyw43_Read32Raw(base + #CYW43_ARMCR4_BANKINFO, @ok)
-      If ok = 0 : ProcedureReturn 0 : EndIf
+      bx = cyw43_Read32Raw(base + #CYW43_ARMCR4_BANKINFO, @readSucceeded)
+      If readSucceeded = 0 : ProcedureReturn 0 : EndIf
       blk = #CYW43_ARMCR4_BSZ_MULT
       If (bx & #CYW43_ARMCR4_BLK_1K) <> 0 : blk = blk >> 3 : EndIf
       total = total + (((bx & #CYW43_ARMCR4_BSZ_MASK) + 1) * blk)
@@ -3781,8 +3781,8 @@ Procedure.i Cyw43ReadRamInfo()
   If Cyw43CoreIsUp(idx) = 0
     If cyw43_CoreReset(idx, 0, 0, 0) = 0 : ProcedureReturn 0 : EndIf
   EndIf
-  coreinfo = cyw43_Read32Raw(base + #CYW43_SOCRAM_COREINFO, @ok)
-  If ok = 0 : ProcedureReturn 0 : EndIf
+  coreinfo = cyw43_Read32Raw(base + #CYW43_SOCRAM_COREINFO, @readSucceeded)
+  If readSucceeded = 0 : ProcedureReturn 0 : EndIf
   nbank = (coreinfo & #CYW43_SRCI_SRNB_MASK) >> #CYW43_SRCI_SRNB_SHIFT
   total = 0
   If memrev <= 7 Or memrev = 12
@@ -3802,8 +3802,8 @@ Procedure.i Cyw43ReadRamInfo()
     If nbank <= 0 Or nbank > 32 : ProcedureReturn cyw43_Fail(#CYW43_ERR_RAMINFO) : EndIf
     For i = 0 To nbank - 1
       If Cyw43Write32(base + #CYW43_SOCRAM_BANKIDX, (#CYW43_SOCRAM_BANKIDX_MEMTYPE_RAM << #CYW43_SOCRAM_BANKIDX_MEMTYPE_SHIFT) | i) = 0 : ProcedureReturn 0 : EndIf
-      bx = cyw43_Read32Raw(base + #CYW43_SOCRAM_BANKINFO, @ok)
-      If ok = 0 : ProcedureReturn 0 : EndIf
+      bx = cyw43_Read32Raw(base + #CYW43_SOCRAM_BANKINFO, @readSucceeded)
+      If readSucceeded = 0 : ProcedureReturn 0 : EndIf
       bankSize = ((bx & #CYW43_SOCRAM_BANKINFO_SZMASK) + 1) * #CYW43_SOCRAM_BANKINFO_SZBASE
       total = total + bankSize
       If total > #CYW43_MAX_MEMSIZE : ProcedureReturn cyw43_Fail(#CYW43_ERR_RAMINFO) : EndIf
@@ -3914,7 +3914,7 @@ Procedure.i Cyw43PrepareDownload()
   Define idx.i
   Define wrap.i
   Define val.i
-  Define ok.l
+  Define readSucceeded.l
 
   ; Core reset begins a new device generation. Do not strand the old
   ; readiness snapshot or let an observer retain an address into reset cores.
@@ -3954,8 +3954,8 @@ Procedure.i Cyw43PrepareDownload()
     ProcedureReturn cyw43_Fail(#CYW43_ERR_NO_WRAPPER)
   EndIf
 
-  val = cyw43_Read32Raw(wrap + #CYW43_BCMA_IOCTL, @ok)
-  If ok = 0
+  val = cyw43_Read32Raw(wrap + #CYW43_BCMA_IOCTL, @readSucceeded)
+  If readSucceeded = 0
     ProcedureReturn 0
   EndIf
   val = val & #CYW43_ARMCR4_CPUHALT
@@ -4352,7 +4352,7 @@ Procedure.i Cyw43UploadNvram(*text, length.i, *work, workMax.i, *scratch, scratc
   Define bad.i
   Define rb.i
   Define token.i
-  Define ok.l
+  Define readSucceeded.l
 
   ; The NVRAM image occupies the running firmware generation's top-of-RAM.
   ; Preserve its publication record and bytes until readiness ownership has
@@ -4402,8 +4402,8 @@ Procedure.i Cyw43UploadNvram(*text, length.i, *work, workMax.i, *scratch, scratc
   ; except a radio with no calibration, and a separate read through a
   ; separate code path is worth four bytes of bus traffic.
   token = PeekN(*work + cooked - 4)
-  rb = cyw43_Read32Raw(cyw43_rambase + cyw43_ramsize - 4, @ok)
-  If ok = 0
+  rb = cyw43_Read32Raw(cyw43_rambase + cyw43_ramsize - 4, @readSucceeded)
+  If readSucceeded = 0
     ProcedureReturn 0
   EndIf
   If rb <> token
@@ -5403,7 +5403,7 @@ Procedure.i cyw43_RxIrqObserve()
   Define fresh.i
   Define mail.i
   Define savedErr.i
-  Define ok.l
+  Define readSucceeded.l
 
   If cyw43_rxIrqActive = 0 Or *cyw43_rxIrqOp = 0
     ProcedureReturn 0
@@ -5444,8 +5444,8 @@ Procedure.i cyw43_RxIrqObserve()
     ProcedureReturn r
   EndIf
 
-  bits = cyw43_Read32Raw(cyw43_rxIrqCore + #CYW43_SD_INTSTATUS_OFF, @ok)
-  If ok = 0
+  bits = cyw43_Read32Raw(cyw43_rxIrqCore + #CYW43_SD_INTSTATUS_OFF, @readSucceeded)
+  If readSucceeded = 0
     r = cyw43_RxIrqFail(#CYW43_RXIRQ_FAULT_STATUS_RD)
     cyw43_err = savedErr
     ProcedureReturn r
@@ -5482,8 +5482,8 @@ Procedure.i cyw43_RxIrqObserve()
       cyw43_err = savedErr
       ProcedureReturn r
     EndIf
-    fresh = cyw43_Read32Raw(cyw43_rxIrqCore + #CYW43_SD_INTSTATUS_OFF, @ok)
-    If ok = 0
+    fresh = cyw43_Read32Raw(cyw43_rxIrqCore + #CYW43_SD_INTSTATUS_OFF, @readSucceeded)
+    If readSucceeded = 0
       r = cyw43_RxIrqFail(#CYW43_RXIRQ_FAULT_FC_RD)
       cyw43_err = savedErr
       ProcedureReturn r
@@ -5504,8 +5504,8 @@ Procedure.i cyw43_RxIrqObserve()
 
   If (cyw43_rxIrqPending & #CYW43_I_HMB_HOST_INT) <> 0
     cyw43_rxIrqHostInt = cyw43_rxIrqHostInt + 1
-    mail = cyw43_Read32Raw(cyw43_rxIrqCore + #CYW43_SD_TOHOSTMBDATA, @ok)
-    If ok = 0
+    mail = cyw43_Read32Raw(cyw43_rxIrqCore + #CYW43_SD_TOHOSTMBDATA, @readSucceeded)
+    If readSucceeded = 0
       r = cyw43_RxIrqFail(#CYW43_RXIRQ_FAULT_MAIL_RD)
       cyw43_err = savedErr
       ProcedureReturn r
@@ -8060,6 +8060,21 @@ EndProcedure
 
 Procedure.i Cyw43ReplyPtr()
   ProcedureReturn @cyw43_rx[0] + cyw43_replyOff
+EndProcedure
+
+; Read the first signed 32-bit little-endian value of a successful control
+; reply, before another receive reuses the transport buffer. Return 1 only
+; for a bounded reply containing the whole word. Failure clears the caller's
+; native-integer output; a null output is refused without a write.
+Procedure.i Cyw43ReplyI32(*value)
+  If *value = 0 : ProcedureReturn 0 : EndIf
+  PokeI(*value, 0)
+  If cyw43_replyLen < 4 Or cyw43_replyOff < 0 Or cyw43_replyOff > #CYW43_RXBUF - 4
+    ProcedureReturn 0
+  EndIf
+  If cyw43_replyLen > #CYW43_RXBUF - cyw43_replyOff : ProcedureReturn 0 : EndIf
+  PokeI(*value, cyw43_Signed32(cyw43_RxLE32(cyw43_replyOff)))
+  ProcedureReturn 1
 EndProcedure
 
 Procedure.i Cyw43RxFrames()

@@ -1,0 +1,163 @@
+XIncludeFile "Anvil/Graphics/neon_frontend.pbi"
+XIncludeFile "Anvil/Graphics/neon_colour.pbi"
+
+Macro FrontError(code)
+ NeonFrontendError(code)
+EndMacro
+
+Global frontendChecks.i
+Global frontendFailures.i
+Global frontendObserved.i
+Global Dim frontendString.a[2]
+
+Procedure FrontCheck(tag.i,value.i,expected.i)
+ PokeI($E1C00040+frontendChecks*24,tag)
+ PokeI($E1C00048+frontendChecks*24,value)
+ PokeI($E1C00050+frontendChecks*24,expected)
+ frontendChecks=frontendChecks+1
+ If value<>expected : frontendFailures=frontendFailures+1 : EndIf
+EndProcedure
+
+Procedure.i FrontSame(value.i,expected.i)
+ If value=expected : ProcedureReturn 1 : EndIf
+ ProcedureReturn 0
+EndProcedure
+
+Procedure.i FrontBox(x.i,y.i,w.i,h.i,colour.i)
+ ProcedureReturn x+y+w+h+(colour & 255)
+EndProcedure
+Procedure.i FrontText(font.i,x.i,y.i,*s,colour.i)
+ ProcedureReturn font+x+y+PeekA(*s)+(colour & 255)
+EndProcedure
+Procedure.i FrontTextTex(font.i,x.i,y.i,*s,colour.i)
+ ProcedureReturn 1+font+x+y+PeekA(*s)+(colour & 255)
+EndProcedure
+Procedure FrontScissor(x.i,y.i,w.i,h.i)
+ frontendObserved=x+10*y+100*w+1000*h
+EndProcedure
+Procedure FrontScissorClear()
+ frontendObserved=99
+EndProcedure
+Procedure.i FrontFanBegin() : ProcedureReturn 17 : EndProcedure
+Procedure FrontFanPoint(x.i,y.i) : frontendObserved=x*10+y : EndProcedure
+Procedure.i FrontFanEnd(colour.i) : ProcedureReturn (colour & 255)+18 : EndProcedure
+Procedure.i FrontFanOutline(colour.i) : ProcedureReturn (colour & 255)+19 : EndProcedure
+Procedure.i FrontLinesBegin() : ProcedureReturn 20 : EndProcedure
+Procedure FrontLine(x0.i,y0.i,x1.i,y1.i) : frontendObserved=x0+10*y0+100*x1+1000*y1 : EndProcedure
+Procedure.i FrontLinesEnd(colour.i) : ProcedureReturn (colour & 255)+21 : EndProcedure
+Procedure.i FrontWidth(font.i,*s) : ProcedureReturn 700+font : EndProcedure
+Procedure.i FrontHeight(font.i) : ProcedureReturn 800+font : EndProcedure
+Procedure.i FrontQuery(selector.i) : ProcedureReturn 900+selector : EndProcedure
+Procedure FrontErrorWriter(code.i) : frontendObserved=code : EndProcedure
+
+Procedure.i Main(services.i)
+ Define i.i,c.i,at.i,guard.i=1
+ For i=0 To 4095 : PokeA($E1C00000+i,0) : Next
+ frontendString[0]=65 : frontendString[1]=0
+ NeonDrawBackendClear()
+ neon_err=0 : gNeonReady=1 : neon_clipOn=1
+ neon_nDraws=1001 : neon_nBoxes=1002 : neon_nGlyphs=1003
+ neon_nRuns=1004 : neon_nVerts=1005 : neon_nTDraws=1006
+ neon_nTGlyphs=1007 : neon_nTVerts=1008 : neon_nClipped=1009
+ FrontCheck(1,NeonDrawBackendActive(),0)
+ FrontCheck(2,NeonMeasureBackendActive(),0)
+ FrontCheck(3,NeonStateBackendActive(),0)
+ FrontCheck(4,NeonStateBackendInstall(@FrontQuery,@FrontErrorWriter),15)
+ FrontCheck(5,NeonStateBackendActive(),0)
+ FrontCheck(6,Neon_Error(),15)
+ FrontCheck(7,NeonMeasureBackendInstall(@FrontWidth,@FrontHeight),15)
+ FrontCheck(8,NeonMeasureBackendActive(),0)
+ FrontCheck(9,Neon_ScissorOn(),1)
+ FrontCheck(10,NeonDrawBackendInstall(@FrontBox,@FrontText,@FrontTextTex,@FrontScissor,@FrontScissorClear,@FrontFanBegin,@FrontFanPoint,@FrontFanEnd,@FrontFanOutline,@FrontLinesBegin,@FrontLine,@FrontLinesEnd),0)
+ FrontCheck(11,NeonDrawBackendActive(),1)
+ FrontCheck(12,NeonMeasureBackendInstall(@FrontWidth,@FrontHeight),0)
+ FrontCheck(13,NeonMeasureBackendActive(),1)
+ FrontCheck(14,gNeonMeasureWidth(2,@frontendString[0]),702)
+ FrontCheck(15,gNeonMeasureLineHeight(3),803)
+ FrontCheck(16,NeonStateBackendInstall(@FrontQuery,@FrontErrorWriter),0)
+ FrontCheck(17,NeonStateBackendActive(),1)
+ FrontCheck(18,Neon_Error(),911) : FrontCheck(19,Neon_Ready(),912)
+ FrontCheck(20,Neon_Draws(),901) : FrontCheck(21,Neon_Boxes(),902)
+ FrontCheck(22,Neon_Glyphs(),903) : FrontCheck(23,Neon_Runs(),904)
+ FrontCheck(24,Neon_Verts(),905) : FrontCheck(25,Neon_TexDraws(),906)
+ FrontCheck(26,Neon_TexGlyphs(),907) : FrontCheck(27,Neon_TexVerts(),908)
+ FrontCheck(28,Neon_Clipped(),909) : FrontCheck(29,Neon_ScissorOn(),910)
+ FrontCheck(30,neon_nDraws,1001)
+ FrontCheck(31,NeonStateBackendInstall(@FrontQuery,0),15)
+ FrontCheck(32,FrontSame(gNeonStateQuery,@FrontQuery),1)
+ FrontCheck(33,NeonStateBackendActive(),1) : FrontCheck(34,frontendObserved,15)
+ FrontCheck(35,NeonMeasureBackendInstall(@FrontWidth,0),15)
+ FrontCheck(36,FrontSame(gNeonMeasureWidth,@FrontWidth),1)
+ FrontCheck(37,NeonMeasureBackendActive(),1)
+ FrontCheck(38,NeonDrawBackendInstall(@FrontBox,@FrontText,@FrontTextTex,@FrontScissor,@FrontScissorClear,@FrontFanBegin,@FrontFanPoint,0,@FrontFanOutline,@FrontLinesBegin,@FrontLine,@FrontLinesEnd),15)
+ FrontCheck(39,FrontSame(gNeonBackendBox,@FrontBox),1)
+ FrontCheck(40,NeonDrawBackendActive(),1)
+ FrontCheck(41,gNeonMeasureWidth(2,@frontendString[0]),702)
+ FrontCheck(42,gNeonBackendBox(1,2,3,4,100),110)
+ FrontCheck(43,gNeonBackendText(2,3,4,@frontendString[0],5),79)
+ FrontCheck(44,gNeonBackendTextTex(2,3,4,@frontendString[0],5),80)
+ gNeonBackendScissorSet(1,2,3,4) : FrontCheck(45,frontendObserved,4321)
+ gNeonBackendScissorClear() : FrontCheck(46,frontendObserved,99)
+ FrontCheck(47,gNeonBackendFanBegin(),17)
+ gNeonBackendFanPoint(1,2) : FrontCheck(48,frontendObserved,12)
+ FrontCheck(49,gNeonBackendFanEnd(17),35)
+ FrontCheck(50,gNeonBackendFanOutline(17),36)
+ FrontCheck(51,gNeonBackendLinesBegin(),20)
+ gNeonBackendLine(1,2,3,4) : FrontCheck(52,frontendObserved,4321)
+ FrontCheck(53,gNeonBackendLinesEnd(17),38)
+ FrontError(55) : FrontCheck(54,frontendObserved,55)
+ FrontCheck(55,neon_err,55) : FrontCheck(56,Neon_Error(),911)
+ FrontCheck(57,NeonStateBackendInstall(0,0),0)
+ FrontCheck(58,NeonStateBackendActive(),0)
+ FrontCheck(59,Neon_Error(),55) : FrontCheck(60,Neon_Ready(),1)
+ FrontCheck(61,Neon_Draws(),1001) : FrontCheck(62,Neon_Boxes(),1002)
+ FrontCheck(63,Neon_Glyphs(),1003) : FrontCheck(64,Neon_Runs(),1004)
+ FrontCheck(65,Neon_Verts(),1005) : FrontCheck(66,Neon_TexDraws(),1006)
+ FrontCheck(67,Neon_TexGlyphs(),1007) : FrontCheck(68,Neon_TexVerts(),1008)
+ FrontCheck(69,Neon_Clipped(),1009)
+ FrontCheck(70,NeonDrawBackendActive(),1) : FrontCheck(71,NeonMeasureBackendActive(),1)
+ FrontCheck(72,NeonDrawBackendInstall(0,0,0,0,0,0,0,0,0,0,0,0),0)
+ FrontCheck(73,NeonDrawBackendActive(),0) : FrontCheck(74,NeonMeasureBackendActive(),0)
+ FrontCheck(75,NeonStateBackendActive(),0)
+ FrontCheck(76,gNeonBackendBox(1,2,3,4,100),10)
+ FrontCheck(77,gNeonBackendText(2,3,4,@frontendString[0],5),10)
+ FrontCheck(78,gNeonBackendTextTex(2,3,4,@frontendString[0],5),10)
+ FrontCheck(79,gNeonMeasureWidth(2,@frontendString[0]),-1)
+ FrontCheck(80,gNeonMeasureLineHeight(3),-1)
+ FrontCheck(81,gNeonStateQuery(1),16)
+ FrontCheck(82,NeonDrawBackendInstall(@FrontBox,@FrontText,@FrontTextTex,@FrontScissor,@FrontScissorClear,@FrontFanBegin,@FrontFanPoint,@FrontFanEnd,@FrontFanOutline,@FrontLinesBegin,@FrontLine,@FrontLinesEnd),0)
+ FrontCheck(83,NeonMeasureBackendInstall(@FrontWidth,@FrontHeight),0)
+ FrontCheck(84,NeonStateBackendInstall(@FrontQuery,@FrontErrorWriter),0)
+ FrontCheck(85,NeonDrawBackendInstall(@FrontBox,@FrontText,@FrontTextTex,@FrontScissor,@FrontScissorClear,@FrontFanBegin,@FrontFanPoint,@FrontFanEnd,@FrontFanOutline,@FrontLinesBegin,@FrontLine,@FrontLinesEnd),0)
+ FrontCheck(86,NeonMeasureBackendActive(),0) : FrontCheck(87,NeonStateBackendActive(),0)
+ FrontCheck(88,NeonDrawBackendActive(),1)
+ FrontCheck(89,NeonMeasureBackendInstall(0,0),0)
+ FrontCheck(90,NeonStateBackendInstall(0,0),0)
+ NeonDrawBackendClear() : FrontCheck(91,NeonDrawBackendActive(),0)
+ FrontCheck(92,Neon_R(-1),255) : FrontCheck(93,Neon_G(-1),255)
+ FrontCheck(94,Neon_B(-1),255) : FrontCheck(95,Neon_A(-1),255)
+ FrontCheck(96,Neon_WithAlpha(-1,0),$00FFFFFF)
+ FrontCheck(97,Neon_RGBA(-1,256,128,-2),$0000FF80)
+ FrontCheck(98,Neon_RGB(-1,256,128),$FF00FF80)
+ FrontCheck(99,Neon_Mul($12345678,3,0),$12345678)
+ FrontCheck(100,Neon_Mul($12345678,3,-2),$12345678)
+ FrontCheck(101,Neon_WithAlpha($1122334455667788,128),$80667788)
+ For i=0 To 15 : PokeA($E2400000+23040+i,$A5) : Next
+ at=$E2400000
+ For i=-16 To 271
+  c=Neon_RGBA(i,255-i,i*3-100,300-i*2)
+  PokeI(at,c) : PokeI(at+8,Neon_RGB(i,255-i,i*3-100))
+  PokeI(at+16,Neon_R(c)) : PokeI(at+24,Neon_G(c))
+  PokeI(at+32,Neon_B(c)) : PokeI(at+40,Neon_A(c))
+  PokeI(at+48,Neon_WithAlpha(c,i-8)) : PokeI(at+56,Neon_Mul(c,55,100))
+  PokeI(at+64,Neon_Mul3(c,30,55,130)) : PokeI(at+72,Neon_Lift(c,(i-16)*4))
+  at=at+80
+ Next
+ For i=0 To 15 : If PeekA($E2400000+23040+i)<>$A5 : guard=0 : EndIf : Next
+ FrontCheck(102,guard,1)
+ PokeI($E1C00000,$4E46524E) : PokeI($E1C00008,frontendChecks)
+ PokeI($E1C00010,frontendFailures) : PokeI($E1C00018,1)
+ PokeI($E1C00020,2880) : PokeI($E1C00028,23040)
+ PokeI($E1C00FF8,$4E52464E)
+ ProcedureReturn frontendFailures
+EndProcedure

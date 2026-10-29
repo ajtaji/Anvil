@@ -41,9 +41,10 @@ XIncludeFile "Anvil/Graphics/Vulkan/vk_semaphore.pbi"
 
 ; One shared pool holds every non-empty vkCmdDraw snapshot recorded by every
 ; command buffer. Native Neon has 4096 flat plus 2048 textured draw records.
-; The pool must hold their combined 6144 records without reserving that many
-; snapshots separately for each of the 32 command buffers.
-#ANVIL_VK_MAX_RECORDED_DRAWS = 6144
+; An immutable indexed outline uses two physical draws for one native draw.
+; Thus 2 * 4096 flat + 2048 textured = 10240 bounded snapshots support the
+; full combined native quota without per-command-buffer reservations.
+XIncludeFile "Anvil/Graphics/Vulkan/vk_draw_limits.pbi"
 #ANVIL_VK_RECORDED_DRAW_BYTES = 240
 
 ; Exactly 240 bytes on the AArch64 ABI. Pipeline, descriptor and buffer values
@@ -183,7 +184,9 @@ Global Dim avkCbRpActive.i[#ANVIL_VK_MAX_COMMAND_BUFFERS + 1]
 Global Dim avkCbRpDone.i[#ANVIL_VK_MAX_COMMAND_BUFFERS + 1]
 Global Dim avkCbFb.i[#ANVIL_VK_MAX_COMMAND_BUFFERS + 1]
 Global Dim avkCbFbHandle.i[#ANVIL_VK_MAX_COMMAND_BUFFERS + 1]
+Global Dim avkCbRpHandle.i[#ANVIL_VK_MAX_COMMAND_BUFFERS + 1]
 Global Dim avkCbClearWord.i[#ANVIL_VK_MAX_COMMAND_BUFFERS + 1]
+Global Dim avkCbLoadColor.i[#ANVIL_VK_MAX_COMMAND_BUFFERS + 1]
 Global Dim avkCbDrawCount.i[#ANVIL_VK_MAX_COMMAND_BUFFERS + 1]
 Global Dim avkCbDrawFirst.i[#ANVIL_VK_MAX_COMMAND_BUFFERS + 1]
 Global Dim avkCbDrawVerts.i[#ANVIL_VK_MAX_COMMAND_BUFFERS + 1]
@@ -1643,7 +1646,9 @@ Procedure.i avkCbClear(c.i)
   avkCbRpDone[c] = 0
   avkCbFb[c] = 0
   avkCbFbHandle[c] = 0
+  avkCbRpHandle[c] = 0
   avkCbClearWord[c] = 0
+  avkCbLoadColor[c] = 0
   avkCbDrawCount[c] = 0
   avkCbDrawFirst[c] = 0
   avkCbDrawVerts[c] = 0
@@ -2352,6 +2357,30 @@ Procedure avkFlightComplete(ok.i)
   avkFlightSemaphoreReservation = 0
   avkFlightBackendAttempted = 0
   avkCompleteCount = avkCompleteCount + 1
+EndProcedure
+
+; Undo only an explicitly unlaunched draw admission. No image layouts,
+; semaphore signals, fence completion or completion counters are published.
+Procedure.i avkFlightCancelAdmission()
+  Define c.i
+  If avkFlightActive = 0 Or avkFlightQuarantined <> 0 Or avkFlightBackendAttempted <> 0 : ProcedureReturn 0 : EndIf
+  If avkFlightGpuLeaseHeld <> 0
+    If avkBackendGpuLeaseRelease(#ANVIL_VK_GPU_LEASE_QUEUE) = 0
+      avkBackendGpuLeaseQuarantine(#ANVIL_VK_GPU_LEASE_QUEUE)
+      avkFlightQuarantined = 1
+      ProcedureReturn 0
+    EndIf
+    avkFlightGpuLeaseHeld = 0
+  EndIf
+  c = avkFlightCb
+  If avkFlightSemaphoreReservation <> #VK_NULL_HANDLE : avkSemaphoreRollback(avkFlightSemaphoreReservation) : EndIf
+  avkFlightReleaseRefs(c)
+  If avkFlightFence <> 0 : avkFenceRelease(avkFlightFence) : EndIf
+  avkCmdState[c] = #ANVIL_VK_CB_EXECUTABLE
+  avkFlightActive = 0 : avkFlightCb = 0 : avkFlightFence = 0
+  avkFlightSemaphoreReservation = 0 : avkFlightBackendAttempted = 0
+  avkSubmitCount = avkSubmitCount - 1
+  ProcedureReturn 1
 EndProcedure
 
 ; Internal one-dispatch path. Public vkCmdDispatch and the queue's compute
@@ -3322,7 +3351,15 @@ Procedure.i AnvilVkQueueSubmitOne(queue.i, commandBuffer.i, fence.i, semaphoreRe
   avkCopyBufferRetain(c)
   avkSubmitCount = avkSubmitCount + 1
   If avkCbDrawCount[c] > 0
+    avkBackendRefusalCode = 0
     job = avkDrawListSubmit()
+    If job = #ANVIL_VK_JOB_REFUSED And avkBackendRefusalCode < 0
+      job = avkBackendRefusalCode
+      If avkFlightCancelAdmission() <> 0
+        ProcedureReturn avkFault(job, "the graphics backend refused draw admission before launch; reservations were rolled back, the fence remains unsignalled and the command buffer may be retried.")
+      EndIf
+      ProcedureReturn avkFault(#VK_ERROR_DEVICE_LOST, "draw admission was refused before launch but the shared GPU lease could not be released; retained resources remain quarantined.")
+    EndIf
     If job < 0
       avkFlightBackendAttempted = 1
       avkFlightComplete(0)
@@ -3641,7 +3678,7 @@ Procedure.i AnvilVkQueueSubmitOne(queue.i, commandBuffer.i, fence.i, semaphoreRe
     avkFlightComplete(1)
     ProcedureReturn #VK_SUCCESS
   EndIf
-  job = avkBackendSubmitClear(avkHeapBase + avkMemOffset[avkImgMemSlot[target]] + avkImgMemOffset[target], avkImgSize[target], avkImgW[target], avkImgH[target], avkImgPitch[target], colour)
+  job = avkBackendSubmitClear(avkHeapBase + avkMemOffset[avkImgMemSlot[target]] + avkImgMemOffset[target], avkImgSize[target], avkImgW[target], avkImgH[target], avkImgPitch[target], colour, 0)
   If job < 0
     avkFlightBackendAttempted = 1
     avkFlightComplete(0)
@@ -3783,12 +3820,16 @@ Procedure.i AnvilVkDeviceDestroy(device.i)
   Define i.i
   Define rc.i
   d = avkDevSlot(device)
-  If d = 0 : ProcedureReturn #ANVIL_VK_ERR_HANDLE : EndIf
+  If d = 0 : ProcedureReturn avkFault(#ANVIL_VK_ERR_HANDLE, "vkDestroyDevice requires a live device; no child or parent was changed.") : EndIf
   If avkFlightActive <> 0
     ProcedureReturn avkFault(#ANVIL_VK_ERR_STATE, "vkDestroyDevice was called with a submission still outstanding (Anvil code -20004, device busy); nothing was destroyed. Call vkDeviceWaitIdle before destroying a device.")
   EndIf
   If avkBackendGpuLeaseRequired() <> 0 And avkBackendGpuLeaseState() < 0
     ProcedureReturn avkFault(#VK_ERROR_DEVICE_LOST, "vkDestroyDevice found an external GPU lease quarantined after uncertain completion (VkResult -4, VK_ERROR_DEVICE_LOST). Check the external producer; device memory remains owned and was not torn down.")
+  EndIf
+  If *avkDeviceChildGuard <> 0
+    rc = avkDeviceChildGuard(device)
+    If rc <> #VK_SUCCESS : ProcedureReturn rc : EndIf
   EndIf
   ; Retire every generation-matched semaphore while the VkDevice handle is
   ; still live. A pending/reserved transaction aborts teardown atomically.
@@ -3840,15 +3881,21 @@ EndProcedure
 Procedure.i AnvilVkInstanceDestroy(instance.i)
   Define s.i
   Define p.i
-  Define d.i
+  Define d.i, rc.i
   s = avkInstSlot(instance)
-  If s = 0 : ProcedureReturn #ANVIL_VK_ERR_HANDLE : EndIf
+  If s = 0 : ProcedureReturn avkFault(#ANVIL_VK_ERR_HANDLE, "vkDestroyInstance requires a live instance; no child or parent was changed.") : EndIf
+  ; Vulkan requires explicit child-before-parent destruction. Preflight the
+  ; entire family before mutating anything, rather than cascading past refusal.
+  If *avkInstanceChildGuard <> 0
+    rc = avkInstanceChildGuard(instance)
+    If rc <> #VK_SUCCESS : ProcedureReturn rc : EndIf
+  EndIf
   d = 1
   While d <= #ANVIL_VK_MAX_DEVICES
     If avkDevLive[d] <> 0
       p = avkDevPhys[d]
       If avkPhysLive[p] <> 0 And avkPhysInst[p] = s
-        AnvilVkDeviceDestroy(avkToken(#ANVIL_VK_TYPE_DEVICE, d, avkDevGen[d]))
+        ProcedureReturn avkFault(#ANVIL_VK_ERR_STATE, "vkDestroyInstance still owns a live device; destroy all devices before the instance. No child or parent was changed.")
       EndIf
     EndIf
     d = d + 1
@@ -3858,6 +3905,7 @@ Procedure.i AnvilVkInstanceDestroy(instance.i)
     If avkPhysLive[p] <> 0 And avkPhysInst[p] = s : avkPhysLive[p] = 0 : EndIf
     p = p + 1
   Wend
+  avkInstSurfaceEnabled[s] = 0
   avkInstLive[s] = 0
   ProcedureReturn #VK_SUCCESS
 EndProcedure

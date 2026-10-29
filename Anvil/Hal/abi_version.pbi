@@ -121,6 +121,13 @@
 ;  as SvcUnimplemented, so this is a minor bump; a 1.7 payload on a 1.6
 ;  monitor gets #SVC_ENOSYS from them.
 ; ----------------------------------------------------------------------
-#SVC_ABI_MINOR   = 7
+; 1.8 - console slot38: resident Neon graphics request dispatcher.
+; Existing slots/signatures and the200-entry table do not move. A target with
+; no registered graphics provider returns ENOSYS; a successful End means the
+; display owner completed presentation. Payload return retires that owner.
+; 1.9 - console slot39: resident normalized keyboard/pointer input.
+; Existing table offsets/signatures and200-entry count remain unchanged.
+; A target without a registered provider answers ENOSYS.
+#SVC_ABI_MINOR   = 9
 #SVC_SLOT_COUNT  = 200         ; 184 at 1.0-1.2; 192 at 1.3; file handles appended at 1.4.
                                ; The boot code sizes its check by it.
