@@ -389,6 +389,7 @@ EndProcedure
 ; retains NetUdpRxData's pointer beyond the call.
 Procedure.i NtpServiceInput(kind.i)
   Define c.i
+  Define *name
   If kind <> ntps_kind Or NetRxTo() <> ntps_localIp
     ProcedureReturn 0
   EndIf
@@ -397,7 +398,8 @@ Procedure.i NtpServiceInput(kind.i)
       ntps_rejects = ntps_rejects + 1
       ProcedureReturn 1
     EndIf
-    c = DnsParseReply(NetUdpRxData(), NetUdpRxLen(), ntps_qid)
+    If ntps_configExplicit <> 0 : *name=@ntps_configName[0] : Else : *name=NtpDefaultServer() : EndIf
+    c = DnsParseReplyFor(NetUdpRxData(), NetUdpRxLen(), ntps_qid, *name)
     If c > 0
       ntps_serverIp = DnsResultIp(0)
       ntps_attemptDeadline = 0

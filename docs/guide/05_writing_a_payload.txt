@@ -644,3 +644,17 @@ encoding, redirects, reusable HTTPS connections and live compressed responses.
 Other boards use the shared code but need their own physical qualification.
 IPv6 and international host conversion, HTTP/2 and HTTP/3, WebSocket upgrades,
 Brotli, Zstandard and managed authentication/cookies remain separate work.
+
+
+@SECTION DNS answers and retry
+
+SvcDnsResolve validates the answer against the requested host name and follows
+bounded CNAME chains within the response. Cached addresses expire at the shorter
+of the authoritative TTL and five minutes. Zero-TTL results are delivered once
+for the requesting transaction, without reusable caching.
+
+A matching truncated UDP reply triggers a TCP retry through the existing network
+service. Keep calling SvcNetService while resolution is pending. Partial TCP
+transfers and cancellation preserve the original query deadline; a failed or
+incomplete answer is never reported as a successful address. IPv6, DNSSEC and
+iterative authoritative resolution remain outside this resolver's contract.

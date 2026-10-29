@@ -184,3 +184,33 @@ judging FIN, and retains authenticated closed state while plaintext is drained.
 Eight physical service-owner tests passed using TCP/crypto doubles. This service
 change compiled in build 414; it has not yet replaced resident 405 or received
 new on-wire qualification in an updated resident image.
+
+
+## DNS reply ownership and large answers
+
+The shared DNS codec now binds `DnsParseReplyFor` to the outstanding host name,
+IN/A question, and query ID. Answer addresses must belong to that question or its
+CNAME chain, independently of record order. Name compression, aliases and record
+counts are bounded; malformed, conflicting and truncated results are explicit
+refusals. The packet-only `DnsParseReply` compatibility API still checks the
+question and answer relationship, but callers with a host name should use the
+bound API. The payload resolver, monitor lookup and time service do so.
+
+`DnsResultTtl` reports the minimum TTL across the alias chain and returned RRset.
+The payload resolver caps reusable entries at five minutes without extending a
+shorter authoritative lifetime. A zero TTL is delivered once to the requesting
+transaction and then discarded; it cannot become a reusable cached answer.
+Expiry handles the millisecond counter wrapping.
+
+A matching truncated UDP reply causes the payload resolver to retry the original
+question over TCP. Two-byte length framing, partial sends/receives, cancellation,
+premature closure and the original overall deadline remain enforced. The retry
+uses the existing TCP service and releases its handle on every terminal path.
+The codec accepts at most 64 answer records and 16 aliases; the TCP message buffer
+holds the full 65,535-byte DNS message limit. This is not DNSSEC validation, AAAA
+support, or an iterative authoritative resolver.
+
+Physical checks cover 30 decoder cases, five cache boundaries, 16 TCP lifecycle
+cases and three rejected UDP triggers. A separate live TCP query to a public
+resolver returned two matching addresses in 58 ms; UDP truncation was exercised
+with deterministic transport inputs, not an on-wire fault-injection server.

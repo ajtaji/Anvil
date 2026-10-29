@@ -16,7 +16,10 @@ XIncludeFile "Anvil/Network/byte_order.pbi"
 ;      no MX, no CNAME chasing OF ITS OWN - though it DOES read through
 ;      the compression pointers a CNAME answer uses, so a name that is a
 ;      CNAME to a host with an A record resolves, because the server put
-;      the A record in the same answer section.
+;      the A record in the same answer section. Only records belonging to
+;      the question or its bounded CNAME chain are returned. DnsParseReplyFor
+;      additionally binds the question to a caller-supplied host name.
+;      DnsResultTtl reports the minimum lifetime of that chain and RRset.
 ;    * Recursion is REQUESTED (RD=1). A monitor talks to a real resolver
 ;      - the one DHCP handed us, or the one typed at `net dns` - and that
 ;      resolver does the walking. An authoritative-only server answering
@@ -239,91 +242,184 @@ EndProcedure
 ;  ordinary "no such host"; the others (format error, server failure,
 ;  refused) mean the resolver, not the name, and the caller says which.
 ; ----------------------------------------------------------------------
-Procedure.i DnsParseReply(*p, n.i, qid.i)
-  Protected flags.i
-  Protected qd.i
-  Protected an.i
-  Protected pos.i
-  Protected i.i
-  Protected rtype.i
-  Protected rclass.i
-  Protected rdlen.i
+; RFC 1035 sections 4.1 and 7.3; RFC 2181 sections 5 and 8.
+; Canonical wire names retain label boundaries. Pointer walks and CNAME
+; chains are bounded independently of the packet's claimed record counts.
+#DNS_MAX_ANSWERS = 64
+#DNS_MAX_ALIASES = 16
+#DNS_E_QUESTION = -208
+#DNS_E_TRUNCATED = -209
+#DNS_E_ALIAS = -210
+Global Dim dns_ttl.i[#DNS_MAX_RESULTS]
+Global Dim dns_rrOwner.i[#DNS_MAX_ANSWERS]
+Global Dim dns_rrType.i[#DNS_MAX_ANSWERS]
+Global Dim dns_rrClass.i[#DNS_MAX_ANSWERS]
+Global Dim dns_rrData.i[#DNS_MAX_ANSWERS]
+Global Dim dns_rrSize.i[#DNS_MAX_ANSWERS]
+Global Dim dns_rrTtl.i[#DNS_MAX_ANSWERS]
+Global Dim dns_current.a[256]
+Global Dim dns_name.a[256]
+Global Dim dns_alias.a[256]
+Global dns_nameEnd.i
 
-  dns_err = #DNS_E_NONE
-  dns_count = 0
-  dns_rcode = 0
+Procedure.i dns_Reject(code.i)
+  dns_count=0 : dns_err=code
+  ProcedureReturn code
+EndProcedure
 
-  If *p = 0 Or n < #DNS_HDR
-    dns_err = #DNS_E_SHORT
-    ProcedureReturn #DNS_E_SHORT
-  EndIf
-  If NetReadBE16(*p + 0) <> (qid & $FFFF)
-    dns_err = #DNS_E_ID
-    ProcedureReturn #DNS_E_ID
-  EndIf
-  flags = NetReadBE16(*p + 2)
-  If (flags & #DNS_FLAG_QR) = 0
-    dns_err = #DNS_E_NOT_REPLY
-    ProcedureReturn #DNS_E_NOT_REPLY
-  EndIf
-  dns_rcode = flags & #DNS_RCODE_MASK
-  If dns_rcode <> 0
-    dns_err = #DNS_E_RCODE
-    ProcedureReturn #DNS_E_RCODE
-  EndIf
-
-  qd = NetReadBE16(*p + 4)
-  an = NetReadBE16(*p + 6)
-  pos = #DNS_HDR
-
-  ; ---- step over the questions ----
-  i = 0
-  While i < qd
-    pos = dns_SkipName(*p, n, pos)
-    If pos < 0
-      dns_err = #DNS_E_MALFORMED
-      ProcedureReturn #DNS_E_MALFORMED
-    EndIf
-    If (pos + 4) > n                        ; QTYPE + QCLASS
-      dns_err = #DNS_E_MALFORMED
-      ProcedureReturn #DNS_E_MALFORMED
-    EndIf
-    pos = pos + 4
-    i = i + 1
-  Wend
-
-  ; ---- read the answers, keeping the A records ----
-  i = 0
-  While i < an
-    pos = dns_SkipName(*p, n, pos)
-    If pos < 0
-      dns_err = #DNS_E_MALFORMED
-      ProcedureReturn #DNS_E_MALFORMED
-    EndIf
-    If (pos + 10) > n                       ; TYPE,CLASS,TTL,RDLENGTH
-      dns_err = #DNS_E_MALFORMED
-      ProcedureReturn #DNS_E_MALFORMED
-    EndIf
-    rtype  = NetReadBE16(*p + pos + 0)
-    rclass = NetReadBE16(*p + pos + 2)
-    ; TTL is *p+pos+4 for four bytes - not needed here
-    rdlen  = NetReadBE16(*p + pos + 8)
-    pos = pos + 10
-    If (pos + rdlen) > n
-      dns_err = #DNS_E_MALFORMED
-      ProcedureReturn #DNS_E_MALFORMED
-    EndIf
-    If rtype = #DNS_TYPE_A And rclass = #DNS_QCLASS_IN And rdlen = 4
-      If dns_count < #DNS_MAX_RESULTS
-        dns_ip[dns_count] = NetReadBE32(*p + pos)
-        dns_count = dns_count + 1
+; Returns canonical wire length, or a negative refusal. nameEnd is the
+; first byte following the original encoded name, not its pointer target.
+Procedure.i dns_ReadName(packet.i,bytes.i,pos.i,destination.i)
+  Define length.i,out.i,nextPos.i,jumps.i,jump.i,i.i,c.i
+  nextPos=-1
+  Repeat
+    If pos<12 Or pos>=bytes : ProcedureReturn #DNS_E_MALFORMED : EndIf
+    length=PeekA(packet+pos)
+    If (length & $C0)=$C0
+      If pos+1>=bytes : ProcedureReturn #DNS_E_MALFORMED : EndIf
+      jump=((length & $3F)<<8) | PeekA(packet+pos+1)
+      If jump<12 Or jump>=pos Or jumps>=128 : ProcedureReturn #DNS_E_MALFORMED : EndIf
+      If nextPos<0 : nextPos=pos+2 : EndIf
+      jumps=jumps+1 : pos=jump
+    Else
+      If length>63 Or pos+1+length>bytes Or out+1+length>255 : ProcedureReturn #DNS_E_MALFORMED : EndIf
+      PokeA(destination+out,length) : out=out+1 : pos=pos+1
+      If length=0
+        If nextPos<0 : nextPos=pos : EndIf
+        dns_nameEnd=nextPos
+        ProcedureReturn out
       EndIf
+      For i=0 To length-1
+        c=PeekA(packet+pos+i)
+        If c>=65 And c<=90 : c=c+32 : EndIf
+        PokeA(destination+out,c) : out=out+1
+      Next
+      pos=pos+length
     EndIf
-    pos = pos + rdlen
-    i = i + 1
-  Wend
+  ForEver
+EndProcedure
 
-  ProcedureReturn dns_count
+Procedure.i dns_EqualName(left.i,right.i,bytes.i)
+  Define i.i
+  For i=0 To bytes-1
+    If PeekA(left+i)<>PeekA(right+i) : ProcedureReturn 0 : EndIf
+  Next
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i dns_TextNameMatches(wire.i,text.i)
+  Define at.i,pos.i,length.i,i.i,c.i
+  Repeat
+    length=PeekA(wire+pos) : pos=pos+1
+    If length=0
+      ProcedureReturn Bool(PeekA(text+at)=0)
+    EndIf
+    For i=0 To length-1
+      If at>=253 : ProcedureReturn 0 : EndIf
+      c=PeekA(text+at)
+      If c>=65 And c<=90 : c=c+32 : EndIf
+      If c=0 Or c=46 Or c<>PeekA(wire+pos) : ProcedureReturn 0 : EndIf
+      at=at+1 : pos=pos+1
+    Next
+    If PeekA(wire+pos)<>0
+      If PeekA(text+at)<>46 : ProcedureReturn 0 : EndIf
+      at=at+1
+    ElseIf PeekA(text+at)=46
+      at=at+1
+    EndIf
+  ForEver
+EndProcedure
+
+; expectedName binds the answer to the outstanding host query. Zero retains
+; the packet-only API, still restricting answers to its single IN/A question.
+Procedure.i DnsParseReplyFor(*p,n.i,qid.i,expectedName.i)
+  Define flags.i,an.i,pos.i,i.i,j.i,length.i,currentLength.i,aliasLength.i
+  Define kind.i,klass.i,size.i,ttl.i,hops.i,aliasAt.i,aliasTtl.i,chainTtl.i
+  Define answerTtl.i,count.i
+  dns_err=0 : dns_count=0 : dns_rcode=0
+  If *p=0 Or n<#DNS_HDR : ProcedureReturn dns_Reject(#DNS_E_SHORT) : EndIf
+  If NetReadBE16(*p)<>(qid & $FFFF) : ProcedureReturn dns_Reject(#DNS_E_ID) : EndIf
+  flags=NetReadBE16(*p+2)
+  If (flags & #DNS_FLAG_QR)=0 Or (flags & $7800)<>0 : ProcedureReturn dns_Reject(#DNS_E_NOT_REPLY) : EndIf
+  If NetReadBE16(*p+4)<>1 : ProcedureReturn dns_Reject(#DNS_E_QUESTION) : EndIf
+  currentLength=dns_ReadName(*p,n,12,@dns_current[0])
+  If currentLength<0 : ProcedureReturn dns_Reject(currentLength) : EndIf
+  pos=dns_nameEnd
+  If pos+4>n : ProcedureReturn dns_Reject(#DNS_E_MALFORMED) : EndIf
+  If NetReadBE16(*p+pos)<>#DNS_QTYPE_A Or NetReadBE16(*p+pos+2)<>#DNS_QCLASS_IN : ProcedureReturn dns_Reject(#DNS_E_QUESTION) : EndIf
+  If expectedName<>0
+    If dns_TextNameMatches(@dns_current[0],expectedName)=0 : ProcedureReturn dns_Reject(#DNS_E_QUESTION) : EndIf
+  EndIf
+  If (flags & $0200)<>0 : ProcedureReturn dns_Reject(#DNS_E_TRUNCATED) : EndIf
+  dns_rcode=flags & #DNS_RCODE_MASK
+  If dns_rcode<>0 : ProcedureReturn dns_Reject(#DNS_E_RCODE) : EndIf
+  pos=pos+4 : an=NetReadBE16(*p+6)
+  If an>#DNS_MAX_ANSWERS : ProcedureReturn dns_Reject(#DNS_E_MALFORMED) : EndIf
+  For i=0 To an-1
+    dns_rrOwner[i]=pos
+    length=dns_ReadName(*p,n,pos,@dns_name[0])
+    If length<0 : ProcedureReturn dns_Reject(length) : EndIf
+    pos=dns_nameEnd
+    If pos+10>n : ProcedureReturn dns_Reject(#DNS_E_MALFORMED) : EndIf
+    kind=NetReadBE16(*p+pos) : klass=NetReadBE16(*p+pos+2)
+    ttl=NetReadBE32(*p+pos+4) : size=NetReadBE16(*p+pos+8)
+    If ttl>$7FFFFFFF : ttl=0 : EndIf
+    pos=pos+10
+    If pos+size>n : ProcedureReturn dns_Reject(#DNS_E_MALFORMED) : EndIf
+    If klass=#DNS_QCLASS_IN And kind=#DNS_TYPE_A And size<>4 : ProcedureReturn dns_Reject(#DNS_E_MALFORMED) : EndIf
+    If klass=#DNS_QCLASS_IN And kind=#DNS_TYPE_CNAME
+      length=dns_ReadName(*p,n,pos,@dns_name[0])
+      If length<0 : ProcedureReturn dns_Reject(length) : EndIf
+      If dns_nameEnd<>pos+size : ProcedureReturn dns_Reject(#DNS_E_MALFORMED) : EndIf
+    EndIf
+    dns_rrType[i]=kind : dns_rrClass[i]=klass : dns_rrData[i]=pos
+    dns_rrSize[i]=size : dns_rrTtl[i]=ttl : pos=pos+size
+  Next
+  chainTtl=$7FFFFFFF
+  For hops=0 To #DNS_MAX_ALIASES
+    count=0 : aliasAt=0 : aliasLength=0 : aliasTtl=$7FFFFFFF : answerTtl=chainTtl
+    For i=0 To an-1
+      If dns_rrClass[i]=#DNS_QCLASS_IN
+        length=dns_ReadName(*p,n,dns_rrOwner[i],@dns_name[0])
+        If length=currentLength And dns_EqualName(@dns_current[0],@dns_name[0],length)
+          If dns_rrType[i]=#DNS_TYPE_A
+            If dns_rrTtl[i]<answerTtl : answerTtl=dns_rrTtl[i] : EndIf
+            If count<#DNS_MAX_RESULTS
+              dns_ip[count]=NetReadBE32(*p+dns_rrData[i]) : count=count+1
+            EndIf
+          ElseIf dns_rrType[i]=#DNS_TYPE_CNAME
+            length=dns_ReadName(*p,n,dns_rrData[i],@dns_name[0])
+            If aliasAt<>0
+              If length<>aliasLength : ProcedureReturn dns_Reject(#DNS_E_ALIAS) : EndIf
+              If dns_EqualName(@dns_alias[0],@dns_name[0],length)=0 : ProcedureReturn dns_Reject(#DNS_E_ALIAS) : EndIf
+            EndIf
+            For j=0 To length-1 : dns_alias[j]=dns_name[j] : Next
+            aliasAt=dns_rrData[i] : aliasLength=length
+            If dns_rrTtl[i]<aliasTtl : aliasTtl=dns_rrTtl[i] : EndIf
+          EndIf
+        EndIf
+      EndIf
+    Next
+    If count>0
+      If aliasAt<>0 : ProcedureReturn dns_Reject(#DNS_E_ALIAS) : EndIf
+      For i=0 To count-1 : dns_ttl[i]=answerTtl : Next
+      dns_count=count : ProcedureReturn count
+    EndIf
+    If aliasAt=0 : ProcedureReturn 0 : EndIf
+    If aliasTtl<chainTtl : chainTtl=aliasTtl : EndIf
+    For j=0 To aliasLength-1 : dns_current[j]=dns_alias[j] : Next
+    currentLength=aliasLength
+  Next
+  ProcedureReturn dns_Reject(#DNS_E_ALIAS)
+EndProcedure
+
+Procedure.i DnsParseReply(*p,n.i,qid.i)
+  ProcedureReturn DnsParseReplyFor(*p,n,qid,0)
+EndProcedure
+
+Procedure.i DnsResultTtl(i.i)
+  If i<0 Or i>=dns_count : ProcedureReturn 0 : EndIf
+  ProcedureReturn dns_ttl[i]
 EndProcedure
 
 Procedure.i DnsResultCount()
@@ -380,6 +476,12 @@ Procedure.i DnsErrorText()
         Default
           ProcedureReturn "dns: the server returned an error code"
       EndSelect
+    Case #DNS_E_QUESTION
+      ProcedureReturn "dns: REFUSED - the response question does not match this host query"
+    Case #DNS_E_TRUNCATED
+      ProcedureReturn "dns: REFUSED - the response is truncated; retry over TCP"
+    Case #DNS_E_ALIAS
+      ProcedureReturn "dns: REFUSED - a conflicting or cyclic alias chain"
     Case #DNS_E_MALFORMED
       ProcedureReturn "dns: REFUSED - a length or a compression pointer in the reply runs past its end"
     Default

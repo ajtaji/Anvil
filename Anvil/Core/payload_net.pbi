@@ -175,7 +175,7 @@ EnableExplicit
 #PAYNET_DNS_ARP_MS    = 250
 #PAYNET_DNS_NAME      = 256      ; 253 characters, the terminator, and slack
 #PAYNET_DNS_CACHE     = 4
-#PAYNET_DNS_CACHE_MS  = 300000   ; five minutes; dns_codec does not keep TTLs
+#PAYNET_DNS_CACHE_MS  = 300000   ; local upper bound; shorter DNS TTLs win
 #PAYNET_SLICE_MAX     = 50       ; the most SvcNetService may spend draining
 #PAYNET_DRAIN_PASSES  = 64       ; and the most receive passes it will make
 
@@ -183,9 +183,17 @@ EnableExplicit
 #PAYNET_DNS_SEND = 1             ; due to send (first try, retry, or ARP wait)
 #PAYNET_DNS_WAIT = 2             ; sent; waiting for the reply
 #PAYNET_DNS_DONE = 3             ; answered; the next step caches it
+#PAYNET_DNS_TCP = 5             ; truncated UDP answer, retrying over TCP
 #PAYNET_DNS_FAIL = 4             ; failed; the next ask for that name hears why
 
 ; ---- DNS -------------------------------------------------------------
+Global paynet_dnsTcp.i
+Global paynet_dnsTcpTxLen.i
+Global paynet_dnsTcpTxOff.i
+Global paynet_dnsTcpRxLen.i
+Global paynet_dnsTcpRxWant.i
+Global Dim paynet_dnsTcpTx.a[#DNS_OUT_MAX+2]
+Global Dim paynet_dnsTcpRx.a[65537]
 Global paynet_dnsState.i
 Global paynet_dnsKind.i
 Global paynet_dnsServer.i
@@ -197,6 +205,8 @@ Global paynet_dnsStart.i
 Global paynet_dnsDue.i
 Global paynet_dnsDeadline.i
 Global paynet_dnsAnswer.i
+Global paynet_dnsTtl.i
+Global paynet_dnsAnswerAt.i
 Global paynet_dnsErr.i
 Global paynet_dnsWhy.i
 Global paynet_dnsQueries.i       ; queries sent, ever
@@ -205,6 +215,7 @@ Global Dim paynet_dnsName.a[#PAYNET_DNS_NAME]
 Global Dim paynet_cacheName.a[#PAYNET_DNS_CACHE * #PAYNET_DNS_NAME]
 Global Dim paynet_cacheIp.i[#PAYNET_DNS_CACHE]
 Global Dim paynet_cacheAt.i[#PAYNET_DNS_CACHE]
+Global Dim paynet_cacheMs.i[#PAYNET_DNS_CACHE]
 Global Dim paynet_cacheUsed.i[#PAYNET_DNS_CACHE]
 Global paynet_cacheNext.i
 
@@ -281,9 +292,11 @@ Procedure.i paynet_CacheFind(*name, now.i)
   Define i.i
   For i = 0 To #PAYNET_DNS_CACHE - 1
     If paynet_cacheUsed[i] <> 0
-      If (now - paynet_cacheAt[i]) >= #PAYNET_DNS_CACHE_MS
+      If ((now - paynet_cacheAt[i]) & $FFFFFFFF) >= paynet_cacheMs[i]
         paynet_cacheUsed[i] = 0
       ElseIf paynet_SameName(@paynet_cacheName[i * #PAYNET_DNS_NAME], *name) <> 0
+        ; TTL zero is a one-delivery transaction result, never reusable.
+        If paynet_cacheUsed[i]=2 : paynet_cacheUsed[i]=0 : EndIf
         ProcedureReturn paynet_cacheIp[i]
       EndIf
     EndIf
@@ -291,7 +304,7 @@ Procedure.i paynet_CacheFind(*name, now.i)
   ProcedureReturn 0
 EndProcedure
 
-Procedure paynet_CachePut(*name, ip.i, now.i)
+Procedure paynet_CachePut(*name, ip.i, now.i, ttl.i)
   Define i.i
   Define slot.i
   slot = -1
@@ -309,7 +322,14 @@ Procedure paynet_CachePut(*name, ip.i, now.i)
   paynet_CopyName(@paynet_cacheName[slot * #PAYNET_DNS_NAME], *name)
   paynet_cacheIp[slot] = ip
   paynet_cacheAt[slot] = now
-  paynet_cacheUsed[slot] = 1
+  If ttl<1
+    paynet_cacheUsed[slot]=2
+    paynet_cacheMs[slot]=#PAYNET_DNS_TRY_MS * #PAYNET_DNS_TRIES
+  Else
+    If ttl>#PAYNET_DNS_CACHE_MS/1000 : ttl=#PAYNET_DNS_CACHE_MS/1000 : EndIf
+    paynet_cacheMs[slot]=ttl*1000
+    paynet_cacheUsed[slot]=1
+  EndIf
 EndProcedure
 
 ; ======================================================================
@@ -347,7 +367,13 @@ Procedure paynet_DnsCloseListener()
   paynet_dnsPort = 0
 EndProcedure
 
+Procedure paynet_DnsCloseTcp()
+  If paynet_dnsTcp>0 : PayNetTcpClose(paynet_dnsTcp) : EndIf
+  paynet_dnsTcp=0
+EndProcedure
+
 Procedure paynet_DnsFail(code.i, *why)
+  paynet_DnsCloseTcp()
   paynet_DnsCloseListener()
   paynet_dnsErr = code
   paynet_dnsWhy = *why
@@ -376,9 +402,11 @@ Procedure.i PayNetDnsInput(kind.i)
     paynet_dnsRejects = paynet_dnsRejects + 1
     ProcedureReturn 1
   EndIf
-  c = DnsParseReply(NetUdpRxData(), NetUdpRxLen(), paynet_dnsQid)
+  c = DnsParseReplyFor(NetUdpRxData(), NetUdpRxLen(), paynet_dnsQid, @paynet_dnsName[0])
   If c > 0
     paynet_dnsAnswer = DnsResultIp(0)
+    paynet_dnsTtl = DnsResultTtl(0)
+    paynet_dnsAnswerAt = millis()
     paynet_dnsState = #PAYNET_DNS_DONE
     ProcedureReturn 1
   EndIf
@@ -386,6 +414,10 @@ Procedure.i PayNetDnsInput(kind.i)
     paynet_dnsErr = #SVC_EIO
     paynet_dnsWhy = "the DNS server answered and had no IPv4 address for that name"
     paynet_dnsState = #PAYNET_DNS_FAIL
+    ProcedureReturn 1
+  EndIf
+  If c = #DNS_E_TRUNCATED
+    paynet_dnsState=#PAYNET_DNS_TCP
     ProcedureReturn 1
   EndIf
   If c = #DNS_E_RCODE
@@ -441,10 +473,94 @@ Procedure paynet_DnsSend(now.i)
 EndProcedure
 
 ; One bounded step: finish an answer or a failure, retry, time out, or send.
+; RFC 1035 section 4.2.2: a two-byte network-order message length on TCP.
+; At most one send and one bounded receive per service step. The original
+; DNS deadline also covers fallback; packet progress never extends it.
+Procedure paynet_DnsTcpStep(now.i)
+  Define rc.i,st.i,n.i,i.i,capacity.i
+  paynet_DnsCloseListener()
+  If ((now-paynet_dnsStart) & $FFFFFFFF)>=(#PAYNET_DNS_TRY_MS * #PAYNET_DNS_TRIES)
+    paynet_DnsFail(#SVC_ETIMEOUT,"the DNS TCP retry exceeded the query deadline")
+    ProcedureReturn
+  EndIf
+  If paynet_dnsTcp=0
+    n=DnsBuildQuery(@paynet_dnsName[0],paynet_dnsQid)
+    If n<=0 Or n>#DNS_OUT_MAX
+      paynet_DnsFail(#SVC_EARG,"the DNS TCP query could not be serialized")
+      ProcedureReturn
+    EndIf
+    NetWriteBE16(@paynet_dnsTcpTx[0],n)
+    For i=0 To n-1 : paynet_dnsTcpTx[i+2]=PeekA(DnsQueryBuf()+i) : Next
+    rc=PayNetTcpOpen(paynet_dnsServer,#DNS_PORT)
+    If rc=#SVC_EBUSY : ProcedureReturn : EndIf
+    If rc<0
+      paynet_DnsFail(rc,"TCP to the DNS resolver could not be opened")
+      ProcedureReturn
+    EndIf
+    paynet_dnsTcp=rc : paynet_dnsTcpTxLen=n+2 : paynet_dnsTcpTxOff=0
+    paynet_dnsTcpRxLen=0 : paynet_dnsTcpRxWant=2
+  EndIf
+  st=PayNetTcpState(paynet_dnsTcp)
+  If st<0
+    paynet_DnsFail(st,"TCP to the DNS resolver failed")
+    ProcedureReturn
+  EndIf
+  If st=#SVC_TCP_CONNECTING : ProcedureReturn : EndIf
+  If st<>#SVC_TCP_OPEN And st<>#SVC_TCP_PEER_CLOSED
+    paynet_DnsFail(#SVC_EIO,"the DNS TCP connection entered an invalid state")
+    ProcedureReturn
+  EndIf
+  If paynet_dnsTcpTxOff<paynet_dnsTcpTxLen And st=#SVC_TCP_OPEN
+    n=PayNetTcpSend(paynet_dnsTcp,@paynet_dnsTcpTx[paynet_dnsTcpTxOff],paynet_dnsTcpTxLen-paynet_dnsTcpTxOff)
+    If n<0 Or n>paynet_dnsTcpTxLen-paynet_dnsTcpTxOff
+      paynet_DnsFail(#SVC_EIO,"the DNS TCP query could not be transmitted")
+      ProcedureReturn
+    EndIf
+    paynet_dnsTcpTxOff=paynet_dnsTcpTxOff+n
+  EndIf
+  capacity=paynet_dnsTcpRxWant-paynet_dnsTcpRxLen
+  If capacity>2048 : capacity=2048 : EndIf
+  n=PayNetTcpRecv(paynet_dnsTcp,@paynet_dnsTcpRx[paynet_dnsTcpRxLen],capacity)
+  If n<0 Or n>capacity
+    paynet_DnsFail(#SVC_EIO,"receiving the DNS TCP answer failed")
+    ProcedureReturn
+  EndIf
+  paynet_dnsTcpRxLen=paynet_dnsTcpRxLen+n
+  If paynet_dnsTcpRxLen=2 And paynet_dnsTcpRxWant=2
+    i=NetReadBE16(@paynet_dnsTcpRx[0])
+    If i<#DNS_HDR
+      paynet_DnsFail(#SVC_EIO,"the DNS TCP answer has an invalid message length")
+      ProcedureReturn
+    EndIf
+    paynet_dnsTcpRxWant=i+2
+  EndIf
+  If paynet_dnsTcpRxLen=paynet_dnsTcpRxWant
+    If paynet_dnsTcpTxOff<>paynet_dnsTcpTxLen
+      paynet_DnsFail(#SVC_EIO,"the resolver replied before the DNS query was transmitted")
+      ProcedureReturn
+    EndIf
+    rc=DnsParseReplyFor(@paynet_dnsTcpRx[2],paynet_dnsTcpRxLen-2,paynet_dnsQid,@paynet_dnsName[0])
+    If rc<=0
+      paynet_DnsFail(#SVC_EIO,"the DNS TCP answer was refused or contained no matching address")
+      ProcedureReturn
+    EndIf
+    paynet_dnsAnswer=DnsResultIp(0) : paynet_dnsTtl=DnsResultTtl(0)
+    paynet_dnsAnswerAt=now
+    paynet_DnsCloseTcp()
+    paynet_dnsState=#PAYNET_DNS_DONE
+  ElseIf n=0 And st=#SVC_TCP_PEER_CLOSED
+    paynet_DnsFail(#SVC_EIO,"the DNS resolver closed an incomplete TCP answer")
+  EndIf
+EndProcedure
+
+
 Procedure paynet_DnsStep(now.i)
+  If paynet_dnsState=#PAYNET_DNS_TCP
+    paynet_DnsTcpStep(now) : ProcedureReturn
+  EndIf
   If paynet_dnsState = #PAYNET_DNS_DONE
     paynet_DnsCloseListener()
-    paynet_CachePut(@paynet_dnsName[0], paynet_dnsAnswer, now)
+    paynet_CachePut(@paynet_dnsName[0], paynet_dnsAnswer, paynet_dnsAnswerAt, paynet_dnsTtl)
     paynet_dnsState = #PAYNET_DNS_IDLE
     ProcedureReturn
   EndIf
@@ -483,6 +599,7 @@ Procedure paynet_DnsStep(now.i)
 EndProcedure
 
 Procedure paynet_DnsCancel()
+  paynet_DnsCloseTcp()
   paynet_DnsCloseListener()
   paynet_dnsState = #PAYNET_DNS_IDLE
   paynet_dnsKind = #HW_LINK_NONE
@@ -533,7 +650,7 @@ Procedure.i PayNetDnsResolve(*name)
     ProcedureReturn ip
   EndIf
 
-  If paynet_dnsState = #PAYNET_DNS_SEND Or paynet_dnsState = #PAYNET_DNS_WAIT
+  If paynet_dnsState = #PAYNET_DNS_SEND Or paynet_dnsState = #PAYNET_DNS_WAIT Or paynet_dnsState = #PAYNET_DNS_TCP
     If paynet_SameName(@paynet_dnsName[0], *name) <> 0
       gSvcDetail = "the query for that name is still in flight; ask again with the same name"
       ProcedureReturn #SVC_EAGAIN

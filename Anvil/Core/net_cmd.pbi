@@ -2260,7 +2260,7 @@ Procedure.i ResolveName(name.i)
         gEthFrames = gEthFrames + 1
         If r = #NET_IN_UDP
           If NetUdpRxFrom() = dnsIp And NetUdpRxPort() = #DNS_PORT And NetUdpRxDstPort() = srcPort
-            c = DnsParseReply(NetUdpRxData(), NetUdpRxLen(), qid)
+            c = DnsParseReplyFor(NetUdpRxData(), NetUdpRxLen(), qid, name)
             If c > 0
               ProcedureReturn DnsResultIp(0)
             EndIf
