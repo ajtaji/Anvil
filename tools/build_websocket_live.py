@@ -1,15 +1,15 @@
 """Build live secure WebSocket echo qualification for physical Pi4.
-Each build supplies a fresh finite pool from the host OS CSPRNG. The callback
-refuses exhaustion; no fixed masks, counter entropy, or unverified TLS.
+Uses resident ABI1.10 hardware-seeded randomness for nonces and masks.
+No desktop entropy pool, fixed masks, or unverified TLS.
 """
 from pathlib import Path
-import argparse,hashlib,json,os,re,secrets,subprocess
+import argparse,hashlib,json,os,re,subprocess
 from pmf_compiler import resolve_compiler
 
 def build(compiler,out):
     root=Path(__file__).resolve().parents[1];out.mkdir(parents=True,exist_ok=False)
-    names=['Anvil/Network/web_url.pbi','Anvil/Network/web_request.pbi','Anvil/Network/web_response.pbi','Anvil/Network/websocket_frame.pbi','Anvil/Network/websocket_handshake.pbi','Anvil/Crypto/sha1.pbi','Anvil/Network/web_transport.pbi','Anvil/Network/web_client.pbi','Anvil/Network/websocket_client.pbi','RaspberryPi4/Lib/mmu.pi4']
-    cases=['secure-echo']
+    names=['Anvil/Network/web_url.pbi','Anvil/Network/web_request.pbi','Anvil/Network/web_response.pbi','Anvil/Network/websocket_frame.pbi','Anvil/Network/websocket_handshake.pbi','Anvil/Crypto/sha1.pbi','Anvil/Network/web_transport.pbi','Anvil/Network/web_client.pbi','Anvil/Network/websocket_client.pbi','RaspberryPi4/Lib/mmu.pi4','Anvil/Network/web_random.pbi']
+    cases=['secure-resident-echo']
     s='#WEB_KERNEL_BINDING=0\n'+'\n'.join(x for n in names for x in (root/n).read_text(encoding='utf8').splitlines() if not x.startswith(('XIncludeFile','#WEB_KERNEL_BINDING=')))+r'''
 Global u.WebUrl,q.WebRequest,a.WebResponse,h.WebClient,f.WebSocketFrame,ws.WebSocketClient
 Global Dim host.a[256]
@@ -24,10 +24,9 @@ Global Dim ctrl.a[125]
 Global Dim tx.a[512]
 Global Dim rx.a[512]
 Global Dim output.a[4]
-Global Dim pool.a[192]
 Global Dim nonce.a[16]
 Global Dim closeCode.a[2]
-Global poolOff.i,wtable.i
+Global randomBytesUsed.i,wtable.i
 Global *wirePet,*wireTime
 Procedure CaptureTable()
  ASM
@@ -35,12 +34,6 @@ Procedure CaptureTable()
  add x1, x1, #:lo12:global_wtable
  str x0, [x1]
  EndASM
-EndProcedure
-Procedure.i PoolRandom(p.i,n.i)
- Define i.i
- If n<0 Or n>192-poolOff : ProcedureReturn -1 : EndIf
- For i=0 To n-1 : PokeA(p+i,pool[poolOff+i]) : pool[poolOff+i]=0 : Next
- poolOff=poolOff+n : ProcedureReturn n
 EndProcedure
 Procedure.i Main()
  Define i.i,rc.i,start.i,now.i,queued.i,closing.i,frames.i,total.i,began.i,cost.i,maxCost.i,url.i
@@ -53,8 +46,13 @@ Procedure.i Main()
  MmuClearNc() : MmuAddNc($08A00000,$09200000) : MmuAddNc($08100000,$08180000)
  rc=MmuBuildTables($4F80000) : If rc<>0 : ProcedureReturn 2 : EndIf
  MmuEnableCached()
- Restore RandomPool : For i=0 To 191 : Read.a pool[i] : Next
- rc=PoolRandom(@nonce[0],16)
+ rc=WebRandomBind(wtable) : PokeI($E1C00060,rc)
+ If rc=0 : rc=WebRandomReady() : EndIf
+ PokeI($E1C00068,rc)
+ If rc<>1 : MmuDisableCachedFlushed() : ProcedureReturn 3 : EndIf
+ began=wireTime() : rc=WebRandomBytes(@nonce[0],16) : randomBytesUsed=rc
+ PokeI($E1C00070,wireTime()-began)
+ If rc<>16 : MmuDisableCachedFlushed() : ProcedureReturn 4 : EndIf
  closeCode[0]=3 : closeCode[1]=232
  u\host=@host[0] : u\hostCapacity=256 : u\target=@target[0] : u\targetCapacity=3072
  url="wss://httpbingo.org/websocket/echo"
@@ -67,7 +65,7 @@ Procedure.i Main()
  If rc=0 : rc=WebSocketFrameInit(@f,@ctrl[0],1024) : EndIf
  start=wireTime()/1000
  If rc=0 : rc=WebClientStart(@h,@u,@q,@a,@tx[0],512,@rx[0],512,start,10000) : EndIf
- If rc=0 : rc=WebSocketClientBind(@ws,@h,@f,@accept[0],0,0,@PoolRandom,@scratch[0]) : EndIf
+ If rc=0 : rc=WebSocketClientBind(@ws,@h,@f,@accept[0],0,0,webRandomBytesFn,@scratch[0]) : EndIf
  While rc>=0 And rc<>2
   wirePet() : WebPayloadService(1) : now=wireTime()/1000
   began=wireTime() : rc=WebSocketClientStep(@ws,@output[0],3,now)
@@ -86,18 +84,14 @@ Procedure.i Main()
  Wend
  PokeI($E1C00010,rc) : PokeI($E1C00018,ws\state) : PokeI($E1C00020,a\status)
  PokeI($E1C00028,total) : PokeI($E1C00030,frames) : PokeI($E1C00038,wireTime()/1000-start)
- PokeI($E1C00040,maxCost) : PokeI($E1C00048,poolOff) : PokeI($E1C00050,u\secure)
+ PokeI($E1C00040,maxCost) : PokeI($E1C00048,randomBytesUsed) : PokeI($E1C00050,u\secure)
  PokeI($E1C00058,f\controlLength)
  For i=0 To f\controlLength-1 : PokeA($E1C00600+i,ctrl[i]) : Next
  If rc<>2 : WebSocketClientAbort(@ws) : EndIf
  MmuDisableCachedFlushed() : ProcedureReturn 0
 EndProcedure
-DataSection
-RandomPool:
 '''
-    pool=secrets.token_bytes(192)
-    for i in range(0,192,24):s+=' Data.a '+','.join(map(str,pool[i:i+24]))+'\n'
-    s+='EndDataSection\n';source=out/'proof.pi4';source.write_text(s,encoding='utf8')
+    source=out/'proof.pi4';source.write_text(s,encoding='utf8')
     q=subprocess.run([str(resolve_compiler(compiler)),'--compile',str(source),'-t','pi4','--load-addr','0x1000000','--stack-addr','0x4f00000','--entry-returns','--wants-services','-o',str(out/'proof.img')],env=dict(os.environ,PMF_ROOT=str(root)),capture_output=True,text=True,encoding='utf8',timeout=180,creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
     log=q.stdout+q.stderr;(out/'compile.txt').write_text(log,encoding='utf8');print(log[-1800:]);assert q.returncode==0
     code=re.search(r'occupying \$([0-9A-Fa-f]+)\.\.\$([0-9A-Fa-f]+)',log);bss=re.search(r'bss \$([0-9A-Fa-f]+)\.\.\$([0-9A-Fa-f]+)',log)

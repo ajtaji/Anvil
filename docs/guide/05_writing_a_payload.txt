@@ -672,7 +672,12 @@ call sequence are in docs/WEB_CLIENT.md.
 A new connection needs a fresh unpredictable 16-byte nonce; every outgoing frame
 needs a fresh unpredictable 4-byte mask. Supply a cryptographic RNG callback.
 The client refuses RNG failure and never substitutes a fixed value or counter.
-There is not yet a public kernel RNG service slot.
+ABI 1.10 supplies SvcRandom at slot 175 and SvcRandomReady at slot 176. Include
+web_random, bind the service table, require readiness 1, then obtain the nonce.
+Pass the bound webRandomBytesFn directly to WebSocketClientBind for masks.
+Requests of 1 through 4096 bytes return the exact count or a negative error.
+The shared provider seeds from hardware and preserves SHA/HMAC working state;
+there is no weak fallback when entropy fails. Calls remain core 0 only.
 
 Keep servicing networking and call WebSocketClientStep. Consume its written
 bytes on every call; a return of 1 marks a data-frame boundary and fin identifies

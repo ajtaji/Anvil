@@ -128,6 +128,8 @@
 ; 1.9 - console slot39: resident normalized keyboard/pointer input.
 ; Existing table offsets/signatures and200-entry count remain unchanged.
 ; A target without a registered provider answers ENOSYS.
-#SVC_ABI_MINOR   = 9
+; 1.10 - existing crypto slots175/176: bounded random bytes and readiness.
+; No table index moves; targets without an entropy provider return ENOCAP.
+#SVC_ABI_MINOR   = 10
 #SVC_SLOT_COUNT  = 200         ; 184 at 1.0-1.2; 192 at 1.3; file handles appended at 1.4.
                                ; The boot code sizes its check by it.

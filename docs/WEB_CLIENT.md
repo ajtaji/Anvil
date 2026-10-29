@@ -268,9 +268,14 @@ Initialization, with separate caller-owned buffers:
 The RNG callback takes `(destination, count)` and must return exactly `count`
 only after filling it with fresh cryptographically unpredictable bytes. A failed
 callback aborts the connection. There is no fixed-mask or counter fallback. This
-is an explicit caller dependency; there is not yet a public kernel RNG slot.
-The live proof supplies a fresh finite pool from the host OS CSPRNG for each
-build, refuses exhaustion, and does not claim a resident RNG service.
+can use resident ABI 1.10 slots 175/176 through `web_random.pbi`:
+`WebRandomBind(table)`, `WebRandomReady()` and `WebRandomBytes(dst,n)`.
+Binding checks the version, entry count and function pointers. Pass the bound
+`webRandomBytesFn` directly as the WebSocket RNG callback. It has the required
+signature; no payload callback wrapper is needed. Obtain the nonce through
+`WebRandomBytes` and require an exact 16-byte return before building the request.
+The initial 419 qualification used a fresh finite desktop entropy pool; the
+current live proof uses resident randomness instead.
 
 Pump `SvcNetService` externally and call `WebSocketClientStep` with an output
 buffer and current milliseconds. Zero means progress, one a data-frame boundary,
@@ -300,3 +305,36 @@ exactly 15 bytes, and closed cleanly in895 ms in this sample. Its longest Step w
 arithmetic. An earlier test set the server's maximum fragment size below the
 outgoing message and received a clean close without an echo; it is recorded as
 failed, not counted as echo qualification.
+
+
+## Resident randomness
+
+ABI 1.10 fills the previously reserved slots 175 `SvcRandom(dst,n)` and 176
+`SvcRandomReady()`. The 200-entry table and all existing slots remain unchanged.
+These calls, like all payload ABI calls, run on core 0. Requests must have a
+nonzero destination and a length from 1 through 4096 bytes. Success returns
+exactly the requested length. Invalid arguments return EARG; an absent provider
+returns ENOCAP, and a busy call returns EBUSY. A provider which is temporarily
+not ready returns EAGAIN; provider failure or a short/oversized result returns
+EIO. Failed provider calls wipe the requested output span. Argument, absent-
+provider and busy refusals do not touch output memory.
+
+Readiness returns 1 after successful initialization, 0 for a provider still
+waiting, or a negative error. The shared DRBG provider lazily gathers 48 bytes
+from the existing hardware entropy owner, refuses failed/short/constant seeds,
+and requires fresh reseeding once its generated-byte counter reaches 1 MiB.
+Requests are bounded; this is not a claim of asynchronous entropy collection.
+There is no fixed, counter or clock fallback. The provider saves and restores
+SHA-256 and HMAC working state and wipes the snapshot afterwards, so an entropy
+call between TLS advances cannot replace an in-progress digest or HMAC key.
+Other targets can register their own provider through the shared service owner;
+absence is explicit rather than being inferred from a board name or network flag.
+
+
+Physical resident qualification on Anvil421: verified WSS upgrade, exact text
+echo and graceful close in 729 ms. The initialized 16-byte nonce call took
+389 us; maximum WebSocket Step was 547 us, excluding TLS service arithmetic.
+No desktop entropy was included. The controlled service proof passed 37 result
+checks and independent SHA-256, HMAC, DRBG and reseed comparisons. An initial
+16-bit ABI header read was corrected to the actual 32-bit fields before this
+qualification. All runs returned to healthy cores/fonts/Vulkan with watchdog off.

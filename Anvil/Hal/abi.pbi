@@ -218,6 +218,7 @@
 XIncludeFile "Anvil/Hal/neon_service_api.pbi"
 XIncludeFile "Anvil/Hal/graphics_service.pbi"
 XIncludeFile "Anvil/Hal/input_service.pbi"
+XIncludeFile "Anvil/Hal/random_service.pbi"
 
 #SVC_MAGIC       = $53564E41   ; 'ANVS' little-endian: bytes 41 4E 56 53
 ; #SVC_ABI_MAJOR / #SVC_ABI_MINOR live in Anvil/Hal/abi_version.pbi, included
@@ -2761,6 +2762,20 @@ Procedure.i SvcSha256(*in, n.i, *out32)
   ProcedureReturn #SVC_OK
 EndProcedure
 
+ ; ABI1.10 fills the reserved entropy slots. Providers remain board-owned.
+Procedure.i SvcRandom(dst.i,n.i)
+  Define rc.i
+  rc=RandomServiceBytes(dst,n)
+  If rc<0 : gSvcDetail="random bytes unavailable, invalid request, or entropy provider failure" : EndIf
+  ProcedureReturn rc
+EndProcedure
+Procedure.i SvcRandomReady()
+  Define rc.i
+  rc=RandomServiceReady()
+  If rc<0 : gSvcDetail="no usable resident entropy provider" : EndIf
+  ProcedureReturn rc
+EndProcedure
+
 ; ----------------------------------------------------------------------
 ;  THE SLOT INSTALLER.
 ;
@@ -2964,6 +2979,8 @@ Procedure BuildServiceTable()
 
   ; --- crypto and entropy, base 168 -----------------------------------
   gSvcTab[#SVC_HDR_WORDS + #SVC_BASE_CRYPTO + 0] = @SvcSha256
+  gSvcTab[#SVC_HDR_WORDS + #SVC_BASE_CRYPTO + 7] = @SvcRandom
+  gSvcTab[#SVC_HDR_WORDS + #SVC_BASE_CRYPTO + 8] = @SvcRandomReady
 
   ; Group 15, new at 1.3. Both arms of the CompilerIf define all three, so
   ; these lines are not themselves gated: on a board without the

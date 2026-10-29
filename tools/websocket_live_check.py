@@ -6,5 +6,10 @@ def check(raw,cases):
     rc,state,status,n,frames,elapsed,maxstep,randomused,secure=struct.unpack_from('<9q',raw,16)
     assert (rc,state,status,n,secure)==(2,3,101,15,1),(rc,state,status,n,secure)
     assert raw[256:256+n]==b'Anvil websocket'
-    assert frames>=1 and randomused>=24
+    assert frames>=1
+    if cases==['secure-resident-echo']:
+        assert randomused==16
+        assert struct.unpack_from('<2q',raw,96)==(0,1),'resident RNG unavailable'
+        return dict(passed=True,frames=frames,elapsed_ms=elapsed,max_step_us=maxstep,resident_rng=True,nonce_us=struct.unpack_from('<q',raw,112)[0])
+    assert randomused>=24
     return dict(passed=True,frames=frames,elapsed_ms=elapsed,max_step_us=maxstep,random_bytes=randomused)
