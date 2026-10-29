@@ -1,0 +1,585 @@
+XIncludeFile "Anvil/Network/web_url.pbi"
+XIncludeFile "Anvil/Network/web_request.pbi"
+XIncludeFile "Anvil/Network/web_cookie_date.pbi"
+XIncludeFile "Anvil/Network/web_cookies.pbi"
+Global jar.WebCookies
+Global u.WebUrl
+Global Dim storage.a[4*#WEB_COOKIE_STRIDE]
+Global Dim host.a[256]
+Global Dim target.a[1024]
+Global Dim field.a[8192]
+Global Dim output.a[1024]
+Procedure.i Allowed(domain.i,bytes.i)
+ ProcedureReturn wckEqual(domain,bytes,"EXAMPLE.com",11,1)
+EndProcedure
+Procedure Url(v.i)
+ Define n.i,rc.i
+ n=0 : While PeekA(v+n)<>0 : n=n+1 : Wend
+ u\host=@host[0] : u\hostCapacity=256 : u\target=@target[0] : u\targetCapacity=1024
+ rc=WebUrlParse(v,n,1,@u)
+EndProcedure
+Procedure Store(p.i,n.i,now.i)
+ Define i.i,rc.i
+ For i=0 To n-1 : Read.a field[i] : Next
+ rc=WebCookieStore(@jar,@u,@field[0],n,now) : PokeI(p,rc)
+EndProcedure
+Procedure CookieFixtureResult(p.i,now.i,same.i,top.i,capacity.i)
+ Define i.i,n.i,query.i,wipe.i
+ For i=0 To 1023 : output[i]=$A5 : Next
+ query=WebCookieHeader(@jar,@u,now,same,top,0,0)
+ n=WebCookieHeader(@jar,@u,now,same,top,@output[0],capacity)
+ PokeI(p,n) : PokeI(p+8,query)
+ For i=0 To 767 : PokeA(p+128+i,output[i]) : Next
+ wipe=WebCookiesClear(@jar)
+ For i=0 To jar\slots*#WEB_COOKIE_STRIDE-1 : If storage[i]<>0 : wipe=-999 : EndIf : Next
+ PokeI(p+16,wipe)
+EndProcedure
+Procedure.i Main(services.i)
+ Define i.i,rc.i,policy.i
+ For i=0 To 65535 : PokeA($E1C00000+i,0) : Next
+ PokeI($E1C00000,$57434B31)
+ PokeI($E1C00008,53)
+ policy=0
+ rc=WebCookiesInit(@jar,@storage[0],4,policy)
+ Url("https://www.example.com/account/login")
+ Restore Case0_0
+ Store($E1C00120+0*1024+0*8,7,1700000000)
+ Url("https://www.example.com/account/login")
+ CookieFixtureResult($E1C00100+0*1024,1700000000,1,0,512)
+ policy=0
+ rc=WebCookiesInit(@jar,@storage[0],4,policy)
+ Url("https://www.example.com/account/login")
+ Restore Case1_0
+ Store($E1C00120+1*1024+0*8,7,1700000000)
+ Url("https://example.com/account/login")
+ CookieFixtureResult($E1C00100+1*1024,1700000000,1,0,512)
+ policy=0
+ rc=WebCookiesInit(@jar,@storage[0],4,policy)
+ Url("https://www.example.com/account/login")
+ Restore Case2_0
+ Store($E1C00120+2*1024+0*8,7,1700000000)
+ Url("https://sub.www.example.com/account/login")
+ CookieFixtureResult($E1C00100+2*1024,1700000000,1,0,512)
+ policy=0
+ rc=WebCookiesInit(@jar,@storage[0],4,policy)
+ Url("https://www.example.com/account/login")
+ Restore Case3_0
+ Store($E1C00120+3*1024+0*8,7,1700000000)
+ Url("https://www.example.com/other")
+ CookieFixtureResult($E1C00100+3*1024,1700000000,1,0,512)
+ policy=0
+ rc=WebCookiesInit(@jar,@storage[0],4,policy)
+ Url("https://www.example.com/account/login")
+ Restore Case4_0
+ Store($E1C00120+4*1024+0*8,22,1700000000)
+ Url("https://www.example.com/accounting")
+ CookieFixtureResult($E1C00100+4*1024,1700000000,1,0,512)
+ policy=0
+ rc=WebCookiesInit(@jar,@storage[0],4,policy)
+ Url("https://www.example.com/account/login")
+ Restore Case5_0
+ Store($E1C00120+5*1024+0*8,22,1700000000)
+ Url("https://www.example.com/account?q=1")
+ CookieFixtureResult($E1C00100+5*1024,1700000000,1,0,512)
+ policy=0
+ rc=WebCookiesInit(@jar,@storage[0],4,policy)
+ Url("https://www.example.com/account/login")
+ Restore Case6_0
+ Store($E1C00120+6*1024+0*8,15,1700000000)
+ Url("http://www.example.com/account/login")
+ CookieFixtureResult($E1C00100+6*1024,1700000000,1,0,512)
+ policy=0
+ rc=WebCookiesInit(@jar,@storage[0],4,policy)
+ Url("http://www.example.com/")
+ Restore Case7_0
+ Store($E1C00120+7*1024+0*8,15,1700000000)
+ Url("http://www.example.com/")
+ CookieFixtureResult($E1C00100+7*1024,1700000000,1,0,512)
+ policy=0
+ rc=WebCookiesInit(@jar,@storage[0],4,policy)
+ Url("https://www.example.com/account/login")
+ Restore Case8_0
+ Store($E1C00120+8*1024+0*8,17,1700000000)
+ Url("https://www.example.com/account/login")
+ CookieFixtureResult($E1C00100+8*1024,1700000000,1,0,512)
+ policy=0
+ rc=WebCookiesInit(@jar,@storage[0],4,policy)
+ Url("https://www.example.com/account/login")
+ Restore Case9_0
+ Store($E1C00120+9*1024+0*8,7,1700000000)
+ Restore Case9_1
+ Store($E1C00120+9*1024+1*8,7,1700000000)
+ Url("https://www.example.com/account/login")
+ CookieFixtureResult($E1C00100+9*1024,1700000000,1,0,512)
+ policy=0
+ rc=WebCookiesInit(@jar,@storage[0],4,policy)
+ Url("https://www.example.com/account/login")
+ Restore Case10_0
+ Store($E1C00120+10*1024+0*8,14,1700000000)
+ Restore Case10_1
+ Store($E1C00120+10*1024+1*8,21,1700000000)
+ Restore Case10_2
+ Store($E1C00120+10*1024+2*8,14,1700000000)
+ Url("https://www.example.com/account/login")
+ CookieFixtureResult($E1C00100+10*1024,1700000000,1,0,512)
+ policy=0
+ rc=WebCookiesInit(@jar,@storage[0],4,policy)
+ Url("https://www.example.com/account/login")
+ Restore Case11_0
+ Store($E1C00120+11*1024+0*8,3,1700000000)
+ Restore Case11_1
+ Store($E1C00120+11*1024+1*8,3,1700000000)
+ Restore Case11_2
+ Store($E1C00120+11*1024+2*8,3,1700000000)
+ Url("https://www.example.com/account/login")
+ CookieFixtureResult($E1C00100+11*1024,1700000000,1,0,512)
+ policy=0
+ rc=WebCookiesInit(@jar,@storage[0],4,policy)
+ Url("https://www.example.com/account/login")
+ Restore Case12_0
+ Store($E1C00120+12*1024+0*8,7,1700000000)
+ Restore Case12_1
+ Store($E1C00120+12*1024+1*8,16,1700000000)
+ Url("https://www.example.com/account/login")
+ CookieFixtureResult($E1C00100+12*1024,1700000000,1,0,512)
+ policy=0
+ rc=WebCookiesInit(@jar,@storage[0],4,policy)
+ Url("https://www.example.com/account/login")
+ Restore Case13_0
+ Store($E1C00120+13*1024+0*8,7,1700000000)
+ Restore Case13_1
+ Store($E1C00120+13*1024+1*8,18,1700000000)
+ Url("https://www.example.com/account/login")
+ CookieFixtureResult($E1C00100+13*1024,1700000000,1,0,512)
+ policy=0
+ rc=WebCookiesInit(@jar,@storage[0],4,policy)
+ Url("https://www.example.com/account/login")
+ Restore Case14_0
+ Store($E1C00120+14*1024+0*8,19,1700000000)
+ Url("https://www.example.com/account/login")
+ CookieFixtureResult($E1C00100+14*1024,1700000010,1,0,512)
+ policy=0
+ rc=WebCookiesInit(@jar,@storage[0],4,policy)
+ Url("https://www.example.com/account/login")
+ Restore Case15_0
+ Store($E1C00120+15*1024+0*8,19,1700000000)
+ Url("https://www.example.com/account/login")
+ CookieFixtureResult($E1C00100+15*1024,1700000009,1,0,512)
+ policy=0
+ rc=WebCookiesInit(@jar,@storage[0],4,policy)
+ Url("https://www.example.com/account/login")
+ Restore Case16_0
+ Store($E1C00120+16*1024+0*8,46,1700000000)
+ Url("https://www.example.com/account/login")
+ CookieFixtureResult($E1C00100+16*1024,1700000000,1,0,512)
+ policy=0
+ rc=WebCookiesInit(@jar,@storage[0],4,policy)
+ Url("https://www.example.com/account/login")
+ Restore Case17_0
+ Store($E1C00120+17*1024+0*8,46,1700000000)
+ Url("https://www.example.com/account/login")
+ CookieFixtureResult($E1C00100+17*1024,1700000000,1,0,512)
+ policy=0
+ rc=WebCookiesInit(@jar,@storage[0],4,policy)
+ Url("https://www.example.com/account/login")
+ Restore Case18_0
+ Store($E1C00120+18*1024+0*8,50,1700000000)
+ Url("https://www.example.com/account/login")
+ CookieFixtureResult($E1C00100+18*1024,1700000000,1,0,512)
+ policy=0
+ rc=WebCookiesInit(@jar,@storage[0],4,policy)
+ Url("https://www.example.com/account/login")
+ Restore Case19_0
+ Store($E1C00120+19*1024+0*8,58,1700000000)
+ Url("https://www.example.com/account/login")
+ CookieFixtureResult($E1C00100+19*1024,1700000000,1,0,512)
+ policy=0
+ rc=WebCookiesInit(@jar,@storage[0],4,policy)
+ Url("https://www.example.com/account/login")
+ Restore Case20_0
+ Store($E1C00120+20*1024+0*8,59,1700000000)
+ Url("https://www.example.com/account/login")
+ CookieFixtureResult($E1C00100+20*1024,1700000000,1,0,512)
+ policy=0
+ rc=WebCookiesInit(@jar,@storage[0],4,policy)
+ Url("https://www.example.com/account/login")
+ Restore Case21_0
+ Store($E1C00120+21*1024+0*8,41,1700000000)
+ Url("https://www.example.com/account/login")
+ CookieFixtureResult($E1C00100+21*1024,1700000000,1,0,512)
+ policy=0
+ rc=WebCookiesInit(@jar,@storage[0],4,policy)
+ Url("https://www.example.com/account/login")
+ Restore Case22_0
+ Store($E1C00120+22*1024+0*8,46,1700000000)
+ Url("https://www.example.com/account/login")
+ CookieFixtureResult($E1C00100+22*1024,1700000000,1,0,512)
+ policy=0
+ rc=WebCookiesInit(@jar,@storage[0],4,policy)
+ Url("https://www.example.com/account/login")
+ Restore Case23_0
+ Store($E1C00120+23*1024+0*8,24,1700000000)
+ Url("https://www.example.com/account/login")
+ CookieFixtureResult($E1C00100+23*1024,1700000000,0,1,512)
+ policy=0
+ rc=WebCookiesInit(@jar,@storage[0],4,policy)
+ Url("https://www.example.com/account/login")
+ Restore Case24_0
+ Store($E1C00120+24*1024+0*8,7,1700000000)
+ Url("https://www.example.com/account/login")
+ CookieFixtureResult($E1C00100+24*1024,1700000000,0,0,512)
+ policy=0
+ rc=WebCookiesInit(@jar,@storage[0],4,policy)
+ Url("https://www.example.com/account/login")
+ Restore Case25_0
+ Store($E1C00120+25*1024+0*8,7,1700000000)
+ Url("https://www.example.com/account/login")
+ CookieFixtureResult($E1C00100+25*1024,1700000000,0,1,512)
+ policy=0
+ rc=WebCookiesInit(@jar,@storage[0],4,policy)
+ Url("https://www.example.com/account/login")
+ Restore Case26_0
+ Store($E1C00120+26*1024+0*8,30,1700000000)
+ Url("https://www.example.com/account/login")
+ CookieFixtureResult($E1C00100+26*1024,1700000000,0,0,512)
+ policy=0
+ rc=WebCookiesInit(@jar,@storage[0],4,policy)
+ Url("https://www.example.com/account/login")
+ Restore Case27_0
+ Store($E1C00120+27*1024+0*8,22,1700000000)
+ Url("https://www.example.com/account/login")
+ CookieFixtureResult($E1C00100+27*1024,1700000000,1,0,512)
+ policy=0
+ rc=WebCookiesInit(@jar,@storage[0],4,policy)
+ Url("https://www.example.com/account/login")
+ Restore Case28_0
+ Store($E1C00120+28*1024+0*8,30,1700000000)
+ Url("https://www.example.com/account/login")
+ CookieFixtureResult($E1C00100+28*1024,1700000000,1,0,512)
+ policy=0
+ rc=WebCookiesInit(@jar,@storage[0],4,policy)
+ Url("https://www.example.com/account/login")
+ Restore Case29_0
+ Store($E1C00120+29*1024+0*8,22,1700000000)
+ Url("https://www.example.com/account/login")
+ CookieFixtureResult($E1C00100+29*1024,1700000000,1,0,512)
+ policy=0
+ rc=WebCookiesInit(@jar,@storage[0],4,policy)
+ Url("https://www.example.com/account/login")
+ Restore Case30_0
+ Store($E1C00120+30*1024+0*8,16,1700000000)
+ Url("https://www.example.com/account/login")
+ CookieFixtureResult($E1C00100+30*1024,1700000000,1,0,512)
+ policy=0
+ rc=WebCookiesInit(@jar,@storage[0],4,policy)
+ Url("https://www.example.com/account/login")
+ Restore Case31_0
+ Store($E1C00120+31*1024+0*8,25,1700000000)
+ Url("https://www.example.com/account/login")
+ CookieFixtureResult($E1C00100+31*1024,1700000000,1,0,512)
+ policy=0
+ rc=WebCookiesInit(@jar,@storage[0],4,policy)
+ Url("https://www.example.com/account/login")
+ Restore Case32_0
+ Store($E1C00120+32*1024+0*8,27,1700000000)
+ Url("https://www.example.com/account/login")
+ CookieFixtureResult($E1C00100+32*1024,1700000000,1,0,512)
+ policy=0
+ policy=@Allowed
+ rc=WebCookiesInit(@jar,@storage[0],4,policy)
+ Url("https://www.example.com/account/login")
+ Restore Case33_0
+ Store($E1C00120+33*1024+0*8,28,1700000000)
+ Url("https://other.example.com/account/x")
+ CookieFixtureResult($E1C00100+33*1024,1700000000,1,0,512)
+ policy=0
+ policy=@Allowed
+ rc=WebCookiesInit(@jar,@storage[0],4,policy)
+ Url("https://www.example.com/account/login")
+ Restore Case34_0
+ Store($E1C00120+34*1024+0*8,19,1700000000)
+ Url("https://www.example.com/account/login")
+ CookieFixtureResult($E1C00100+34*1024,1700000000,1,0,512)
+ policy=0
+ rc=WebCookiesInit(@jar,@storage[0],4,policy)
+ Url("https://www.example.com/account/login")
+ Restore Case35_0
+ Store($E1C00120+35*1024+0*8,31,1700000000)
+ Url("https://sub.www.example.com/account/x")
+ CookieFixtureResult($E1C00100+35*1024,1700000000,1,0,512)
+ policy=0
+ rc=WebCookiesInit(@jar,@storage[0],4,policy)
+ Url("https://www.example.com/account/login")
+ Restore Case36_0
+ Store($E1C00120+36*1024+0*8,28,1700000000)
+ Url("https://www.example.com/account/login")
+ CookieFixtureResult($E1C00100+36*1024,1700000000,1,0,512)
+ policy=0
+ rc=WebCookiesInit(@jar,@storage[0],4,policy)
+ Url("https://www.example.com/account/login")
+ Restore Case37_0
+ Store($E1C00120+37*1024+0*8,12,1700000000)
+ Url("https://www.example.com/account/login")
+ CookieFixtureResult($E1C00100+37*1024,1700000000,1,0,512)
+ policy=0
+ rc=WebCookiesInit(@jar,@storage[0],4,policy)
+ Url("https://www.example.com/account/login")
+ Restore Case38_0
+ Store($E1C00120+38*1024+0*8,9,1700000000)
+ Url("https://www.example.com/account/login")
+ CookieFixtureResult($E1C00100+38*1024,1700000000,1,0,512)
+ policy=0
+ rc=WebCookiesInit(@jar,@storage[0],4,policy)
+ Url("https://www.example.com/account/login")
+ Restore Case39_0
+ Store($E1C00120+39*1024+0*8,7,1700000000)
+ Url("https://www.example.com/account/login")
+ CookieFixtureResult($E1C00100+39*1024,1700000000,1,0,3)
+ policy=0
+ rc=WebCookiesInit(@jar,@storage[0],1,policy)
+ Url("https://www.example.com/account/login")
+ Restore Case40_0
+ Store($E1C00120+40*1024+0*8,3,1700000000)
+ Restore Case40_1
+ Store($E1C00120+40*1024+1*8,3,1700000000)
+ Url("https://www.example.com/account/login")
+ CookieFixtureResult($E1C00100+40*1024,1700000000,1,0,512)
+ policy=0
+ rc=WebCookiesInit(@jar,@storage[0],4,policy)
+ Url("https://www.example.com/account/login")
+ Restore Case41_0
+ Store($E1C00120+41*1024+0*8,5,1700000000)
+ Url("https://www.example.com/account/login")
+ CookieFixtureResult($E1C00100+41*1024,1700000000,1,0,512)
+ policy=0
+ rc=WebCookiesInit(@jar,@storage[0],4,policy)
+ Url("https://www.example.com/account/login")
+ Restore Case42_0
+ Store($E1C00120+42*1024+0*8,5,1700000000)
+ Url("https://www.example.com/account/login")
+ CookieFixtureResult($E1C00100+42*1024,1700000000,1,0,512)
+ policy=0
+ rc=WebCookiesInit(@jar,@storage[0],4,policy)
+ Url("https://www.example.com/account/login")
+ Restore Case43_0
+ Store($E1C00120+43*1024+0*8,2,1700000000)
+ Url("https://www.example.com/account/login")
+ CookieFixtureResult($E1C00100+43*1024,1700000000,1,0,512)
+ policy=0
+ rc=WebCookiesInit(@jar,@storage[0],4,policy)
+ Url("https://www.example.com/account/login")
+ Restore Case44_0
+ Store($E1C00120+44*1024+0*8,10,1700000000)
+ Url("https://www.example.com/account/login")
+ CookieFixtureResult($E1C00100+44*1024,1700000000,1,0,512)
+ policy=0
+ rc=WebCookiesInit(@jar,@storage[0],4,policy)
+ Url("https://www.example.com/account/login")
+ Restore Case45_0
+ Store($E1C00120+45*1024+0*8,29,1700000000)
+ Url("https://www.example.com/account/login")
+ CookieFixtureResult($E1C00100+45*1024,1700000000,1,0,512)
+ policy=0
+ rc=WebCookiesInit(@jar,@storage[0],4,policy)
+ Url("https://www.example.com/account/login")
+ Restore Case46_0
+ Store($E1C00120+46*1024+0*8,18,1700000000)
+ Url("https://www.example.com/")
+ CookieFixtureResult($E1C00100+46*1024,1700000000,1,0,512)
+ policy=0
+ rc=WebCookiesInit(@jar,@storage[0],4,policy)
+ Url("https://www.example.com/account/login")
+ Restore Case47_0
+ Store($E1C00120+47*1024+0*8,42,1700000000)
+ Url("https://www.example.com/account/login")
+ CookieFixtureResult($E1C00100+47*1024,1700000000,1,0,512)
+ policy=0
+ rc=WebCookiesInit(@jar,@storage[0],1,policy)
+ Url("https://www.example.com/account/login")
+ Restore Case48_0
+ Store($E1C00120+48*1024+0*8,14,1700000000)
+ Restore Case48_1
+ Store($E1C00120+48*1024+1*8,3,1700000000)
+ Url("https://www.example.com/account/login")
+ CookieFixtureResult($E1C00100+48*1024,1700000000,1,0,512)
+ policy=0
+ rc=WebCookiesInit(@jar,@storage[0],4,policy)
+ Url("https://www.example.com/account/login")
+ Url("https://www.example.com/account/login")
+ Restore Case49_0
+ Store($E1C00120+49*1024+0*8,31,1700000000)
+ Url("http://www.example.com/account/login")
+ Restore Case49_1
+ Store($E1C00120+49*1024+1*8,22,1700000000)
+ Url("https://www.example.com/account/login")
+ CookieFixtureResult($E1C00100+49*1024,1700000000,1,0,512)
+ policy=0
+ policy=@Allowed
+ rc=WebCookiesInit(@jar,@storage[0],4,policy)
+ Url("https://www.example.com/account/login")
+ Url("https://www.example.com/account/login")
+ Restore Case50_0
+ Store($E1C00120+50*1024+0*8,31,1700000000)
+ Url("http://www.example.com/account/login")
+ Restore Case50_1
+ Store($E1C00120+50*1024+1*8,42,1700000000)
+ Url("https://www.example.com/account/login")
+ CookieFixtureResult($E1C00100+50*1024,1700000000,1,0,512)
+ policy=0
+ rc=WebCookiesInit(@jar,@storage[0],4,policy)
+ Url("https://www.example.com/account/login")
+ Url("https://www.example.com/account/login")
+ Restore Case51_0
+ Store($E1C00120+51*1024+0*8,31,1700000000)
+ Url("http://www.example.com/account/login")
+ Restore Case51_1
+ Store($E1C00120+51*1024+1*8,28,1700000000)
+ Url("https://www.example.com/account/login")
+ CookieFixtureResult($E1C00100+51*1024,1700000000,1,0,512)
+ policy=0
+ rc=WebCookiesInit(@jar,@storage[0],4,policy)
+ Url("https://www.example.com/account/login")
+ Url("https://www.example.com/account/login")
+ Restore Case52_0
+ Store($E1C00120+52*1024+0*8,31,1700000000)
+ Url("http://www.example.com/account/login")
+ Restore Case52_1
+ Store($E1C00120+52*1024+1*8,16,1700000000)
+ Url("https://www.example.com/account/login")
+ CookieFixtureResult($E1C00100+52*1024,1700000000,1,0,512)
+ ProcedureReturn 0
+EndProcedure
+DataSection
+Case0_0:
+ Data.a 115,105,100,61,111,110,101
+Case1_0:
+ Data.a 115,105,100,61,111,110,101
+Case2_0:
+ Data.a 115,105,100,61,111,110,101
+Case3_0:
+ Data.a 115,105,100,61,111,110,101
+Case4_0:
+ Data.a 115,105,100,61,111,110,101,59,32,80,97,116,104,61,47,97,99,99,111,117,110,116
+Case5_0:
+ Data.a 115,105,100,61,111,110,101,59,32,80,97,116,104,61,47,97,99,99,111,117,110,116
+Case6_0:
+ Data.a 115,105,100,61,111,110,101,59,32,83,101,99,117,114,101
+Case7_0:
+ Data.a 115,105,100,61,111,110,101,59,32,83,101,99,117,114,101
+Case8_0:
+ Data.a 115,105,100,61,111,110,101,59,32,72,116,116,112,79,110,108,121
+Case9_0:
+ Data.a 115,105,100,61,111,110,101
+Case9_1:
+ Data.a 115,105,100,61,116,119,111
+Case10_0:
+ Data.a 97,61,114,111,111,116,59,32,80,97,116,104,61,47
+Case10_1:
+ Data.a 97,61,100,101,101,112,59,32,80,97,116,104,61,47,97,99,99,111,117,110,116
+Case10_2:
+ Data.a 98,61,108,97,115,116,59,32,80,97,116,104,61,47
+Case11_0:
+ Data.a 97,61,49
+Case11_1:
+ Data.a 98,61,50
+Case11_2:
+ Data.a 97,61,51
+Case12_0:
+ Data.a 115,105,100,61,111,110,101
+Case12_1:
+ Data.a 115,105,100,61,120,59,32,77,97,120,45,65,103,101,61,48
+Case13_0:
+ Data.a 115,105,100,61,111,110,101
+Case13_1:
+ Data.a 115,105,100,61,120,59,32,77,97,120,45,65,103,101,61,45,49,48
+Case14_0:
+ Data.a 115,105,100,61,111,110,101,59,32,77,97,120,45,65,103,101,61,49,48
+Case15_0:
+ Data.a 115,105,100,61,111,110,101,59,32,77,97,120,45,65,103,101,61,49,48
+Case16_0:
+ Data.a 115,105,100,61,111,110,101,59,32,69,120,112,105,114,101,115,61,87,101,100,44,32,48,57,32,74,117,110,32,50,48,50,49,32,49,48,58,49,56,58,49,52,32,71,77,84
+Case17_0:
+ Data.a 115,105,100,61,111,110,101,59,32,69,120,112,105,114,101,115,61,87,101,100,44,32,48,57,32,74,117,110,32,50,48,51,56,32,49,48,58,49,56,58,49,52,32,71,77,84
+Case18_0:
+ Data.a 115,105,100,61,111,110,101,59,32,69,120,112,105,114,101,115,61,87,101,100,110,101,115,100,97,121,44,32,48,57,45,74,117,110,45,50,49,32,49,48,58,49,56,58,49,52,32,71,77,84
+Case19_0:
+ Data.a 115,105,100,61,111,110,101,59,32,77,97,120,45,65,103,101,61,49,48,59,32,69,120,112,105,114,101,115,61,87,101,100,44,32,48,57,32,74,117,110,32,50,48,50,49,32,49,48,58,49,56,58,49,52,32,71,77,84
+Case20_0:
+ Data.a 115,105,100,61,111,110,101,59,32,77,97,120,45,65,103,101,61,49,48,120,59,32,69,120,112,105,114,101,115,61,87,101,100,44,32,48,57,32,74,117,110,32,50,48,50,49,32,49,48,58,49,56,58,49,52,32,71,77,84
+Case21_0:
+ Data.a 115,105,100,61,111,110,101,59,32,77,97,120,45,65,103,101,61,57,57,57,57,57,57,57,57,57,57,57,57,57,57,57,57,57,57,57,57,57,57,57,57
+Case22_0:
+ Data.a 115,105,100,61,111,110,101,59,32,69,120,112,105,114,101,115,61,87,101,100,44,32,51,49,32,68,101,99,32,49,57,54,57,32,50,51,58,53,57,58,53,57,32,71,77,84
+Case23_0:
+ Data.a 115,105,100,61,111,110,101,59,32,83,97,109,101,83,105,116,101,61,83,116,114,105,99,116
+Case24_0:
+ Data.a 115,105,100,61,111,110,101
+Case25_0:
+ Data.a 115,105,100,61,111,110,101
+Case26_0:
+ Data.a 115,105,100,61,111,110,101,59,32,83,97,109,101,83,105,116,101,61,78,111,110,101,59,32,83,101,99,117,114,101
+Case27_0:
+ Data.a 115,105,100,61,111,110,101,59,32,83,97,109,101,83,105,116,101,61,78,111,110,101
+Case28_0:
+ Data.a 95,95,72,111,115,116,45,115,105,100,61,111,110,101,59,32,83,101,99,117,114,101,59,32,80,97,116,104,61,47
+Case29_0:
+ Data.a 95,95,72,111,115,116,45,115,105,100,61,111,110,101,59,32,83,101,99,117,114,101
+Case30_0:
+ Data.a 95,95,83,101,99,117,114,101,45,115,105,100,61,111,110,101
+Case31_0:
+ Data.a 115,105,100,61,111,110,101,59,32,68,111,109,97,105,110,61,101,118,105,108,46,116,101,115,116
+Case32_0:
+ Data.a 115,105,100,61,111,110,101,59,32,68,111,109,97,105,110,61,101,120,97,109,112,108,101,46,99,111,109
+Case33_0:
+ Data.a 115,105,100,61,111,110,101,59,32,68,111,109,97,105,110,61,46,69,88,65,77,80,76,69,46,99,111,109
+Case34_0:
+ Data.a 115,105,100,61,111,110,101,59,32,68,111,109,97,105,110,61,99,111,109
+Case35_0:
+ Data.a 115,105,100,61,111,110,101,59,32,68,111,109,97,105,110,61,119,119,119,46,101,120,97,109,112,108,101,46,99,111,109
+Case36_0:
+ Data.a 115,105,100,61,111,110,101,59,32,80,97,114,116,105,116,105,111,110,101,100,59,32,83,101,99,117,114,101
+Case37_0:
+ Data.a 115,105,100,61,111,110,101,13,10,88,58,121
+Case38_0:
+ Data.a 115,105,100,61,34,111,110,101,34
+Case39_0:
+ Data.a 115,105,100,61,111,110,101
+Case40_0:
+ Data.a 97,61,49
+Case40_1:
+ Data.a 98,61,50
+Case41_0:
+ Data.a 97,32,98,61,120
+Case42_0:
+ Data.a 97,61,120,44,121
+Case43_0:
+ Data.a 97,61
+Case44_0:
+ Data.a 97,61,49,59,32,80,97,116,104,61
+Case45_0:
+ Data.a 32,32,97,32,9,61,32,9,49,9,32,59,32,80,97,116,104,61,32,47,97,99,99,111,117,110,116,9,32
+Case46_0:
+ Data.a 97,61,49,59,32,80,97,116,104,61,47,97,99,99,111,117,110,116
+Case47_0:
+ Data.a 97,61,49,59,32,69,120,112,105,114,101,115,61,77,111,110,44,32,50,57,32,70,101,98,32,50,48,51,50,32,48,48,58,48,48,58,48,48,32,71,77,84
+Case48_0:
+ Data.a 97,61,49,59,32,77,97,120,45,65,103,101,61,48
+Case48_1:
+ Data.a 98,61,50
+Case49_0:
+ Data.a 115,105,100,61,103,111,111,100,59,32,83,101,99,117,114,101,59,32,80,97,116,104,61,47,97,99,99,111,117,110,116
+Case49_1:
+ Data.a 115,105,100,61,98,97,100,59,32,80,97,116,104,61,47,97,99,99,111,117,110,116
+Case50_0:
+ Data.a 115,105,100,61,103,111,111,100,59,32,83,101,99,117,114,101,59,32,80,97,116,104,61,47,97,99,99,111,117,110,116
+Case50_1:
+ Data.a 115,105,100,61,98,97,100,59,32,68,111,109,97,105,110,61,101,120,97,109,112,108,101,46,99,111,109,59,32,80,97,116,104,61,47,97,99,99,111,117,110,116
+Case51_0:
+ Data.a 115,105,100,61,103,111,111,100,59,32,83,101,99,117,114,101,59,32,80,97,116,104,61,47,97,99,99,111,117,110,116
+Case51_1:
+ Data.a 115,105,100,61,98,97,100,59,32,80,97,116,104,61,47,97,99,99,111,117,110,116,47,108,111,103,105,110
+Case52_0:
+ Data.a 115,105,100,61,103,111,111,100,59,32,83,101,99,117,114,101,59,32,80,97,116,104,61,47,97,99,99,111,117,110,116
+Case52_1:
+ Data.a 115,105,100,61,119,105,100,101,59,32,80,97,116,104,61,47
+EndDataSection

@@ -1522,3 +1522,6 @@ text is unchanged; no new board execution or boot claim follows.
 
 | `Anvil/Network/web_credentials.pbi` | protocol-facts | ietf-rfc | RFC 7617 section 2, RFC 6750 section 2.1 | independently implemented wire values; no copied code |
 | `Anvil/Network/web_form.pbi` | protocol-facts | whatwg-url | WHATWG URL section 5.2 | independently implemented field serialization; no copied code |
+
+| `Anvil/Network/web_cookie_date.pbi` | protocol-facts | ietf-rfc | RFC 6265 section 5.1.1 | independent cookie-date parser and Gregorian conversion |
+| `Anvil/Network/web_cookies.pbi` | protocol-facts | ietf-rfc | RFC 6265 sections 5.1-5.4; draft-ietf-httpbis-rfc6265bis-22 (work in progress) | independently implemented storage and selected scope/prefix/SameSite rules; no copied code |

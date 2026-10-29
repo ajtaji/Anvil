@@ -643,7 +643,7 @@ qualification covers fragmented input, output backpressure, binary upload
 encoding, redirects, reusable HTTPS connections and live compressed responses.
 Other boards use the shared code but need their own physical qualification.
 IPv6 and international host conversion, HTTP/2 and HTTP/3,
-Brotli, Zstandard and managed authentication/cookies remain separate work.
+Brotli, Zstandard and automated authentication flows remain separate work.
 
 
 @SECTION DNS answers and retry
@@ -730,3 +730,20 @@ Inputs remain alive until output phase 4. Set the form Content-Type and let
 WebClientStep send the encoded output as the request body. UTF-8 conversion and
 newline normalization are explicit application choices. Exact contracts and
 physical qualification are in docs/WEB_CLIENT.md.
+
+
+@SECTION Managed HTTP cookies
+
+The shared web_cookie_response library connects a bounded caller-owned cookie
+jar to HTTP requests and responses. Initialize separate storage for each
+session, capture Set-Cookie fields after final response headers, and apply the
+selected cookies before request output begins. Apply again after redirects so
+changed or deleted cookies do not survive in copied request headers.
+
+Selection checks host/domain, path, expiry, Secure and explicit SameSite
+context. Expired replacements delete cookies; replacement preserves ordering.
+Domain scope defaults to host-only. Broader domains require a callback that
+rejects public suffixes. No public-suffix list, browser script API, partitioned
+cookie support or disk persistence is implied. Keep verified HTTPS enabled,
+supply trusted Unix time, and clear the jar when the application session ends.
+The full limits, ownership rules and physical evidence are in docs/WEB_CLIENT.md.

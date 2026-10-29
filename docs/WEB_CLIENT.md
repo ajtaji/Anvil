@@ -84,7 +84,8 @@ WebContent pipeline described below.
 
 The URL parser accepts HTTP(S) ASCII hostnames and IPv4 forms; IPv6 literals,
 and international host conversion remain open.
-HTTP/2, HTTP/3 and a managed cookie/authentication layer remain open.
+HTTP/2, HTTP/3 and automated authentication flows remain open.
+The bounded managed cookie library is described below.
 Applications may send ordinary Authorization and Cookie fields explicitly.
 WebSocket upgrade uses the shared WebSocket client described below. Anvil 424
 supports four TLS slots over the four-handle payload TCP pool. Plain TCP and TLS
@@ -485,3 +486,68 @@ and another request to httpbingo.org overlapped verified HTTPS requests to
 example.com and www.cloudflare.com. Expected page/trace content, TLSv1.3 trace
 metadata and all streamed event IDs matched. Capture 257 supplements the
 single-origin test in `docs/evidence/anvil-tls424-20261029`.
+
+
+## Managed application cookies
+
+Include `Anvil/Network/web_cookie_response.pbi`. `WebCookiesInit` receives a
+context, caller-owned eight-byte-aligned storage, 1..64 slots, and an optional
+domain-policy callback. Allocate `slots * WEB_COOKIE_STRIDE` bytes (3584 per
+slot). Keep storage separate from URLs, headers, scratch and output. No shared
+global jar or automatic disk persistence exists; choose a separate jar for
+each session or account and call `WebCookiesClear` to wipe it.
+
+`WebCookieStore(jar, url, field, bytes, now)` accepts one Set-Cookie field.
+Use trusted Unix seconds for now. It stores name/value, host or authorized
+domain, default/explicit path, expiry, Secure, HttpOnly and SameSite policy.
+Max-Age takes precedence over Expires, and an expired replacement deletes the
+matching cookie. Replacement preserves ordering. A full jar returns LIMIT;
+expired entries are reclaimed when storing. Names are limited to 128 bytes,
+values 2048, domains 253 and paths 1024. Malformed or oversized input is refused
+rather than truncated. Invalid date/age attributes are ignored. The date parser
+accepts ordinary HTTP dates and hyphenated legacy dates, with validated
+Gregorian dates; it is not a locale-dependent date parser.
+
+Without a domain callback, cookies stay host-only: a Domain equal to the host
+is narrowed to host-only and a parent domain is refused. A callback receives
+an explicit domain byte span and must return exactly 1 only for an authorized
+registrable domain. It must reject public suffixes using an application policy
+or maintained suffix data; the jar does not ship or download a public suffix
+list. Host suffix boundaries are checked independently. Never use an
+unconditional accept callback for arbitrary websites.
+
+`WebCookieHeader(jar, url, now, sameSite, topLevelSafe, dst, capacity)` selects
+cookies for the target and returns an explicit byte length, without NUL. A null
+destination/zero capacity measures. A short buffer is refused before writing.
+Longer paths precede shorter paths, then original creation order. Secure
+cookies require HTTPS; a plain HTTP response cannot overlay a matching Secure
+cookie. Prefix checks cover __Host- and __Secure-. SameSite defaults to Lax;
+Strict requires sameSite=1, Lax additionally permits a safe top-level navigation,
+and None requires Secure. The caller supplies those request-context facts.
+
+This is an application HTTP API, not a browser script cookie API. HttpOnly
+cookies may be sent over HTTP by this library; do not expose jar storage to
+untrusted scripts. The caller must decide whether an incoming response is
+eligible to set cookies (for example a first-party request). Partitioned
+cookies, browser navigation/site calculation, IDNA and persistence are not
+implemented. The modern prefix/SameSite behavior is based on a cited draft;
+this is not a claim of full browser conformance to that draft.
+
+After final response headers arrive, `WebCookiesCapture` processes separate
+Set-Cookie fields using caller scratch. It returns the accepted field count or
+the first error; earlier fields remain committed if a later one is refused.
+`WebCookiesApply` removes all existing Cookie fields and writes the jar's
+current selection into a request. It accepts adding-fields or finalized-but-
+unsent requests and refuses once output has begun. Capacity is checked before
+modifying headers. Scratch and removed header tail bytes are wiped.
+
+For redirects, capture the intermediate response before following it, then
+apply cookies for the new URL before the first Step on that hop. Start and
+FollowRedirect do not send request header bytes themselves. Reapplying is
+necessary even on the same origin: a server may have changed or deleted a
+cookie. Do not simply copy the previous Cookie header.
+
+Physical qualification and the retained failed-run diagnosis are in
+`docs/evidence/anvil-web-cookies-20261029`. These shared libraries run in the
+application; they do not require a new resident firmware image beyond the
+already-qualified HTTP/TLS services.

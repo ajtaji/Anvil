@@ -1,0 +1,35 @@
+Managed application cookies, physical Pi 4 on Anvil 424.
+Final capture 261 passed 53 lifecycle fixtures: host/path boundaries, domain
+policy, Secure/HttpOnly/SameSite, prefixes, replacement/order, expiry/deletion,
+Max-Age precedence, date formats, capacity refusal, cleanup and secure-cookie
+overlay prevention. Shared fixtures compile for Pi 3 and Rock Pi; no physical
+execution claim for those boards.
+
+Capture 263 passed real verified HTTPS creation, replay, deletion and an empty
+jar request: 481/486/486/475 ms respectively. Synthetic session cookie only.
+Every request began with two stale Cookie headers; Apply removed both and
+selected only the current jar value. Both adding-fields and finalized-unsent
+request states were exercised. The server echoed exactly the current cookie,
+then an empty cookie object after deletion. The jar was wiped at the end.
+All final runs returned with healthy cores, fonts, Vulkan and watchdog off.
+
+Retained failures: the first lifecycle payload used a leading dereference on
+an indirect callback invocation. The emitted instruction at 0x01006C68 loaded
+from returned value 1, matching FAR=1 and the processor exception. Changing
+the invocation to the function-pointer name fixed the source error. The
+harness preserved diagnostics and waited the full reboot window; the monitor
+answered without manual intervention. It was not a firmware update.
+The first live checker expected a bare JSON cookie map, while the server
+returns it within a cookies object. Correcting the expectation passed the
+same captured bytes; original and corrected results are retained. The final
+live run used the corrected checker and final integration source.
+
+Limits and application obligations are documented in docs/WEB_CLIENT.md.
+No browser-conformance, public-suffix database, partitioned-cookie, script API
+or persistent-storage claim is made. Domain scope is host-only unless the
+application supplies a suffix-aware authorization callback.
+
+The fixture procedure Result was renamed CookieFixtureResult to avoid a
+false board-dependency classification in the layering gate. Both raw image
+and PMF container are byte-identical to qualified capture 261. No rerun was
+needed for this source-label-only change.

@@ -1,0 +1,1079 @@
+{
+  "bytes": 67440,
+  "sha256": "279d602728837beaccec94cd3aa1137f48f67826d60c6074bfc4c1b81eed2b95",
+  "checked_ranges": {
+    "code": [
+      "0x1000000",
+      "0x10106EF"
+    ],
+    "bss": [
+      "0x1080000",
+      "0x108617F"
+    ],
+    "stack": [
+      "0x4e00000",
+      "0x4efffff"
+    ],
+    "report": [
+      "0xe1c00000",
+      "0xe1c0ffff"
+    ]
+  },
+  "source_hashes": {
+    "Anvil/Network/web_url.pbi": "ca039a6f75b175ba094f6718afcecf488a5651ccb5ec3dc2c41bf8b7dc45fbad",
+    "Anvil/Network/web_request.pbi": "488173fff0bc967418eefab2a8e8d739f27348a8c6b4d75d1ba49b8c87aa73aa",
+    "Anvil/Network/web_cookie_date.pbi": "0b5a02dee21e11767785b20328c1ac860f19a81e35afda1aa9912aa24d424fd6",
+    "Anvil/Network/web_cookies.pbi": "41ab235c4552487c1ae18df4330dcad701f1e9ffe03bed272ea9f4a66f499f93"
+  },
+  "cases": [
+    {
+      "name": "host",
+      "fields": [
+        "sid=one"
+      ],
+      "expected": "sid=one",
+      "url": "https://www.example.com/account/login",
+      "request": "https://www.example.com/account/login",
+      "now": 1700000000,
+      "requestTime": 1700000000,
+      "same": 1,
+      "top": 0,
+      "policy": 0,
+      "slots": 4,
+      "cap": 512,
+      "codes": [
+        0
+      ]
+    },
+    {
+      "name": "other-host",
+      "fields": [
+        "sid=one"
+      ],
+      "expected": "",
+      "url": "https://www.example.com/account/login",
+      "request": "https://example.com/account/login",
+      "now": 1700000000,
+      "requestTime": 1700000000,
+      "same": 1,
+      "top": 0,
+      "policy": 0,
+      "slots": 4,
+      "cap": 512,
+      "codes": [
+        0
+      ]
+    },
+    {
+      "name": "subdomain",
+      "fields": [
+        "sid=one"
+      ],
+      "expected": "",
+      "url": "https://www.example.com/account/login",
+      "request": "https://sub.www.example.com/account/login",
+      "now": 1700000000,
+      "requestTime": 1700000000,
+      "same": 1,
+      "top": 0,
+      "policy": 0,
+      "slots": 4,
+      "cap": 512,
+      "codes": [
+        0
+      ]
+    },
+    {
+      "name": "default-path",
+      "fields": [
+        "sid=one"
+      ],
+      "expected": "",
+      "url": "https://www.example.com/account/login",
+      "request": "https://www.example.com/other",
+      "now": 1700000000,
+      "requestTime": 1700000000,
+      "same": 1,
+      "top": 0,
+      "policy": 0,
+      "slots": 4,
+      "cap": 512,
+      "codes": [
+        0
+      ]
+    },
+    {
+      "name": "path-boundary",
+      "fields": [
+        "sid=one; Path=/account"
+      ],
+      "expected": "",
+      "url": "https://www.example.com/account/login",
+      "request": "https://www.example.com/accounting",
+      "now": 1700000000,
+      "requestTime": 1700000000,
+      "same": 1,
+      "top": 0,
+      "policy": 0,
+      "slots": 4,
+      "cap": 512,
+      "codes": [
+        0
+      ]
+    },
+    {
+      "name": "query-boundary",
+      "fields": [
+        "sid=one; Path=/account"
+      ],
+      "expected": "sid=one",
+      "url": "https://www.example.com/account/login",
+      "request": "https://www.example.com/account?q=1",
+      "now": 1700000000,
+      "requestTime": 1700000000,
+      "same": 1,
+      "top": 0,
+      "policy": 0,
+      "slots": 4,
+      "cap": 512,
+      "codes": [
+        0
+      ]
+    },
+    {
+      "name": "secure-http",
+      "fields": [
+        "sid=one; Secure"
+      ],
+      "expected": "",
+      "url": "https://www.example.com/account/login",
+      "request": "http://www.example.com/account/login",
+      "now": 1700000000,
+      "requestTime": 1700000000,
+      "same": 1,
+      "top": 0,
+      "policy": 0,
+      "slots": 4,
+      "cap": 512,
+      "codes": [
+        0
+      ]
+    },
+    {
+      "name": "secure-origin",
+      "fields": [
+        "sid=one; Secure"
+      ],
+      "expected": "",
+      "url": "http://www.example.com/",
+      "request": "http://www.example.com/",
+      "now": 1700000000,
+      "requestTime": 1700000000,
+      "same": 1,
+      "top": 0,
+      "policy": 0,
+      "slots": 4,
+      "cap": 512,
+      "codes": [
+        -663
+      ]
+    },
+    {
+      "name": "http-only",
+      "fields": [
+        "sid=one; HttpOnly"
+      ],
+      "expected": "sid=one",
+      "url": "https://www.example.com/account/login",
+      "request": "https://www.example.com/account/login",
+      "now": 1700000000,
+      "requestTime": 1700000000,
+      "same": 1,
+      "top": 0,
+      "policy": 0,
+      "slots": 4,
+      "cap": 512,
+      "codes": [
+        0
+      ]
+    },
+    {
+      "name": "replacement",
+      "fields": [
+        "sid=one",
+        "sid=two"
+      ],
+      "expected": "sid=two",
+      "url": "https://www.example.com/account/login",
+      "request": "https://www.example.com/account/login",
+      "now": 1700000000,
+      "requestTime": 1700000000,
+      "same": 1,
+      "top": 0,
+      "policy": 0,
+      "slots": 4,
+      "cap": 512,
+      "codes": [
+        0,
+        0
+      ]
+    },
+    {
+      "name": "ordering",
+      "fields": [
+        "a=root; Path=/",
+        "a=deep; Path=/account",
+        "b=last; Path=/"
+      ],
+      "expected": "a=deep; a=root; b=last",
+      "url": "https://www.example.com/account/login",
+      "request": "https://www.example.com/account/login",
+      "now": 1700000000,
+      "requestTime": 1700000000,
+      "same": 1,
+      "top": 0,
+      "policy": 0,
+      "slots": 4,
+      "cap": 512,
+      "codes": [
+        0,
+        0,
+        0
+      ]
+    },
+    {
+      "name": "replacement-keeps-order",
+      "fields": [
+        "a=1",
+        "b=2",
+        "a=3"
+      ],
+      "expected": "a=3; b=2",
+      "url": "https://www.example.com/account/login",
+      "request": "https://www.example.com/account/login",
+      "now": 1700000000,
+      "requestTime": 1700000000,
+      "same": 1,
+      "top": 0,
+      "policy": 0,
+      "slots": 4,
+      "cap": 512,
+      "codes": [
+        0,
+        0,
+        0
+      ]
+    },
+    {
+      "name": "delete",
+      "fields": [
+        "sid=one",
+        "sid=x; Max-Age=0"
+      ],
+      "expected": "",
+      "url": "https://www.example.com/account/login",
+      "request": "https://www.example.com/account/login",
+      "now": 1700000000,
+      "requestTime": 1700000000,
+      "same": 1,
+      "top": 0,
+      "policy": 0,
+      "slots": 4,
+      "cap": 512,
+      "codes": [
+        0,
+        0
+      ]
+    },
+    {
+      "name": "negative-age",
+      "fields": [
+        "sid=one",
+        "sid=x; Max-Age=-10"
+      ],
+      "expected": "",
+      "url": "https://www.example.com/account/login",
+      "request": "https://www.example.com/account/login",
+      "now": 1700000000,
+      "requestTime": 1700000000,
+      "same": 1,
+      "top": 0,
+      "policy": 0,
+      "slots": 4,
+      "cap": 512,
+      "codes": [
+        0,
+        0
+      ]
+    },
+    {
+      "name": "expiry",
+      "fields": [
+        "sid=one; Max-Age=10"
+      ],
+      "expected": "",
+      "url": "https://www.example.com/account/login",
+      "request": "https://www.example.com/account/login",
+      "now": 1700000000,
+      "requestTime": 1700000010,
+      "same": 1,
+      "top": 0,
+      "policy": 0,
+      "slots": 4,
+      "cap": 512,
+      "codes": [
+        0
+      ]
+    },
+    {
+      "name": "before-expiry",
+      "fields": [
+        "sid=one; Max-Age=10"
+      ],
+      "expected": "sid=one",
+      "url": "https://www.example.com/account/login",
+      "request": "https://www.example.com/account/login",
+      "now": 1700000000,
+      "requestTime": 1700000009,
+      "same": 1,
+      "top": 0,
+      "policy": 0,
+      "slots": 4,
+      "cap": 512,
+      "codes": [
+        0
+      ]
+    },
+    {
+      "name": "past-date",
+      "fields": [
+        "sid=one; Expires=Wed, 09 Jun 2021 10:18:14 GMT"
+      ],
+      "expected": "",
+      "url": "https://www.example.com/account/login",
+      "request": "https://www.example.com/account/login",
+      "now": 1700000000,
+      "requestTime": 1700000000,
+      "same": 1,
+      "top": 0,
+      "policy": 0,
+      "slots": 4,
+      "cap": 512,
+      "codes": [
+        0
+      ]
+    },
+    {
+      "name": "future-date",
+      "fields": [
+        "sid=one; Expires=Wed, 09 Jun 2038 10:18:14 GMT"
+      ],
+      "expected": "sid=one",
+      "url": "https://www.example.com/account/login",
+      "request": "https://www.example.com/account/login",
+      "now": 1700000000,
+      "requestTime": 1700000000,
+      "same": 1,
+      "top": 0,
+      "policy": 0,
+      "slots": 4,
+      "cap": 512,
+      "codes": [
+        0
+      ]
+    },
+    {
+      "name": "old-format",
+      "fields": [
+        "sid=one; Expires=Wednesday, 09-Jun-21 10:18:14 GMT"
+      ],
+      "expected": "",
+      "url": "https://www.example.com/account/login",
+      "request": "https://www.example.com/account/login",
+      "now": 1700000000,
+      "requestTime": 1700000000,
+      "same": 1,
+      "top": 0,
+      "policy": 0,
+      "slots": 4,
+      "cap": 512,
+      "codes": [
+        0
+      ]
+    },
+    {
+      "name": "age-overrides-date",
+      "fields": [
+        "sid=one; Max-Age=10; Expires=Wed, 09 Jun 2021 10:18:14 GMT"
+      ],
+      "expected": "sid=one",
+      "url": "https://www.example.com/account/login",
+      "request": "https://www.example.com/account/login",
+      "now": 1700000000,
+      "requestTime": 1700000000,
+      "same": 1,
+      "top": 0,
+      "policy": 0,
+      "slots": 4,
+      "cap": 512,
+      "codes": [
+        0
+      ]
+    },
+    {
+      "name": "invalid-age-keeps-date",
+      "fields": [
+        "sid=one; Max-Age=10x; Expires=Wed, 09 Jun 2021 10:18:14 GMT"
+      ],
+      "expected": "",
+      "url": "https://www.example.com/account/login",
+      "request": "https://www.example.com/account/login",
+      "now": 1700000000,
+      "requestTime": 1700000000,
+      "same": 1,
+      "top": 0,
+      "policy": 0,
+      "slots": 4,
+      "cap": 512,
+      "codes": [
+        0
+      ]
+    },
+    {
+      "name": "overflow-age",
+      "fields": [
+        "sid=one; Max-Age=999999999999999999999999"
+      ],
+      "expected": "sid=one",
+      "url": "https://www.example.com/account/login",
+      "request": "https://www.example.com/account/login",
+      "now": 1700000000,
+      "requestTime": 1700000000,
+      "same": 1,
+      "top": 0,
+      "policy": 0,
+      "slots": 4,
+      "cap": 512,
+      "codes": [
+        0
+      ]
+    },
+    {
+      "name": "pre-epoch",
+      "fields": [
+        "sid=one; Expires=Wed, 31 Dec 1969 23:59:59 GMT"
+      ],
+      "expected": "",
+      "url": "https://www.example.com/account/login",
+      "request": "https://www.example.com/account/login",
+      "now": 1700000000,
+      "requestTime": 1700000000,
+      "same": 1,
+      "top": 0,
+      "policy": 0,
+      "slots": 4,
+      "cap": 512,
+      "codes": [
+        0
+      ]
+    },
+    {
+      "name": "strict-cross-site",
+      "fields": [
+        "sid=one; SameSite=Strict"
+      ],
+      "expected": "",
+      "url": "https://www.example.com/account/login",
+      "request": "https://www.example.com/account/login",
+      "now": 1700000000,
+      "requestTime": 1700000000,
+      "same": 0,
+      "top": 1,
+      "policy": 0,
+      "slots": 4,
+      "cap": 512,
+      "codes": [
+        0
+      ]
+    },
+    {
+      "name": "lax-subresource",
+      "fields": [
+        "sid=one"
+      ],
+      "expected": "",
+      "url": "https://www.example.com/account/login",
+      "request": "https://www.example.com/account/login",
+      "now": 1700000000,
+      "requestTime": 1700000000,
+      "same": 0,
+      "top": 0,
+      "policy": 0,
+      "slots": 4,
+      "cap": 512,
+      "codes": [
+        0
+      ]
+    },
+    {
+      "name": "lax-navigation",
+      "fields": [
+        "sid=one"
+      ],
+      "expected": "sid=one",
+      "url": "https://www.example.com/account/login",
+      "request": "https://www.example.com/account/login",
+      "now": 1700000000,
+      "requestTime": 1700000000,
+      "same": 0,
+      "top": 1,
+      "policy": 0,
+      "slots": 4,
+      "cap": 512,
+      "codes": [
+        0
+      ]
+    },
+    {
+      "name": "none-secure",
+      "fields": [
+        "sid=one; SameSite=None; Secure"
+      ],
+      "expected": "sid=one",
+      "url": "https://www.example.com/account/login",
+      "request": "https://www.example.com/account/login",
+      "now": 1700000000,
+      "requestTime": 1700000000,
+      "same": 0,
+      "top": 0,
+      "policy": 0,
+      "slots": 4,
+      "cap": 512,
+      "codes": [
+        0
+      ]
+    },
+    {
+      "name": "none-insecure",
+      "fields": [
+        "sid=one; SameSite=None"
+      ],
+      "expected": "",
+      "url": "https://www.example.com/account/login",
+      "request": "https://www.example.com/account/login",
+      "now": 1700000000,
+      "requestTime": 1700000000,
+      "same": 1,
+      "top": 0,
+      "policy": 0,
+      "slots": 4,
+      "cap": 512,
+      "codes": [
+        -663
+      ]
+    },
+    {
+      "name": "valid-host-prefix",
+      "fields": [
+        "__Host-sid=one; Secure; Path=/"
+      ],
+      "expected": "__Host-sid=one",
+      "url": "https://www.example.com/account/login",
+      "request": "https://www.example.com/account/login",
+      "now": 1700000000,
+      "requestTime": 1700000000,
+      "same": 1,
+      "top": 0,
+      "policy": 0,
+      "slots": 4,
+      "cap": 512,
+      "codes": [
+        0
+      ]
+    },
+    {
+      "name": "invalid-host-prefix",
+      "fields": [
+        "__Host-sid=one; Secure"
+      ],
+      "expected": "",
+      "url": "https://www.example.com/account/login",
+      "request": "https://www.example.com/account/login",
+      "now": 1700000000,
+      "requestTime": 1700000000,
+      "same": 1,
+      "top": 0,
+      "policy": 0,
+      "slots": 4,
+      "cap": 512,
+      "codes": [
+        -663
+      ]
+    },
+    {
+      "name": "invalid-secure-prefix",
+      "fields": [
+        "__Secure-sid=one"
+      ],
+      "expected": "",
+      "url": "https://www.example.com/account/login",
+      "request": "https://www.example.com/account/login",
+      "now": 1700000000,
+      "requestTime": 1700000000,
+      "same": 1,
+      "top": 0,
+      "policy": 0,
+      "slots": 4,
+      "cap": 512,
+      "codes": [
+        -663
+      ]
+    },
+    {
+      "name": "foreign-domain",
+      "fields": [
+        "sid=one; Domain=evil.test"
+      ],
+      "expected": "",
+      "url": "https://www.example.com/account/login",
+      "request": "https://www.example.com/account/login",
+      "now": 1700000000,
+      "requestTime": 1700000000,
+      "same": 1,
+      "top": 0,
+      "policy": 0,
+      "slots": 4,
+      "cap": 512,
+      "codes": [
+        -663
+      ]
+    },
+    {
+      "name": "parent-needs-policy",
+      "fields": [
+        "sid=one; Domain=example.com"
+      ],
+      "expected": "",
+      "url": "https://www.example.com/account/login",
+      "request": "https://www.example.com/account/login",
+      "now": 1700000000,
+      "requestTime": 1700000000,
+      "same": 1,
+      "top": 0,
+      "policy": 0,
+      "slots": 4,
+      "cap": 512,
+      "codes": [
+        -663
+      ]
+    },
+    {
+      "name": "policy-domain",
+      "fields": [
+        "sid=one; Domain=.EXAMPLE.com"
+      ],
+      "expected": "sid=one",
+      "url": "https://www.example.com/account/login",
+      "request": "https://other.example.com/account/x",
+      "now": 1700000000,
+      "requestTime": 1700000000,
+      "same": 1,
+      "top": 0,
+      "policy": 1,
+      "slots": 4,
+      "cap": 512,
+      "codes": [
+        0
+      ]
+    },
+    {
+      "name": "public-suffix-refused",
+      "fields": [
+        "sid=one; Domain=com"
+      ],
+      "expected": "",
+      "url": "https://www.example.com/account/login",
+      "request": "https://www.example.com/account/login",
+      "now": 1700000000,
+      "requestTime": 1700000000,
+      "same": 1,
+      "top": 0,
+      "policy": 1,
+      "slots": 4,
+      "cap": 512,
+      "codes": [
+        -663
+      ]
+    },
+    {
+      "name": "equal-domain-narrowed",
+      "fields": [
+        "sid=one; Domain=www.example.com"
+      ],
+      "expected": "",
+      "url": "https://www.example.com/account/login",
+      "request": "https://sub.www.example.com/account/x",
+      "now": 1700000000,
+      "requestTime": 1700000000,
+      "same": 1,
+      "top": 0,
+      "policy": 0,
+      "slots": 4,
+      "cap": 512,
+      "codes": [
+        0
+      ]
+    },
+    {
+      "name": "partitioned",
+      "fields": [
+        "sid=one; Partitioned; Secure"
+      ],
+      "expected": "",
+      "url": "https://www.example.com/account/login",
+      "request": "https://www.example.com/account/login",
+      "now": 1700000000,
+      "requestTime": 1700000000,
+      "same": 1,
+      "top": 0,
+      "policy": 0,
+      "slots": 4,
+      "cap": 512,
+      "codes": [
+        -664
+      ]
+    },
+    {
+      "name": "injection",
+      "fields": [
+        "sid=one\r\nX:y"
+      ],
+      "expected": "",
+      "url": "https://www.example.com/account/login",
+      "request": "https://www.example.com/account/login",
+      "now": 1700000000,
+      "requestTime": 1700000000,
+      "same": 1,
+      "top": 0,
+      "policy": 0,
+      "slots": 4,
+      "cap": 512,
+      "codes": [
+        -661
+      ]
+    },
+    {
+      "name": "quoted",
+      "fields": [
+        "sid=\"one\""
+      ],
+      "expected": "sid=\"one\"",
+      "url": "https://www.example.com/account/login",
+      "request": "https://www.example.com/account/login",
+      "now": 1700000000,
+      "requestTime": 1700000000,
+      "same": 1,
+      "top": 0,
+      "policy": 0,
+      "slots": 4,
+      "cap": 512,
+      "codes": [
+        0
+      ]
+    },
+    {
+      "name": "short-header",
+      "fields": [
+        "sid=one"
+      ],
+      "expected": "sid=one",
+      "url": "https://www.example.com/account/login",
+      "request": "https://www.example.com/account/login",
+      "now": 1700000000,
+      "requestTime": 1700000000,
+      "same": 1,
+      "top": 0,
+      "policy": 0,
+      "slots": 4,
+      "cap": 3,
+      "codes": [
+        0
+      ]
+    },
+    {
+      "name": "full-jar",
+      "fields": [
+        "a=1",
+        "b=2"
+      ],
+      "expected": "a=1",
+      "url": "https://www.example.com/account/login",
+      "request": "https://www.example.com/account/login",
+      "now": 1700000000,
+      "requestTime": 1700000000,
+      "same": 1,
+      "top": 0,
+      "policy": 0,
+      "slots": 1,
+      "cap": 512,
+      "codes": [
+        0,
+        -662
+      ]
+    },
+    {
+      "name": "invalid-name",
+      "fields": [
+        "a b=x"
+      ],
+      "expected": "",
+      "url": "https://www.example.com/account/login",
+      "request": "https://www.example.com/account/login",
+      "now": 1700000000,
+      "requestTime": 1700000000,
+      "same": 1,
+      "top": 0,
+      "policy": 0,
+      "slots": 4,
+      "cap": 512,
+      "codes": [
+        -661
+      ]
+    },
+    {
+      "name": "invalid-value",
+      "fields": [
+        "a=x,y"
+      ],
+      "expected": "",
+      "url": "https://www.example.com/account/login",
+      "request": "https://www.example.com/account/login",
+      "now": 1700000000,
+      "requestTime": 1700000000,
+      "same": 1,
+      "top": 0,
+      "policy": 0,
+      "slots": 4,
+      "cap": 512,
+      "codes": [
+        -661
+      ]
+    },
+    {
+      "name": "empty-value",
+      "fields": [
+        "a="
+      ],
+      "expected": "a=",
+      "url": "https://www.example.com/account/login",
+      "request": "https://www.example.com/account/login",
+      "now": 1700000000,
+      "requestTime": 1700000000,
+      "same": 1,
+      "top": 0,
+      "policy": 0,
+      "slots": 4,
+      "cap": 512,
+      "codes": [
+        0
+      ]
+    },
+    {
+      "name": "empty-path",
+      "fields": [
+        "a=1; Path="
+      ],
+      "expected": "a=1",
+      "url": "https://www.example.com/account/login",
+      "request": "https://www.example.com/account/login",
+      "now": 1700000000,
+      "requestTime": 1700000000,
+      "same": 1,
+      "top": 0,
+      "policy": 0,
+      "slots": 4,
+      "cap": 512,
+      "codes": [
+        0
+      ]
+    },
+    {
+      "name": "spaces",
+      "fields": [
+        "  a \t= \t1\t ; Path= /account\t "
+      ],
+      "expected": "a=1",
+      "url": "https://www.example.com/account/login",
+      "request": "https://www.example.com/account/login",
+      "now": 1700000000,
+      "requestTime": 1700000000,
+      "same": 1,
+      "top": 0,
+      "policy": 0,
+      "slots": 4,
+      "cap": 512,
+      "codes": [
+        0
+      ]
+    },
+    {
+      "name": "short-target",
+      "fields": [
+        "a=1; Path=/account"
+      ],
+      "expected": "",
+      "url": "https://www.example.com/account/login",
+      "request": "https://www.example.com/",
+      "now": 1700000000,
+      "requestTime": 1700000000,
+      "same": 1,
+      "top": 0,
+      "policy": 0,
+      "slots": 4,
+      "cap": 512,
+      "codes": [
+        0
+      ]
+    },
+    {
+      "name": "leap-valid",
+      "fields": [
+        "a=1; Expires=Mon, 29 Feb 2032 00:00:00 GMT"
+      ],
+      "expected": "a=1",
+      "url": "https://www.example.com/account/login",
+      "request": "https://www.example.com/account/login",
+      "now": 1700000000,
+      "requestTime": 1700000000,
+      "same": 1,
+      "top": 0,
+      "policy": 0,
+      "slots": 4,
+      "cap": 512,
+      "codes": [
+        0
+      ]
+    },
+    {
+      "name": "expired-slot-reuse",
+      "fields": [
+        "a=1; Max-Age=0",
+        "b=2"
+      ],
+      "expected": "b=2",
+      "url": "https://www.example.com/account/login",
+      "request": "https://www.example.com/account/login",
+      "now": 1700000000,
+      "requestTime": 1700000000,
+      "same": 1,
+      "top": 0,
+      "policy": 0,
+      "slots": 1,
+      "cap": 512,
+      "codes": [
+        0,
+        0
+      ]
+    },
+    {
+      "name": "secure-overwrite",
+      "fields": [
+        "sid=good; Secure; Path=/account",
+        "sid=bad; Path=/account"
+      ],
+      "expected": "sid=good",
+      "url": "https://www.example.com/account/login",
+      "request": "https://www.example.com/account/login",
+      "now": 1700000000,
+      "requestTime": 1700000000,
+      "same": 1,
+      "top": 0,
+      "policy": 0,
+      "slots": 4,
+      "cap": 512,
+      "codes": [
+        0,
+        -663
+      ],
+      "field_urls": [
+        "https://www.example.com/account/login",
+        "http://www.example.com/account/login"
+      ]
+    },
+    {
+      "name": "secure-parent-overlay",
+      "fields": [
+        "sid=good; Secure; Path=/account",
+        "sid=bad; Domain=example.com; Path=/account"
+      ],
+      "expected": "sid=good",
+      "url": "https://www.example.com/account/login",
+      "request": "https://www.example.com/account/login",
+      "now": 1700000000,
+      "requestTime": 1700000000,
+      "same": 1,
+      "top": 0,
+      "policy": 1,
+      "slots": 4,
+      "cap": 512,
+      "codes": [
+        0,
+        -663
+      ],
+      "field_urls": [
+        "https://www.example.com/account/login",
+        "http://www.example.com/account/login"
+      ]
+    },
+    {
+      "name": "secure-deeper-overlay",
+      "fields": [
+        "sid=good; Secure; Path=/account",
+        "sid=bad; Path=/account/login"
+      ],
+      "expected": "sid=good",
+      "url": "https://www.example.com/account/login",
+      "request": "https://www.example.com/account/login",
+      "now": 1700000000,
+      "requestTime": 1700000000,
+      "same": 1,
+      "top": 0,
+      "policy": 0,
+      "slots": 4,
+      "cap": 512,
+      "codes": [
+        0,
+        -663
+      ],
+      "field_urls": [
+        "https://www.example.com/account/login",
+        "http://www.example.com/account/login"
+      ]
+    },
+    {
+      "name": "secure-wider-path",
+      "fields": [
+        "sid=good; Secure; Path=/account",
+        "sid=wide; Path=/"
+      ],
+      "expected": "sid=good; sid=wide",
+      "url": "https://www.example.com/account/login",
+      "request": "https://www.example.com/account/login",
+      "now": 1700000000,
+      "requestTime": 1700000000,
+      "same": 1,
+      "top": 0,
+      "policy": 0,
+      "slots": 4,
+      "cap": 512,
+      "codes": [
+        0,
+        0
+      ],
+      "field_urls": [
+        "https://www.example.com/account/login",
+        "http://www.example.com/account/login"
+      ]
+    }
+  ]
+}
