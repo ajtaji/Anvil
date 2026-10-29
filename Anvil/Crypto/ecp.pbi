@@ -90,7 +90,7 @@
 ;       y^2 = x^3 - 3x + b                            else rejected
 ;    3. e = the leftmost bitlen(n) bits of the hash, reduced mod n
 ;    4. w = s^-1 mod n (Fermat: s^(n-2)); u1 = e*w, u2 = r*w mod n
-;    5. R = u1*G + u2*Q by one interleaved (Shamir) double-and-add over
+;    5. R = u1*G + u2*Q by joint two-bit public windows over
 ;       Jacobian coordinates; R at infinity           rejected
 ;    6. v = x(R) mod n (one conditional subtraction - p < 2n for both
 ;       curves, checked by the gate); valid iff v = r.
@@ -128,6 +128,10 @@
 ;  fused multiply, the windowed inversion and the affine shortcut in
 ;  EcpAddPt took off 31% / 32%. For scale, P-256 on ec256.pi4's i15 core
 ;  is about 155 million.
+;  Physical Pi4 qualification, 2026-10-29: raw and DER fixtures plus
+;  independently verified boundary signatures passed with the joint
+;  two-bit window. Recorded timings and payloads accompany WEB_CLIENT.md.
+;  Earlier evidence below describes the original implementation only.
 ;  Real chains through the X.509 engine: tools/a64/a64_x509_check.py
 ;  mode D. NOTHING HERE HAS RUN ON SILICON from the session that wrote
 ;  it.
@@ -136,7 +140,8 @@ EnableExplicit
 
 #ECP_W32  = $FFFFFFFF
 #ECP_S    = 18                      ; limbs per register slot (17 + 1)
-#ECP_NREG = 64                      ; registers in the file
+#ECP_NREG = 112                     ; registers, including public joint table
+#ECP_JOINT = 64                     ; 16 Jacobian points, i*G + j*Q
 
 ; EcpLastErr, numbered as ecdsa.pi4's EcdsaLastErr.
 #ECP_ERR_OK     = 0
@@ -826,6 +831,9 @@ Procedure.i EcpVrfyRaw(curve.i, hashAddr.i, hashLen.i, qAddr.i, qLen.i, sigAddr.
   Protected i.i
   Protected b1.i
   Protected b2.i
+  Protected j.i
+  Protected slot.i
+  Protected prev.i
 
   EcpRefusedAt = #ECP_AT_NONE
   If EcpLoadCurve(curve) = 0
@@ -899,27 +907,51 @@ Procedure.i EcpVrfyRaw(curve.i, hashAddr.i, hashLen.i, qAddr.i, qLen.i, sigAddr.
   EcpMul(#ECP_RU1, #ECP_RE, #ECP_RW, 1)          ; e * w, plain
   EcpMul(#ECP_RU2, #ECP_RR, #ECP_RW, 1)          ; r * w, plain
 
-  ; ---- 5. R = u1*G + u2*Q, interleaved double-and-add ----
-  EcpCopy(#ECP_SX, #ECP_GX)
-  EcpCopy(#ECP_SY, #ECP_GY)
-  EcpCopy(#ECP_SZ, #ECP_GZ)
-  EcpAddPt(#ECP_SX, #ECP_SY, #ECP_SZ, #ECP_QX, #ECP_QY, #ECP_QZ)
+  ; ---- 5. R = u1*G + u2*Q, joint two-bit public windows ----
+  ; All scalars and table indices are public verification data. The
+  ; complete point adder preserves equal/opposite/infinity cases.
+  For j = 0 To 3
+    For k = 0 To 3
+      slot = #ECP_JOINT + (j * 4 + k) * 3
+      If j = 0 And k = 0
+        EcpCopy(slot, #ECP_RONEP)
+        EcpCopy(slot + 1, #ECP_RONEP)
+        EcpZero(slot + 2)
+      Else
+        If k = 0
+          prev = slot - 12
+        Else
+          prev = slot - 3
+        EndIf
+        EcpCopy(slot, prev)
+        EcpCopy(slot + 1, prev + 1)
+        EcpCopy(slot + 2, prev + 2)
+        If k = 0
+          EcpAddPt(slot, slot + 1, slot + 2, #ECP_QX, #ECP_QY, #ECP_QZ)
+        Else
+          EcpAddPt(slot, slot + 1, slot + 2, #ECP_GX, #ECP_GY, #ECP_GZ)
+        EndIf
+      EndIf
+    Next
+  Next
   EcpCopy(#ECP_AX, #ECP_RONEP)
   EcpCopy(#ECP_AY, #ECP_RONEP)
   EcpZero(#ECP_AZ)                               ; at infinity
-  i = EcpNBits - 1
+  i = (EcpNBits - 1) & -2
   While i >= 0
+    EcpDbl(#ECP_AX, #ECP_AY, #ECP_AZ)
     EcpDbl(#ECP_AX, #ECP_AY, #ECP_AZ)
     b1 = EcpBit(#ECP_RU1, i)
     b2 = EcpBit(#ECP_RU2, i)
-    If b1 <> 0 And b2 <> 0
-      EcpAddPt(#ECP_AX, #ECP_AY, #ECP_AZ, #ECP_SX, #ECP_SY, #ECP_SZ)
-    ElseIf b1 <> 0
-      EcpAddPt(#ECP_AX, #ECP_AY, #ECP_AZ, #ECP_GX, #ECP_GY, #ECP_GZ)
-    ElseIf b2 <> 0
-      EcpAddPt(#ECP_AX, #ECP_AY, #ECP_AZ, #ECP_QX, #ECP_QY, #ECP_QZ)
+    If i + 1 < EcpNBits
+      b1 = b1 + 2 * EcpBit(#ECP_RU1, i + 1)
+      b2 = b2 + 2 * EcpBit(#ECP_RU2, i + 1)
     EndIf
-    i = i - 1
+    If b1 <> 0 Or b2 <> 0
+      slot = #ECP_JOINT + (b1 + 4 * b2) * 3
+      EcpAddPt(#ECP_AX, #ECP_AY, #ECP_AZ, slot, slot + 1, slot + 2)
+    EndIf
+    i = i - 2
   Wend
   EcpRefusedAt = #ECP_AT_INFINITY
   If EcpIsZero(#ECP_AZ)

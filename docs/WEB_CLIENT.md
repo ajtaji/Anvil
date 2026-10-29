@@ -359,3 +359,12 @@ call alone would understate the stall. Include both call sites when profiling.
 The first open spent 41,064 us loading cold roots; the warm open took 653 us.
 Verification remains synchronous and TLS still permits one connection. This
 improvement does not establish a display-frame latency bound.
+
+Anvil 423 also uses joint two-bit public windows for P-384 and P-521 issuer
+verification. All 116 raw/DER and independently checked boundary cases passed
+on the Pi 4. Typical nontrivial positive signatures cost 7-11% less; small-scalar
+cases cost 1-3% more because of table setup. Shared proofs compile on Pi 3 and
+Rock Pi. The register table grows by 6,912 bytes. Live verified gzip/deflate
+HTTPS took 595/475 ms, with maximum handshake calls of 252,139/250,901 us.
+Network round trips vary; the complete request is not claimed uniformly faster.
+Evidence is retained in `docs/evidence/anvil-tls423-20261029`.
