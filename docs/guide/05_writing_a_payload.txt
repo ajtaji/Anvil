@@ -713,3 +713,20 @@ buffers and preserved keys, sequence numbers, transcript and certificate key.
 NetService advances the pool in round-robin order. Calls still run on core 0,
 and certificate arithmetic remains synchronous. Closing wipes the connection's
 buffers and saved state; returning from a payload closes all its TLS handles.
+
+
+@SECTION API credentials and forms
+
+The shared web_credentials library formats Basic and Bearer Authorization
+values from explicit byte spans. Pass the returned length to WebRequestHeader
+and wipe temporary credentials and the retained request headers after use.
+Use verified HTTPS and the intended origin. This formats values; it does not
+acquire tokens, refresh them or automatically retry authentication challenges.
+
+The web_form library streams application/x-www-form-urlencoded fields into
+bounded output buffers, including a one-byte buffer. WebFormInit reports the
+encoded field length; sum lengths for Content-Length or use a chunked request.
+Inputs remain alive until output phase 4. Set the form Content-Type and let
+WebClientStep send the encoded output as the request body. UTF-8 conversion and
+newline normalization are explicit application choices. Exact contracts and
+physical qualification are in docs/WEB_CLIENT.md.

@@ -444,3 +444,37 @@ Controlled lifecycle tests cover pool exhaustion, fresh and stale handles,
 isolated state and wiping; separate regressions cover eight closure cases and
 fourteen scheduling/partial-send cases. Evidence and scope are retained in
 `docs/evidence/anvil-tls424-20261029`.
+
+
+## Credentials and form submissions
+
+`web_credentials.pbi` formats explicit byte spans with `WebCredentialBasic`
+or `WebCredentialBearer`. A nonnegative result is the Authorization value's
+byte length, without a NUL terminator. Pass it to `WebRequestHeader`, then
+wipe the temporary buffer with `WebCredentialWipe`. The request header buffer
+also retains the value until wiped after use. Buffers must be disjoint.
+A null destination and zero capacity measure the validated value; short output
+or invalid input returns an error without modifying the destination.
+
+Use credentials only with verified HTTPS and the intended origin. The helper
+has no transport and cannot enforce that choice. Basic rejects a colon in the
+username and control bytes in either field; the caller chooses the negotiated
+encoding and normalization. Bearer validates the token wire grammar, including
+trailing padding. These helpers do not acquire/refresh tokens, select a realm,
+retry a challenge or manage cookies. Existing redirect handling removes
+Authorization on a change of origin.
+
+`web_form.pbi` serializes one form field from already encoded UTF-8 bytes.
+`WebFormInit(context, name, nameBytes, value, valueBytes, separator)` returns
+the complete encoded length. Use separator 0 for the first field and 1 for
+later fields. Keep inputs alive and unchanged while `WebFormOutput` emits into
+disjoint output buffers; phase 4 means complete. Zero output capacity applies
+backpressure. Even a one-byte buffer can split percent escapes correctly.
+Each input is bounded to 1 MiB. Spaces become plus signs and literal plus,
+ampersand, equals, tilde, NUL and non-ASCII bytes are escaped. No Unicode or
+newline conversion is implicit. Sum field lengths for Content-Length, or use
+a chunked request; set Content-Type to application/x-www-form-urlencoded.
+
+All 46 physical fixtures passed. Real HTTPS Basic, bad-password rejection,
+Bearer and exact form POST passed on Anvil 424 in 550/473/477/484 ms. These are
+individual measurements. Evidence: `docs/evidence/anvil-web-values-20261029`.

@@ -1,0 +1,97 @@
+#WEB_KERNEL_BINDING=0
+XIncludeFile "Anvil/Network/web_url.pbi"
+XIncludeFile "Anvil/Network/web_request.pbi"
+XIncludeFile "Anvil/Network/web_response.pbi"
+XIncludeFile "Anvil/Network/web_transport.pbi"
+XIncludeFile "Anvil/Network/web_client.pbi"
+XIncludeFile "Anvil/Network/web_credentials.pbi"
+XIncludeFile "Anvil/Network/web_form.pbi"
+XIncludeFile "RaspberryPi4/Lib/mmu.pi4"
+Global u.WebUrl
+Global q.WebRequest
+Global a.WebResponse
+Global client.WebClient
+Global form.WebForm
+Global Dim host.a[256]
+Global Dim target.a[1024]
+Global Dim qh.a[2048]
+Global Dim ah.a[4096]
+Global Dim line.a[1024]
+Global Dim tx.a[512]
+Global Dim rx.a[512]
+Global Dim output.a[64]
+Global Dim auth.a[256]
+Global Dim body.a[256]
+Global *wirePet,*wireTime
+Global wtable.i
+Procedure CaptureTable()
+ ASM
+ adrp x1, global_wtable
+ add x1, x1, #:lo12:global_wtable
+ str x0, [x1]
+ EndASM
+EndProcedure
+Procedure.i Main()
+ Define i.i,j.i,rc.i,start.i,n.i,v.i,p.i,off.i,total.i,take.i,step.i,length.i,k.i,method.i,methodLength.i
+ CaptureTable()
+ For i=0 To 32767 : PokeA($E1C00000+i,0) : Next
+ PokeI($E1C00000,$57435632)
+ rc=WebPayloadBind(wtable) : If rc<>0 : ProcedureReturn 1 : EndIf
+ wirePet=PeekI(wtable+16+6*8) : wireTime=PeekI(wtable+16+11*8)
+ MmuClearNc() : MmuAddNc($08A00000,$09200000) : MmuAddNc($08100000,$08180000)
+ rc=MmuBuildTables($4F80000) : If rc<>0 : ProcedureReturn 2 : EndIf
+ MmuEnableCached()
+ For i=0 To 3
+  p=$E1C00100+i*4096 : total=0 : off=0 : length=0
+  u\host=@host[0] : u\hostCapacity=256 : u\target=@target[0] : u\targetCapacity=1024
+  method="GET" : methodLength=3
+  If i<2
+   v="https://httpbingo.org/basic-auth/anvil/demo"
+  ElseIf i=2
+   v="https://httpbingo.org/bearer"
+  Else
+   v="https://httpbingo.org/post" : method="POST" : methodLength=4
+   rc=WebFormInit(@form,"road",4,"Taylor St + 5th & Main",22,0)
+   While form\phase<>4 And rc>=0
+    rc=WebFormOutput(@form,@body[total],7) : If rc>=0 : total=total+rc : EndIf
+   Wend
+  EndIf
+  n=0 : While PeekA(v+n)<>0 : n=n+1 : Wend
+  rc=WebUrlParse(v,n,1,@u)
+  If rc=0 : rc=WebRequestInit(@q,@u,method,methodLength,total,0,@qh[0],2048) : EndIf
+  If rc=0 : rc=WebRequestHeader(@q,"User-Agent",10,"Anvil",5) : EndIf
+  If rc=0 : rc=WebRequestHeader(@q,"Accept-Encoding",15,"identity",8) : EndIf
+  If i=0
+   n=WebCredentialBasic("anvil",5,"demo",4,@auth[0],256)
+  ElseIf i=1
+   n=WebCredentialBasic("anvil",5,"wrong",5,@auth[0],256)
+  ElseIf i=2
+   n=WebCredentialBearer("synthetic-test-token",20,@auth[0],256)
+  Else
+   n=0
+   If rc=0 : rc=WebRequestHeader(@q,"Content-Type",12,"application/x-www-form-urlencoded",33) : EndIf
+  EndIf
+  If n<0 : rc=n : ElseIf n>0 And rc=0 : rc=WebRequestHeader(@q,"Authorization",13,@auth[0],n) : EndIf
+  k=WebCredentialWipe(@auth[0],256)
+  If rc=0 : rc=WebRequestFinishHeaders(@q) : EndIf
+  If rc=0 : rc=WebResponseInit(@a,@line[0],1024,@ah[0],4096,0) : EndIf
+  start=wireTime()/1000
+  If rc=0 : rc=WebClientStart(@client,@u,@q,@a,@tx[0],512,@rx[0],512,start,20000) : EndIf
+  While rc=0
+   wirePet() : WebPayloadService(1)
+   take=total-off : If take>3 : take=3 : EndIf
+   step=WebClientStep(@client,@body[off],take,Bool(off+take=total),@output[0],31,wireTime()/1000)
+   off=off+client\consumed : n=client\written
+   If length+n>3072 : rc=-993 : Break : EndIf
+   For j=0 To n-1 : PokeA(p+64+length+j,output[j]) : Next
+   length=length+n
+   If step<>0 : rc=step : Break : EndIf
+  Wend
+  PokeI(p,rc) : PokeI(p+8,a\status) : PokeI(p+16,wireTime()/1000-start) : PokeI(p+24,length) : PokeI(p+32,off) : PokeI(p+40,total)
+  WebClientClose(@client)
+  k=WebCredentialWipe(@qh[0],2048)
+  If rc<0 : Break : EndIf
+ Next
+ PokeI($E1C00008,rc)
+ MmuDisableCachedFlushed() : ProcedureReturn 0
+EndProcedure

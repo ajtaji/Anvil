@@ -1519,3 +1519,6 @@ text is unchanged; no new board execution or boot claim follows.
 | `Anvil/Network/web_event_stream.pbi` | protocol-facts | whatwg-html | HTML Standard 9.2, server-sent events | independently implemented from the wire contract; no copied implementation |
 | `Anvil/Network/websocket_handshake.pbi` | protocol-facts | ietf-rfc | RFC 6455 sections 4–8 | cite the document; no copied implementation |
 | `Anvil/Network/websocket_client.pbi` | protocol-facts | ietf-rfc | RFC 6455 sections 4–8 | cite the document; no copied implementation |
+
+| `Anvil/Network/web_credentials.pbi` | protocol-facts | ietf-rfc | RFC 7617 section 2, RFC 6750 section 2.1 | independently implemented wire values; no copied code |
+| `Anvil/Network/web_form.pbi` | protocol-facts | whatwg-url | WHATWG URL section 5.2 | independently implemented field serialization; no copied code |
