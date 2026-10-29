@@ -889,7 +889,9 @@ EndProcedure
 ;  takes the single long form 0x81 the parser accepts. Every other id is
 ;  still -1.
 ; ----------------------------------------------------------------------
+Global *EcdsaVerifyHook
 Procedure.i EcdsaVrfy(curve.i, hashAddr.i, hashLen.i, qAddr.i, qLen.i, sigAddr.i, sigLen.i)
+  If EcdsaVerifyHook<>0 : ProcedureReturn EcdsaVerifyHook(curve,hashAddr,hashLen,qAddr,qLen,sigAddr,sigLen) : EndIf
   Protected i.i
   Protected rawLen.i
   Protected r.i

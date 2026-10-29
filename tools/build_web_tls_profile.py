@@ -3,7 +3,7 @@ from pathlib import Path
 import argparse,hashlib,json,os,re,subprocess
 from pmf_compiler import resolve_compiler
 
-def build(compiler,out):
+def build(compiler,out,cancel_handshakes=False):
     root=Path(__file__).resolve().parents[1];out.mkdir(parents=True,exist_ok=False)
     cases=['gzip','deflate']
     names=['Anvil/Core/crc_constants.pbi', 'Anvil/Core/crc.pbi', 'Anvil/Network/web_url.pbi', 'Anvil/Network/web_request.pbi', 'Anvil/Network/web_response.pbi', 'Anvil/Network/web_transport.pbi', 'Anvil/Network/web_client.pbi', 'Anvil/Network/web_inflate.pbi', 'Anvil/Network/web_content.pbi', 'Anvil/Network/web_content_response.pbi', 'RaspberryPi4/Lib/mmu.pi4']
@@ -104,6 +104,25 @@ Procedure.i Main()
  ProcedureReturn 0
 EndProcedure
 '''
+    if cancel_handshakes:
+        s=s.replace(' Define i.i,rc.i\n CaptureTable()', ' Define i.i,rc.i,h.i,st.i,began.i,cost.i,start.i\n CaptureTable()')
+        s=s.replace(' MmuEnableCached()', ''' MmuEnableCached()
+ PokeI($E1C00018,$43414E31)
+ For i=0 To 1
+  h=webpTlsOpen("httpbingo.org",443)
+  PokeI($E1C03000+i*64,h)
+  start=wireTime()/1000 : st=0 : cost=0
+  While h>0 And wireTime()/1000-start<5000
+   wirePet() : began=wireTime() : st=webpTlsState(h) : cost=wireTime()-began
+   If st<0 Or st=4 : Break : EndIf
+   If st=2+i And cost>=1500 : Break : EndIf
+   WebPayloadService(1)
+  Wend
+  PokeI($E1C03008+i*64,st) : PokeI($E1C03010+i*64,cost)
+  PokeI($E1C03018+i*64,webpTlsClose(h))
+  PokeI($E1C03020+i*64,webpTlsState(h))
+ Next
+''')
     source=out/'proof.pi4';source.write_text(s,encoding='utf8')
     q=subprocess.run([str(resolve_compiler(compiler)),'--compile',str(source),'-t','pi4','--load-addr','0x1000000','--stack-addr','0x4f00000','--entry-returns','--wants-services','-o',str(out/'proof.img')],env=dict(os.environ,PMF_ROOT=str(root)),capture_output=True,text=True,encoding='utf8',timeout=180,creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
     log=q.stdout+q.stderr;(out/'compile.txt').write_text(log,encoding='utf8');print(log[-1800:]);assert q.returncode==0
@@ -112,4 +131,5 @@ EndProcedure
     (out/'identity.json').write_text(json.dumps(dict(bytes=len(payload),sha256=hashlib.sha256(payload).hexdigest(),checked_ranges=ranges,source_hashes={n:hashlib.sha256((root/n).read_bytes()).hexdigest() for n in names},cases=cases),indent=2),encoding='utf8')
 if __name__=='__main__':
     ap=argparse.ArgumentParser(description=__doc__);ap.add_argument('--compiler',required=True);ap.add_argument('--out',type=Path,required=True)
-    args=ap.parse_args();build(args.compiler,args.out.resolve())
+    ap.add_argument('--cancel-handshakes',action='store_true')
+    args=ap.parse_args();build(args.compiler,args.out.resolve(),args.cancel_handshakes)

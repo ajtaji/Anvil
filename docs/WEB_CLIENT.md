@@ -229,14 +229,15 @@ count is an explicit transport failure. Application plaintext is drained before
 the receive buffer is reused.
 
 This separates coalesced records and partial-send retries across service calls.
-It does not make individual certificate verification or key-share arithmetic
-resumable, and one TLS record can still contain several handshake messages.
+Record budgeting alone does not make certificate/key-share arithmetic
+resumable. The cooperative driver described below adds that scheduling; one
+TLS record can still contain several handshake messages.
 There is no frame-time guarantee. Physical scheduling and transport-close checks
 use controlled crypto/TCP doubles; live HTTPS qualification is recorded separately.
 
-Installed419 passes live verified HTTPS gzip and deflate requests after reboot.
+Historical baseline: installed419 passed live verified HTTPS gzip and deflate requests after reboot.
 The longest measured handshake service calls remain about 347 ms; record budgeting
-has not removed this arithmetic bottleneck. First open with cold root setup took
+had not removed this arithmetic bottleneck. First open with cold root setup took
 41 ms in this sample, while the following warm open took654 microseconds.
 
 
@@ -432,8 +433,8 @@ The layout gate refuses omitted working fields or an unsliced large buffer.
 Calls remain serialized on core 0. This is overlapping connection lifetimes,
 not concurrent execution of shared cryptographic arithmetic. NetService moves
 one allocated connection per advance in round-robin order; a handle operation
-also advances that particular connection. Certificate verification remains
-synchronous. Close wipes that slot's snapshot and buffers; payload return
+also requests progress. With the cooperative driver, an already active worker
+finishes its slice before another handshake enters shared scratch. Close wipes that slot's snapshot and buffers; payload return
 closes every allocated TLS handle. Diagnostics list all allocated handles.
 
 Physical qualification on Anvil 424 kept four verified HTTPS connections open.
@@ -553,18 +554,22 @@ application; they do not require a new resident firmware image beyond the
 already-qualified HTTP/TLS services.
 
 
-## Cooperative certificate arithmetic (integration in progress)
+## Cooperative TLS scheduling
 
-The shared Crypto libraries now provide resumable modular exponentiation and
-ECDSA verification. These are arithmetic building blocks, not yet used by the
-resident TLS service. Existing TLS handshakes can still block on arithmetic;
-no complete asynchronous-handshake claim is made.
+The shared Crypto libraries provide resumable modular exponentiation, RSA,
+X25519 and ECDSA operations. The resident TLS client can use these through
+Core/tls_cooperative.pbi and the existing cooperative context backend. One
+worker owns shared crypto scratch and retains the handshake/parser call stack
+while yielding back to the caller. It does not change certificate verification,
+use background cores, or enable timer preemption.
 
 Include bignum.pbi before bignum_job.pbi. A zero-initialized BnPowJob owns
 pointers to the output, exponent, modulus, and two nonoverlapping scratch
 buffers under the existing BnModpow capacity/representation contract.
 BnPowBegin returns 0 pending, 1 complete, -1 invalid, or -2 already active.
-Begin performs the base conversion. BnPowStep(job, bitBudget) performs at most
+Begin performs the base conversion. BnPowBeginDeferred instead defers that
+conversion to Step, which advances at most bitBudget limbs before beginning
+the exponent phase. BnPowStep(job, bitBudget) then performs at most
 that many exponent bits (two Montgomery multiplies per bit), returning 0
 pending or 1 complete; an invalid budget returns -1 without changing the job.
 The public scheduling budget must not depend on secrets. Independent jobs may
@@ -585,7 +590,7 @@ limited to 64 bytes. These verification jobs never handle private scalars.
 
 Each ECDSA job exclusively owns its family's shared arithmetic scratch. Never
 interleave synchronous ECDSA/ec256/Ecp operations with an active job. This is
-an explicit scheduling requirement for future TLS integration, not a claim of
+an explicit scheduling requirement enforced by the TLS worker, not a claim of
 thread safety or a per-connection arithmetic context. P-256 advances scalar
 and affine inversions eight bits at a time and its joint multiplication one
 window at a time; wider curves advance inversions one nibble at a time.
@@ -594,6 +599,52 @@ Physical Pi 4 evidence is in docs/evidence/anvil-tls-jobs-20261029. The P-256
 and wider-curve suites check 103 and 116 verdict/diagnostic cases respectively;
 24 modular exponentiation cases independently check results, interleaving,
 budgets and cancellation. Pi 3 and Rock Pi compilation also passes, with no
-physical execution claim for those targets. Full handshake integration,
-resumable RSA/X25519, connection cancellation and timing under live traffic
-remain required before these results establish nonblocking TLS.
+physical execution claim for those targets.
+
+RsaJobBegin copies the signature representative, modulus and public exponent.
+Step advances one conversion limb or exponent bit. Result=1 means the public
+operation completed: the caller MUST still validate PKCS#1/PSS encoding and
+compare the expected digest. The existing TLS RSA verifier does both.
+X25519JobBegin copies/clamps the scalar, and Step advances a fixed ladder bit
+or fixed inversion unit; output is written only at completion. Completion and
+Cancel wipe the private scalar and intermediate field elements. Both families
+exclusively own existing scratch until completion/cancellation.
+
+TlsCooperativeInstall requires an idle TLS pool and a qualified cooperative
+backend in the composition. The current AArch64 backend requires EL3 and the
+same core/address space; failure retains the synchronous path and is reported
+at boot and by tls status. The shared libraries contain no Pi 4 hardware calls.
+The Pi 4 composition also supplies the Pi 5 composition, but runtime support
+on a different board/EL is not established by Pi 4 measurements.
+
+The worker targets approximately 2 ms between yield checks. This is not a
+hard upper bound: a single arithmetic unit, record operation or device I/O
+can take longer, and one high-level HTTP step can call multiple services.
+Certificate parsing yields between VM/native operations and anchor scans;
+root-store parsing yields only after its shared file handle has closed.
+The initial file read remains synchronous. Trust/entropy preparation is now
+part of connection progress: SVC_TLS_RESOLVING includes this preparation.
+After a positive Open handle, callers must check State for preparation errors
+and Close failed handles, just as for later DNS/TCP/handshake errors.
+
+Close cancels/reaps an owned worker before releasing the connection and wipes
+its private stack. Deadline checks run on resume. Other connections preserve
+their own TLS snapshots; only one handshake worker enters shared arithmetic.
+This is cooperative serialized execution, not concurrent thread-safe crypto.
+
+
+Anvil 426 physical qualification: gzip and deflate returned HTTP 200 with
+validated decoded content. Observed maximum NetService calls were 2.651 and
+2.654 ms; state queries during handshake were at most 2.579 ms. High-level
+HTTP Step maxima were 8.613 and 8.612 ms. Cold Start still took 20.804 ms;
+the following warm Start took 691 microseconds. Full requests took 571 and
+494 ms. These are observations, not latency guarantees. Build 425 without
+parser yields had measured roughly 12.4 ms service and 23 ms HTTP Step stalls.
+
+The live cancellation test closed connections during connecting and handshake
+states, rejected their stale handles, and then completed two verified HTTPS
+requests. Separate saved-context tests check cancellation inside private key
+work, caller-slot restoration, stack locals, secret wiping and 31 RSA/X25519
+cases. The updated modular job passed all 24 independent arithmetic cases.
+Evidence is retained with the prior scheduling measurements under
+`docs/evidence/anvil-tls-jobs-20261029`.

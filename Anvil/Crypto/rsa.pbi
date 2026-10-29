@@ -497,7 +497,9 @@ EndProcedure
 ;  modulus was odd. Leading zero bytes of the modulus are stripped; xlen
 ;  must equal the resulting modulus length. e is a big-endian byte string.
 ; ----------------------------------------------------------------------
+Global *RsaPublicHook
 Procedure.i RsaPublic(x.i, xlen.i, nPtr.i, nLen.i, ePtr.i, eLen.i)
+  If RsaPublicHook<>0 : ProcedureReturn RsaPublicHook(x,xlen,nPtr,nLen,ePtr,eLen) : EndIf
   Protected r.i
   Protected m0i.i
   While nLen > 0 And (PeekA(nPtr) & 255) = 0

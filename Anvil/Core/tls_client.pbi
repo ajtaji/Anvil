@@ -15,12 +15,13 @@
 ;  slot) and every TLS slot call. The one stretch of pure computation is
 ;  the handshake's own arithmetic - an X25519 share at open and the chain
 ;  and CertificateVerify signatures when the server's flight lands - which
-;  is done in the call that has the bytes. Its cost depends on cache state
-;  and the certificate algorithms; it is not bounded to one display frame.
+;  uses an optional cooperative driver. Without that driver it runs in the
+;  call that has the bytes and is not bounded to one display frame.
 ;
 ;  FOUR SERIALIZED CONNECTIONS. Large buffers belong to fixed pool slots.
 ;  Explicit snapshots preserve TLS keys, sequences, transcript and certificate
-;  key between calls. Shared arithmetic runs to completion before switching.
+;  key between calls. A cooperative worker serializes in-flight arithmetic
+;  ownership while retaining the parser call stack across service calls.
 ;  Handles are monotonically allocated and stale handles are refused. The
 ;  service advances one allocated slot per call in round-robin order.
 ;
@@ -56,6 +57,7 @@ EnableExplicit
 #TLSC_OPEN      = 4
 #TLSC_CLOSED    = 5
 #TLSC_FAILED    = 6
+#TLSC_PREPARE   = 7
 
 #TLSC_NAME_MAX  = 256
 #TLSC_HS_BUF    = 24576     ; the largest handshake message: a certificate chain
@@ -261,7 +263,7 @@ EndProcedure
 ;  TlsClientAdvance - move the connection on without waiting for I/O.
 ;  Signature/key-share arithmetic is synchronous; not a frame-time guarantee.
 ; ----------------------------------------------------------------------
-Procedure tlsc_AdvanceCurrent()
+Procedure tlsc_AdvanceWork()
   Define r.i
   Define st.i
   Define n.i
@@ -271,11 +273,29 @@ Procedure tlsc_AdvanceCurrent()
     ProcedureReturn
   EndIf
 
-  If tlsc_state = #TLSC_RESOLVING Or tlsc_state = #TLSC_TCP Or tlsc_state = #TLSC_HS
+  If tlsc_state = #TLSC_PREPARE Or tlsc_state = #TLSC_RESOLVING Or tlsc_state = #TLSC_TCP Or tlsc_state = #TLSC_HS
     If ((millis() - tlsc_t0) & $FFFFFFFF) > #TLSC_HS_MS
       tlsc_Refuse(#SVC_ETIMEOUT, "the HTTPS connection was not established within 20 seconds")
       ProcedureReturn
     EndIf
+  EndIf
+
+  If tlsc_state=#TLSC_PREPARE
+  r = TlsRootsEnsure()
+  If r <= 0
+    tlsc_why = TlsRootsErrorText(r)
+    tlsc_Refuse(#SVC_ESTATE,tlsc_why) : ProcedureReturn
+  EndIf
+  If tlsc_seeded = 0
+    If DrbgAutoSeed() < 0
+      tlsc_why = "the hardware random generator would not seed TLS's generator"
+      tlsc_Refuse(#SVC_EIO,tlsc_why) : ProcedureReturn
+    EndIf
+    tlsc_seeded = 1
+  Else
+    DrbgAutoReseed()
+  EndIf
+    tlsc_state=#TLSC_RESOLVING
   EndIf
 
   If tlsc_state = #TLSC_RESOLVING
@@ -371,6 +391,18 @@ Procedure tlsc_AdvanceCurrent()
   EndIf
 EndProcedure
 
+ ; Optional cooperative driver installed by the target composition. The
+; arithmetic implementation remains independent of scheduler/target details.
+Global *tlsc_advanceHook
+Global *tlsc_closeHook
+Procedure tlsc_AdvanceCurrent()
+ If tlsc_advanceHook<>0
+  tlsc_advanceHook()
+ Else
+  tlsc_AdvanceWork()
+ EndIf
+EndProcedure
+
 Procedure TlsClientAdvance()
  Define i.i,slot.i
  For i=0 To #TLSC_CONNECTIONS-1
@@ -428,20 +460,6 @@ Procedure.i TlsClientOpen(*host, port.i)
     gSvcDetail = "the clock is not trusted (no SNTP time yet, not set by hand), and certificate dates cannot be checked against a guess"
     ProcedureReturn #SVC_ESTATE
   EndIf
-  r = TlsRootsEnsure()
-  If r <= 0
-    gSvcDetail = TlsRootsErrorText(r)
-    ProcedureReturn #SVC_ESTATE
-  EndIf
-  If tlsc_seeded = 0
-    If DrbgAutoSeed() < 0
-      gSvcDetail = "the hardware random generator would not seed TLS's generator"
-      ProcedureReturn #SVC_EIO
-    EndIf
-    tlsc_seeded = 1
-  Else
-    DrbgAutoReseed()
-  EndIf
   tlsc_Select(slot)
   tlsc_nextHandle=tlsc_nextHandle+1 : tlsc_handles[slot]=tlsc_nextHandle
   For r = 0 To n - 1
@@ -464,7 +482,7 @@ Procedure.i TlsClientOpen(*host, port.i)
   tlsc_ringHead = 0
   tlsc_ringTail = 0
   tlsc_t0 = millis()
-  tlsc_state = #TLSC_RESOLVING
+  tlsc_state = #TLSC_PREPARE
   tlsc_AdvanceCurrent()
   ProcedureReturn tlsc_handles[tlsc_slot]
 EndProcedure
@@ -477,6 +495,8 @@ Procedure.i TlsClientState(h.i)
   EndIf
   tlsc_AdvanceCurrent()
   Select tlsc_state
+    Case #TLSC_PREPARE
+      ProcedureReturn #SVC_TLS_RESOLVING
     Case #TLSC_RESOLVING
       ProcedureReturn #SVC_TLS_RESOLVING
     Case #TLSC_TCP
@@ -557,6 +577,7 @@ EndProcedure
 
 ; Close: close_notify if established, then TCP; the handle is free at once.
 Procedure.i TlsClientClose(h.i)
+  If tlsc_closeHook<>0 : tlsc_closeHook(h) : EndIf
   Define r.i
   Define i.i
   r = tlsc_Handle(h)
@@ -607,6 +628,8 @@ Procedure tlsc_ShowCurrent()
   Select tlsc_state
     Case #TLSC_IDLE
       PrintN("none")
+    Case #TLSC_PREPARE
+      PrintN("preparing trust and entropy")
     Case #TLSC_RESOLVING
       PrintN("resolving the name")
     Case #TLSC_TCP
@@ -646,6 +669,11 @@ Procedure tlsc_ShowCurrent()
 EndProcedure
 
 Procedure TlsClientShow()
+  If tlsc_advanceHook<>0
+    PrintN("TLS scheduling: cooperative arithmetic")
+  Else
+    PrintN("TLS scheduling: synchronous arithmetic")
+  EndIf
   Define slot.i,previous.i,count.i
   previous=tlsc_slot
   For slot=0 To #TLSC_CONNECTIONS-1

@@ -1531,3 +1531,7 @@ text is unchanged; no new board execution or boot claim follows.
 | `Anvil/Crypto/ecdsa_job.pbi` | consulted | bearssl | existing shared arithmetic | resumable scheduling around the existing verified arithmetic; original license retained |
 
 | `Anvil/Crypto/ecp_job.pbi` | reference-only | bearssl | existing shared arithmetic | resumable scheduling around the existing verified arithmetic; original license retained |
+
+| `Anvil/Crypto/rsa_job.pbi` | consulted | bearssl | MIT | original notice retained in licenses/BearSSL-LICENSE.txt |
+| `Anvil/Crypto/x25519_job.pbi` | consulted | bearssl | MIT | original notice retained in licenses/BearSSL-LICENSE.txt |
+| `Anvil/Crypto/x25519_job.pbi` | protocol-facts | ietf-rfc | IETF specification | RFC 7748 scalar clamping |

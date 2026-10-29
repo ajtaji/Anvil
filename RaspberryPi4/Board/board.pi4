@@ -1185,7 +1185,7 @@ StackAddress $8000000
 ;      #ANVIL_BUILD = 1        ; pmf:build off
 ;  The IDE's Compiler > Build Number... window writes that word for you.
 ; ======================================================================
-#ANVIL_BUILD = 424        ; pmf:build
+#ANVIL_BUILD = 426        ; pmf:build
 
 ;  The two optional siblings, written by the same successful build. They
 ;  are INTEGERS because `#NAME = <literal>` takes a number and nothing
@@ -1194,7 +1194,7 @@ StackAddress $8000000
 ;  for. YYYYMMDD and HHMMSS read correctly as decimal numbers anyway, and
 ;  CmdVersion() prints them with their separators put back.
 #ANVIL_BUILD_DATE = 20261029   ; pmf:builddate
-#ANVIL_BUILD_TIME = 133700     ; pmf:buildtime
+#ANVIL_BUILD_TIME = 170255     ; pmf:buildtime
 
 ; ======================================================================
 ;  THE LIBRARIES. A library never includes a library - the main file
@@ -2280,6 +2280,15 @@ XIncludeFile "Anvil/Core/payload_net.pbi"
 ; the monitor's own `https get` / `tls` commands over the same engine.
 XIncludeFile "Anvil/Core/tls_roots.pbi"
 XIncludeFile "Anvil/Core/tls_client.pbi"
+XIncludeFile "Anvil/Crypto/bignum_job.pbi"
+XIncludeFile "Anvil/Crypto/ecdsa_job.pbi"
+XIncludeFile "Anvil/Crypto/ecp_job.pbi"
+XIncludeFile "Anvil/Crypto/rsa_job.pbi"
+XIncludeFile "Anvil/Crypto/x25519_job.pbi"
+XIncludeFile "Anvil/Hal/aarch64_counter.pbi"
+XIncludeFile "Anvil/Kernel/Scheduler/scheduler.pbi"
+XIncludeFile "Anvil/Kernel/Scheduler/cooperative_a64.pbi"
+XIncludeFile "Anvil/Core/tls_cooperative.pbi"
 XIncludeFile "Anvil/Core/tls_cmd.pbi"
 XIncludeFile "Anvil/Core/pmfboot.pbi"
 ; ----------------------------------------------------------------------
@@ -2898,6 +2907,14 @@ Procedure Main()
   ; the answer to a typed command goes to the message log instead - see
   ; Anvil/Core/messages.pbi. Everything above this line was the boot, and
   ; stays on every console exactly as before.
+  ; Shared cooperative TLS driver; no IRQ, timer or secondary-core ownership.
+  ; Lower-EL compositions retain their existing synchronous driver until the
+  ; context backend has a qualified lower-EL execution contract.
+  If TlsCooperativeInstall(HwMonLo(),(HwMonBytes()+3) & -4)<>0
+    PrintN("TLS arithmetic: cooperative service slices enabled.")
+  Else
+    PrintN("TLS arithmetic: synchronous fallback (context backend unavailable).")
+  EndIf
   MessagesStart()
   MsgLogStart()                                    ; and every kept line to MSGLOG.TXT on the stick
 

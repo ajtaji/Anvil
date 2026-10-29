@@ -231,7 +231,9 @@ EndProcedure
 ;  X25519(out, secScalar, point) - out = secScalar * point on Curve25519.
 ;  All buffers are 32-byte little-endian per RFC 7748. Returns 1.
 ; ----------------------------------------------------------------------
+Global *X25519ComputeHook
 Procedure.i X25519(out.i, secScalar.i, point.i)
+  If X25519ComputeHook<>0 : ProcedureReturn X25519ComputeHook(out,secScalar,point) : EndIf
   Protected i.i
   Protected j.i
   Protected secSwap.i

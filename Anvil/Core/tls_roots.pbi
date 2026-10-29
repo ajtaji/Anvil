@@ -380,6 +380,7 @@ EndProcedure
 ;  #TLSROOT_ERR_*. The previous store is replaced only by a load that
 ;  registered at least one root.
 ; ----------------------------------------------------------------------
+Global *TlsRootsPauseHook
 Procedure.i TlsRootsLoad(*path)
   Define size.i
   Define got.i
@@ -448,6 +449,11 @@ Procedure.i TlsRootsLoad(*path)
 
   i = 0
   While i < size
+    ; The file is already closed: suspending here cannot retain the shared
+    ; storage handle while another service performs file I/O.
+    If TlsRootsPauseHook<>0
+      If TlsRootsPauseHook()=0 : tlsroot_err=#TLSROOT_ERR_READ : ProcedureReturn tlsroot_err : EndIf
+    EndIf
     If tlsroot_PemIs(i, ?tlsroot_begin, 27, size) <> 0
       j = i + 27
       While j < size And tlsroot_PemIs(j, ?tlsroot_end, 25, size) = 0

@@ -17,15 +17,16 @@ Structure BnPowJob
  words.i
  bit.i
  state.i
+ conversion.i
 EndStructure
 
 ; Storage and all operands must remain valid, separate, and unmodified until
 ; completion or cancellation. x is reduced modulo the odd modulus on entry,
 ; as for BnModpow. The buffers have the same capacity contract as BnModpow.
 ; A zero-length exponent is allowed with a null exponent pointer.
-Procedure.i BnPowBegin(*job.BnPowJob,x.i,e.i,bytes.i,m.i,inverse.i,power.i,scratch.i)
+Procedure.i BnPowBeginDeferred(*job.BnPowJob,x.i,e.i,bytes.i,m.i,inverse.i,power.i,scratch.i)
  If *job=0 : ProcedureReturn -1 : EndIf
- If *job\state=1 : ProcedureReturn -2 : EndIf
+ If *job\state=1 Or *job\state=3 : ProcedureReturn -2 : EndIf
  If x=0 Or m=0 Or power=0 Or scratch=0 : ProcedureReturn -1 : EndIf
  If bytes<0 Or bytes>8192 : ProcedureReturn -1 : EndIf
  If bytes>0
@@ -38,11 +39,21 @@ Procedure.i BnPowBegin(*job.BnPowJob,x.i,e.i,bytes.i,m.i,inverse.i,power.i,scrat
  *job\modulus=m : *job\inverse=inverse
  *job\power=power : *job\scratch=scratch
  *job\words=(BnGw(m,0)+31)>>4 : *job\bit=0
- BnCopyWords(power,x,*job\words) : BnToMonty(power,m)
+ BnCopyWords(power,x,*job\words)
  BnZero(x,BnGw(m,0)) : BnSw(x,1,1)
- *job\state=1
- If bytes=0 : *job\state=2 : EndIf
- ProcedureReturn *job\state-1
+ *job\state=3 : *job\conversion=*job\words-1
+ If bytes=0 : *job\state=2 : ProcedureReturn 1 : EndIf
+ ProcedureReturn 0
+EndProcedure
+
+ ; Synchronous-setup compatibility entry. Deferred callers avoid the whole
+; base conversion in Begin and let Step advance it one limb per budget unit.
+Procedure.i BnPowBegin(*job.BnPowJob,x.i,e.i,bytes.i,m.i,inverse.i,power.i,scratch.i)
+ Define rc.i
+ rc=BnPowBeginDeferred(*job,x,e,bytes,m,inverse,power,scratch)
+ If rc<>0 : ProcedureReturn rc : EndIf
+ BnToMonty(power,m) : *job\conversion=0 : *job\state=1
+ ProcedureReturn 0
 EndProcedure
 
 ; Return 0 pending, 1 complete, -1 invalid/inactive. Invalid budgets do not
@@ -52,6 +63,14 @@ Procedure.i BnPowStep(*job.BnPowJob,bitBudget.i)
  If *job=0 : ProcedureReturn -1 : EndIf
  If bitBudget<1 Or bitBudget>65536 : ProcedureReturn -1 : EndIf
  If *job\state=2 : ProcedureReturn 1 : EndIf
+ If *job\state=3
+  limit=bitBudget
+  If limit>*job\conversion : limit=*job\conversion : EndIf
+  For k=1 To limit : BnMulAddSmall(*job\power,0,*job\modulus) : Next
+  *job\conversion=*job\conversion-limit
+  If *job\conversion=0 : *job\state=1 : EndIf
+  ProcedureReturn 0
+ EndIf
  If *job\state<>1 : ProcedureReturn -1 : EndIf
  k=*job\bit : limit=k+bitBudget
  If limit>(*job\bytes<<3) : limit=*job\bytes<<3 : EndIf
@@ -74,7 +93,7 @@ EndProcedure
 Procedure BnPowClear(*job.BnPowJob)
  Define i.i,p.i
  If *job=0 : ProcedureReturn : EndIf
- If *job\state=1 Or *job\state=2
+ If *job\state=1 Or *job\state=2 Or *job\state=3
   For i=0 To *job\words-1
    BnSw(*job\power,i,0) : BnSw(*job\scratch,i,0)
   Next
