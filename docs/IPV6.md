@@ -66,3 +66,25 @@ fixed-header length, and link padding. Both returning tests left all cores,
 fonts and Vulkan healthy. Pi 3 and Rock Pi compilation passed; no physical
 execution is claimed for those boards. Evidence and reproducible builders are
 under `docs/evidence/anvil-ipv6-20261029` and `tools/build_ipv6_*_cpu.py`.
+
+
+## Shared transport checksums
+
+The Internet sum/fold/finish arithmetic now has one owner in
+`Anvil/Network/internet_checksum.pbi`. IPv4 retains compatibility wrappers;
+IPv6 uses the same implementation. `IPv6TransportChecksum` receives 16-byte
+source/destination addresses, the final upper-layer protocol, and a payload
+span of 0..65535 bytes. Extension headers are excluded. It returns the checksum
+or -1 for an invalid argument. A received message including its checksum
+validates when the result is zero. A UDP sender maps a computed zero to 65535.
+
+The sum helper operates on valid spans with a nonnegative seed and Anvil's
+64-bit integer ABI. When summing consecutive spans, all except the last must
+have even lengths. Capture 280 checked 60 cases against independent host
+sums, with all four pointer alignments and payload lengths through 65535.
+
+The full Anvil 427 image also passed verified HTTPS gzip/deflate over its
+existing IPv4 link after installing the shared checksum owner. Capture 281
+returned healthy; the cooperative TLS timings remained approximately 2.7 ms
+maximum service and 8.6 ms HTTP Step in that run. This is IPv4 regression
+evidence, not an IPv6 wire test.

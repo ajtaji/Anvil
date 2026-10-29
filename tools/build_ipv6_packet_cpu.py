@@ -5,7 +5,7 @@ from pmf_compiler import resolve_compiler
 
 def build(compiler,out):
  root=Path(__file__).resolve().parents[1];out.mkdir(parents=True,exist_ok=False)
- names=['Anvil/Network/ipv6_packet.pbi','Anvil/Network/byte_order.pbi','RaspberryPi4/Lib/mmu.pi4']
+ names=['Anvil/Network/ipv6_packet.pbi','Anvil/Network/byte_order.pbi','RaspberryPi4/Lib/mmu.pi4','Anvil/Network/internet_checksum.pbi']
  src=ipaddress.IPv6Address('2001:db8::1').packed;dst=ipaddress.IPv6Address('fe80::abcd').packed
  def packet(proto,data):return struct.pack('!IHBB',0x6a512345,len(data),proto,64)+src+dst+data
  cases=[];vectors=[]

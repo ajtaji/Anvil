@@ -3,6 +3,7 @@
 ; No link, neighbor, socket or checksum state.
 ; Source/destination validity and transport checks belong to the endpoint.
 XIncludeFile "Anvil/Network/byte_order.pbi"
+XIncludeFile "Anvil/Network/internet_checksum.pbi"
 #IPV6_PACKET_ARGUMENT = -700
 #IPV6_PACKET_SHORT = -701
 #IPV6_PACKET_VERSION = -702
@@ -120,4 +121,21 @@ Procedure.i IPv6PacketHeader(out.i,capacity.i,source.i,destination.i,payloadByte
   PokeA(out+8+i,PeekA(source+i)) : PokeA(out+24+i,PeekA(destination+i))
  Next
  ProcedureReturn 40
+EndProcedure
+
+; RFC 8200 section 8.1 pseudo-header with the final upper-layer protocol
+; and length (extension bytes excluded). Returns 0..65535, or -1 invalid.
+; Includes any checksum already present: validation succeeds with result 0.
+; For UDP emission, translate a computed zero checksum to $FFFF.
+Procedure.i IPv6TransportChecksum(source.i,destination.i,protocol.i,payload.i,bytes.i)
+ Define sum.i
+ If source=0 Or destination=0 : ProcedureReturn -1 : EndIf
+ If bytes<0 Or bytes>65535 : ProcedureReturn -1 : EndIf
+ If bytes>0 And payload=0 : ProcedureReturn -1 : EndIf
+ If protocol<0 Or protocol>255 : ProcedureReturn -1 : EndIf
+ sum=InternetChecksumSum16(source,16,0)
+ sum=InternetChecksumSum16(destination,16,sum)
+ sum=sum+bytes+protocol
+ sum=InternetChecksumSum16(payload,bytes,sum)
+ ProcedureReturn InternetChecksumFinish(sum)
 EndProcedure

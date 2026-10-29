@@ -1538,3 +1538,5 @@ text is unchanged; no new board execution or boot claim follows.
 
 | `Anvil/Network/ipv6_address.pbi` | protocol-facts | ietf-rfc | IETF specification | RFC 4291 address notation; RFC 5952 hexadecimal formatting |
 | `Anvil/Network/ipv6_packet.pbi` | protocol-facts | ietf-rfc | IETF specification | RFC 8200 packet/extension layout; RFC 5095 unknown routing semantics |
+
+| `Anvil/Network/internet_checksum.pbi` | protocol-facts | ietf-rfc | IETF specification | RFC 1071 sum/fold; extracted unchanged from the existing IPv4 implementation |
