@@ -642,7 +642,7 @@ The detailed API and ownership rules are in docs/WEB_CLIENT.md. Physical Pi 4
 qualification covers fragmented input, output backpressure, binary upload
 encoding, redirects, reusable HTTPS connections and live compressed responses.
 Other boards use the shared code but need their own physical qualification.
-IPv6 and international host conversion, HTTP/2 and HTTP/3, WebSocket upgrades,
+IPv6 and international host conversion, HTTP/2 and HTTP/3,
 Brotli, Zstandard and managed authentication/cookies remain separate work.
 
 
@@ -658,3 +658,29 @@ service. Keep calling SvcNetService while resolution is pending. Partial TCP
 transfers and cancellation preserve the original query deadline; a failed or
 incomplete answer is never reported as a successful address. IPv6, DNSSEC and
 iterative authoritative resolution remain outside this resolver's contract.
+
+
+@SECTION WebSocket messages
+
+The shared WebSocket client uses the existing HTTP parser and TCP/TLS services.
+Parse ws or wss with WebSocketUrlParse, build the upgrade request with
+WebSocketRequestInit, finalize its headers, and explicitly enable upgrades on the
+response with WebResponseAllowUpgrade. Initialize the frame decoder, start the
+HTTP client, and bind it using WebSocketClientBind. The full buffer contract and
+call sequence are in docs/WEB_CLIENT.md.
+
+A new connection needs a fresh unpredictable 16-byte nonce; every outgoing frame
+needs a fresh unpredictable 4-byte mask. Supply a cryptographic RNG callback.
+The client refuses RNG failure and never substitutes a fixed value or counter.
+There is not yet a public kernel RNG service slot.
+
+Keep servicing networking and call WebSocketClientStep. Consume its written
+bytes on every call; a return of 1 marks a data-frame boundary and fin identifies
+the end of the message. Fragmented text keeps its UTF-8 state across frames.
+Ping and Close replies are automatic. Outgoing complete messages must fit the TX
+buffer; outgoing fragmentation and negotiated extensions are not implemented.
+Queue opcode 8 with WebSocketClientSend for graceful close, or abort explicitly.
+A close timeout, malformed frame or missing close handshake is an error.
+
+This does not make TLS certificate arithmetic asynchronous: the separate network
+service can still take about 347 ms during a handshake on the measured Pi4.

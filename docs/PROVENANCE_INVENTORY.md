@@ -1513,3 +1513,7 @@ text is unchanged; no new board execution or boot claim follows.
 | `Anvil/Network/web_redirect.pbi` | protocol-facts | ietf-rfc | RFC 3986 section 5; RFC 9110 sections 9.2 and 15.4 | cite the document; no copied implementation |
 | `Anvil/Network/web_inflate.pbi` | protocol-facts | ietf-rfc | RFC 1951 sections 3.1 and 3.2 | cite the document; no copied implementation |
 | `Anvil/Network/web_content.pbi` | protocol-facts | ietf-rfc | RFC 1950, RFC 1951, RFC 1952 | cite the document; no copied implementation |
+
+| `Anvil/Network/websocket_frame.pbi` | protocol-facts | ietf-rfc | RFC 6455 sections 4–8 | cite the document; no copied implementation |
+| `Anvil/Network/websocket_handshake.pbi` | protocol-facts | ietf-rfc | RFC 6455 sections 4–8 | cite the document; no copied implementation |
+| `Anvil/Network/websocket_client.pbi` | protocol-facts | ietf-rfc | RFC 6455 sections 4–8 | cite the document; no copied implementation |

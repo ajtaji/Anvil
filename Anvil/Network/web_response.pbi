@@ -29,6 +29,7 @@ Structure WebResponse
   status.i
   versionMinor.i
   headOnly.i
+  allowUpgrade.i
   line.i
   lineCapacity.i
   lineLength.i
@@ -150,6 +151,15 @@ Procedure.i WebResponseInit(*s.WebResponse,line.i,lineCapacity.i,headers.i,heade
   *s\line=line : *s\lineCapacity=lineCapacity
   *s\headers=headers : *s\headerCapacity=headerCapacity : *s\headOnly=headOnly
   ProcedureReturn 0
+EndProcedure
+
+; Opt-in only. The protocol owner must validate all upgrade handshake fields.
+Procedure.i WebResponseAllowUpgrade(*s.WebResponse)
+  If *s=0 : ProcedureReturn #WEB_RESPONSE_ARGUMENT : EndIf
+  If *s\state<>#WEB_RESPONSE_STATUS Or *s\error<>0 Or *s\metadataBytes<>0 Or *s\headOnly<>0
+    ProcedureReturn #WEB_RESPONSE_ARGUMENT
+  EndIf
+  *s\allowUpgrade=1 : ProcedureReturn 0
 EndProcedure
 
 Procedure.i wrStoreLine(*s.WebResponse)
@@ -353,7 +363,11 @@ Procedure.i wrLine(*s.WebResponse)
   EndIf
   If n>0 : ProcedureReturn wrHeader(*s,Bool(*s\state=#WEB_RESPONSE_TRAILERS)) : EndIf
   If *s\state=#WEB_RESPONSE_TRAILERS : *s\state=#WEB_RESPONSE_DONE : ProcedureReturn 0 : EndIf
-  If *s\status=101 : ProcedureReturn #WEB_RESPONSE_UPGRADE : EndIf
+  If *s\status=101
+    If *s\allowUpgrade=0 : ProcedureReturn #WEB_RESPONSE_UPGRADE : EndIf
+    If *s\versionMinor<>1 Or *s\chunked<>0 Or *s\haveLength<>0 Or *s\connectionClose<>0 : ProcedureReturn #WEB_RESPONSE_FRAMING : EndIf
+    *s\state=#WEB_RESPONSE_DONE : *s\reusable=0 : ProcedureReturn 0
+  EndIf
   If *s\chunked<>0 And *s\haveLength<>0 : ProcedureReturn #WEB_RESPONSE_FRAMING : EndIf
   If *s\status<200
     If *s\chunked<>0 Or *s\haveLength<>0 : ProcedureReturn #WEB_RESPONSE_FRAMING : EndIf

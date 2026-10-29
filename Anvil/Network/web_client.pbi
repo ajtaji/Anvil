@@ -34,7 +34,7 @@ Structure WebClient
 EndStructure
 
 Procedure.i wcFail(*s.WebClient,error.i)
-  If *s\state=1 Or *s\state=2 : WebTransportClose(@*s\connection) : EndIf
+  If *s\state=1 Or *s\state=2 Or *s\state=3 : WebTransportClose(@*s\connection) : EndIf
   *s\state=-1 : *s\error=error
   ProcedureReturn error
 EndProcedure
@@ -73,7 +73,8 @@ Procedure WebClientClose(*s.WebClient)
 EndProcedure
 
 ; A zero result means call again; 1 means a complete response; negative means
-; failure and closed transport. Always consume written output before reusing it.
+; failure and closed transport. Opted-in upgrade returns 2 and retains unread
+; rx bytes/connection for protocol validation. Always consume output before reuse.
 ; Early final responses stop uploading and prohibit connection reuse.
 Procedure.i WebClientStep(*s.WebClient,body.i,bytes.i,endBody.i,output.i,capacity.i,now.i)
   Define *request.WebRequest,*response.WebResponse,rc.i,st.i
@@ -81,6 +82,7 @@ Procedure.i WebClientStep(*s.WebClient,body.i,bytes.i,endBody.i,output.i,capacit
   *s\consumed=0 : *s\written=0
   If *s\state=-1 : ProcedureReturn *s\error : EndIf
   If *s\state=2 : ProcedureReturn 1 : EndIf
+  If *s\state=3 : ProcedureReturn 2 : EndIf
   If *s\state<>1 : ProcedureReturn #WEB_CLIENT_STATE : EndIf
   If bytes<0 Or capacity<0 Or (bytes>0 And body=0) Or (capacity>0 And output=0) : ProcedureReturn wcFail(*s,#WEB_CLIENT_ARGUMENT) : EndIf
   If ((now-*s\started) & $FFFFFFFF)>=*s\timeout : ProcedureReturn wcFail(*s,#WEB_CLIENT_TIMEOUT) : EndIf
@@ -107,6 +109,12 @@ Procedure.i WebClientStep(*s.WebClient,body.i,bytes.i,endBody.i,output.i,capacit
     If rc<0 : ProcedureReturn wcFail(*s,rc) : EndIf
   EndIf
   If *response\state=#WEB_RESPONSE_DONE
+    If *response\status=101 And *response\allowUpgrade
+      ; Upgraded bytes may follow headers in the same read. Keep them and
+      ; the connection for the protocol owner; never reuse as ordinary HTTP.
+      If *request\state<>2 Or *s\txOffset<>*s\txLength Or st<>1 : ProcedureReturn wcFail(*s,#WEB_CLIENT_STATE) : EndIf
+      *s\state=3 : ProcedureReturn 2
+    EndIf
     If *request\state<>2 Or *s\txOffset<>*s\txLength Or st=2 Or *s\rxOffset<>*s\rxLength : *response\reusable=0 : EndIf
     *s\state=2
     If *response\reusable=0 : WebTransportClose(@*s\connection) : EndIf
