@@ -1535,3 +1535,6 @@ text is unchanged; no new board execution or boot claim follows.
 | `Anvil/Crypto/rsa_job.pbi` | consulted | bearssl | MIT | original notice retained in licenses/BearSSL-LICENSE.txt |
 | `Anvil/Crypto/x25519_job.pbi` | consulted | bearssl | MIT | original notice retained in licenses/BearSSL-LICENSE.txt |
 | `Anvil/Crypto/x25519_job.pbi` | protocol-facts | ietf-rfc | IETF specification | RFC 7748 scalar clamping |
+
+| `Anvil/Network/ipv6_address.pbi` | protocol-facts | ietf-rfc | IETF specification | RFC 4291 address notation; RFC 5952 hexadecimal formatting |
+| `Anvil/Network/ipv6_packet.pbi` | protocol-facts | ietf-rfc | IETF specification | RFC 8200 packet/extension layout; RFC 5095 unknown routing semantics |
