@@ -1542,3 +1542,5 @@ text is unchanged; no new board execution or boot claim follows.
 | `Anvil/Network/internet_checksum.pbi` | protocol-facts | ietf-rfc | IETF specification | RFC 1071 sum/fold; extracted unchanged from the existing IPv4 implementation |
 
 | `Anvil/Network/ipv6_neighbor.pbi` | protocol-facts | ietf-rfc | IETF specification | RFC 4861 neighbor discovery validity and wire messages; RFC 6980 fragment refusal |
+
+| `Anvil/Network/ipv6_reachability.pbi` | protocol-facts | ietf-rfc | IETF specification | RFC 4861 sections 7.2 and 7.3; independently implemented reachability state and timers |

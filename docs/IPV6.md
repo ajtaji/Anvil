@@ -114,3 +114,27 @@ Vulkan healthy. Pi 3 and Rock Pi compile the shared neighbor implementation;
 these are compile checks, not physical qualification on those targets.
 Multicast reception, neighbor state, DAD/SLAAC and IPv6 transport integration
 are still required before this can carry web traffic.
+
+
+## Neighbor reachability policy
+
+`ipv6_reachability.pbi` supplies caller-owned, interface-scoped entry state.
+Init starts address resolution. Tick returns at most one multicast/unicast
+solicitation action and consumes one bounded attempt; it never waits or sends.
+After three unanswered attempts it reports failure once. The endpoint must
+dispatch each action, fail queued packets and invalidate dependent routes.
+The caller supplies monotonic milliseconds, the interface retransmit interval,
+and randomized reachable duration. This library does not choose randomness.
+
+Use transitions expired/stale entries through the five-second DELAY before
+unicast probing. Learn applies validated NS/RA address information. Advertise
+implements solicited/override/router flag handling, preserves an existing MAC
+when override is refused, and explicitly reports a router-to-host transition.
+Confirm accepts upper-layer evidence of forward progress; receiving arbitrary
+traffic or duplicate ACKs does not qualify. Address ownership, entry allocation,
+route/cache management and packet queues remain the endpoint's responsibility.
+
+Capture 284 on Anvil 427 passed 388 cases: 336 advertisement combinations,
+timer boundaries, retry limits, upper-layer confirmation, use/learning and init.
+All cores, fonts and Vulkan remained healthy. Pi 3/Rock Pi compilation passed.
+This is physical execution of shared policy, not an IPv6 wire qualification.
