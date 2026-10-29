@@ -1525,3 +1525,9 @@ text is unchanged; no new board execution or boot claim follows.
 
 | `Anvil/Network/web_cookie_date.pbi` | protocol-facts | ietf-rfc | RFC 6265 section 5.1.1 | independent cookie-date parser and Gregorian conversion |
 | `Anvil/Network/web_cookies.pbi` | protocol-facts | ietf-rfc | RFC 6265 sections 5.1-5.4; draft-ietf-httpbis-rfc6265bis-22 (work in progress) | independently implemented storage and selected scope/prefix/SameSite rules; no copied code |
+
+| `Anvil/Crypto/bignum_job.pbi` | consulted | bearssl | existing shared arithmetic | resumable scheduling around the existing verified arithmetic; original license retained |
+
+| `Anvil/Crypto/ecdsa_job.pbi` | consulted | bearssl | existing shared arithmetic | resumable scheduling around the existing verified arithmetic; original license retained |
+
+| `Anvil/Crypto/ecp_job.pbi` | reference-only | bearssl | existing shared arithmetic | resumable scheduling around the existing verified arithmetic; original license retained |

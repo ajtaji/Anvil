@@ -551,3 +551,49 @@ Physical qualification and the retained failed-run diagnosis are in
 `docs/evidence/anvil-web-cookies-20261029`. These shared libraries run in the
 application; they do not require a new resident firmware image beyond the
 already-qualified HTTP/TLS services.
+
+
+## Cooperative certificate arithmetic (integration in progress)
+
+The shared Crypto libraries now provide resumable modular exponentiation and
+ECDSA verification. These are arithmetic building blocks, not yet used by the
+resident TLS service. Existing TLS handshakes can still block on arithmetic;
+no complete asynchronous-handshake claim is made.
+
+Include bignum.pbi before bignum_job.pbi. A zero-initialized BnPowJob owns
+pointers to the output, exponent, modulus, and two nonoverlapping scratch
+buffers under the existing BnModpow capacity/representation contract.
+BnPowBegin returns 0 pending, 1 complete, -1 invalid, or -2 already active.
+Begin performs the base conversion. BnPowStep(job, bitBudget) performs at most
+that many exponent bits (two Montgomery multiplies per bit), returning 0
+pending or 1 complete; an invalid budget returns -1 without changing the job.
+The public scheduling budget must not depend on secrets. Independent jobs may
+interleave when all writable storage is separate. BnPowClear wipes scratch and
+the descriptor, including cancellation; output/exponent/modulus remain owned
+by the caller. Do not abandon live operand storage or overlap its spans.
+
+After the ordinary ec256/ecp/ecdsa dependencies, include ecdsa_job.pbi and
+optionally ecp_job.pbi. EcdsaJobBegin accepts digest, key and signature spans
+and a DER flag for P-256. EcpJobBegin accepts a curve identifier and raw
+signature for P-384/P-521. Both copy/decode input before returning, return 0
+pending or 1 completed, and return -2 if already active. Step returns 0 pending,
+1 complete, or -1 inactive. Read the matching JobResult only after completion;
+it is a verification verdict, not a pending-state indication. Existing error
+codes distinguish malformed, invalid and unsupported cases. Cancel releases
+ownership; public verification scratch is not promised erased. Hashes are
+limited to 64 bytes. These verification jobs never handle private scalars.
+
+Each ECDSA job exclusively owns its family's shared arithmetic scratch. Never
+interleave synchronous ECDSA/ec256/Ecp operations with an active job. This is
+an explicit scheduling requirement for future TLS integration, not a claim of
+thread safety or a per-connection arithmetic context. P-256 advances scalar
+and affine inversions eight bits at a time and its joint multiplication one
+window at a time; wider curves advance inversions one nibble at a time.
+
+Physical Pi 4 evidence is in docs/evidence/anvil-tls-jobs-20261029. The P-256
+and wider-curve suites check 103 and 116 verdict/diagnostic cases respectively;
+24 modular exponentiation cases independently check results, interleaving,
+budgets and cancellation. Pi 3 and Rock Pi compilation also passes, with no
+physical execution claim for those targets. Full handshake integration,
+resumable RSA/X25519, connection cancellation and timing under live traffic
+remain required before these results establish nonblocking TLS.

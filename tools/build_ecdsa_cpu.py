@@ -3,7 +3,7 @@ from pathlib import Path
 import argparse,hashlib,json,os,re,subprocess
 from pmf_compiler import resolve_compiler
 
-def build(compiler,out,edge_vectors=False,wide_curves=False):
+def build(compiler,out,edge_vectors=False,wide_curves=False,cooperative=False):
     root=Path(__file__).resolve().parents[1];out.mkdir(parents=True,exist_ok=False)
     names=['Anvil/Crypto/bignum.pbi','Anvil/Crypto/ec256.pbi','Anvil/Crypto/ecp.pbi','Anvil/Crypto/ecdsa.pbi','RaspberryPi4/Lib/mmu.pi4','Anvil/Core/cryptotest_vectors.pbi']
     corpus=(root/names[-1]).read_text(encoding='utf8')
@@ -122,6 +122,40 @@ Procedure.i Main()
         s+=f'V{idx}:\n'
         for j in range(0,len(raw),24):s+=' Data.b '+','.join(map(str,raw[j:j+24]))+'\n'
     s+='EndDataSection\n'
+    if cooperative:
+        extra=['Anvil/Crypto/bignum_job.pbi','Anvil/Crypto/ecdsa_job.pbi','Anvil/Crypto/ecp_job.pbi']
+        names+=extra
+        s=s.replace('Global wtable.i','XIncludeFile "Anvil/Crypto/bignum_job.pbi"\nXIncludeFile "Anvil/Crypto/ecdsa_job.pbi"\nXIncludeFile "Anvil/Crypto/ecp_job.pbi"\nGlobal wtable.i')
+        s=s.replace('Define i.i,rc.i,t.i,elapsed.i,p.i,kind.i,curve.i,err.i','Define i.i,rc.i,t.i,elapsed.i,p.i,kind.i,curve.i,err.i,stepTime.i,maxStep.i,steps.i,der.i,wide.i,rawBytes.i')
+        start=s.index(' If kind=1\n');end=s.index(' err=EcdsaLastErr',start)
+        s=s[:start]+""" der=1 : If kind=1 Or kind=4 : der=0 : EndIf
+ wide=0 : If curve=24 Or curve=25 : wide=1 : EndIf
+ stepTime=timer()
+ If wide<>0
+  rawBytes=sn
+  For i=0 To sn-1 : PokeA(@EcdsaRsig+i,signature[i]) : Next
+  If der<>0 : rawBytes=EcdsaAsn1ToRaw(@EcdsaRsig,sn) : EndIf
+  If rawBytes=0
+   EcpLastErr=#ECDSA_ERR_MALFORMED : EcpJobResult=0 : rc=1
+  Else
+   rc=EcpJobBegin(curve,@digest[0],hn,@key[0],qn,@EcdsaRsig,rawBytes)
+  EndIf
+ ElseIf kind=2 And curve<>23
+  EcdsaJobResult=EcdsaVrfy(curve,@digest[0],hn,@key[0],qn,@signature[0],sn) : rc=1
+ Else
+  rc=EcdsaJobBegin(@digest[0],hn,@key[0],qn,@signature[0],sn,der)
+ EndIf
+ maxStep=timer()-stepTime : steps=0
+ While rc=0
+  stepTime=timer()
+  If wide<>0 : rc=EcpJobStep() : Else : rc=EcdsaJobStep() : EndIf
+  stepTime=timer()-stepTime
+  If stepTime>maxStep : maxStep=stepTime : EndIf
+  steps=steps+1 : pet()
+ Wend
+ If wide<>0 : rc=EcpJobResult : EcdsaLastErr=EcpLastErr : Else : rc=EcdsaJobResult : EndIf
+ PokeI($E1C03000+index*16,maxStep) : PokeI($E1C03008+index*16,steps)
+"""+s[end:]
     source=out/'proof.pi4';source.write_text(s,encoding='utf8')
     q=subprocess.run([str(resolve_compiler(compiler)),'--compile',str(source),'-t','pi4','--load-addr','0x1000000','--stack-addr','0x4f00000','--entry-returns','--wants-services','-o',str(out/'proof.img')],env=dict(os.environ,PMF_ROOT=str(root)),capture_output=True,text=True,encoding='utf8',timeout=180,creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
     log=q.stdout+q.stderr;(out/'compile.txt').write_text(log,encoding='utf8');print(log[-1800:]);assert q.returncode==0
@@ -133,4 +167,5 @@ Procedure.i Main()
 if __name__=='__main__':
     ap=argparse.ArgumentParser(description=__doc__);ap.add_argument('--compiler',required=True);ap.add_argument('--out',type=Path,required=True);ap.add_argument('--edge-vectors',action='store_true')
     ap.add_argument('--wide-curves',action='store_true')
-    args=ap.parse_args();build(args.compiler,args.out.resolve(),args.edge_vectors,args.wide_curves)
+    ap.add_argument('--cooperative',action='store_true')
+    args=ap.parse_args();build(args.compiler,args.out.resolve(),args.edge_vectors,args.wide_curves,args.cooperative)

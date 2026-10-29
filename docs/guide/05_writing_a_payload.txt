@@ -747,3 +747,16 @@ rejects public suffixes. No public-suffix list, browser script API, partitioned
 cookie support or disk persistence is implied. Keep verified HTTPS enabled,
 supply trusted Unix time, and clear the jar when the application session ends.
 The full limits, ownership rules and physical evidence are in docs/WEB_CLIENT.md.
+
+
+@SECTION Cooperative certificate arithmetic
+
+The shared Crypto directory provides resumable modular exponentiation and
+ECDSA verification for P-256, P-384 and P-521. A caller advances a bounded
+arithmetic unit and regains control between calls. This permits scheduling
+other work without changing signature verification rules. The ECDSA jobs own
+shared scratch exclusively and must be serialized with synchronous crypto.
+
+These are tested arithmetic building blocks. The resident TLS service does
+not yet use them; full nonblocking handshakes are not yet qualified. See
+WEB_CLIENT.md for ownership, return values, cancellation and physical evidence.
