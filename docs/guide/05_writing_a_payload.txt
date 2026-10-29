@@ -691,3 +691,17 @@ This does not make TLS certificate arithmetic asynchronous: the separate network
 service or state query can still take about 252 ms during a handshake on the
 measured Pi4 after the P-256 and wider-curve verification improvements. The work is synchronous;
 include state-query time as well as network-service time when profiling.
+
+@SECTION Streamed HTTP events
+
+Include Anvil/Network/web_event_stream.pbi to receive text/event-stream messages
+as they arrive. Check the HTTP status and media type, then feed decoded body
+bytes from the shared HTTP client. A return of 1 exposes one complete event;
+read its length-delimited data, event name and last ID, call Next, and retain
+any unconsumed input for the next feed. Keep servicing the underlying network.
+
+The parser supports split UTF-8, CR/LF/CRLF, multiline data, persistent IDs and
+retry hints. It uses caller-owned bounded buffers and refuses overflow. EOF
+discards an unfinished event. Reconnect scheduling and request replay remain
+application policy; the parser itself never retries a request. Buffer sizes,
+ownership and the complete API contract are in docs/WEB_CLIENT.md.

@@ -368,3 +368,46 @@ Rock Pi. The register table grows by 6,912 bytes. Live verified gzip/deflate
 HTTPS took 595/475 ms, with maximum handshake calls of 252,139/250,901 us.
 Network round trips vary; the complete request is not claimed uniformly faster.
 Evidence is retained in `docs/evidence/anvil-tls423-20261029`.
+
+## Streamed HTTP events
+
+Include `Anvil/Network/web_event_stream.pbi` to decode `text/event-stream`
+incrementally from HTTP response body bytes. This is a shared parser, usable
+with ordinary GET streams or streamed POST replies. It has no socket ownership.
+Check HTTP status and Content-Type before feeding; pass decompressed bytes if
+the response has content encoding. Continue servicing networking separately.
+
+`WebEventStreamInit` takes the context and separate caller-owned line, data,
+event-name, provisional-ID and last-ID buffers. The two ID buffers share a
+capacity. All buffers must remain alive and must not overlap. Line capacity is
+4..65536 bytes, data 1..1048576, event name 7..65536, IDs 1..65536. Data capacity
+includes the internal trailing newline until dispatch. Length fields describe
+UTF-8 byte spans, not NUL-terminated strings; event data can contain NUL.
+
+Feed returns 0 for more input, 1 for one event, or a negative error. Advance
+the input by `consumed`, retain any remainder, read `dataLength`, `eventLength`
+and `lastIdLength`, then call `WebEventStreamNext`. Feeding a ready event again
+returns 1 without consuming anything. Work is proportional to the supplied
+input and bounded buffer sizes; callers choose a suitable slice size.
+
+The parser handles CR, LF and CRLF, split UTF-8 and its replacement decoding,
+one leading BOM, multiline data, comments, exact field-name matching, event
+names and persistent IDs. IDs containing NUL are ignored. `lastId` commits at
+each blank line, including an ID-only block. The default event name is message.
+Valid decimal retry hints update `retry` and set the sticky `retryChanged`
+flag; callers clear the flag after observing it. Oversized hints saturate at
+2,147,483,647 ms. The initial hint is 3000 ms. Exhausted buffers return
+`WEB_EVENT_LIMIT`; no event is silently truncated.
+
+Call `WebEventStreamEof` only after consuming a ready event. It discards an
+unfinished event and closes the parser; it never invents a final dispatch.
+Network reconnection, retry scheduling and Last-Event-ID request headers remain
+application policy. This is not the browser DOM EventSource API or an automatic
+reconnector. Do not automatically replay non-idempotent POST requests.
+
+Physical Pi4 qualification passed 44 fragmented/coalesced fixtures. A verified
+HTTPS stream delivered three ping events at 473, 1564 and 2487 ms; the first
+two arrived before response completion. An initial request received HTTP 402
+and was refused. The successful request included the normal Anvil User-Agent;
+the failed request is not counted as qualification. Shared fixtures also compile
+for Pi3 and Rock Pi, without a physical execution claim for those boards.

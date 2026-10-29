@@ -430,6 +430,7 @@ Every row is a reference that was read. None of them contributed code, so the
 | py-videocore6 | not pinned | GPL-2.0-or-later | yes (corroboration only) | none needed | the citations, kept; recorded so the copyleft upstream is not mistaken for a permissive one |
 | OpenBSD GENET | `d728e260â€¦` | BSD-2-Clause (MAC) / **BSD-4-Clause (PHY)** | yes; nothing taken | none needed | the citations, kept; the four-clause PHY files stay flagged so nobody treats the set as one licence |
 | IETF RFCs | per document | specification | yes | none needed | the citations, kept |
+| WHATWG HTML | section 9.2, consulted 2026-10-29 | specification facts | yes | no copied implementation | section and public URL retained |
 | Vendor and standards documents | per document | specification | yes | none needed | the citations, kept |
 
 These figures are a historical snapshot. The current table also records the
@@ -1515,5 +1516,6 @@ text is unchanged; no new board execution or boot claim follows.
 | `Anvil/Network/web_content.pbi` | protocol-facts | ietf-rfc | RFC 1950, RFC 1951, RFC 1952 | cite the document; no copied implementation |
 
 | `Anvil/Network/websocket_frame.pbi` | protocol-facts | ietf-rfc | RFC 6455 sections 4–8 | cite the document; no copied implementation |
+| `Anvil/Network/web_event_stream.pbi` | protocol-facts | whatwg-html | HTML Standard 9.2, server-sent events | independently implemented from the wire contract; no copied implementation |
 | `Anvil/Network/websocket_handshake.pbi` | protocol-facts | ietf-rfc | RFC 6455 sections 4–8 | cite the document; no copied implementation |
 | `Anvil/Network/websocket_client.pbi` | protocol-facts | ietf-rfc | RFC 6455 sections 4–8 | cite the document; no copied implementation |
