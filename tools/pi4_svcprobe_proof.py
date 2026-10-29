@@ -83,7 +83,7 @@ SVC_MAGIC = 0x53564E41           # 'ANVS'
 # blocks at 184 and 192 (entry_count 200), and 1.5 filled the net group.
 # The reference probe is built needing 1.0 and the major-mismatch control
 # needing 2.0.
-ABI_MAJOR, ABI_MINOR, SLOT_COUNT = 1, 7, 200
+ABI_MAJOR, ABI_MINOR, SLOT_COUNT = 1, 10, 200
 PROBE_NEED_MINOR = 0
 
 # The result block, word by word, from pi4SvcProbe.pi4's own header.

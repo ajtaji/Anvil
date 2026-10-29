@@ -183,7 +183,8 @@ ABI_MAJOR = 1
 # and 1.5 filled the net group's reserved slots (72..79, 85, 86) once the two
 # IP layers had merged.  Neither moved an existing slot.  1.6 filled TLS (80..83, 87) and 1.7 the
 # file-handle group's directory-by-path slots (196, 197): minor bumps, nothing moved.
-ABI_MINOR = 7
+# 1.8/1.9 filled graphics/input38/39;1.10 fills entropy175/176.
+ABI_MINOR = 10
 SLOT_COUNT = 200
 HDR_BYTES = 16
 MAGIC = 0x53564E41              # 'ANVS'
@@ -225,6 +226,7 @@ INSTALLED = {
     35: "SvcBacklight", 36: "SvcTextHeight",
     # ABI 1.2: console slot 13.
     37: "SvcScreenCapture",
+    38: "SvcNeonGraphics", 39: "SvcNativeInput",
 
     40: "SvcTouchPoll", 41: "SvcTouchQueued", 42: "SvcTouchFlush",
     43: "SvcTouchMaxPoints",
@@ -264,6 +266,7 @@ INSTALLED = {
     162: "SvcGnssErrText",
 
     168: "SvcSha256",
+    175: "SvcRandom", 176: "SvcRandomReady",
 
     # ABI 1.3: the four-core payload service.  Both arms of the CompilerIf
     # define all three, so these are installed on every board - a board
