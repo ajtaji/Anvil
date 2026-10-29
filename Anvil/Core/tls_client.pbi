@@ -1,14 +1,13 @@
 ; ======================================================================
-;  tls_client.pbi - HTTPS FOR EVERYTHING ON THE BOARD. One TLS 1.3 client
-;  connection behind a handle: the name is resolved, TCP opened, the
+;  tls_client.pbi - HTTPS FOR EVERYTHING ON THE BOARD. Bounded TLS 1.3 client
+;  connections behind handles: the name is resolved, TCP opened, the
 ;  handshake run and the certificate chain verified against the root
 ;  store (Anvil/Core/tls_roots.pbi), and then application bytes go in and
 ;  out in the clear on this side, encrypted on the wire.
 ;
 ;  It serves the service table's TLS slots (80..83 and 87, Anvil/Hal/
 ;  abi.pbi) for payloads and the monitor's own `https` command, through
-;  the SAME code: a kernel service, not a payload's private stack (Ron,
-;  2026-10-14: "anvil is to be a full service kernel").
+;  the SAME kernel service and shared protocol implementation.
 ;
 ;  THE RULE OF Anvil/Core/payload_net.pbi HOLDS: NOTHING WAITS. Open
 ;  returns a handle at once; DNS, TCP and the handshake advance from
@@ -19,10 +18,11 @@
 ;  is done in the call that has the bytes. Its cost depends on cache state
 ;  and the certificate algorithms; it is not bounded to one display frame.
 ;
-;  ONE CONNECTION AT A TIME. tls13_hs keeps its state in globals (it is
-;  the Pico core's design), so there is one handle, 1; a second open while
-;  it is in use is #SVC_EBUSY. That is the honest limit of the library,
-;  stated where a caller meets it.
+;  FOUR SERIALIZED CONNECTIONS. Large buffers belong to fixed pool slots.
+;  Explicit snapshots preserve TLS keys, sequences, transcript and certificate
+;  key between calls. Shared arithmetic runs to completion before switching.
+;  Handles are monotonically allocated and stale handles are refused. The
+;  service advances one allocated slot per call in round-robin order.
 ;
 ;  WHAT IS VERIFIED, ALWAYS: the chain to a root in the store, every
 ;  signature in it, the server's CertificateVerify, its Finished, the
@@ -66,6 +66,8 @@ EnableExplicit
 #TLSC_RING      = 65536     ; plaintext received, not yet read; a power of two
 #TLSC_HS_MS     = 20000     ; DNS + TCP + handshake, all of it
 
+XIncludeFile "Anvil/Crypto/tls13_context.pbi"
+#TLSC_CONNECTIONS=4
 Global tlsc_state.i
 Global tlsc_fail.i                 ; the latched #SVC_* code
 Global tlsc_why.i                  ; and its fragment
@@ -84,12 +86,65 @@ Global tlsc_tlsErr.i               ; Tls13Err / Tls13X509Err / Tls13PeerAlert at
 Global tlsc_x509Err.i
 Global tlsc_peerAlert.i
 Global tlsc_nameLen.i
-Global Dim tlsc_name.a[#TLSC_NAME_MAX]
-Global Dim tlsc_hs.a[#TLSC_HS_BUF]
-Global Dim tlsc_recv.a[#TLSC_RECV_BUF]
-Global Dim tlsc_tx.a[#TLSC_TX_BUF]
-Global Dim tlsc_in.a[#TLSC_IN_BUF]
-Global Dim tlsc_ring.a[#TLSC_RING]
+Global Dim tlsc_name.a[#TLSC_CONNECTIONS*#TLSC_NAME_MAX]
+Global Dim tlsc_hs.a[#TLSC_CONNECTIONS*#TLSC_HS_BUF]
+Global Dim tlsc_recv.a[#TLSC_CONNECTIONS*#TLSC_RECV_BUF]
+Global Dim tlsc_tx.a[#TLSC_CONNECTIONS*#TLSC_TX_BUF]
+Global Dim tlsc_in.a[#TLSC_CONNECTIONS*#TLSC_IN_BUF]
+Global Dim tlsc_ring.a[#TLSC_CONNECTIONS*#TLSC_RING]
+
+Global tlsc_slot.i
+Global tlsc_cursor.i
+Global tlsc_nextHandle.i
+Global Dim tlsc_handles.i[#TLSC_CONNECTIONS]
+Global Dim tlsc_saved.i[#TLSC_CONNECTIONS*17]
+Global Dim tlsc_context.a[#TLSC_CONNECTIONS*#TLS13_CONTEXT_SIZE]
+
+; Only one core enters the ABI. Switching happens between complete crypto
+; calls, never in the middle of an AES/HMAC/X.509 operation.
+Procedure tlsc_Select(slot.i)
+ Define base.i,rc.i
+ If slot=tlsc_slot : ProcedureReturn : EndIf
+ base=tlsc_slot*17
+ tlsc_saved[base+0]=tlsc_state
+ tlsc_saved[base+1]=tlsc_fail
+ tlsc_saved[base+2]=tlsc_why
+ tlsc_saved[base+3]=tlsc_tcp
+ tlsc_saved[base+4]=tlsc_port
+ tlsc_saved[base+5]=tlsc_ip
+ tlsc_saved[base+6]=tlsc_t0
+ tlsc_saved[base+7]=tlsc_txLen
+ tlsc_saved[base+8]=tlsc_txOff
+ tlsc_saved[base+9]=tlsc_inLen
+ tlsc_saved[base+10]=tlsc_inOff
+ tlsc_saved[base+11]=tlsc_ringHead
+ tlsc_saved[base+12]=tlsc_ringTail
+ tlsc_saved[base+13]=tlsc_tlsErr
+ tlsc_saved[base+14]=tlsc_x509Err
+ tlsc_saved[base+15]=tlsc_peerAlert
+ tlsc_saved[base+16]=tlsc_nameLen
+ rc=Tls13ContextSave(@tlsc_context[tlsc_slot*#TLS13_CONTEXT_SIZE],#TLS13_CONTEXT_SIZE)
+ tlsc_slot=slot
+ base=slot*17
+ tlsc_state=tlsc_saved[base+0]
+ tlsc_fail=tlsc_saved[base+1]
+ tlsc_why=tlsc_saved[base+2]
+ tlsc_tcp=tlsc_saved[base+3]
+ tlsc_port=tlsc_saved[base+4]
+ tlsc_ip=tlsc_saved[base+5]
+ tlsc_t0=tlsc_saved[base+6]
+ tlsc_txLen=tlsc_saved[base+7]
+ tlsc_txOff=tlsc_saved[base+8]
+ tlsc_inLen=tlsc_saved[base+9]
+ tlsc_inOff=tlsc_saved[base+10]
+ tlsc_ringHead=tlsc_saved[base+11]
+ tlsc_ringTail=tlsc_saved[base+12]
+ tlsc_tlsErr=tlsc_saved[base+13]
+ tlsc_x509Err=tlsc_saved[base+14]
+ tlsc_peerAlert=tlsc_saved[base+15]
+ tlsc_nameLen=tlsc_saved[base+16]
+ rc=Tls13ContextRestore(@tlsc_context[slot*#TLS13_CONTEXT_SIZE],#TLS13_CONTEXT_SIZE)
+EndProcedure
 
 Procedure tlsc_Refuse(code.i, *why)
   If tlsc_state <> #TLSC_FAILED
@@ -126,7 +181,7 @@ EndProcedure
 Procedure.i tlsc_Flush()
   Define k.i
   If tlsc_txOff < tlsc_txLen
-    k = PayNetTcpSend(tlsc_tcp, @tlsc_tx[tlsc_txOff], tlsc_txLen - tlsc_txOff)
+    k = PayNetTcpSend(tlsc_tcp, @tlsc_tx[tlsc_slot*#TLSC_TX_BUF+tlsc_txOff], tlsc_txLen - tlsc_txOff)
     If k < 0
       tlsc_Refuse(k, "the TCP connection under TLS refused a send")
       ProcedureReturn -1
@@ -144,7 +199,7 @@ Procedure.i tlsc_Flush()
   ProcedureReturn 0
 EndProcedure
 
-; Appends a record of n bytes already built at tlsc_tx[tlsc_txLen].
+; Appends a record of n bytes already built at tlsc_tx[tlsc_slot*#TLSC_TX_BUF+tlsc_txLen].
 Procedure tlsc_Queued(n.i)
   tlsc_txLen = tlsc_txLen + n
 EndProcedure
@@ -157,7 +212,7 @@ Procedure.i tlsc_Feed()
   Define n.i
   If tlsc_inOff < tlsc_inLen And tlsc_RingFree() >= #TLSC_APP_CHUNK + 256
     Tls13AppLen = 0
-    fed = Tls13FeedBytesLimited(@tlsc_in[tlsc_inOff], tlsc_inLen - tlsc_inOff, 1)
+    fed = Tls13FeedBytesLimited(@tlsc_in[tlsc_slot*#TLSC_IN_BUF+tlsc_inOff], tlsc_inLen - tlsc_inOff, 1)
     If fed < 0
       tlsc_Refuse(#SVC_EIO, "the server's TLS was refused - certificate, signature, Finished or record (tls status for the codes)")
       ProcedureReturn -1
@@ -166,7 +221,7 @@ Procedure.i tlsc_Feed()
     n = Tls13AppLen
     If n > 0
       For i = 0 To n - 1
-        tlsc_ring[tlsc_ringHead] = PeekA(Tls13AppAddr + i)
+        tlsc_ring[tlsc_slot*#TLSC_RING+tlsc_ringHead] = PeekA(Tls13AppAddr + i)
         tlsc_ringHead = (tlsc_ringHead + 1) & (#TLSC_RING - 1)
       Next
       Tls13AppLen = 0
@@ -182,10 +237,10 @@ EndProcedure
 ; The handshake begins once TCP is open: init, key share, ClientHello.
 Procedure tlsc_Begin()
   Define n.i
-  Tls13SetHsBuffer(@tlsc_hs[0], #TLSC_HS_BUF)
-  Tls13SetRecvBuffer(@tlsc_recv[0], #TLSC_RECV_BUF)
+  Tls13SetHsBuffer(@tlsc_hs[tlsc_slot*#TLSC_HS_BUF+0], #TLSC_HS_BUF)
+  Tls13SetRecvBuffer(@tlsc_recv[tlsc_slot*#TLSC_RECV_BUF+0], #TLSC_RECV_BUF)
   Tls13SetGroup(#TLS_GROUP_X25519)
-  If Tls13Init(@tlsc_name[0], tlsc_nameLen, WallClockNow()) = 0
+  If Tls13Init(@tlsc_name[tlsc_slot*#TLSC_NAME_MAX+0], tlsc_nameLen, WallClockNow()) = 0
     tlsc_Refuse(#SVC_ESTATE, "TLS would not start (no trusted time, no root store, or a key-schedule fault)")
     ProcedureReturn
   EndIf
@@ -193,7 +248,7 @@ Procedure tlsc_Begin()
     tlsc_Refuse(#SVC_EIO, "TLS could not make its key share (the random generator refused)")
     ProcedureReturn
   EndIf
-  n = Tls13BuildClientHello(@tlsc_tx[tlsc_txLen], #TLSC_TX_BUF - tlsc_txLen)
+  n = Tls13BuildClientHello(@tlsc_tx[tlsc_slot*#TLSC_TX_BUF+tlsc_txLen], #TLSC_TX_BUF - tlsc_txLen)
   If n <= 0
     tlsc_Refuse(#SVC_EIO, "TLS could not build its ClientHello")
     ProcedureReturn
@@ -206,7 +261,7 @@ EndProcedure
 ;  TlsClientAdvance - move the connection on without waiting for I/O.
 ;  Signature/key-share arithmetic is synchronous; not a frame-time guarantee.
 ; ----------------------------------------------------------------------
-Procedure TlsClientAdvance()
+Procedure tlsc_AdvanceCurrent()
   Define r.i
   Define st.i
   Define n.i
@@ -224,7 +279,7 @@ Procedure TlsClientAdvance()
   EndIf
 
   If tlsc_state = #TLSC_RESOLVING
-    r = PayNetDnsResolve(@tlsc_name[0])
+    r = PayNetDnsResolve(@tlsc_name[tlsc_slot*#TLSC_NAME_MAX+0])
     If r = #SVC_EAGAIN Or r = #SVC_EBUSY
       ProcedureReturn
     EndIf
@@ -266,7 +321,7 @@ Procedure TlsClientAdvance()
     ProcedureReturn
   EndIf
   If tlsc_inLen = 0
-    n = PayNetTcpRecv(tlsc_tcp, @tlsc_in[0], #TLSC_IN_BUF)
+    n = PayNetTcpRecv(tlsc_tcp, @tlsc_in[tlsc_slot*#TLSC_IN_BUF+0], #TLSC_IN_BUF)
     If n < 0
       ; A reset/error is never authenticated end-of-stream, even after data.
       tlsc_Refuse(n, "the TCP connection under TLS failed")
@@ -288,7 +343,7 @@ Procedure TlsClientAdvance()
   EndIf
   If tlsc_state = #TLSC_HS
     If Tls13State = #TLS13_ST_SEND_FINISHED
-      n = Tls13BuildClientFinished(@tlsc_tx[tlsc_txLen], #TLSC_TX_BUF - tlsc_txLen)
+      n = Tls13BuildClientFinished(@tlsc_tx[tlsc_slot*#TLSC_TX_BUF+tlsc_txLen], #TLSC_TX_BUF - tlsc_txLen)
       If n <= 0
         tlsc_Refuse(#SVC_EIO, "TLS could not build its Finished")
         ProcedureReturn
@@ -316,20 +371,35 @@ Procedure TlsClientAdvance()
   EndIf
 EndProcedure
 
-Procedure.i tlsc_Handle(h.i)
-  If h <> 1 Or tlsc_state = #TLSC_IDLE
-    gSvcDetail = "that is not an open TLS handle: there is one, 1, and only the TLS open service hands it out"
-    ProcedureReturn #SVC_EARG
+Procedure TlsClientAdvance()
+ Define i.i,slot.i
+ For i=0 To #TLSC_CONNECTIONS-1
+  slot=(tlsc_cursor+i) % #TLSC_CONNECTIONS
+  If tlsc_handles[slot]>0
+   tlsc_cursor=(slot+1) % #TLSC_CONNECTIONS
+   tlsc_Select(slot) : tlsc_AdvanceCurrent() : ProcedureReturn
   EndIf
-  ProcedureReturn 0
+ Next
+EndProcedure
+
+Procedure.i tlsc_Handle(h.i)
+ Define slot.i
+ If h>0
+  For slot=0 To #TLSC_CONNECTIONS-1
+   If tlsc_handles[slot]=h : tlsc_Select(slot) : ProcedureReturn 0 : EndIf
+  Next
+ EndIf
+ gSvcDetail="that TLS handle is not open"
+ ProcedureReturn #SVC_EARG
 EndProcedure
 
 ; ----------------------------------------------------------------------
-;  TlsClientOpen(*host, port) - handle 1 at once, or negative.
+;  TlsClientOpen(*host, port) - a fresh handle at once, or negative.
 ; ----------------------------------------------------------------------
 Procedure.i TlsClientOpen(*host, port.i)
   Define n.i
   Define r.i
+  Define slot.i
   If *host = 0
     gSvcDetail = "the host name pointer was zero"
     ProcedureReturn #SVC_EARG
@@ -346,8 +416,12 @@ Procedure.i TlsClientOpen(*host, port.i)
     gSvcDetail = "the host name must be 1 to 253 characters"
     ProcedureReturn #SVC_EARG
   EndIf
-  If tlsc_state <> #TLSC_IDLE
-    gSvcDetail = "the one TLS connection is in use - close it first"
+  slot=-1
+  For r=0 To #TLSC_CONNECTIONS-1
+    If tlsc_handles[r]=0 : slot=r : Break : EndIf
+  Next
+  If slot<0 Or tlsc_nextHandle=$7FFFFFFF
+    gSvcDetail="the bounded TLS connection pool is full"
     ProcedureReturn #SVC_EBUSY
   EndIf
   If WallClockTrusted() = 0
@@ -368,10 +442,12 @@ Procedure.i TlsClientOpen(*host, port.i)
   Else
     DrbgAutoReseed()
   EndIf
+  tlsc_Select(slot)
+  tlsc_nextHandle=tlsc_nextHandle+1 : tlsc_handles[slot]=tlsc_nextHandle
   For r = 0 To n - 1
-    tlsc_name[r] = PeekA(*host + r)
+    tlsc_name[tlsc_slot*#TLSC_NAME_MAX+r] = PeekA(*host + r)
   Next
-  tlsc_name[n] = 0
+  tlsc_name[tlsc_slot*#TLSC_NAME_MAX+n] = 0
   tlsc_nameLen = n
   tlsc_port = port
   tlsc_ip = 0
@@ -389,8 +465,8 @@ Procedure.i TlsClientOpen(*host, port.i)
   tlsc_ringTail = 0
   tlsc_t0 = millis()
   tlsc_state = #TLSC_RESOLVING
-  TlsClientAdvance()
-  ProcedureReturn 1
+  tlsc_AdvanceCurrent()
+  ProcedureReturn tlsc_handles[tlsc_slot]
 EndProcedure
 
 Procedure.i TlsClientState(h.i)
@@ -399,7 +475,7 @@ Procedure.i TlsClientState(h.i)
   If r < 0
     ProcedureReturn r
   EndIf
-  TlsClientAdvance()
+  tlsc_AdvanceCurrent()
   Select tlsc_state
     Case #TLSC_RESOLVING
       ProcedureReturn #SVC_TLS_RESOLVING
@@ -429,7 +505,7 @@ Procedure.i TlsClientSend(h.i, *b, n.i)
     gSvcDetail = "a send needs a buffer and a byte count of zero or more"
     ProcedureReturn #SVC_EARG
   EndIf
-  TlsClientAdvance()
+  tlsc_AdvanceCurrent()
   If tlsc_state = #TLSC_FAILED
     gSvcDetail = tlsc_why
     ProcedureReturn tlsc_fail
@@ -441,7 +517,7 @@ Procedure.i TlsClientSend(h.i, *b, n.i)
   If take > #TLSC_APP_CHUNK
     take = #TLSC_APP_CHUNK
   EndIf
-  r = Tls13BuildAppRecord(@tlsc_tx[0], #TLSC_TX_BUF, *b, take)
+  r = Tls13BuildAppRecord(@tlsc_tx[tlsc_slot*#TLSC_TX_BUF+0], #TLSC_TX_BUF, *b, take)
   If r <= 0
     tlsc_Refuse(#SVC_EIO, "TLS could not protect the bytes to send")
     gSvcDetail = tlsc_why
@@ -465,10 +541,10 @@ Procedure.i TlsClientRecv(h.i, *b, n.i)
     gSvcDetail = "a receive needs a buffer and a byte count of zero or more"
     ProcedureReturn #SVC_EARG
   EndIf
-  TlsClientAdvance()
+  tlsc_AdvanceCurrent()
   k = 0
   While k < n And tlsc_ringTail <> tlsc_ringHead
-    PokeA(*b + k, tlsc_ring[tlsc_ringTail])
+    PokeA(*b + k, tlsc_ring[tlsc_slot*#TLSC_RING+tlsc_ringTail])
     tlsc_ringTail = (tlsc_ringTail + 1) & (#TLSC_RING - 1)
     k = k + 1
   Wend
@@ -482,12 +558,13 @@ EndProcedure
 ; Close: close_notify if established, then TCP; the handle is free at once.
 Procedure.i TlsClientClose(h.i)
   Define r.i
+  Define i.i
   r = tlsc_Handle(h)
   If r < 0
     ProcedureReturn r
   EndIf
   If tlsc_state = #TLSC_OPEN And tlsc_txLen = 0
-    r = Tls13BuildAlert(@tlsc_tx[0], #TLSC_TX_BUF, #TLS_ALERT_LEVEL_WARNING, #TLS_ALERT_CLOSE_NOTIFY)
+    r = Tls13BuildAlert(@tlsc_tx[tlsc_slot*#TLSC_TX_BUF+0], #TLSC_TX_BUF, #TLS_ALERT_LEVEL_WARNING, #TLS_ALERT_CLOSE_NOTIFY)
     If r > 0
       tlsc_txLen = r
       tlsc_txOff = 0
@@ -503,18 +580,29 @@ Procedure.i TlsClientClose(h.i)
   tlsc_inLen = 0
   tlsc_ringHead = 0
   tlsc_ringTail = 0
+  tlsc_handles[tlsc_slot]=0
+  r=Tls13ContextWipe(@tlsc_context[tlsc_slot*#TLS13_CONTEXT_SIZE],#TLS13_CONTEXT_SIZE)
+  r=Tls13ContextRestore(@tlsc_context[tlsc_slot*#TLS13_CONTEXT_SIZE],#TLS13_CONTEXT_SIZE)
+  GcmWipe() : AesWipe()
+  For i=0 To #TLSC_NAME_MAX-1 : tlsc_name[tlsc_slot*#TLSC_NAME_MAX+i]=0 : Next
+  For i=0 To #TLSC_HS_BUF-1 : tlsc_hs[tlsc_slot*#TLSC_HS_BUF+i]=0 : Next
+  For i=0 To #TLSC_RECV_BUF-1 : tlsc_recv[tlsc_slot*#TLSC_RECV_BUF+i]=0 : Next
+  For i=0 To #TLSC_TX_BUF-1 : tlsc_tx[tlsc_slot*#TLSC_TX_BUF+i]=0 : Next
+  For i=0 To #TLSC_IN_BUF-1 : tlsc_in[tlsc_slot*#TLSC_IN_BUF+i]=0 : Next
+  For i=0 To #TLSC_RING-1 : tlsc_ring[tlsc_slot*#TLSC_RING+i]=0 : Next
   ProcedureReturn #SVC_OK
 EndProcedure
 
 ; A payload's connection ends with it (RunAt -> PayNetPayloadReturned).
 Procedure TlsClientPayloadReturned()
-  If tlsc_state <> #TLSC_IDLE
-    TlsClientClose(1)
-  EndIf
+ Define slot.i,rc.i
+ For slot=0 To #TLSC_CONNECTIONS-1
+  If tlsc_handles[slot]>0 : rc=TlsClientClose(tlsc_handles[slot]) : EndIf
+ Next
 EndProcedure
 
 ; `tls status` - the connection, and on a refusal the library's own codes.
-Procedure TlsClientShow()
+Procedure tlsc_ShowCurrent()
   Print("TLS connection: ")
   Select tlsc_state
     Case #TLSC_IDLE
@@ -534,7 +622,7 @@ Procedure TlsClientShow()
   EndSelect
   If tlsc_nameLen > 0
     Print("  host ")
-    str_print_at(@tlsc_name[0])
+    str_print_at(@tlsc_name[tlsc_slot*#TLSC_NAME_MAX+0])
     Print(":")
     PrintDec(tlsc_port)
     If tlsc_ip <> 0
@@ -555,4 +643,18 @@ Procedure TlsClientShow()
     PrintDec(tlsc_peerAlert)
     PrintNl()
   EndIf
+EndProcedure
+
+Procedure TlsClientShow()
+  Define slot.i,previous.i,count.i
+  previous=tlsc_slot
+  For slot=0 To #TLSC_CONNECTIONS-1
+    If tlsc_handles[slot]>0
+      tlsc_Select(slot)
+      Print("TLS handle ") : PrintDec(tlsc_handles[slot]) : PrintNl()
+      tlsc_ShowCurrent() : count=count+1
+    EndIf
+  Next
+  If count=0 : PrintN("TLS connections: none") : EndIf
+  tlsc_Select(previous)
 EndProcedure

@@ -6,11 +6,12 @@ from pmf_compiler import resolve_compiler
 ap=argparse.ArgumentParser(description="Compile TLS closure qualification for a physical Pi 4")
 ap.add_argument('--compiler',required=True);ap.add_argument('--out',type=Path,required=True);args=ap.parse_args()
 r=Path(__file__).resolve().parents[1];d=args.out.resolve();d.mkdir(parents=True,exist_ok=False)
-names=['Anvil/Core/tls_client.pbi','Anvil/Hal/abi.pbi','Anvil/Crypto/tls13_hs.pbi']
+names=['Anvil/Core/tls_client.pbi','Anvil/Hal/abi.pbi','Anvil/Crypto/tls13_hs.pbi','Anvil/Crypto/tls13_context.pbi']
 owner=(r/names[0]).read_text(encoding='utf8')
 # Compile the actual TLS service owner. Display-only diagnostics are outside
 # this probe; crypto/TCP seams are deterministic doubles, not TLS wire tests.
 owner=owner[:owner.index('; `tls status`')]
+owner=owner.replace('XIncludeFile "Anvil/Crypto/tls13_context.pbi"','')
 needed=set(re.findall(r'#[A-Z][A-Z_0-9]*',owner));defined=set(re.findall(r'(?m)^#([A-Z][A-Z_0-9]*)\s*=',owner))
 needed.update(['#TLS13_ST_CONNECTED','#TLS13_ST_WAIT_SH'])
 constants=[]
@@ -22,6 +23,21 @@ s='\n'.join(constants)+r'''
 Global Tls13Err.i,Tls13X509Err.i,Tls13PeerAlert.i,Tls13AppLen.i,Tls13AppAddr.i,Tls13State.i,gSvcDetail.i
 Global mode.i,reads.i,feeds.i,closes.i,clockValue.i
 Global Dim plain.a[16]
+; These closure fixtures stay on slot zero; context isolation has a separate
+; real AES-GCM proof. No crypto correctness is claimed by these doubles.
+Procedure.i Tls13ContextSave(p.i,n.i)
+ ProcedureReturn n
+EndProcedure
+Procedure.i Tls13ContextRestore(p.i,n.i)
+ ProcedureReturn n
+EndProcedure
+Procedure.i Tls13ContextWipe(p.i,n.i)
+ ProcedureReturn n
+EndProcedure
+Procedure GcmWipe()
+EndProcedure
+Procedure AesWipe()
+EndProcedure
 Procedure.i millis()
  ProcedureReturn clockValue
 EndProcedure
@@ -111,6 +127,7 @@ EndProcedure
 Procedure Record(which.i)
  Define p.i,first.i,second.i,count.i,after.i,i.i
  mode=which : reads=0 : feeds=0 : closes=0 : clockValue=0
+ tlsc_slot=0 : tlsc_handles[0]=1
  tlsc_state=#TLSC_OPEN : tlsc_tcp=1 : tlsc_fail=0 : tlsc_why=0
  tlsc_txLen=0 : tlsc_txOff=0 : tlsc_inLen=0 : tlsc_inOff=0
  tlsc_ringHead=0 : tlsc_ringTail=0 : Tls13State=#TLS13_ST_CONNECTED : Tls13AppLen=0

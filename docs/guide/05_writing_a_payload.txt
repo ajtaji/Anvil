@@ -609,7 +609,7 @@ invalid headers fail explicitly. Body bytes can be binary. A completed response
 may permit a subsequent request on the same connection, but unread bytes or an
 unfinished upload prevent reuse.
 
-@NOTE The HTTP step has bounded parsing and transport operations. The existing TLS provider still performs key-share and certificate arithmetic synchronously and has one global TLS connection. Multiple HTTP contexts do not remove those limits, and a successful network test is not proof of a display-frame budget. Keep certificate, hostname and date verification enabled; TLS requires a trusted clock and root store.
+@NOTE The HTTP step has bounded parsing and transport operations. The existing TLS provider still performs key-share and certificate arithmetic synchronously. The TLS pool permits four overlapping connections; HTTP contexts share the underlying four-handle TCP pool, and a successful network test is not proof of a display-frame budget. Keep certificate, hostname and date verification enabled; TLS requires a trusted clock and root store.
 
 @SECTION Redirects and compressed responses
 
@@ -705,3 +705,11 @@ retry hints. It uses caller-owned bounded buffers and refuses overflow. EOF
 discards an unfinished event. Reconnect scheduling and request replay remain
 application policy; the parser itself never retries a request. Buffer sizes,
 ownership and the complete API contract are in docs/WEB_CLIENT.md.
+
+The TLS service supports four overlapping connections. Save the positive handle
+returned by Open; it is not a slot number, and a closed handle never identifies
+a later connection. A full pool returns EBUSY. Each connection has separate
+buffers and preserved keys, sequence numbers, transcript and certificate key.
+NetService advances the pool in round-robin order. Calls still run on core 0,
+and certificate arithmetic remains synchronous. Closing wipes the connection's
+buffers and saved state; returning from a payload closes all its TLS handles.

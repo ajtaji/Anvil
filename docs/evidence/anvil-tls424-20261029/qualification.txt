@@ -1,0 +1,30 @@
+Anvil 424: four independently owned TLS slots
+
+Physical Pi 4 captures 249-254. All returned with healthy cores, fonts,
+Vulkan and watchdog off. Monitor image was verified after installation.
+Three verified HTTPS replies completed at 1522/1560/1615 ms while a fourth
+connection continued an event stream until 5662 ms. Event arrivals were
+1560/3613/5661 ms, before and at EOF. Bodies and event metadata matched.
+The live test uses one public origin; it does not claim different certificate
+algorithms in the same run. Resident-randomness secure WebSocket echo passed.
+
+Context proof uses the real record owner and independent AES-GCM oracle for
+four alternating records; handshake declarations are fixtures. Pool lifecycle
+uses controlled transport/handshake doubles. It proves four slots, refusal of
+a fifth, stale-handle rejection, independent fields, and wipe on payload return.
+The initial checker expected wrong numeric ABI errors. Corrected checker passed
+the same captured bytes; both verdicts are retained. No failed check is hidden.
+Eight close cases and fourteen bounded record/partial-send cases passed.
+Shared pool fixtures compile on Pi 3 and Rock Pi; no physical claim there.
+
+Reproduce with tools/build_tls_context_cpu.py, build_tls_pool_cpu.py,
+build_tls_pool_live.py, build_tls_close_cpu.py, build_tls_budget_cpu.py and
+their matching checkers. tls_context_layout_check.py guards field/buffer
+coverage. Run compiled proofs on hardware with readback, never an emulator.
+Historical generated fixture source containing obsolete owner comments is not
+republished; checked binaries, identity hashes and current builders are retained.
+
+Monitor source hashes describe the build inputs. Later owner-header and ABI
+comments do not alter executable code. No protocol or arithmetic changed after
+the image was built. Calls remain serialized on core 0 and certificate work is
+still synchronous; this does not establish a frame-time bound.

@@ -26,9 +26,12 @@ def build(compiler,out):
 #SVC_EIO=-105
 #TLSC_RING=65536
 #TLSC_APP_CHUNK=16384
+#TLSC_TX_BUF=64
+#TLSC_IN_BUF=64
 Global TlsRecvAddr.i,TlsRecvSize.i,TlsRecvLen.i,Tls13AppLen.i,Tls13AppAddr.i
 Global calls.i,failRecord.i,appRecord.i,failure.i,sendCalls.i,sendMode.i
 Global tlsc_inOff.i,tlsc_inLen.i,tlsc_txOff.i,tlsc_txLen.i,tlsc_tcp.i,tlsc_ringHead.i,tlsc_ringTail.i
+Global tlsc_slot.i
 Global Dim storage.a[17000]
 Global Dim tlsc_in.a[64]
 Global Dim tlsc_tx.a[64]

@@ -2054,10 +2054,10 @@ EndProcedure
 ;    78  SvcTcpRecv(h, *b, n)     bytes delivered, 0 = nothing yet
 ;    79  SvcTcpClose(h)           #SVC_OK; the handle is free at once, the
 ;                                 orderly close carries on behind it
-;    80  SvcTlsOpen(*host, port)  1.6. Handle 1 AT ONCE, or negative; the
+;    80  SvcTlsOpen(*host, port)  1.6. Fresh positive handle, or negative; the
 ;                                 name, TCP and the TLS 1.3 handshake run in
-;                                 the background. ONE connection at a time
-;                                 (#SVC_EBUSY otherwise). Refused #SVC_ESTATE
+;                                 the background. Four connection slots;
+;                                 #SVC_EBUSY when full. Refused #SVC_ESTATE
 ;                                 without a trusted clock or a root store.
 ;    81  SvcTlsSend(h, *b, n)     plaintext bytes taken, 0..n (0 until open,
 ;                                 or while the last record is still going)
@@ -2179,7 +2179,7 @@ EndProcedure
 ; ---- TLS, 80..83 and 87 (1.6). Anvil/Core/tls_client.pbi is the engine:
 ; HTTPS to any server whose chain reaches a root in the store on the stick
 ; (Anvil/Core/tls_roots.pbi), verified always - chain, signatures, the
-; host name, the dates against a trusted clock. One connection, handle 1.
+; host name, the dates against a trusted clock. Four serialized connection slots.
 ; Nothing waits: Open answers at once and the name, TCP and the handshake
 ; advance in SvcNetService and every TLS slot.
 Procedure.i SvcTlsOpen(*host, port.i)

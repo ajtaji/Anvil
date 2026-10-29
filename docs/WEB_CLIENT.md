@@ -84,11 +84,11 @@ WebContent pipeline described below.
 
 The URL parser accepts HTTP(S) ASCII hostnames and IPv4 forms; IPv6 literals,
 and international host conversion remain open.
-HTTP/2, HTTP/3, WebSocket upgrade and a managed cookie/authentication layer
-are not supplied by this client. Applications may send ordinary
-Authorization and Cookie fields explicitly. The existing TLS provider has one
-connection because its cryptographic state is global; plain TCP has four payload
-handles. Multiple client contexts do not remove those provider limits.
+HTTP/2, HTTP/3 and a managed cookie/authentication layer remain open.
+Applications may send ordinary Authorization and Cookie fields explicitly.
+WebSocket upgrade uses the shared WebSocket client described below. Anvil 424
+supports four TLS slots over the four-handle payload TCP pool. Plain TCP and TLS
+compete for that underlying pool; four TLS slots do not add four more sockets.
 
 TLS always checks the chain, name, dates, CertificateVerify and Finished through
 the existing provider. It requires a trusted clock and root store. Do not disable
@@ -103,9 +103,9 @@ no claim that every underlying TLS/service operation meets a frame-time budget.
 
 Physical tests also cover fragmented input, output backpressure, binary uploads,
 short writes, early rejection, cancellation, deadlines, reset/error handling and
-sequential reuse using transport doubles. The installed monitor remains build
-405; new monitor compositions are compiled but not yet deployed. See the named
-web-networking evidence archives and the vault checkpoint for exact run outcomes.
+sequential reuse using transport doubles. Anvil 424 is installed and verified
+on the Pi 4. See the named web-networking evidence archives for the scope of
+each physical run; a fixture pass is not a live-server qualification.
 
 Live HTTPS qualification also passed known-length and chunked POSTs with exact
 1,025-byte echoes, and two deterministic five-byte GET responses over one
@@ -357,7 +357,7 @@ before this change. TLS state queries also advance the handshake: the gzip
 sample's long call occurred in the state query, so its 46,605 us maximum service
 call alone would understate the stall. Include both call sites when profiling.
 The first open spent 41,064 us loading cold roots; the warm open took 653 us.
-Verification remains synchronous and TLS still permits one connection. This
+At that revision verification remained synchronous and TLS permitted one connection. This
 improvement does not establish a display-frame latency bound.
 
 Anvil 423 also uses joint two-bit public windows for P-384 and P-521 issuer
@@ -411,3 +411,36 @@ two arrived before response completion. An initial request received HTTP 402
 and was refused. The successful request included the normal Anvil User-Agent;
 the failed request is not counted as qualification. Shared fixtures also compile
 for Pi3 and Rock Pi, without a physical execution claim for those boards.
+
+## Bounded TLS connection pool
+
+The kernel TLS service now owns four connection slots. Keep the positive handle
+returned by `SvcTlsOpen` and pass it unchanged to send, receive, state and close.
+Handles are not slot numbers: each successful open receives a fresh value, and
+closed handles remain invalid when their slot is reused. A full pool returns
+EBUSY; the underlying TCP pool can independently refuse a connection. No ABI
+slot numbers or function signatures changed.
+
+Large receive, transmit, handshake, input, name and plaintext-ring buffers are
+separate for every slot. Switching saves 83 TLS working fields and the retained
+certificate key into a 2392-byte snapshot, plus 17 client fields. The global
+DRBG and trust-anchor store are shared and never rolled back. Restoring a
+connection invalidates the AES-GCM key cache before another record uses it.
+The layout gate refuses omitted working fields or an unsliced large buffer.
+
+Calls remain serialized on core 0. This is overlapping connection lifetimes,
+not concurrent execution of shared cryptographic arithmetic. NetService moves
+one allocated connection per advance in round-robin order; a handle operation
+also advances that particular connection. Certificate verification remains
+synchronous. Close wipes that slot's snapshot and buffers; payload return
+closes every allocated TLS handle. Diagnostics list all allocated handles.
+
+Physical qualification on Anvil 424 kept four verified HTTPS connections open.
+Three exact replies completed at 1522, 1560 and 1615 ms while the fourth
+delivered an event stream at 1560, 3613 and 5661 ms and completed at 5662 ms.
+A secure WebSocket echo regression also passed. The real record-owner proof
+matched four alternating AES-GCM records against an independent oracle.
+Controlled lifecycle tests cover pool exhaustion, fresh and stale handles,
+isolated state and wiping; separate regressions cover eight closure cases and
+fourteen scheduling/partial-send cases. Evidence and scope are retained in
+`docs/evidence/anvil-tls424-20261029`.
