@@ -478,3 +478,10 @@ a chunked request; set Content-Type to application/x-www-form-urlencoded.
 All 46 physical fixtures passed. Real HTTPS Basic, bad-password rejection,
 Bearer and exact form POST passed on Anvil 424 in 550/473/477/484 ms. These are
 individual measurements. Evidence: `docs/evidence/anvil-web-values-20261029`.
+
+
+The four-slot pool also passed a live different-origin run: an HTTP event stream
+and another request to httpbingo.org overlapped verified HTTPS requests to
+example.com and www.cloudflare.com. Expected page/trace content, TLSv1.3 trace
+metadata and all streamed event IDs matched. Capture 257 supplements the
+single-origin test in `docs/evidence/anvil-tls424-20261029`.
