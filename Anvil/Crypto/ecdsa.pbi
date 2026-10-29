@@ -97,10 +97,9 @@
 ;  public key is published in the certificate, and the message hash is
 ;  computed from data both peers hold.  There is no secret to leak, so
 ;  the ASN.1 walk and the length checks use ordinary control flow.  The
-;  two scalar multiplies underneath are ec256's constant-time ladder
-;  anyway (it has one shape, and it is the safe one), and the order
-;  inversion rides bignum's constant-time Montgomery ladder for the same
-;  reason.  NEITHER THE PICO FAMILIES NOR THIS ONE CARRIES A CT GATE FOR
+;  verification point product now uses a joint public-scalar table; the
+;  general EcdsaMuladd and private-key EcPointMul ladders are unchanged.
+;  The order inversion still uses the shared Montgomery ladder.  NEITHER THE PICO FAMILIES NOR THIS ONE CARRIES A CT GATE FOR
 ;  THIS MODULE, and tools/a64/a64_ecdsa_check.py has no --timing for the
 ;  same reason: inventing one here would be measuring a property nobody
 ;  claims.
@@ -356,6 +355,11 @@ Global Dim EcdsaTmp.a[#ECDSA_RAWMAX]  ; conversion staging
 Global Dim EcdsaPpt.w[3 * #EC_WORDS]
 Global Dim EcdsaQpt.w[3 * #EC_WORDS]
 
+; Verification-only joint multiplication scratch. Scalars are derived from
+; public signature/message data; private-key multiplication keeps EcPointMul.
+Global Dim EcdsaJoint.w[48 * #EC_WORDS]
+Global Dim EcdsaPublicTmp.w[3 * #EC_WORDS]
+
 Global EcdsaReady.i                   ; 0 until EcdsaInit has run
 Global EcdsaLastErr.i                 ; why the last call answered as it did
 
@@ -536,6 +540,64 @@ Procedure.i EcdsaMuladd(ptAddr.i, ptLen.i, xs.i, xslen.i, ys.i, yslen.i)
   ProcedureReturn r & BnNot(z & t)
 EndProcedure
 
+ ; Add public verification points, including infinity/equal/opposite cases.
+; EcPointAdd uses an incomplete formula; its flag distinguishes equal from
+; opposite points when the resulting Z is zero. Never use this variable-time
+; helper or its scalar loop for private-key operations.
+Procedure EcdsaPublicAdd(p.i,q.i)
+  Define flag.i
+  If BnIsZero(EcCoord(q,2))<>0 : ProcedureReturn : EndIf
+  If BnIsZero(EcCoord(p,2))<>0
+    EcPointCopy(p,q) : ProcedureReturn
+  EndIf
+  EcPointCopy(@EcdsaPublicTmp,q)
+  flag=EcPointAdd(p,q)
+  If BnIsZero(EcCoord(p,2))<>0
+    If flag=0
+      EcPointDouble(@EcdsaPublicTmp) : EcPointCopy(p,@EcdsaPublicTmp)
+    Else
+      EcPointZero(p)
+    EndIf
+  EndIf
+EndProcedure
+
+; Compute x*Q+y*G together with a two-bit public window. Sixteen table
+; entries hold i*Q+j*G, including infinity. Complete public addition handles
+; Q=G and Q=-G during precomputation and cancellation in the running sum.
+; x/y are exactly32-byte ECDSA verification scalars, never private scalars.
+; The general constant-time EcdsaMuladd entry remains unchanged.
+Procedure.i EcdsaVerifyMuladd(q.i,qn.i,x.i,y.i)
+  Define stride.i,p1.i,p2.i,i.i,j.i,bit.i,index.i,xb.i,yb.i,entry.i
+  If qn<>65 : ProcedureReturn 0 : EndIf
+  stride=6 * #EC_WORDS
+  p1=@EcdsaJoint+stride : p2=@EcdsaJoint+4*stride
+  EcPointZero(@EcdsaJoint)
+  If EcPointDecode(p1,q,qn)=0 : ProcedureReturn 0 : EndIf
+  If EcPointDecode(p2,@EcGen,65)=0 : ProcedureReturn 0 : EndIf
+  EcPointCopy(p1+stride,p1) : EcPointDouble(p1+stride)
+  EcPointCopy(p1+2*stride,p1+stride) : EcdsaPublicAdd(p1+2*stride,p1)
+  EcPointCopy(p2+4*stride,p2) : EcPointDouble(p2+4*stride)
+  EcPointCopy(p2+8*stride,p2+4*stride) : EcdsaPublicAdd(p2+8*stride,p2)
+  For j=1 To 3
+    For i=1 To 3
+      entry=@EcdsaJoint+(i+4*j)*stride
+      EcPointCopy(entry,@EcdsaJoint+i*stride)
+      EcdsaPublicAdd(entry,@EcdsaJoint+4*j*stride)
+    Next
+  Next
+  EcPointZero(@EcdsaPpt)
+  For i=0 To 31
+    xb=PeekA(x+i) & 255 : yb=PeekA(y+i) & 255
+    For bit=6 To 0 Step -2
+      EcPointDouble(@EcdsaPpt) : EcPointDouble(@EcdsaPpt)
+      index=((xb>>bit) & 3) | (((yb>>bit) & 3)<<2)
+      If index<>0 : EcdsaPublicAdd(@EcdsaPpt,@EcdsaJoint+index*stride) : EndIf
+    Next
+  Next
+  If BnIsZero(EcCoord(@EcdsaPpt,2))<>0 : ProcedureReturn 0 : EndIf
+  EcPointEncode(q,@EcdsaPpt) : ProcedureReturn 1
+EndProcedure
+
 ; ----------------------------------------------------------------------
 ;  EcdsaVrfyRaw(hashAddr, hashLen, qAddr, qLen, sigAddr, sigLen)
 ;  -> 1 valid / 0 rejected.
@@ -602,7 +664,7 @@ Procedure.i EcdsaVrfyRaw(hashAddr.i, hashLen.i, qAddr.i, qLen.i, sigAddr.i, sigL
     PokeB(@EcdsaU + i, PeekA(qAddr + i) & 255)
     i = i + 1
   Wend
-  res = EcdsaMuladd(@EcdsaU, 65, @EcdsaTx, 32, @EcdsaTy, 32)
+  res = EcdsaVerifyMuladd(@EcdsaU, 65, @EcdsaTx, @EcdsaTy)
 
   ; X coordinate of the result, reduced mod n, must equal r.
   BnZero(@EcdsaT1, BnGw(@EcdsaN, 0))

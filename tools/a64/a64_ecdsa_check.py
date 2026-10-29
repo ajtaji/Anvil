@@ -92,6 +92,12 @@ Run: python tools/a64/a64_ecdsa_check.py
      python tools/a64/a64_ecdsa_check.py --mutate
 """
 
+# The shared verifier now uses EcdsaVerifyMuladd for public scalar products.
+# Physical coverage is tools/build_ecdsa_cpu.py plus ecdsa_cpu_check.py (including
+# equal/opposite points and final infinity). M7 below mutates the retained legacy
+# EcdsaMuladd helper, now outside the signature path: its survival does not
+# establish coverage of the active point-at-infinity guard.
+
 from __future__ import annotations
 
 import argparse

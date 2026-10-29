@@ -338,3 +338,24 @@ No desktop entropy was included. The controlled service proof passed 37 result
 checks and independent SHA-256, HMAC, DRBG and reseed comparisons. An initial
 16-bit ABI header read was corrected to the actual 32-bit fields before this
 qualification. All runs returned to healthy cores/fonts/Vulkan with watchdog off.
+
+
+## TLS verification cost on Anvil 422
+
+P-256 verification now computes its two public scalar products together with a
+small two-bit table. The retained general multiplication entry and private-key
+ladder are unchanged. Complete addition handles equal/opposite points and the
+point at infinity. All 51 existing verdict/diagnostic cases and 52 additional
+independently checked cases passed on the Pi 4. The original ten positive cases
+had a median of 178,231.5 us; the final path measured 94,790 us, about 47% lower.
+Shared crypto proofs compile for Pi 3 and Rock Pi; those are compile checks,
+not physical execution claims for those boards.
+
+After installing 422, live verified HTTPS gzip/deflate tests took 573/493 ms.
+The longest handshake work was 266,907/265,409 us versus approximately 347 ms
+before this change. TLS state queries also advance the handshake: the gzip
+sample's long call occurred in the state query, so its 46,605 us maximum service
+call alone would understate the stall. Include both call sites when profiling.
+The first open spent 41,064 us loading cold roots; the warm open took 653 us.
+Verification remains synchronous and TLS still permits one connection. This
+improvement does not establish a display-frame latency bound.
