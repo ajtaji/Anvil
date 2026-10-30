@@ -1566,6 +1566,7 @@ text is unchanged; no new board execution or boot claim follows.
 | `Anvil/Network/ipv6_slaac.pbi` | protocol-facts | ietf-rfc | IETF specification | independent SLAAC lifetime policy; cite RFC 4861/4862 |
 
 | `Anvil/Network/ipv6_rdnss.pbi` | protocol-facts | ietf-rfc | IETF specification | independent RDNSS option decoder; RFC 8106 sections 5.1 and 5.3.1 |
+| `Anvil/Network/ipv6_rdnss_list.pbi` | protocol-facts | ietf-rfc | IETF specification | independent scoped RDNSS lifetime repository; RFC 8106 sections 5.1 and 6 |
 | `Anvil/Network/ipv6_router.pbi` | protocol-facts | ietf-rfc | IETF specification | independent RA copy-out codec; cite RFC 4861 |
 
 | `Anvil/Network/ipv6_default_routers.pbi` | protocol-facts | ietf-rfc | IETF specification | independent default-router policy; cite RFC 4861/4191 |

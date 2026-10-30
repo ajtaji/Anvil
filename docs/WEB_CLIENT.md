@@ -2330,3 +2330,33 @@ Evidence: docs/evidence/anvil-ipv6-20261030/rdnss-decoder477.
 The resident monitor is unchanged. Automatic RDNSS learning is **not enabled**;
 the per-interface lifetime repository, link-generation cleanup, scoped transport
 selection and live advertisement-to-DNS integration remain to be implemented.
+
+
+### Per-interface RDNSS repository qualification
+
+`Anvil/Network/ipv6_rdnss_list.pbi` now provides caller-owned storage for 3..16
+learned DNS servers per interface. Init, Apply, Tick, Get and Clear require the
+correct interface identity and generation. A newer generation clears old state;
+stale operations cannot modify or select from the replacement. Clear supports
+loss of usability within the current generation.
+
+Apply validates an entire advertisement batch before mutation. Zero lifetimes
+withdraw addresses, finite lifetimes expire on the extended monotonic clock,
+and infinity remains eligible until replaced or withdrawn. Renewal preserves an
+existing entry's position. Newly retained addresses precede older entries in
+input order. Full storage evicts the earliest-expiring entry, breaking ties
+against the least-preferred entry. Lookup expires stale entries before copying
+an address. Invalid inputs leave state and destination bytes untouched.
+
+Fifty-one lifecycle steps passed on the physical Pi, capture 114, checking the
+complete state of two interfaces and buffer guards after every operation.
+Coverage includes renewal/withdrawal, capacity pressure and ties, zero/infinite
+and maximum finite lifetimes, clocks beyond 32 bits, overflow limits, input
+aliasing, failed batch atomicity, link changes, cross-interface isolation and
+idempotent link-down cleanup. Core/font/Vulkan/watchdog checks passed.
+Evidence: docs/evidence/anvil-ipv6-20261030/rdnss-list477.
+
+This repository is not yet connected to resident RA reception or DNS selection.
+Installed monitor 477 is unchanged; automatic resolver discovery is still not
+enabled. Scoped transport, live RA ownership integration and an end-to-end
+advertisement-to-web test are the next required work.

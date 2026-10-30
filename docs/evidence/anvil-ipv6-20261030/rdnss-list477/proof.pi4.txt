@@ -1,0 +1,230 @@
+XIncludeFile "RaspberryPi4/Lib/mmu.pi4"
+XIncludeFile "Anvil/Network/ipv6_rdnss_list.pbi"
+
+Global s0.IPv6RdnssList,s1.IPv6RdnssList
+Global Dim entries0.a[88]
+Global Dim entries1.a[88]
+Global Dim selected.a[16]
+Procedure StoreState(p.i,*s.IPv6RdnssList,rows.i)
+ Define i.i
+ PokeI(p,*s\generation) : PokeI(p+8,*s\kind) : PokeI(p+16,*s\lastNow)
+ PokeI(p+24,*s\revision) : PokeI(p+32,*s\capacity) : PokeI(p+40,*s\count)
+ For i=0 To 87 : PokeA(p+48+i,PeekA(rows+i)) : Next
+EndProcedure
+Procedure Save(index.i,rc.i)
+ Define p.i,i.i
+ p=$E1C00100+index*384 : PokeI(p,rc)
+ StoreState(p+8,@s0,@entries0[0]) : StoreState(p+144,@s1,@entries1[0])
+ For i=0 To 15 : PokeA(p+280+i,selected[i]) : Next
+EndProcedure
+Procedure.i Main()
+ Define i.i,rc.i
+ For i=0 To 131071 : PokeA($E1C00000+i,$A5) : Next
+ For i=0 To 87 : entries0[i]=$A5 : entries1[i]=$A5 : Next
+ PokeI($E1C00000,$52444C53)
+ MmuClearNc() : rc=MmuBuildTables($4F80000) : If rc<>0 : ProcedureReturn 2 : EndIf
+ MmuEnableCached()
+ For i=0 To 15 : selected[i]=$A5 : Next
+rc=IPv6RdnssListInit(@s0,1,1,@entries0[0],3,100)
+ Save(0,rc)
+ For i=0 To 15 : selected[i]=$A5 : Next
+rc=IPv6RdnssListApply(@s0,1,1,100,?R0,3)
+ Save(1,rc)
+ For i=0 To 15 : selected[i]=$A5 : Next
+rc=IPv6RdnssListApply(@s0,1,1,200,?R1,1)
+ Save(2,rc)
+ For i=0 To 15 : selected[i]=$A5 : Next
+rc=IPv6RdnssListGet(@s0,1,1,200,0,@selected[0])
+ Save(3,rc)
+ For i=0 To 15 : selected[i]=$A5 : Next
+rc=IPv6RdnssListApply(@s0,1,1,300,?R2,2)
+ Save(4,rc)
+ For i=0 To 15 : selected[i]=$A5 : Next
+rc=IPv6RdnssListTick(@s0,2,1,300)
+ Save(5,rc)
+ For i=0 To 15 : selected[i]=$A5 : Next
+rc=IPv6RdnssListTick(@s0,1,2,300)
+ Save(6,rc)
+ For i=0 To 15 : selected[i]=$A5 : Next
+rc=IPv6RdnssListTick(@s0,1,1,199)
+ Save(7,rc)
+ For i=0 To 15 : selected[i]=$A5 : Next
+rc=IPv6RdnssListApply(@s0,1,1,300,?R3,1)
+ Save(8,rc)
+ For i=0 To 15 : selected[i]=$A5 : Next
+rc=IPv6RdnssListApply(@s0,1,1,400,?R4,2)
+ Save(9,rc)
+ For i=0 To 15 : selected[i]=$A5 : Next
+rc=IPv6RdnssListApply(@s0,1,1,500,?R5,1)
+ Save(10,rc)
+ For i=0 To 15 : selected[i]=$A5 : Next
+rc=IPv6RdnssListGet(@s0,1,1,2400,0,@selected[0])
+ Save(11,rc)
+ For i=0 To 15 : selected[i]=$A5 : Next
+rc=IPv6RdnssListApply(@s0,1,1,2400,?R6,1)
+ Save(12,rc)
+ For i=0 To 15 : selected[i]=$A5 : Next
+rc=IPv6RdnssListApply(@s0,1,1,2500,?R7,1)
+ Save(13,rc)
+ For i=0 To 15 : selected[i]=$A5 : Next
+rc=IPv6RdnssListGet(@s0,1,1,2500,2,@selected[0])
+ Save(14,rc)
+ For i=0 To 15 : selected[i]=$A5 : Next
+rc=IPv6RdnssListTick(@s0,1,1,20200)
+ Save(15,rc)
+ For i=0 To 15 : selected[i]=$A5 : Next
+rc=IPv6RdnssListApply(@s0,1,1,20300,?R8,1)
+ Save(16,rc)
+ For i=0 To 15 : selected[i]=$A5 : Next
+rc=IPv6RdnssListTick(@s0,1,1,21300)
+ Save(17,rc)
+ For i=0 To 15 : selected[i]=$A5 : Next
+rc=IPv6RdnssListApply(@s0,1,1,30000,?R9,1)
+ Save(18,rc)
+ For i=0 To 15 : selected[i]=$A5 : Next
+rc=IPv6RdnssListTick(@s0,1,1,4294976295)
+ Save(19,rc)
+ For i=0 To 15 : selected[i]=$A5 : Next
+rc=IPv6RdnssListInit(@s0,1,1,@entries0[0],3,0)
+ Save(20,rc)
+ For i=0 To 15 : selected[i]=$A5 : Next
+rc=IPv6RdnssListInit(@s0,1,2,@entries0[0],3,0)
+ Save(21,rc)
+ For i=0 To 15 : selected[i]=$A5 : Next
+rc=IPv6RdnssListApply(@s0,1,1,0,?R10,1)
+ Save(22,rc)
+ For i=0 To 15 : selected[i]=$A5 : Next
+rc=IPv6RdnssListApply(@s0,1,2,0,?R11,1)
+ Save(23,rc)
+ For i=0 To 15 : selected[i]=$A5 : Next
+rc=IPv6RdnssListInit(@s1,2,1,@entries1[0],3,0)
+ Save(24,rc)
+ For i=0 To 15 : selected[i]=$A5 : Next
+rc=IPv6RdnssListApply(@s1,2,1,0,?R12,1)
+ Save(25,rc)
+ For i=0 To 15 : selected[i]=$A5 : Next
+rc=IPv6RdnssListTick(@s1,2,1,1000)
+ Save(26,rc)
+ For i=0 To 15 : selected[i]=$A5 : Next
+rc=IPv6RdnssListGet(@s0,2,2,1000,0,@selected[0])
+ Save(27,rc)
+ For i=0 To 15 : selected[i]=$A5 : Next
+rc=IPv6RdnssListGet(@s0,1,2,1000,0,@selected[0])
+ Save(28,rc)
+ For i=0 To 15 : selected[i]=$A5 : Next
+rc=IPv6RdnssListApply(@s0,1,2,1000,@entries0[0],1)
+ Save(29,rc)
+ For i=0 To 15 : selected[i]=$A5 : Next
+rc=IPv6RdnssListGet(@s0,1,2,1000,0,@entries0[0])
+ Save(30,rc)
+ For i=0 To 15 : selected[i]=$A5 : Next
+rc=IPv6RdnssListInit(@s0,1,3,@s0,3,0)
+ Save(31,rc)
+ For i=0 To 15 : selected[i]=$A5 : Next
+rc=IPv6RdnssListInit(@s0,1,3,@entries0[0],2,0)
+ Save(32,rc)
+ For i=0 To 15 : selected[i]=$A5 : Next
+rc=IPv6RdnssListApply(@s0,1,2,1100,0,0)
+ Save(33,rc)
+ For i=0 To 15 : selected[i]=$A5 : Next
+rc=IPv6RdnssListApply(@s0,1,2,1100,0,-1)
+ Save(34,rc)
+ For i=0 To 15 : selected[i]=$A5 : Next
+rc=IPv6RdnssListApply(@s0,1,2,1100,0,4097)
+ Save(35,rc)
+ For i=0 To 15 : selected[i]=$A5 : Next
+rc=IPv6RdnssListApply(@s0,1,2,1100,0,1)
+ Save(36,rc)
+ For i=0 To 15 : selected[i]=$A5 : Next
+rc=IPv6RdnssListApply(@s0,1,2,1200,?R13,1)
+ Save(37,rc)
+ For i=0 To 15 : selected[i]=$A5 : Next
+rc=IPv6RdnssListApply(@s0,1,2,1200,?R14,1)
+ Save(38,rc)
+ For i=0 To 15 : selected[i]=$A5 : Next
+rc=IPv6RdnssListApply(@s0,1,2,1200,?R15,1)
+ Save(39,rc)
+ For i=0 To 15 : selected[i]=$A5 : Next
+rc=IPv6RdnssListTick(@s0,1,2,9223354444668731393)
+ Save(40,rc)
+ For i=0 To 15 : selected[i]=$A5 : Next
+rc=IPv6RdnssListInit(@s0,1,3,@entries0[0],3,9223354444668731392)
+ Save(41,rc)
+ For i=0 To 15 : selected[i]=$A5 : Next
+rc=IPv6RdnssListApply(@s0,1,3,9223354444668731392,?R16,1)
+ Save(42,rc)
+ For i=0 To 15 : selected[i]=$A5 : Next
+rc=IPv6RdnssListGet(@s0,1,3,9223354444668731392,0,@selected[0])
+ Save(43,rc)
+ For i=0 To 15 : selected[i]=$A5 : Next
+rc=IPv6RdnssListInit(@s0,1,4,@entries0[0],3,0)
+ Save(44,rc)
+ For i=0 To 15 : selected[i]=$A5 : Next
+rc=IPv6RdnssListApply(@s0,1,4,0,?R17,3)
+ Save(45,rc)
+ For i=0 To 15 : selected[i]=$A5 : Next
+rc=IPv6RdnssListApply(@s0,1,4,1,?R18,2)
+ Save(46,rc)
+ For i=0 To 15 : selected[i]=$A5 : Next
+rc=IPv6RdnssListClear(@s0,1,3,1)
+ Save(47,rc)
+ For i=0 To 15 : selected[i]=$A5 : Next
+rc=IPv6RdnssListClear(@s0,1,4,2)
+ Save(48,rc)
+ For i=0 To 15 : selected[i]=$A5 : Next
+rc=IPv6RdnssListClear(@s0,1,4,3)
+ Save(49,rc)
+ For i=0 To 15 : selected[i]=$A5 : Next
+rc=IPv6RdnssListGet(@s0,1,4,3,0,@selected[0])
+ Save(50,rc)
+ PokeI($E1C00008,51)
+ MmuDisableCachedFlushed()
+ ProcedureReturn 0
+EndProcedure
+DataSection
+ R0:
+ Data.a 254,128,0,0,0,0,0,0,0,0,0,0,0,0,0,1,3,0,0,0,0,0,0,0
+ Data.a 254,128,0,0,0,0,0,0,0,0,0,0,0,0,0,2,5,0,0,0,0,0,0,0
+ Data.a 254,128,0,0,0,0,0,0,0,0,0,0,0,0,0,3,7,0,0,0,0,0,0,0
+ R1:
+ Data.a 254,128,0,0,0,0,0,0,0,0,0,0,0,0,0,2,20,0,0,0,0,0,0,0
+ R2:
+ Data.a 254,128,0,0,0,0,0,0,0,0,0,0,0,0,0,4,2,0,0,0,0,0,0,0
+ Data.a 255,2,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1,0,0,0,0,0,0,0
+ R3:
+ Data.a 254,128,0,0,0,0,0,0,0,0,0,0,0,0,0,4,8,0,0,0,0,0,0,0
+ R4:
+ Data.a 254,128,0,0,0,0,0,0,0,0,0,0,0,0,0,5,1,0,0,0,0,0,0,0
+ Data.a 254,128,0,0,0,0,0,0,0,0,0,0,0,0,0,6,2,0,0,0,0,0,0,0
+ R5:
+ Data.a 254,128,0,0,0,0,0,0,0,0,0,0,0,0,0,4,0,0,0,0,0,0,0,0
+ R6:
+ Data.a 254,128,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0
+ R7:
+ Data.a 254,128,0,0,0,0,0,0,0,0,0,0,0,0,0,7,255,255,255,255,0,0,0,0
+ R8:
+ Data.a 254,128,0,0,0,0,0,0,0,0,0,0,0,0,0,7,1,0,0,0,0,0,0,0
+ R9:
+ Data.a 254,128,0,0,0,0,0,0,0,0,0,0,0,0,0,1,254,255,255,255,0,0,0,0
+ R10:
+ Data.a 254,128,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1,0,0,0,0,0,0,0
+ R11:
+ Data.a 254,128,0,0,0,0,0,0,0,0,0,0,0,0,0,1,255,255,255,255,0,0,0,0
+ R12:
+ Data.a 254,128,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1,0,0,0,0,0,0,0
+ R13:
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0
+ R14:
+ Data.a 254,128,0,0,0,0,0,0,0,0,0,0,0,0,0,1,255,255,255,255,255,255,255,255
+ R15:
+ Data.a 254,128,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,1,0,0,0
+ R16:
+ Data.a 254,128,0,0,0,0,0,0,0,0,0,0,0,0,0,1,254,255,255,255,0,0,0,0
+ R17:
+ Data.a 254,128,0,0,0,0,0,0,0,0,0,0,0,0,0,1,255,255,255,255,0,0,0,0
+ Data.a 254,128,0,0,0,0,0,0,0,0,0,0,0,0,0,2,255,255,255,255,0,0,0,0
+ Data.a 254,128,0,0,0,0,0,0,0,0,0,0,0,0,0,3,255,255,255,255,0,0,0,0
+ R18:
+ Data.a 254,128,0,0,0,0,0,0,0,0,0,0,0,0,0,4,255,255,255,255,0,0,0,0
+ Data.a 254,128,0,0,0,0,0,0,0,0,0,0,0,0,0,5,255,255,255,255,0,0,0,0
+EndDataSection
