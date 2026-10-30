@@ -130,7 +130,7 @@ Global Dim exfat_gptEntry.a[48]
 Global Dim exfat_name.w[#EXFAT_MAX_NAME + 1]
 Global Dim exfat_want.w[#EXFAT_MAX_NAME + 1]
 Global exfat_wantLength.i
-Global Dim exfat_upcaseFast.w[255]
+Global Dim exfat_upcaseFast.w[256]
 Global exfat_upcaseFastReady.i
 
 ; Current open object.
@@ -1257,34 +1257,48 @@ Procedure.i exfat_NameHash(*name, count.i)
   ProcedureReturn sum
 EndProcedure
 
+; Mount-only word reader. Each validation pass starts with an empty window;
+; no cached table bytes survive into a later pass or a different mount.
+Global exfat_upcaseChunkAt.i=-1
+Global exfat_upcaseChunkCount.i
+Procedure.i exfat_MountUpcaseWord(offset.i)
+  Define at.i,take.i
+  If offset<0 Or (offset & 1)<>0 Or offset+1>=exfat_upcaseLength
+    exfat_Fail(#EXFAT_E_UPCASE) : ProcedureReturn -1
+  EndIf
+  at=(offset/512)*512
+  If exfat_upcaseChunkAt<>at
+    exfat_upcaseChunkAt=-1 : exfat_upcaseChunkCount=0
+    take=exfat_upcaseLength-at : If take>512 : take=512 : EndIf
+    If exfat_StreamRead(exfat_upcaseCluster,0,exfat_upcaseLength,at,@exfat_upcaseChunk[0],take)<>take
+      ProcedureReturn -1
+    EndIf
+    exfat_upcaseChunkCount=take : exfat_upcaseChunkAt=at
+  EndIf
+  offset=offset-at
+  If offset+1>=exfat_upcaseChunkCount : ProcedureReturn -1 : EndIf
+  ProcedureReturn (exfat_upcaseChunk[offset] & $FF) | ((exfat_upcaseChunk[offset+1] & $FF)<<8)
+EndProcedure
+
 Procedure.i exfat_BuildFastUpcase()
   Define cp.i
   Define off.i
   Define word.i
   Define skip.i
-  Define lo.i
-  Define hi.i
   Define endCp.i
+  exfat_upcaseChunkAt=-1 : exfat_upcaseChunkCount=0
   cp = 0
   off = 0
   While cp < 256 And off + 1 < exfat_upcaseLength
-    lo = exfat_StreamByte(exfat_upcaseCluster, 0, exfat_upcaseLength, off)
-    hi = exfat_StreamByte(exfat_upcaseCluster, 0, exfat_upcaseLength, off + 1)
-    If lo < 0 Or hi < 0
-      ProcedureReturn 0
-    EndIf
-    word = lo | (hi << 8)
+    word = exfat_MountUpcaseWord(off)
+    If word < 0 : ProcedureReturn 0 : EndIf
     off = off + 2
     If word = $FFFF
       If off + 1 >= exfat_upcaseLength
         ProcedureReturn exfat_Fail(#EXFAT_E_UPCASE)
       EndIf
-      lo = exfat_StreamByte(exfat_upcaseCluster, 0, exfat_upcaseLength, off)
-      hi = exfat_StreamByte(exfat_upcaseCluster, 0, exfat_upcaseLength, off + 1)
-      If lo < 0 Or hi < 0
-        ProcedureReturn 0
-      EndIf
-      skip = lo | (hi << 8)
+      skip = exfat_MountUpcaseWord(off)
+      If skip < 0 : ProcedureReturn 0 : EndIf
       off = off + 2
       If skip = 0 Or cp + skip > 65536
         ProcedureReturn exfat_Fail(#EXFAT_E_UPCASE)
@@ -1324,19 +1338,14 @@ EndProcedure
 Procedure.i exfat_ValidateUpcase()
   Define cp.i
   Define off.i
-  Define lo.i
-  Define hi.i
   Define word.i
   Define skip.i
+  exfat_upcaseChunkAt=-1 : exfat_upcaseChunkCount=0
   cp = 0
   off = 0
   While off + 1 < exfat_upcaseLength And cp < 65536
-    lo = exfat_StreamByte(exfat_upcaseCluster, 0, exfat_upcaseLength, off)
-    hi = exfat_StreamByte(exfat_upcaseCluster, 0, exfat_upcaseLength, off + 1)
-    If lo < 0 Or hi < 0
-      ProcedureReturn 0
-    EndIf
-    word = lo | (hi << 8)
+    word = exfat_MountUpcaseWord(off)
+    If word < 0 : ProcedureReturn 0 : EndIf
     off = off + 2
     If word = $FFFF
       If off + 1 >= exfat_upcaseLength
@@ -1346,12 +1355,8 @@ Procedure.i exfat_ValidateUpcase()
         EndIf
         ProcedureReturn exfat_Fail(#EXFAT_E_UPCASE)
       EndIf
-      lo = exfat_StreamByte(exfat_upcaseCluster, 0, exfat_upcaseLength, off)
-      hi = exfat_StreamByte(exfat_upcaseCluster, 0, exfat_upcaseLength, off + 1)
-      If lo < 0 Or hi < 0
-        ProcedureReturn 0
-      EndIf
-      skip = lo | (hi << 8)
+      skip = exfat_MountUpcaseWord(off)
+      If skip < 0 : ProcedureReturn 0 : EndIf
       off = off + 2
       If skip = 0 Or cp + skip > 65536
         ProcedureReturn exfat_Fail(#EXFAT_E_UPCASE)

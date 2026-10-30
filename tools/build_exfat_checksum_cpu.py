@@ -30,6 +30,134 @@ Procedure.i OldChecksum()
   ProcedureReturn sum
 EndProcedure
 
+
+Procedure.i OldValidate()
+  Define cp.i
+  Define off.i
+  Define lo.i
+  Define hi.i
+  Define word.i
+  Define skip.i
+  cp = 0
+  off = 0
+  While off + 1 < exfat_upcaseLength And cp < 65536
+    lo = exfat_StreamByte(exfat_upcaseCluster, 0, exfat_upcaseLength, off)
+    hi = exfat_StreamByte(exfat_upcaseCluster, 0, exfat_upcaseLength, off + 1)
+    If lo < 0 Or hi < 0
+      ProcedureReturn 0
+    EndIf
+    word = lo | (hi << 8)
+    off = off + 2
+    If word = $FFFF
+      If off + 1 >= exfat_upcaseLength
+        If cp = $FFFF
+          cp = cp + 1
+          Break
+        EndIf
+        ProcedureReturn exfat_Fail(#EXFAT_E_UPCASE)
+      EndIf
+      lo = exfat_StreamByte(exfat_upcaseCluster, 0, exfat_upcaseLength, off)
+      hi = exfat_StreamByte(exfat_upcaseCluster, 0, exfat_upcaseLength, off + 1)
+      If lo < 0 Or hi < 0
+        ProcedureReturn 0
+      EndIf
+      skip = lo | (hi << 8)
+      off = off + 2
+      If skip = 0 Or cp + skip > 65536
+        ProcedureReturn exfat_Fail(#EXFAT_E_UPCASE)
+      EndIf
+      cp = cp + skip
+    Else
+      cp = cp + 1
+    EndIf
+  Wend
+  If cp <> 65536 Or off <> exfat_upcaseLength
+    ProcedureReturn exfat_Fail(#EXFAT_E_UPCASE)
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+Procedure.i OldBuildFast()
+  Define cp.i
+  Define off.i
+  Define word.i
+  Define skip.i
+  Define lo.i
+  Define hi.i
+  Define endCp.i
+  cp = 0
+  off = 0
+  While cp < 256 And off + 1 < exfat_upcaseLength
+    lo = exfat_StreamByte(exfat_upcaseCluster, 0, exfat_upcaseLength, off)
+    hi = exfat_StreamByte(exfat_upcaseCluster, 0, exfat_upcaseLength, off + 1)
+    If lo < 0 Or hi < 0
+      ProcedureReturn 0
+    EndIf
+    word = lo | (hi << 8)
+    off = off + 2
+    If word = $FFFF
+      If off + 1 >= exfat_upcaseLength
+        ProcedureReturn exfat_Fail(#EXFAT_E_UPCASE)
+      EndIf
+      lo = exfat_StreamByte(exfat_upcaseCluster, 0, exfat_upcaseLength, off)
+      hi = exfat_StreamByte(exfat_upcaseCluster, 0, exfat_upcaseLength, off + 1)
+      If lo < 0 Or hi < 0
+        ProcedureReturn 0
+      EndIf
+      skip = lo | (hi << 8)
+      off = off + 2
+      If skip = 0 Or cp + skip > 65536
+        ProcedureReturn exfat_Fail(#EXFAT_E_UPCASE)
+      EndIf
+      endCp = cp + skip
+      If endCp > 256
+        endCp = 256
+      EndIf
+      While cp < endCp
+        exfat_upcaseFast[cp] = cp
+        cp = cp + 1
+      Wend
+    Else
+      exfat_upcaseFast[cp] = word
+      cp = cp + 1
+    EndIf
+  Wend
+  If cp <> 256
+    ProcedureReturn exfat_Fail(#EXFAT_E_UPCASE)
+  EndIf
+  ; Microsoft defines mandatory mappings for the first 128 code points.
+  cp = 0
+  While cp < 128
+    If cp >= 97 And cp <= 122
+      If exfat_upcaseFast[cp] <> cp - 32
+        ProcedureReturn exfat_Fail(#EXFAT_E_UPCASE)
+      EndIf
+    ElseIf exfat_upcaseFast[cp] <> cp
+      ProcedureReturn exfat_Fail(#EXFAT_E_UPCASE)
+    EndIf
+    cp = cp + 1
+  Wend
+  exfat_upcaseFastReady = 1
+  ProcedureReturn 1
+EndProcedure
+Procedure PrepareTable(prefix.i)
+ Define i.i,v.i
+ For i=0 To prefix-1
+  v=i : If i>=97 And i<=122 : v=i-32 : EndIf
+  exfat_Put16(@gateDisk[0]+35*512,i*2,v)
+ Next
+ exfat_Put16(@gateDisk[0]+35*512,prefix*2,$FFFF)
+ exfat_Put16(@gateDisk[0]+35*512,prefix*2+2,65535-prefix)
+ exfat_Put16(@gateDisk[0]+35*512,prefix*2+4,$FFFF)
+ exfat_upcaseLength=prefix*2+6 : exfat_DropCaches()
+EndProcedure
+Procedure ValidationRow(index.i)
+ Define p.i,t.i,rc.i
+ p=$E1C01000+index*64
+ exfat_DropCaches() : t=A64CounterReadOrdered() : rc=OldValidate()
+ PokeI(p,rc) : PokeI(p+16,A64CounterReadOrdered()-t)
+ exfat_DropCaches() : t=A64CounterReadOrdered() : rc=exfat_ValidateUpcase()
+ PokeI(p+8,rc) : PokeI(p+24,A64CounterReadOrdered()-t)
+EndProcedure
 Procedure.i Main()
  Define rc.i,i.i,j.i,n.i,start.i,slow.i,fast.i,old.i,new.i,p.i,reads.i
  For i=0 To 65535 : PokeA($E1C00000+i,0) : Next
@@ -86,6 +214,16 @@ Procedure.i Main()
  PokeI(p,old) : PokeI(p+8,new) : PokeI(p+16,slow) : PokeI(p+24,fast) : PokeI(p+32,gateReads-reads)
  exfat_upcaseLength=1024 : gateFailLba=36 : exfat_DropCaches()
  PokeI($E1C00018,exfat_UpcaseTableChecksum()) : gateFailLba=-1
+ PrepareTable(255) : ValidationRow(0)
+ PokeI($E1C01020,exfat_BuildFastUpcase()) : PokeI($E1C01028,exfat_upcaseFast[255] & $FFFF)
+ PrepareTable(4095) : ValidationRow(1)
+ PrepareTable(4095) : exfat_upcaseLength=8194 : ValidationRow(2)
+ PrepareTable(4095) : exfat_Put16(@gateDisk[0]+35*512,8192,0) : ValidationRow(3)
+ PrepareTable(4095) : exfat_Put16(@gateDisk[0]+35*512,8192,65535) : ValidationRow(4)
+ PrepareTable(4095) : exfat_upcaseLength=8198 : ValidationRow(5)
+ PrepareTable(4095) : gateFailLba=36 : ValidationRow(6) : gateFailLba=-1
+ PrepareTable(255) : exfat_Put16(@gateDisk[0]+35*512,194,97) : exfat_DropCaches()
+ PokeI($E1C00020,OldBuildFast()) : exfat_DropCaches() : PokeI($E1C00028,exfat_BuildFastUpcase())
  PokeI($E1C00010,A64CounterFrequency())
  MmuDisableCachedFlushed() : ProcedureReturn 0
 EndProcedure

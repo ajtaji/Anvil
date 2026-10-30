@@ -806,3 +806,26 @@ The candidate update initially hit a full boot partition. The current boot
 image was untouched. Two obsolete candidate copies were matched against their
 local archives before removal; recovery backups were retained. Candidate,
 boot file and running build 433 were then verified by full hashes.
+
+
+## Buffered exFAT up-case validation (build 434)
+
+The two remaining mount-time up-case parsing passes now use a 512-byte word
+window. Each pass invalidates that window before starting, so a different
+mount or a checksum pass cannot leave it with stale bytes. Full structural,
+skip-count, end-of-table and mandatory ASCII-mapping checks remain. Runtime
+filename lookups keep their existing path. The fast mapping array now explicitly
+contains all 256 entries that its parser populates.
+
+The physical regression passed, along with compressed runs crossing a block
+boundary, the final literal U+FFFF, truncated tables, zero/oversized skips,
+trailing bytes, bad mandatory mappings and injected read failure. For a
+synthetic 8,196-byte table the validation pass fell from 13,200 us to 315 us;
+this is an in-memory chained-volume measurement, not an I/O latency bound.
+
+The same cold root-file/HTTPS probe measured 16484 us on 433 and 14288 us on 434
+for its first open. Gzip, deflate and cancellation passed. Installation retained
+recovery backups and verified the candidate, boot image and running image by
+hash; startup waited 90 seconds before readiness checks. Cores, fonts and Vulkan
+remained healthy. Device waits and mount ownership are still synchronous;
+this is reduced blocking work, not completion of nonblocking networking.
