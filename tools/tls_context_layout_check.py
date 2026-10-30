@@ -38,7 +38,8 @@ def check():
     for name,limit in [('name','NAME_MAX'),('hs','HS_BUF'),('recv','RECV_BUF'),('tx','TX_BUF'),('in','IN_BUF'),('ring','RING')]:
         assert f'Global Dim tlsc_{name}.a[#TLSC_CONNECTIONS*#TLSC_{limit}]' in client
         for expression in re.findall(r'\btlsc_'+name+r'\[([^]]+)\]',client):
-            assert expression.startswith(f'tlsc_slot*#TLSC_{limit}+'),(name,expression)
+            base=f'tlsc_slot*#TLSC_{limit}'
+            assert expression==base or expression.startswith(base+'+'),(name,expression)
     return {'state_fields':len(rows),'snapshot_bytes':size,'client_fields':len(fields),'isolated_large_buffers':6}
 
 if __name__=='__main__':print(check())

@@ -243,6 +243,7 @@
 #TLS_EXT_SERVER_NAME            = 0
 #TLS_EXT_SUPPORTED_GROUPS       = 10
 #TLS_EXT_SIGNATURE_ALGORITHMS   = 13
+#TLS_EXT_ALPN                   = 16
 #TLS_EXT_PRE_SHARED_KEY         = 41
 #TLS_EXT_EARLY_DATA             = 42
 #TLS_EXT_SUPPORTED_VERSIONS     = 43
@@ -341,6 +342,9 @@
 #TLS13_REFUSE_UNOFFERED_EXTENSION        = 51
 #TLS13_REFUSE_EXT_NOT_ALLOWED_HERE       = 52
 #TLS13_REFUSE_PSK_KEY_EXCHANGE_MODES     = 53
+#TLS13_REFUSE_ALPN_FORMAT                = 54
+#TLS13_REFUSE_ALPN_SELECTION             = 55
+#TLS13_REFUSE_ALPN_DUPLICATE             = 56
 ; --- Certificate ---
 #TLS13_REFUSE_CERT_CONTEXT_NOT_EMPTY     = 60
 #TLS13_REFUSE_EMPTY_CERT_LIST            = 61
@@ -449,6 +453,10 @@ Global Dim TlsLbl.a[80]              ; the HKDF label texts, back to back
 Global Dim TlsCvCtx.a[98]            ; 64 spaces + the context string + NUL
 Global TlsLabelsReady.i
 Global TlsKdfFault.i                 ; 1 once an hkdf call came back short
+Global TlsAlpnOfferLen.i
+Global TlsAlpnSelectedLen.i
+Global Dim TlsAlpnOffer.a[256]
+Global Dim TlsAlpnSelected.a[256]
 ; label offsets inside TlsLbl
 #TLS_L_DERIVED   = 0            ; "derived"
 #TLS_L_DERIVED_N = 7
@@ -995,6 +1003,9 @@ EndProcedure
 ;  validates every certificate full stop.
 ; ----------------------------------------------------------------------
 Procedure.i Tls13Init(nameAddr.i, nameLen.i, unixTime.i)
+  Define i.i
+  TlsAlpnOfferLen=0 : TlsAlpnSelectedLen=0
+  For i=0 To 255 : TlsAlpnOffer[i]=0 : TlsAlpnSelected[i]=0 : Next
   Tls13State = #TLS13_ST_IDLE
   Tls13Err = #TLS13_OK
   Tls13Alert = 0
@@ -1097,6 +1108,62 @@ EndProcedure
 ; ======================================================================
 ;  CLIENTHELLO (RFC 8446 4.1.2)
 ; ======================================================================
+; Optional RFC 7301 protocol list: one length byte then 1..255 opaque bytes
+; per name, at most 256 total bytes. Call after Init, before ClientHello.
+; Empty input disables ALPN. Copy before commit, including aliased input.
+Procedure.i Tls13SetAlpn(protocols.i,bytes.i)
+ Define p.i,n.i,i.i
+ Define Dim copy.a[256]
+ If Tls13State<>#TLS13_ST_START : ProcedureReturn TlsFail(#TLS13_REFUSE_WRONG_STATE,#TLS_ALERT_INTERNAL_ERROR) : EndIf
+ If bytes<0 Or bytes>256 Or (bytes>0 And protocols=0) : ProcedureReturn TlsFail(#TLS13_REFUSE_ALPN_FORMAT,#TLS_ALERT_INTERNAL_ERROR) : EndIf
+ For i=0 To bytes-1 : copy[i]=PeekA(protocols+i) : Next
+ p=0
+ While p<bytes
+  n=copy[p]&255 : p=p+1
+  If n=0 Or n>bytes-p : ProcedureReturn TlsFail(#TLS13_REFUSE_ALPN_FORMAT,#TLS_ALERT_INTERNAL_ERROR) : EndIf
+  p=p+n
+ Wend
+ For i=0 To 255
+  If i<bytes : TlsAlpnOffer[i]=copy[i] : Else : TlsAlpnOffer[i]=0 : EndIf
+  TlsAlpnSelected[i]=0
+ Next
+ TlsAlpnOfferLen=bytes : TlsAlpnSelectedLen=0
+ ProcedureReturn 1
+EndProcedure
+
+; Selection is visible to the application only after the verified handshake.
+; Returns selected byte count, zero when absent, -1 for state/buffer refusal.
+Procedure.i Tls13Alpn(destination.i,capacity.i)
+ Define i.i
+ If Tls13State<>#TLS13_ST_CONNECTED : ProcedureReturn -1 : EndIf
+ If TlsAlpnSelectedLen=0 : ProcedureReturn 0 : EndIf
+ If destination=0 Or capacity<TlsAlpnSelectedLen : ProcedureReturn -1 : EndIf
+ For i=0 To TlsAlpnSelectedLen-1 : PokeA(destination+i,TlsAlpnSelected[i]) : Next
+ ProcedureReturn TlsAlpnSelectedLen
+EndProcedure
+
+Procedure.i TlsAlpnReadSelection(body.i,bytes.i)
+ Define p.i,n.i,offered.i,i.i,equal.i
+ If TlsAlpnOfferLen=0 : ProcedureReturn TlsFail(#TLS13_REFUSE_UNOFFERED_EXTENSION,#TLS_ALERT_UNSUPPORTED_EXTENSION) : EndIf
+ If bytes<4 : ProcedureReturn TlsFail(#TLS13_REFUSE_ALPN_FORMAT,#TLS_ALERT_DECODE_ERROR) : EndIf
+ n=TlsRd8(body+2)
+ If TlsRd16(body)<>bytes-2 Or n=0 Or n+3<>bytes : ProcedureReturn TlsFail(#TLS13_REFUSE_ALPN_FORMAT,#TLS_ALERT_DECODE_ERROR) : EndIf
+ p=0
+ While p<TlsAlpnOfferLen
+  offered=TlsAlpnOffer[p]&255 : p=p+1 : equal=0
+  If offered=n
+   equal=1
+   For i=0 To n-1 : If TlsAlpnOffer[p+i]<>TlsRd8(body+3+i) : equal=0 : EndIf : Next
+  EndIf
+  If equal<>0
+   For i=0 To n-1 : TlsAlpnSelected[i]=TlsRd8(body+3+i) : Next
+   TlsAlpnSelectedLen=n : ProcedureReturn 1
+  EndIf
+  p=p+offered
+ Wend
+ ProcedureReturn TlsFail(#TLS13_REFUSE_ALPN_SELECTION,#TLS_ALERT_ILLEGAL_PARAMETER)
+EndProcedure
+
 Procedure.i Tls13BuildClientHello(dst.i, dstmax.i)
   Protected p.i
   Protected extStart.i
@@ -1120,10 +1187,10 @@ Procedure.i Tls13BuildClientHello(dst.i, dstmax.i)
   If nlen < 0
     nlen = 0
   EndIf
-  ; The largest ClientHello this builder can emit is 197 bytes plus the
-  ; server name, so the room is checked BEFORE a single byte is written -
+  ; Without ALPN the largest ClientHello is 197 bytes plus the
+  ; server name; reserve the optional ALPN bytes too before any write -
   ; a bound checked afterwards is a bound that already overflowed.
-  If dstmax < 256 + nlen
+  If dstmax < 256 + nlen + TlsAlpnOfferLen + Bool(TlsAlpnOfferLen>0)*6
     ProcedureReturn TlsFail(#TLS13_REFUSE_BUF_TOO_SMALL, #TLS_ALERT_INTERNAL_ERROR)
   EndIf
 
@@ -1155,6 +1222,14 @@ Procedure.i Tls13BuildClientHello(dst.i, dstmax.i)
     TlsWr16(p, nlen) : p = p + 2
     TlsCopy(p, TlsNameAddr, nlen) : p = p + nlen
     TlsNoteOffered(#TLS_EXT_SERVER_NAME)
+  EndIf
+
+  ; RFC 7301 section 3.1; TLS 1.3 selects this in EncryptedExtensions.
+  If TlsAlpnOfferLen>0
+    TlsWr16(p,#TLS_EXT_ALPN) : TlsWr16(p+2,TlsAlpnOfferLen+2)
+    TlsWr16(p+4,TlsAlpnOfferLen)
+    TlsCopy(p+6,@TlsAlpnOffer[0],TlsAlpnOfferLen) : p=p+6+TlsAlpnOfferLen
+    TlsNoteOffered(#TLS_EXT_ALPN)
   EndIf
 
   ; ---- supported_groups. RFC 8446 9.2 makes this mandatory alongside
@@ -1421,6 +1496,8 @@ Procedure.i TlsHandleEncryptedExtensions(msg.i, mlen.i)
   Protected extLen.i
   Protected et.i
   Protected el.i
+  Protected sawAlpn.i
+  sawAlpn=0
 
   If mlen < 6
     ProcedureReturn TlsFail(#TLS13_REFUSE_HS_TRUNCATED, #TLS_ALERT_DECODE_ERROR)
@@ -1465,9 +1542,13 @@ Procedure.i TlsHandleEncryptedExtensions(msg.i, mlen.i)
       ; RFC 8446 4.2: an answer to a question we did not ask.
       ProcedureReturn TlsFail(#TLS13_REFUSE_UNOFFERED_EXTENSION, #TLS_ALERT_UNSUPPORTED_EXTENSION)
     EndIf
-    ; server_name and supported_groups are the only ones that can
-    ; legitimately land here for this client, and neither carries
-    ; anything this client acts on. Their VALUES are ignored, on purpose.
+    If et=#TLS_EXT_ALPN
+      If sawAlpn<>0 : ProcedureReturn TlsFail(#TLS13_REFUSE_ALPN_DUPLICATE,#TLS_ALERT_ILLEGAL_PARAMETER) : EndIf
+      sawAlpn=1
+      If TlsAlpnReadSelection(p,el)=0 : ProcedureReturn 0 : EndIf
+    EndIf
+    ; The remaining offered server_name and supported_groups values
+    ; do not change client behavior. ALPN was checked and retained above.
     p = p + el
   Wend
 

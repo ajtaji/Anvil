@@ -27,6 +27,8 @@ Procedure Start(seed.i)
  For i=0 To 11 : iv[i]=seed+32+i : Next
  Tls13RecReset() : Tls13RecSetWriteKey(@key[0],@iv[0])
  For i=0 To 519 : xEePkey[i]=(seed+i) & 255 : Next
+ TlsAlpnOfferLen=seed : TlsAlpnSelectedLen=seed+2
+ For i=0 To 255 : TlsAlpnOffer[i]=(seed+i)&255 : TlsAlpnSelected[i]=(seed+2*i)&255 : Next
  Tls13State=seed : TlsHsLen=seed+123 : TlsTrSnap[0]=seed+1
 EndProcedure
 Procedure Emit(index.i)
@@ -37,6 +39,10 @@ Procedure Emit(index.i)
  PokeI(p+24,TlsHsLen) : PokeI(p+32,TlsTrSnap[0])
  PokeI(p+40,xEePkey[0]) : PokeI(p+48,xEePkey[519])
  For i=0 To n-1 : PokeA(p+64+i,output[i]) : Next
+ p=$E1C00800+index*64
+ PokeI(p,TlsAlpnOfferLen) : PokeI(p+8,TlsAlpnSelectedLen)
+ PokeI(p+16,TlsAlpnOffer[0]) : PokeI(p+24,TlsAlpnOffer[255])
+ PokeI(p+32,TlsAlpnSelected[0]) : PokeI(p+40,TlsAlpnSelected[255])
 EndProcedure
 Procedure.i Main(services.i)
  Define i.i,n.i,ok.i

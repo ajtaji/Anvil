@@ -2449,3 +2449,56 @@ build-479 HTTP result passed its body check but failed the exact DNS-query-count
 assertion; its wire log and the expected failing CPU regression are retained.
 Automatic RDNSS needs a suitable live advertisement-to-web qualification. Public
 off-link IPv6, HTTP/2-3 and remaining atomic TLS/device work remain open.
+
+
+### Bounded TLS ALPN foundation: build 482
+
+The shared TLS handshake now supports an optional, copied ALPN offer through
+`Tls13SetAlpn(protocols, bytes)`, called after initialization and before building
+ClientHello. Its input is the RFC 7301 sequence of one-byte name lengths and
+nonempty opaque protocol names, bounded to 256 total bytes. Empty input disables
+ALPN. Invalid lists are refused rather than truncated. Existing callers do not
+advertise ALPN and retain their HTTP/1 behavior.
+
+The TLS 1.3 EncryptedExtensions handler accepts exactly one offered protocol,
+rejecting malformed, duplicate and unoffered selections. The selected name is
+available through `Tls13Alpn(destination, capacity)` only in the connected state:
+it returns its byte count, zero for no selection, or -1 for a state/buffer refusal.
+Names are opaque bytes, not zero-terminated strings. Certificate and Finished
+verification are unchanged. An application requiring h2 must require that exact
+selection; an absent selection does not establish HTTP/2 support.
+
+Both the copied offer and selection belong to the connection snapshot, which is
+now 2,920 bytes. Save/restore/wipe coverage includes the new state. The layout
+checker also accepts the exact base of a per-slot buffer, as well as that base
+plus an offset; its previous false refusal is tracked in forum topic 1531.
+
+On the physical Pi 4 running build 482, capture 131 passed 21 ALPN wire/guard
+cases, including both protocol choices, absence, malformed lengths, duplicates,
+unoffered names, a maximum 255-byte opaque name and undersized output. This is a
+codec fixture with a transcript stub, not a full ALPN handshake. Capture 132
+passed independent AES-GCM record comparisons while switching connection
+snapshots with different offer/selection contents, then verified complete wipe.
+
+Capture 130 passed the existing certificate-verified HTTPS, cancellation and
+gzip/deflate regressions on the installed monitor. The maximum observed web call
+was 2,188 microseconds and the whole-service maximum was 1,991 microseconds in
+this run. These observations are not universal upper bounds. Core, font, Vulkan
+and watchdog checks passed. Pi 3 build 96 compiles from the shared implementation.
+
+The boot partition refused the first candidate write while holding over 1 GB of
+accumulated images. The boot file remained unchanged. Four redundant candidate
+images were removed only after their full hashes matched retained backups, and
+the failed candidate was rewritten. Candidate, boot file and full running image
+were then verified. Build 481 remains at `1:/B481V482.IMG` for rollback.
+
+Evidence: `docs/evidence/anvil-ipv6-20261030/alpn482`. This is the handshake-library
+foundation: the application-facing TLS service has not yet exposed the offer
+and selection, and no live h2 negotiation or HTTP/2 exchange is claimed. Next are
+that service integration and the HTTP/2 engine. HTTP/3, public off-link IPv6,
+automatic RDNSS-to-web qualification and remaining atomic TLS/device work remain
+open.
+
+Protocol references: [RFC 7301 section 3](https://www.rfc-editor.org/rfc/rfc7301.html#section-3)
+and [RFC 8446 section 4.2](https://www.rfc-editor.org/rfc/rfc8446.html#section-4.2).
+These supply protocol facts; no implementation code was copied.
