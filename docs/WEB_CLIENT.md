@@ -1145,3 +1145,34 @@ interface-policy coverage and adding source unions, exact MTU output, duplicate
 handling, atomic overflow and unchanged-buffer guards. Per-group scheduling and
 live receive/filter integration remain outstanding. Anvil 441 remains installed;
 these tests establish source-list behavior, not live multicast or IPv6 web traffic.
+
+
+## Per-group multicast report scheduling
+
+`ipv6_mld_group.pbi` now owns any-source membership scheduling for one group.
+It tracks delayed query responses, pending source unions, join/leave repeats,
+interface revisions and one outstanding transmit token. The caller supplies
+randomized delays, validated input, owned source storage and service-loop calls.
+A positive Step result is only packet preparation: Sent consumes a repeat only
+on matching driver completion. Definitely-unsent work remains pending; an
+ambiguous failure marks the membership failed until generation reinitialization.
+
+Query and membership revisions are separate from the transmit token. A newer
+query or join/leave change arriving during transmission survives the older
+completion. General/group queries clear source filtering; source-specific
+queries merge owned source sets and emit INCLUDE responses. Interface revision
+changes cancel pending work and make old acknowledgements stale. No RX pointer
+is retained, and output cannot overlap context or source storage.
+
+In v1 mode, validated reports from other nodes can suppress pending reports.
+The caller must exclude local loopback and validate the exact group first.
+Every v1 leave emits one Done message; no optional Done-suppression setting is
+required. Join repetition uses the v1 delay bound; v2 uses the v2 bound.
+
+All 57 final physical Pi CPU scenarios passed, covering early/due timers,
+unsent/retry, stale/duplicate completion, changes and queries during transmission,
+v1 suppression, Done emission, revision cancellation, atomic source overflow,
+backwards time and output/context overlap. Packet bytes and owned lists were
+checked independently. This scheduler is not yet connected to live multicast:
+receive-side report validation, device filtering, membership ownership and
+network-loop binding remain. Anvil 441 remains installed and healthy.

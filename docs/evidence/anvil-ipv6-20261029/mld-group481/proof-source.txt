@@ -1,0 +1,230 @@
+XIncludeFile "RaspberryPi4/Lib/mmu.pi4"
+XIncludeFile "Anvil/Network/ipv6_neighbor.pbi"
+XIncludeFile "Anvil/Network/ipv6_mld.pbi"
+XIncludeFile "Anvil/Network/ipv6_mld_policy.pbi"
+XIncludeFile "Anvil/Network/ipv6_mld_group.pbi"
+Global g.IPv6MldGroupState
+Global q.IPv6MldQueryView
+Global Dim owned.a[1424]
+Global Dim output.a[1500]
+Procedure Save(index.i,rc.i)
+ Define p.i,i.i,busy.i
+ p=$E1C00100+index*4096
+ PokeI(p,rc)
+ busy=0 : If g\awaiting<>0 : busy=1 : EndIf
+ PokeI(p+8,g\joined)
+ PokeI(p+16,g\changeCount)
+ PokeI(p+24,g\changeDue)
+ PokeI(p+32,g\queryDue)
+ PokeI(p+40,g\queryCount)
+ PokeI(p+48,g\lastReporter)
+ PokeI(p+56,busy)
+ PokeI(p+64,g\failed)
+ PokeI(p+72,g\revision)
+ PokeI(p+80,g\version)
+ For i=0 To 1499 : PokeA(p+128+i,output[i]) : Next
+ For i=0 To 1423 : PokeA(p+1728+i,owned[i]) : Next
+EndProcedure
+Procedure.i Main()
+ Define i.i,rc.i,token.i
+ For i=0 To 524287 : PokeA($E1C00000+i,0) : Next
+ PokeI($E1C00000,$4D475231)
+ MmuClearNc() : rc=MmuBuildTables($4F80000) : If rc<>0 : ProcedureReturn 2 : EndIf
+ MmuEnableCached()
+For i=0 To 1499 : output[i]=$A5 : Next
+rc=IPv6MldGroupInit(@g,1,1,2,?Vector0,@owned[0],1424,0)
+ Save(0,rc)
+For i=0 To 1499 : output[i]=$A5 : Next
+rc=IPv6MldGroupChange(@g,1,1,0,1,2)
+ Save(1,rc)
+For i=0 To 1499 : output[i]=$A5 : Next
+rc=IPv6MldGroupStep(@g,1,g\revision,0,?Vector1,@output[0],1500) : token=g\awaiting
+ Save(2,rc)
+For i=0 To 1499 : output[i]=$A5 : Next
+rc=IPv6MldGroupSent(@g,1,g\revision,1,token,0,100)
+ Save(3,rc)
+For i=0 To 1499 : output[i]=$A5 : Next
+rc=IPv6MldGroupStep(@g,1,g\revision,2,?Vector1,@output[0],1500) : token=g\awaiting
+ Save(4,rc)
+For i=0 To 1499 : output[i]=$A5 : Next
+rc=IPv6MldGroupSent(@g,1,1,3,token-1,1,100)
+ Save(5,rc)
+For i=0 To 1499 : output[i]=$A5 : Next
+rc=IPv6MldGroupStep(@g,1,g\revision,3,?Vector1,@output[0],1500) : token=g\awaiting
+ Save(6,rc)
+For i=0 To 1499 : output[i]=$A5 : Next
+rc=IPv6MldGroupSent(@g,1,g\revision,4,token,1,100)
+ Save(7,rc)
+For i=0 To 1499 : output[i]=$A5 : Next
+rc=IPv6MldGroupSent(@g,1,1,5,token,1,100)
+ Save(8,rc)
+For i=0 To 1499 : output[i]=$A5 : Next
+rc=IPv6MldGroupStep(@g,1,g\revision,103,?Vector1,@output[0],1500) : token=g\awaiting
+ Save(9,rc)
+For i=0 To 1499 : output[i]=$A5 : Next
+rc=IPv6MldGroupStep(@g,1,g\revision,104,?Vector1,@output[0],1500) : token=g\awaiting
+ Save(10,rc)
+For i=0 To 1499 : output[i]=$A5 : Next
+rc=IPv6MldGroupChange(@g,1,1,105,0,2)
+ Save(11,rc)
+For i=0 To 1499 : output[i]=$A5 : Next
+rc=IPv6MldGroupSent(@g,1,g\revision,106,token,1,100)
+ Save(12,rc)
+For i=0 To 1499 : output[i]=$A5 : Next
+rc=IPv6MldGroupStep(@g,1,g\revision,107,?Vector1,@output[0],1500) : token=g\awaiting
+ Save(13,rc)
+For i=0 To 1499 : output[i]=$A5 : Next
+rc=IPv6MldGroupSent(@g,1,g\revision,108,token,1,100)
+ Save(14,rc)
+For i=0 To 1499 : output[i]=$A5 : Next
+rc=IPv6MldGroupChange(@g,1,1,109,1,2)
+ Save(15,rc)
+For i=0 To 1499 : output[i]=$A5 : Next
+rc=IPv6MldGroupStep(@g,1,g\revision,110,?Vector1,@output[0],1500) : token=g\awaiting
+ Save(16,rc)
+For i=0 To 1499 : output[i]=$A5 : Next
+rc=IPv6MldGroupSent(@g,1,g\revision,111,token,1,100)
+ Save(17,rc)
+For i=0 To 1499 : output[i]=$A5 : Next
+rc=IPv6MldGroupStep(@g,1,g\revision,211,?Vector1,@output[0],1500) : token=g\awaiting
+ Save(18,rc)
+For i=0 To 1499 : output[i]=$A5 : Next
+rc=IPv6MldGroupSent(@g,1,g\revision,212,token,1,100)
+ Save(19,rc)
+For i=0 To 1499 : output[i]=$A5 : Next
+q\group=?Vector0 : q\sourceCount=2 : q\sources=?Vector4 : q\maxDelay=1000 : rc=IPv6MldGroupQuery(@g,1,g\revision,220,@q,10)
+ Save(20,rc)
+For i=0 To 1499 : output[i]=$A5 : Next
+rc=IPv6MldGroupStep(@g,1,g\revision,229,?Vector1,@output[0],1500) : token=g\awaiting
+ Save(21,rc)
+For i=0 To 1499 : output[i]=$A5 : Next
+rc=IPv6MldGroupStep(@g,1,g\revision,230,?Vector1,@output[0],1500) : token=g\awaiting
+ Save(22,rc)
+For i=0 To 1499 : output[i]=$A5 : Next
+q\group=?Vector0 : q\sourceCount=2 : q\sources=?Vector5 : q\maxDelay=1000 : rc=IPv6MldGroupQuery(@g,1,g\revision,231,@q,20)
+ Save(23,rc)
+For i=0 To 1499 : output[i]=$A5 : Next
+rc=IPv6MldGroupSent(@g,1,g\revision,232,token,1,100)
+ Save(24,rc)
+For i=0 To 1499 : output[i]=$A5 : Next
+rc=IPv6MldGroupStep(@g,1,g\revision,233,?Vector1,@output[0],1500) : token=g\awaiting
+ Save(25,rc)
+For i=0 To 1499 : output[i]=$A5 : Next
+rc=IPv6MldGroupSent(@g,1,g\revision,234,token,1,100)
+ Save(26,rc)
+For i=0 To 1499 : output[i]=$A5 : Next
+q\group=?Vector2 : q\sourceCount=0 : q\sources=0 : q\maxDelay=1000 : rc=IPv6MldGroupQuery(@g,1,g\revision,240,@q,50)
+ Save(27,rc)
+For i=0 To 1499 : output[i]=$A5 : Next
+q\group=?Vector0 : q\sourceCount=1 : q\sources=?Vector6 : q\maxDelay=1000 : rc=IPv6MldGroupQuery(@g,1,g\revision,241,@q,10)
+ Save(28,rc)
+For i=0 To 1499 : output[i]=$A5 : Next
+rc=IPv6MldGroupStep(@g,1,g\revision,250,?Vector1,@output[0],1500) : token=g\awaiting
+ Save(29,rc)
+For i=0 To 1499 : output[i]=$A5 : Next
+rc=IPv6MldGroupStep(@g,1,g\revision,251,?Vector1,@output[0],1500) : token=g\awaiting
+ Save(30,rc)
+For i=0 To 1499 : output[i]=$A5 : Next
+rc=IPv6MldGroupSent(@g,1,g\revision,252,token,1,100)
+ Save(31,rc)
+For i=0 To 1499 : output[i]=$A5 : Next
+q\group=?Vector0 : q\sourceCount=0 : q\sources=0 : q\maxDelay=1000 : rc=IPv6MldGroupQuery(@g,1,g\revision,260,@q,0)
+ Save(32,rc)
+For i=0 To 1499 : output[i]=$A5 : Next
+rc=IPv6MldGroupSync(@g,1,2,1,270)
+ Save(33,rc)
+For i=0 To 1499 : output[i]=$A5 : Next
+rc=IPv6MldGroupChange(@g,1,2,271,0,2)
+ Save(34,rc)
+For i=0 To 1499 : output[i]=$A5 : Next
+rc=IPv6MldGroupStep(@g,1,g\revision,271,?Vector1,@output[0],1500) : token=g\awaiting
+ Save(35,rc)
+For i=0 To 1499 : output[i]=$A5 : Next
+rc=IPv6MldGroupSent(@g,1,g\revision,271,token,1,1000)
+ Save(36,rc)
+For i=0 To 1499 : output[i]=$A5 : Next
+rc=IPv6MldGroupChange(@g,1,2,272,1,2)
+ Save(37,rc)
+For i=0 To 1499 : output[i]=$A5 : Next
+rc=IPv6MldGroupStep(@g,1,g\revision,273,?Vector1,@output[0],1500) : token=g\awaiting
+ Save(38,rc)
+For i=0 To 1499 : output[i]=$A5 : Next
+rc=IPv6MldGroupSent(@g,1,g\revision,274,token,1,1000)
+ Save(39,rc)
+For i=0 To 1499 : output[i]=$A5 : Next
+rc=IPv6MldGroupHeardV1(@g,1,2,275)
+ Save(40,rc)
+For i=0 To 1499 : output[i]=$A5 : Next
+q\group=?Vector0 : q\sourceCount=2 : q\sources=?Vector7 : q\maxDelay=1000 : rc=IPv6MldGroupQuery(@g,1,g\revision,276,@q,5)
+ Save(41,rc)
+For i=0 To 1499 : output[i]=$A5 : Next
+rc=IPv6MldGroupStep(@g,1,g\revision,281,?Vector1,@output[0],1500) : token=g\awaiting
+ Save(42,rc)
+For i=0 To 1499 : output[i]=$A5 : Next
+rc=IPv6MldGroupSync(@g,1,3,2,282)
+ Save(43,rc)
+For i=0 To 1499 : output[i]=$A5 : Next
+rc=IPv6MldGroupSent(@g,1,2,283,token,1,100)
+ Save(44,rc)
+For i=0 To 1499 : output[i]=$A5 : Next
+rc=IPv6MldGroupChange(@g,1,3,284,0,2)
+ Save(45,rc)
+For i=0 To 1499 : output[i]=$A5 : Next
+rc=IPv6MldGroupStep(@g,1,g\revision,285,?Vector1,@output[0],1500) : token=g\awaiting
+ Save(46,rc)
+For i=0 To 1499 : output[i]=$A5 : Next
+rc=IPv6MldGroupSent(@g,1,g\revision,286,token,-1,100)
+ Save(47,rc)
+For i=0 To 1499 : output[i]=$A5 : Next
+rc=IPv6MldGroupStep(@g,1,g\revision,287,?Vector1,@output[0],1500) : token=g\awaiting
+ Save(48,rc)
+For i=0 To 1499 : output[i]=$A5 : Next
+rc=IPv6MldGroupInit(@g,2,1,2,?Vector0,@owned[0],32,0)
+ Save(49,rc)
+For i=0 To 1499 : output[i]=$A5 : Next
+rc=IPv6MldGroupChange(@g,2,1,0,1,2)
+ Save(50,rc)
+For i=0 To 1499 : output[i]=$A5 : Next
+rc=IPv6MldGroupStep(@g,2,1,1,?Vector1,@g,100)
+ Save(51,rc)
+For i=0 To 1499 : output[i]=$A5 : Next
+rc=IPv6MldGroupQuery(@g,2,1,1,@g,1)
+ Save(52,rc)
+For i=0 To 1499 : output[i]=$A5 : Next
+q\group=?Vector0 : q\maxDelay=1000 : q\sourceCount=2 : q\sources=?Vector3 : rc=IPv6MldGroupQuery(@g,2,1,1,@q,10)
+ Save(53,rc)
+For i=0 To 1499 : output[i]=$A5 : Next
+q\sourceCount=1 : q\sources=?Vector3+32 : rc=IPv6MldGroupQuery(@g,2,1,2,@q,1)
+ Save(54,rc)
+For i=0 To 1499 : output[i]=$A5 : Next
+rc=IPv6MldGroupChange(@g,2,1,0,0,2)
+ Save(55,rc)
+For i=0 To 1499 : output[i]=$A5 : Next
+rc=IPv6MldGroupChange(@g,1,1,2,0,2)
+ Save(56,rc)
+ PokeI($E1C00008,57)
+ MmuDisableCachedFlushed()
+ ProcedureReturn 0
+EndProcedure
+DataSection
+Vector0:
+ Data.a 255,2,0,0,0,0,0,0,0,0,0,1,255,0,18,52
+Vector1:
+ Data.a 254,128,0,0,0,0,0,0,0,0,0,0,0,0,18,52
+Vector2:
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+Vector3:
+ Data.a 32,1,13,184,0,0,0,0,0,0,0,0,0,0,0,1,32,1,13,184,0,0,0,0
+ Data.a 0,0,0,0,0,0,0,2,32,1,13,184,0,0,0,0,0,0,0,0,0,0,0,3
+Vector4:
+ Data.a 32,1,13,184,0,0,0,0,0,0,0,0,0,0,0,1,32,1,13,184,0,0,0,0
+ Data.a 0,0,0,0,0,0,0,2
+Vector5:
+ Data.a 32,1,13,184,0,0,0,0,0,0,0,0,0,0,0,2,32,1,13,184,0,0,0,0
+ Data.a 0,0,0,0,0,0,0,3
+Vector6:
+ Data.a 32,1,13,184,0,0,0,0,0,0,0,0,0,0,0,1
+Vector7:
+ Data.a 32,1,13,184,0,0,0,0,0,0,0,0,0,0,0,1,32,1,13,184,0,0,0,0
+ Data.a 0,0,0,0,0,0,0,2
+EndDataSection
