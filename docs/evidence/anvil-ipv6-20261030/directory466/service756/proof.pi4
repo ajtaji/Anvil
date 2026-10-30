@@ -1,0 +1,107 @@
+#WEB_KERNEL_BINDING=0
+XIncludeFile "Anvil/Core/crc_constants.pbi"
+XIncludeFile "Anvil/Core/crc.pbi"
+XIncludeFile "Anvil/Network/web_url.pbi"
+XIncludeFile "Anvil/Network/web_request.pbi"
+XIncludeFile "Anvil/Network/web_response.pbi"
+XIncludeFile "Anvil/Network/web_transport.pbi"
+XIncludeFile "Anvil/Network/web_client.pbi"
+XIncludeFile "Anvil/Network/web_inflate.pbi"
+XIncludeFile "Anvil/Network/web_content.pbi"
+XIncludeFile "Anvil/Network/web_content_response.pbi"
+XIncludeFile "RaspberryPi4/Lib/mmu.pi4"
+Global u.WebUrl,q.WebRequest,a.WebResponse,client.WebClient,content.WebContent
+Global Dim host.a[256]
+Global Dim target.a[3072]
+Global Dim qh.a[1024]
+Global Dim ah.a[4096]
+Global Dim line.a[1024]
+Global Dim tx.a[512]
+Global Dim rx.a[512]
+Global Dim encoded.a[128]
+Global Dim decoded.a[128]
+Global Dim history.a[32768]
+Global Dim workspace.i[1376]
+Global *wirePet,*wireTime
+Global wtable.i
+Procedure CaptureTable()
+ ASM
+ adrp x1, global_wtable
+ add x1, x1, #:lo12:global_wtable
+ str x0, [x1]
+ EndASM
+EndProcedure
+Procedure Run(index.i,url.i,bytes.i)
+ Define rc.i,start.i,p.i,i.i,out.i,httpRc.i,ready.i,encLen.i,encOff.i,steps.i,cap.i,began.i,duration.i,startCost.i,stepCost.i,serviceCost.i,decodeCost.i,lastState.i,nextState.i,slot.i
+ p=$E1C00100+index*4096
+ For i=0 To 4095 : PokeA(p+i,0) : Next
+ u\host=@host[0] : u\hostCapacity=256 : u\target=@target[0] : u\targetCapacity=3072
+ rc=WebUrlParse(url,bytes,1,@u)
+ If rc=0 : rc=WebRequestInit(@q,@u,"GET",3,0,1,@qh[0],1024) : EndIf
+ If rc=0 : rc=WebRequestHeader(@q,"User-Agent",10,"Anvil",5) : EndIf
+ If rc=0 : rc=WebRequestHeader(@q,"Accept-Encoding",15,"gzip, deflate",13) : EndIf
+ If rc=0 : rc=WebRequestFinishHeaders(@q) : EndIf
+ If rc=0 : rc=WebResponseInit(@a,@line[0],1024,@ah[0],4096,0) : EndIf
+ start=wireTime()/1000
+ began=wireTime()
+ If rc=0 : rc=WebClientStart(@client,@u,@q,@a,@tx[0],512,@rx[0],512,start,20000) : EndIf
+ startCost=wireTime()-began
+ lastState=1
+ While rc=0
+  wirePet() : began=wireTime() : WebPayloadService(1)
+  duration=wireTime()-began : If duration>serviceCost : serviceCost=duration : EndIf
+  slot=p+128+lastState*16
+  If lastState>=1 And lastState<=5
+   If duration>PeekI(slot) : PokeI(slot,duration) : EndIf
+  EndIf
+  began=wireTime() : nextState=webpTlsState(client\connection\handle) : duration=wireTime()-began
+  If lastState>=1 And lastState<=5
+   If duration>PeekI(slot+8) : PokeI(slot+8,duration) : EndIf
+  EndIf
+  lastState=nextState
+  If encOff=encLen And httpRc<>1
+   encOff=0
+   began=wireTime()
+   httpRc=WebClientStep(@client,0,0,1,@encoded[0],128,wireTime()/1000)
+   duration=wireTime()-began : If duration>stepCost : stepCost=duration : EndIf
+   encLen=client\written
+   If httpRc<0 : rc=httpRc : Break : EndIf
+  EndIf
+  If ready=0 And a\state>=#WEB_RESPONSE_LENGTH
+   rc=WebContentFromResponse(@content,@a,@history[0],32768,@workspace[0],11008,65536)
+   If rc<0 : Break : EndIf
+   ready=1
+  EndIf
+  If ready
+   cap=17 : If steps % 3=0 : cap=0 : EndIf
+   began=wireTime()
+   rc=WebContentFeed(@content,@encoded[encOff],encLen-encOff,Bool(httpRc=1),@decoded[0],cap)
+   duration=wireTime()-began : If duration>decodeCost : decodeCost=duration : EndIf
+   encOff=encOff+content\consumed
+   For i=0 To content\written-1 : If out<2048 : PokeA(p+1024+out,decoded[i]) : EndIf : out=out+1 : Next
+  EndIf
+  steps=steps+1
+  If wireTime()/1000-start>20000 : rc=-552 : Break : EndIf
+ Wend
+ PokeI(p,rc) : PokeI(p+8,a\status) : PokeI(p+16,content\mode) : PokeI(p+24,out) : PokeI(p+32,wireTime()/1000-start)
+ PokeI(p+40,a\bodyBytes) : PokeI(p+48,content\members) : PokeI(p+56,steps)
+ PokeI(p+64,startCost) : PokeI(p+72,stepCost) : PokeI(p+80,serviceCost) : PokeI(p+88,decodeCost)
+ WebClientClose(@client)
+EndProcedure
+Procedure.i Main()
+ Define i.i,rc.i
+ CaptureTable()
+ For i=0 To 16383 : PokeA($E1C00000+i,$A5) : Next
+ PokeI($E1C00000,$57434431)
+ rc=WebPayloadBind(wtable) : PokeI($E1C00010,rc)
+ If rc<>0 : ProcedureReturn 1 : EndIf
+ *wirePet=PeekI(wtable+16+6*8) : *wireTime=PeekI(wtable+16+11*8)
+ MmuClearNc() : MmuAddNc($08A00000,$09200000) : MmuAddNc($08100000,$08180000)
+ rc=MmuBuildTables($4F80000) : If rc<>0 : ProcedureReturn 2 : EndIf
+ MmuEnableCached()
+ Run(0,"https://httpbingo.org/gzip",26)
+ Run(1,"https://httpbingo.org/deflate",29)
+ PokeI($E1C00008,2)
+ MmuDisableCachedFlushed()
+ ProcedureReturn 0
+EndProcedure

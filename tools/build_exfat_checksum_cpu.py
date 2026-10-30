@@ -159,6 +159,52 @@ Procedure ValidationRow(index.i)
  exfat_DropCaches() : t=A64CounterReadOrdered() : rc=exfat_ValidateUpcase()
  PokeI(p+8,rc) : PokeI(p+24,A64CounterReadOrdered()-t)
 EndProcedure
+Procedure.i ProofPartialDirectoryWrite(lba.i,count.i,dst.i)
+ PokeA(@gateDisk[0]+lba*512,166) : ProcedureReturn 0
+EndProcedure
+Procedure.i ProofDirectoryCache()
+ Define i.i,base.i,before.i,rc.i
+ GateFormat() : ExFatSetRangeReader(@GateReader) : ExFatSetRangeWriter(@GateWriter)
+ If ExFatMount(1)=0 : ProcedureReturn 1 : EndIf
+ exfat_sectorsPerCluster=8 : exfat_blocksPerCluster=8 : exfat_bytesPerCluster=4096 : exfat_clusterCount=128
+ base=exfat_partLba+exfat_heapOffset
+ For i=0 To 12287 : PokeA(@gateDisk[0]+base*512+i,(i/512) & 255) : Next
+ exfat_DropCaches()
+ If exfat_DirRead(2,2,8192,0,@gateRead[0])=0 Or gateRead[0]<>0 : ProcedureReturn 2 : EndIf
+ If exfat_DirRead(3,2,4096,0,@gateRead[0])=0 Or gateRead[0]<>8 : ProcedureReturn 3 : EndIf
+ If exfat_StreamRead(4,2,4096,0,@gateBig[0],512)<>512 : ProcedureReturn 4 : EndIf
+ before=gateReads
+ If exfat_DirRead(2,2,8192,0,@gateRead[0])=0 Or gateRead[0]<>0 : ProcedureReturn 5 : EndIf
+ If exfat_DirRead(3,2,4096,0,@gateRead[0])=0 Or gateRead[0]<>8 Or gateReads<>before : ProcedureReturn 6 : EndIf
+ If exfat_DirRead(2,0,8192,0,@gateRead[0])=0 Or gateReads<=before : ProcedureReturn 7 : EndIf
+ before=gateReads
+ If exfat_DirRead(2,2,512,0,@gateRead[0])=0 Or gateReads<=before : ProcedureReturn 8 : EndIf
+ If exfat_DirRead(2,2,512,16,@gateRead[0])<>0 Or ExFatLastError()<>#EXFAT_E_BOUNDS : ProcedureReturn 9 : EndIf
+ If exfat_DirRead(2,2,8192,255,@gateRead[0])=0 Or gateRead[0]<>15 : ProcedureReturn 10 : EndIf
+ If exfat_DirRead(2,2,8192,0,0)<>0 : ProcedureReturn 11 : EndIf
+ If exfat_SetFatEntry(2,3)=0 Or exfat_FlushFat()=0 : ProcedureReturn 20 : EndIf
+ If exfat_DirRead(2,0,8192,128,@gateRead[0])=0 Or gateRead[0]<>8 : ProcedureReturn 21 : EndIf
+ before=gateWrites
+ If exfat_SetFatEntry(2,4)=0 Or gateWrites<>before : ProcedureReturn 22 : EndIf
+ If exfat_DirRead(2,0,8192,128,@gateRead[0])=0 Or gateRead[0]<>16 : ProcedureReturn 23 : EndIf
+ ExFatSetRangeWriter(0)
+ If exfat_DirRead(2,0,8192,128,@gateRead[0])=0 Or gateRead[0]<>8 : ProcedureReturn 24 : EndIf
+ ExFatSetRangeWriter(@GateWriter)
+ PokeA(@gateDisk[0]+base*512,88) : ExFatSetRangeReader(@GateReader)
+ If exfat_DirRead(2,2,8192,0,@gateRead[0])=0 Or gateRead[0]<>88 : ProcedureReturn 12 : EndIf
+ exfat_Copy(@gateBig[0],@gateDisk[0]+base*512,512) : gateBig[0]=123
+ If exfat_WriteBlocks(base,1,@gateBig[0])=0 : ProcedureReturn 13 : EndIf
+ If exfat_DirRead(2,2,8192,0,@gateRead[0])=0 Or gateRead[0]<>123 : ProcedureReturn 14 : EndIf
+ ExFatSetRangeWriter(@ProofPartialDirectoryWrite)
+ If exfat_WriteBlocks(base,1,@gateBig[0])<>0 : ProcedureReturn 15 : EndIf
+ If exfat_DirRead(2,2,8192,0,@gateRead[0])=0 Or (gateRead[0] & 255)<>166 : ProcedureReturn 16 : EndIf
+ exfat_DropCaches() : exfat_error=0 : exfat_dirty=1 : exfat_ioFailed=0 : gateFailLba=base+1
+ If exfat_DirRead(2,2,8192,0,@gateRead[0])=0 Or (gateRead[0] & 255)<>166 : ProcedureReturn 17 : EndIf
+ If exfat_error<>0 Or exfat_ioFailed<>0 : ProcedureReturn 18 : EndIf
+ If exfat_DirRead(2,2,8192,16,@gateRead[0])<>0 Or exfat_ioFailed<>1 : ProcedureReturn 19 : EndIf
+ gateFailLba=-1 : exfat_dirty=0 : exfat_ioFailed=0 : ExFatSetRangeWriter(0)
+ ProcedureReturn 0
+EndProcedure
 Global profileTestClock.i
 Procedure.i ProofProfileClock()
  profileTestClock=profileTestClock+10 : ProcedureReturn profileTestClock
@@ -168,7 +214,7 @@ Procedure.i Main()
  For i=0 To 65535 : PokeA($E1C00000+i,0) : Next
  MmuClearNc() : rc=MmuBuildTables($4F80000) : If rc<>0 : ProcedureReturn 9999 : EndIf
  MmuEnableCached()
- PokeI($E1C00000,$58464332)
+ PokeI($E1C00000,$58464333)
  PokeI($E1C00040,ExFatProfileBegin())
  ExFatProfileSetClock(@ProofProfileClock)
  start=ExFatProfileBegin() : ExFatProfileEnd(0,start)
@@ -181,6 +227,8 @@ Procedure.i Main()
  PokeI($E1C00068,ExFatProfileValue(7,0))
  rc=GateMain() : PokeI($E1C00008,rc)
  If rc<>0 : MmuDisableCachedFlushed() : ProcedureReturn rc : EndIf
+ rc=ProofDirectoryCache() : PokeI($E1C00080,rc)
+ If rc<>0 : MmuDisableCachedFlushed() : ProcedureReturn 9500+rc : EndIf
  GateFormat() : ExFatSetRangeReader(@GateReader) : ExFatSetRangeWriter(0)
  rc=ExFatMount(1) : If rc=0 : MmuDisableCachedFlushed() : ProcedureReturn 9000+ExFatLastError() : EndIf
  For i=10 To 73 : exfat_Put32(@gateDisk[0]+25*512,i*4,i+1) : Next

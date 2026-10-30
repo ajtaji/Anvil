@@ -204,9 +204,23 @@ Global exfat_fatDirty.i
 Global Dim exfat_bmpSector.a[#EXFAT_MAX_SECTOR]
 Global exfat_bmpTag.i = -1
 Global exfat_bmpDirty.i
+; Two bounded directory windows survive intervening file reads. Writes,
+; mounts and reader changes invalidate both before cached metadata is reused.
+#EXFAT_DIR_WINDOW = 4096
+Global Dim exfat_dcacheData.a[2*#EXFAT_DIR_WINDOW]
+Global Dim exfat_dcacheFirst.i[2]
+Global Dim exfat_dcacheFlags.i[2]
+Global Dim exfat_dcacheLength.i[2]
+Global Dim exfat_dcacheOffset.i[2]
+Global Dim exfat_dcacheCount.i[2]
+Global exfat_dcacheNext.i
+Procedure exfat_DropDirectoryCache()
+ exfat_dcacheCount[0]=0 : exfat_dcacheCount[1]=0 : exfat_dcacheNext=0
+EndProcedure
 Declare.i exfat_FlushMeta()
 
 Procedure exfat_DropCaches()
+  exfat_DropDirectoryCache()
   exfat_rcacheSector = -1
   exfat_fatTag = -1
   exfat_fatDirty = 0
@@ -288,6 +302,7 @@ EndProcedure
 
 Procedure ExFatSetRangeWriter(address.i)
   If address = 0
+    exfat_DropDirectoryCache() ; discarded FAT edits also discard their logical mappings
     ; Unwritten FAT and bitmap changes can only exist after a failure, and
     ; with no writer they could never reach the medium.
     exfat_fatDirty = 0
@@ -346,7 +361,8 @@ Procedure.i exfat_WriteBlocks(lba.i, count.i, *src)
     ProcedureReturn exfat_Fail(#EXFAT_E_BOUNDS)
   EndIf
   exfat_lastLba = lba
-  ; The read cache cannot describe a sector once anything has been written.
+  ; The read caches cannot describe metadata after any write attempt.
+  exfat_DropDirectoryCache()
   exfat_rcacheSector = -1
   If exfat_writer(lba, count, *src) = 0
     exfat_ioFailed = 1
@@ -466,6 +482,7 @@ Procedure.i exfat_SetFatEntry(cluster.i, value.i)
     ProcedureReturn 0
   EndIf
   exfat_Put32(@exfat_fatSector[0], off, value)
+  exfat_DropDirectoryCache() ; buffered FAT edits can change a directory mapping
   exfat_fatDirty = 1
   ProcedureReturn 1
 EndProcedure
@@ -1112,8 +1129,8 @@ Procedure.i exfat_StreamByte(first.i, flags.i, length.i, offset.i)
 EndProcedure
 
 Procedure.i exfat_DirRead(first.i, flags.i, length.i, index.i, *dst)
-  Define maxBytes.i
-  Define got.i
+  Define maxBytes.i,got.i,offset.i,slot.i,width.i,at.i,take.i
+  Define savedError.i,savedIo.i,savedLba.i
   If index < 0 Or index >= 8388608
     ProcedureReturn exfat_Fail(#EXFAT_E_BOUNDS)
   EndIf
@@ -1122,13 +1139,37 @@ Procedure.i exfat_DirRead(first.i, flags.i, length.i, index.i, *dst)
   Else
     maxBytes = length
   EndIf
-  If index * 32 >= maxBytes
-    ProcedureReturn exfat_Fail(#EXFAT_E_BOUNDS)
+  offset=index*32
+  If offset >= maxBytes : ProcedureReturn exfat_Fail(#EXFAT_E_BOUNDS) : EndIf
+  If *dst=0 : ProcedureReturn exfat_Fail(#EXFAT_E_CHAIN) : EndIf
+  For slot=0 To 1
+    If exfat_dcacheCount[slot]>0 And exfat_dcacheFirst[slot]=first And exfat_dcacheFlags[slot]=flags And exfat_dcacheLength[slot]=maxBytes
+      If offset>=exfat_dcacheOffset[slot] And offset+32<=exfat_dcacheOffset[slot]+exfat_dcacheCount[slot]
+        exfat_Copy(*dst,@exfat_dcacheData[slot*#EXFAT_DIR_WINDOW]+offset-exfat_dcacheOffset[slot],32)
+        ProcedureReturn 1
+      EndIf
+    EndIf
+  Next
+  ; Never speculate past a cluster boundary or the declared stream length.
+  width=exfat_bytesPerCluster : If width>#EXFAT_DIR_WINDOW : width=#EXFAT_DIR_WINDOW : EndIf
+  If width>=32 And maxBytes-offset>=32
+    at=(offset/width)*width : take=width
+    If take>maxBytes-at : take=maxBytes-at : EndIf
+    slot=exfat_dcacheNext : exfat_dcacheCount[slot]=0
+    savedError=exfat_error : savedIo=exfat_ioFailed : savedLba=exfat_lastLba
+    got=exfat_StreamRead(first,flags,maxBytes,at,@exfat_dcacheData[slot*#EXFAT_DIR_WINDOW],take)
+    If got=take
+      exfat_dcacheFirst[slot]=first : exfat_dcacheFlags[slot]=flags : exfat_dcacheLength[slot]=maxBytes
+      exfat_dcacheOffset[slot]=at : exfat_dcacheCount[slot]=take : exfat_dcacheNext=1-slot
+      exfat_Copy(*dst,@exfat_dcacheData[slot*#EXFAT_DIR_WINDOW]+offset-at,32)
+      ProcedureReturn 1
+    EndIf
+    ; Optional read-ahead must not make an otherwise readable entry fail.
+    ; Retry only the requested entry with the original error/dirty state.
+    exfat_error=savedError : exfat_ioFailed=savedIo : exfat_lastLba=savedLba
   EndIf
-  got = exfat_StreamRead(first, flags, maxBytes, index * 32, *dst, 32)
-  If got <> 32
-    ProcedureReturn exfat_Fail(#EXFAT_E_CHAIN)
-  EndIf
+  got = exfat_StreamRead(first, flags, maxBytes, offset, *dst, 32)
+  If got <> 32 : ProcedureReturn exfat_Fail(#EXFAT_E_CHAIN) : EndIf
   ProcedureReturn 1
 EndProcedure
 

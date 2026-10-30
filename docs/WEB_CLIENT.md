@@ -1959,3 +1959,50 @@ The trace identifies repeated directory reads and boot metadata work as further
 optimization targets. No validation was removed, and the initial filesystem
 open remains synchronous. Networking and the previously listed remaining
 protocol work are not complete.
+
+
+### Directory reuse during bounded root reads (build466)
+
+The shared exFAT driver now retains two 4 KiB directory windows independently
+of the file-data sector cache. This avoids fetching the same directory entries
+again when the root loader reopens its file after each bounded read. No shared
+file handle is held across a yield. Mounts, reader changes, writes (including
+failed writes), buffered FAT changes and discarded FAT edits invalidate the
+windows. Directory checks and stream bounds remain enforced. Read-ahead stays
+within a cluster; failure in an unrequested sector falls back to the original
+single-entry read, preserving its error behavior.
+
+The identical cold HTTPS probe on the physical Pi 4 measured:
+
+| Measurement | Build465 | Build466 |
+| --- | ---: | ---: |
+| 47 path lookups, total | 53.699 ms | 8.227 ms |
+| Mean path lookup | 1.143 ms | 0.175 ms |
+| System-directory scan | 0.829 ms | 0.536 ms |
+| Cold root open, maximum | 4.967 ms | 3.853 ms |
+| Whole network service, maximum | 5.113 ms | 4.023 ms |
+
+These are individual cold-run observations, not worst-case guarantees. Stage
+count/total differences exclude startup activity. Boot validation still took
+1.373 ms and the initial open remains synchronous; TLS blocking is not finished.
+
+The first post-restart probe was correctly refused with SVC_ESTATE because SNTP
+had timed out and the clock contained only an untrusted restored floor. It did
+not exercise root loading and is retained as a failed probe, not a performance
+sample. A requested SNTP synchronization established network time, after which
+certificate-verified public HTTPS gzip/deflate content checks passed. Temporary
+DNS overrides were removed. No certificate or time checks were bypassed.
+
+Physical RAM tests passed the full filesystem regression, 28 checksum lengths,
+clock diagnostics, cache hits across intervening file reads, key separation,
+boundaries, reader rebinding, successful and partial failed writes, buffered
+FAT remapping/discard, and both optional and required read failures. Build466
+was installed and its full running-image hash verified after the full boot and
+readiness interval; cores, fonts, Vulkan and watchdog checks passed. Build465
+is retained as rollback. Pi3build80 compiles the same shared implementation;
+physical Pi3 execution was not tested. Evidence, including the refused first
+probe and successful synchronized rerun:
+`docs/evidence/anvil-ipv6-20261030/directory466`.
+
+Remaining IPv6/off-link/PMTU and DNS transport work, HTTP/2-3 and managed-cookie
+policy remain open alongside the synchronous first-open work.
