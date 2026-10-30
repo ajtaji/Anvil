@@ -1250,3 +1250,36 @@ output on refusal were checked independently. Anvil 441 returned normally,
 cores/fonts/Vulkan healthy. These controls are not yet composed into the monitor
 or exercised against the live radio; resident ownership and generation-aware
 integration remain before IPv6 web traffic is available.
+
+
+## Resident IPv6 link-local service: live Wi-Fi qualification
+
+Anvil 444 now composes a shared host lifecycle and resident service with the
+CYW43 multicast adapter. The adapter preserves existing multicast memberships,
+adds all-nodes and solicited-node filters, verifies readback, then disables and
+checks firmware neighbor offload. IPv4 ARP offload remains unchanged.
+The host waits for a confirmed membership-report transmission before starting
+randomized duplicate-address detection. Generation changes discard stale
+receipts. Query sources and pending state remain in owned storage; receive
+callbacks never configure the radio or recursively pump receive traffic.
+
+The shared host lifecycle passed 40 physical Pi CPU cases, including pending,
+unsent and stale completions, DAD conflicts, version changes, time bounds and
+exact echo/neighbor reply bytes. The installed build 444 was checked against
+its full image SHA-256 after a 90-second boot interval. Its live Wi-Fi address
+answered all four Windows IPv6 link-local pings, with no loss (69-109 ms).
+The IPv4 console, cores, font slots and Vulkan remained healthy.
+
+The implementation is shared; Pi 4/5 composition enables the CYW43 adapter.
+Pi 3 build 61 compiles the composition but does not activate it without a
+resident entropy provider. Other link drivers still need multicast-filter
+adapters. This is link-local neighbor discovery and echo, not IPv6 web access:
+router discovery, routed addressing and TCP integration remain open, alongside
+remaining TLS waits and HTTP/2-3. The verified build 441 recovery image is
+retained on the Pi boot volume.
+
+The final source exposes shared validation helpers through named public APIs.
+Its rebuilt 40-case qualification image is byte-identical to the tested image.
+Full monitor build 445 differs from installed 444 only in fourteen MOVZ
+instructions carrying build-number/time constants (21 bytes); no protocol
+code changed. Build 445 was compiled and compared, not installed.

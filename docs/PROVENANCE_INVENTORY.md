@@ -1558,3 +1558,6 @@ text is unchanged; no new board execution or boot claim follows.
 
 | `Anvil/Net/cyw43_multicast.pbi` | interface-facts | broadcom-brcmfmac | ISC | firmware iovar shapes only; independently implemented |
 | `Anvil/Net/cyw43_multicast.pbi` | interface-facts | linux-v6.12 | GPL-2.0 (per file) | firmware iovar shapes only; independently implemented |
+
+| `Anvil/Network/ipv6_host.pbi` | protocol-facts | ietf-rfc | IETF specification | independent lifecycle composition; cite specifications |
+| `Anvil/Core/ipv6_service.pbi` | protocol-facts | ietf-rfc | IETF specification | modified EUI-64 address facts; independent implementation |

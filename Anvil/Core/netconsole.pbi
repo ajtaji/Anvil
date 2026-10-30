@@ -1208,6 +1208,12 @@ Procedure NetDhcpLinkDown(kind.i)
   EndIf
 EndProcedure
 
+Global *gNetProtocolTickHook=0
+Global gNetProtocolTickBusy.i
+Procedure NetSetProtocolTickHook(*fn)
+ If gNetProtocolTickBusy=0 : *gNetProtocolTickHook=*fn : EndIf
+EndProcedure
+
 Procedure NetDhcpTick()
   Define kind.i
   Define state.i
@@ -1321,6 +1327,11 @@ Procedure NetDhcpTick()
       EndIf
     EndIf
   Next
+  ; Protocol services run after receive spans and DHCP transitions are done.
+  If *gNetProtocolTickHook<>0 And gNetProtocolTickBusy=0
+    gNetProtocolTickBusy=1 : gNetProtocolTickHook() : gNetProtocolTickBusy=0
+  EndIf
+
 EndProcedure
 
 ; Bounded foreground wait used by boot and the `dhcp` command. It advances

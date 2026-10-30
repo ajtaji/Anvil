@@ -1185,7 +1185,7 @@ StackAddress $8000000
 ;      #ANVIL_BUILD = 1        ; pmf:build off
 ;  The IDE's Compiler > Build Number... window writes that word for you.
 ; ======================================================================
-#ANVIL_BUILD = 443        ; pmf:build
+#ANVIL_BUILD = 445        ; pmf:build
 
 ;  The two optional siblings, written by the same successful build. They
 ;  are INTEGERS because `#NAME = <literal>` takes a number and nothing
@@ -1194,7 +1194,7 @@ StackAddress $8000000
 ;  for. YYYYMMDD and HHMMSS read correctly as decimal numbers anyway, and
 ;  CmdVersion() prints them with their separators put back.
 #ANVIL_BUILD_DATE = 20261029   ; pmf:builddate
-#ANVIL_BUILD_TIME = 220253     ; pmf:buildtime
+#ANVIL_BUILD_TIME = 233242     ; pmf:buildtime
 
 ; ======================================================================
 ;  THE LIBRARIES. A library never includes a library - the main file
@@ -2169,6 +2169,17 @@ XIncludeFile "RaspberryPi4/Board/eth.pi4"
 ; (Core/netfmt.pi4) and ArgWord (Core/argfmt.pi4) - are all above.
 XIncludeFile "Anvil/Core/netrecv_cmd.pbi"
 XIncludeFile "Anvil/Core/net_cmd.pbi"
+XIncludeFile "Anvil/Network/ipv6_neighbor.pbi"
+XIncludeFile "Anvil/Network/ipv6_endpoint.pbi"
+XIncludeFile "Anvil/Network/ipv6_mld.pbi"
+XIncludeFile "Anvil/Network/ipv6_mld_policy.pbi"
+XIncludeFile "Anvil/Network/ipv6_mld_group.pbi"
+XIncludeFile "Anvil/Network/ipv6_host.pbi"
+XIncludeFile "Anvil/Net/cyw43_multicast.pbi"
+XIncludeFile "Anvil/Network/link_cyw_ipv6.pbi"
+XIncludeFile "Anvil/Hal/random_service.pbi"
+XIncludeFile "Anvil/Core/ipv6_service.pbi"
+XIncludeFile "Anvil/Core/ipv6_status.pbi"
 XIncludeFile "Anvil/Core/tcp_cmd.pbi"
 XIncludeFile "Anvil/Services/Http/monitor.pbi"
 ; The Pi 4 HwBootEl1 backend (booti/bootm's EL2->EL1 handoff). Comes after
@@ -2921,6 +2932,8 @@ Procedure Main()
     PrintN("TLS arithmetic: synchronous fallback (context backend unavailable).")
   EndIf
   BoardLinkTxInstall()
+  IPv6ServiceBind(@IPv6CywGeneration,@IPv6CywPrepare)
+  NetSetIPv6StatusHook(@IPv6ServiceSay)
   MessagesStart()
   MsgLogStart()                                    ; and every kept line to MSGLOG.TXT on the stick
 

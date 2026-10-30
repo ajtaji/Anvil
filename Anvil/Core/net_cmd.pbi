@@ -92,13 +92,19 @@
 ;  frame leave by" are different questions and merging them is how the
 ;  old single-address report came to be believed.
 ; ----------------------------------------------------------------------
+Global *gNetIPv6StatusHook=0
+Procedure NetSetIPv6StatusHook(*fn)
+ *gNetIPv6StatusHook=*fn
+EndProcedure
+
 Procedure NetSayInterfaces()
   Define k.i
   Define n.i
   Define src.i
+  If *gNetIPv6StatusHook<>0 : gNetIPv6StatusHook() : EndIf
   n = NetIfCount()
   If n = 0
-    PrintN("No interface on this board holds an address, so nothing can reach it")
+    PrintN("No interface on this board holds an IPv4 address, so IPv4 is unavailable")
     PrintN("over the network yet. Put a cable in, or join a wireless network.")
     For k = 1 To #DHCPC_IFS - 1
       If HwLinkHas(k) <> 0

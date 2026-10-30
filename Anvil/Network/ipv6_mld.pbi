@@ -12,12 +12,12 @@ Structure IPv6MldQueryView
  sources.i
  sourceCount.i
 EndStructure
-Procedure.i ipv6mld_Span(p.i,n.i)
+Procedure.i IPv6MldSpanValid(p.i,n.i)
  If p<=0 Or n<=0 : ProcedureReturn 0 : EndIf
  If p>$7FFFFFFFFFFFFFFF-n : ProcedureReturn 0 : EndIf
  ProcedureReturn 1
 EndProcedure
-Procedure.i ipv6mld_LinkLocal(p.i)
+Procedure.i IPv6MldLinkLocal(p.i)
  Define i.i
  If PeekA(p)<>254 Or PeekA(p+1)<>128 : ProcedureReturn 0 : EndIf
  For i=2 To 7
@@ -45,14 +45,14 @@ EndProcedure
 Procedure.i IPv6MldReport(out.i,capacity.i,source.i,group.i,version.i,mode.i)
  Define dst.IPv6AddressStorage
  Define n.i,rc.i,i.i,body.i
- If ipv6mld_Span(out,capacity)=0 Or capacity>1500 : ProcedureReturn #IPV6_MLD_INVALID : EndIf
- If ipv6mld_Span(source,16)=0 Or ipv6mld_Span(group,16)=0 : ProcedureReturn #IPV6_MLD_INVALID : EndIf
+ If IPv6MldSpanValid(out,capacity)=0 Or capacity>1500 : ProcedureReturn #IPV6_MLD_INVALID : EndIf
+ If IPv6MldSpanValid(source,16)=0 Or IPv6MldSpanValid(group,16)=0 : ProcedureReturn #IPV6_MLD_INVALID : EndIf
  If out<source+16 And source<out+capacity : ProcedureReturn #IPV6_MLD_INVALID : EndIf
  If out<group+16 And group<out+capacity : ProcedureReturn #IPV6_MLD_INVALID : EndIf
  If version<>1 And version<>2 : ProcedureReturn #IPV6_MLD_INVALID : EndIf
  If mode<>2 And mode<>3 And mode<>4 : ProcedureReturn #IPV6_MLD_INVALID : EndIf
  If ipv6mld_Group(group)=0 : ProcedureReturn #IPV6_MLD_INVALID : EndIf
- If ipv6mld_LinkLocal(source)=0 And IPv6AddressUnspecified(source)=0 : ProcedureReturn #IPV6_MLD_INVALID : EndIf
+ If IPv6MldLinkLocal(source)=0 And IPv6AddressUnspecified(source)=0 : ProcedureReturn #IPV6_MLD_INVALID : EndIf
  n=24 : If version=2 : n=28 : EndIf
  If capacity<n+48 : ProcedureReturn #IPV6_MLD_INVALID : EndIf
  dst\high=0 : dst\low=0
@@ -86,13 +86,13 @@ EndProcedure
 Procedure.i IPv6MldQuery(packet.i,bytes.i,*query.IPv6MldQueryView)
  Define view.IPv6PacketView
  Define rc.i,at.i,end.i,n.i,kind.i,alerts.i,body.i,version.i,count.i,i.i,delay.i,interval.i
- If ipv6mld_Span(packet,bytes)=0 Or bytes>1500 : ProcedureReturn #IPV6_MLD_INVALID : EndIf
- If ipv6mld_Span(*query,SizeOf(IPv6MldQueryView))=0 : ProcedureReturn #IPV6_MLD_INVALID : EndIf
+ If IPv6MldSpanValid(packet,bytes)=0 Or bytes>1500 : ProcedureReturn #IPV6_MLD_INVALID : EndIf
+ If IPv6MldSpanValid(*query,SizeOf(IPv6MldQueryView))=0 : ProcedureReturn #IPV6_MLD_INVALID : EndIf
  If *query<packet+bytes And packet<*query+SizeOf(IPv6MldQueryView) : ProcedureReturn #IPV6_MLD_INVALID : EndIf
  rc=IPv6PacketParse(packet,bytes,@view)
  If rc<>0 : ProcedureReturn #IPV6_MLD_INVALID : EndIf
  If view\protocol<>58 Or view\hopLimit<>1 Or view\fragmented<>0 : ProcedureReturn #IPV6_MLD_INVALID : EndIf
- If ipv6mld_LinkLocal(view\source)=0 Or PeekA(packet+6)<>0 : ProcedureReturn #IPV6_MLD_INVALID : EndIf
+ If IPv6MldLinkLocal(view\source)=0 Or PeekA(packet+6)<>0 : ProcedureReturn #IPV6_MLD_INVALID : EndIf
  ; Parser has bounded this first Hop-by-Hop header and every option span.
  end=40+(PeekA(packet+41)+1)*8 : at=42 : alerts=0
  While at<end
@@ -146,9 +146,9 @@ EndProcedure
 Procedure.i IPv6MldSourceReport(out.i,capacity.i,source.i,group.i,sources.i,count.i)
  Define i.i,rc.i,n.i,at.i
  If count<1 Or count>89 : ProcedureReturn #IPV6_MLD_INVALID : EndIf
- If ipv6mld_Span(out,capacity)=0 Or capacity>1500 : ProcedureReturn #IPV6_MLD_INVALID : EndIf
+ If IPv6MldSpanValid(out,capacity)=0 Or capacity>1500 : ProcedureReturn #IPV6_MLD_INVALID : EndIf
  If capacity<76+count*16 : ProcedureReturn #IPV6_MLD_INVALID : EndIf
- If ipv6mld_Span(sources,count*16)=0 : ProcedureReturn #IPV6_MLD_INVALID : EndIf
+ If IPv6MldSpanValid(sources,count*16)=0 : ProcedureReturn #IPV6_MLD_INVALID : EndIf
  If out<sources+count*16 And sources<out+capacity : ProcedureReturn #IPV6_MLD_INVALID : EndIf
  For i=0 To count-1
   at=sources+i*16
@@ -180,10 +180,10 @@ EndProcedure
 Procedure.i IPv6MldMergeSources(storage.i,capacity.i,count.i,input.i,added.i)
  Define i.i,j.i,unique.i,found.i,at.i,total.i
  If capacity<16 Or capacity>1424 Or (capacity % 16)<>0 : ProcedureReturn #IPV6_MLD_INVALID : EndIf
- If ipv6mld_Span(storage,capacity)=0 : ProcedureReturn #IPV6_MLD_INVALID : EndIf
+ If IPv6MldSpanValid(storage,capacity)=0 : ProcedureReturn #IPV6_MLD_INVALID : EndIf
  If count<0 Or count>capacity/16 Or added<0 Or added>89 : ProcedureReturn #IPV6_MLD_INVALID : EndIf
  If added>0
-  If ipv6mld_Span(input,added*16)=0 : ProcedureReturn #IPV6_MLD_INVALID : EndIf
+  If IPv6MldSpanValid(input,added*16)=0 : ProcedureReturn #IPV6_MLD_INVALID : EndIf
   If storage<input+added*16 And input<storage+capacity : ProcedureReturn #IPV6_MLD_INVALID : EndIf
  EndIf
  For i=0 To count-1
@@ -229,13 +229,13 @@ EndProcedure
 Procedure.i IPv6MldHeardReport(packet.i,bytes.i,group.i,local.i)
  Define view.IPv6PacketView
  Define at.i,last.i,kind.i,n.i,alerts.i,body.i
- If ipv6mld_Span(packet,bytes)=0 Or bytes>1500 : ProcedureReturn #IPV6_MLD_INVALID : EndIf
- If ipv6mld_Span(group,16)=0 Or ipv6mld_Span(local,16)=0 : ProcedureReturn #IPV6_MLD_INVALID : EndIf
+ If IPv6MldSpanValid(packet,bytes)=0 Or bytes>1500 : ProcedureReturn #IPV6_MLD_INVALID : EndIf
+ If IPv6MldSpanValid(group,16)=0 Or IPv6MldSpanValid(local,16)=0 : ProcedureReturn #IPV6_MLD_INVALID : EndIf
  If ipv6mld_Group(group)=0 : ProcedureReturn #IPV6_MLD_INVALID : EndIf
- If ipv6mld_LinkLocal(local)=0 And IPv6AddressUnspecified(local)=0 : ProcedureReturn #IPV6_MLD_INVALID : EndIf
+ If IPv6MldLinkLocal(local)=0 And IPv6AddressUnspecified(local)=0 : ProcedureReturn #IPV6_MLD_INVALID : EndIf
  If IPv6PacketParse(packet,bytes,@view)<>0 : ProcedureReturn #IPV6_MLD_INVALID : EndIf
  If view\protocol<>58 Or view\hopLimit<>1 Or view\fragmented<>0 : ProcedureReturn #IPV6_MLD_INVALID : EndIf
- If ipv6mld_LinkLocal(view\source)=0 Or PeekA(packet+6)<>0 : ProcedureReturn #IPV6_MLD_INVALID : EndIf
+ If IPv6MldLinkLocal(view\source)=0 Or PeekA(packet+6)<>0 : ProcedureReturn #IPV6_MLD_INVALID : EndIf
  If ipv6mld_SameAddress(view\source,local)<>0 : ProcedureReturn #IPV6_MLD_INVALID : EndIf
  If ipv6mld_SameAddress(view\destination,group)=0 : ProcedureReturn #IPV6_MLD_INVALID : EndIf
  last=40+(PeekA(packet+41)+1)*8 : at=42 : alerts=0

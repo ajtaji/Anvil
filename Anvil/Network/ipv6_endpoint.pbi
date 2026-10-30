@@ -22,7 +22,7 @@ Structure IPv6Endpoint
  mac.q
 EndStructure
 
-Procedure.i ipv6ep_Same(a.i,b.i,n.i)
+Procedure.i IPv6EndpointBytesEqual(a.i,b.i,n.i)
  Define i.i
  For i=0 To n-1
   If PeekA(a+i)<>PeekA(b+i) : ProcedureReturn 0 : EndIf
@@ -36,7 +36,7 @@ Procedure.i ipv6ep_Span(p.i,n.i)
  ProcedureReturn 1
 EndProcedure
 
-Procedure.i ipv6ep_Separate(a.i,an.i,b.i,bn.i)
+Procedure.i IPv6EndpointSpansSeparate(a.i,an.i,b.i,bn.i)
  If a<b+bn And b<a+an : ProcedureReturn 0 : EndIf
  ProcedureReturn 1
 EndProcedure
@@ -46,8 +46,8 @@ Procedure.i IPv6EndpointInit(*ep.IPv6Endpoint,generation.i,address.i,mac.i,now.i
  Define i.i,nonzero.i
  If ipv6ep_Span(*ep,SizeOf(IPv6Endpoint))=0 : ProcedureReturn #IPV6_EP_ARGUMENT : EndIf
  If ipv6ep_Span(address,16)=0 Or ipv6ep_Span(mac,6)=0 : ProcedureReturn #IPV6_EP_ARGUMENT : EndIf
- If ipv6ep_Separate(*ep,SizeOf(IPv6Endpoint),address,16)=0 : ProcedureReturn #IPV6_EP_ARGUMENT : EndIf
- If ipv6ep_Separate(*ep,SizeOf(IPv6Endpoint),mac,6)=0 : ProcedureReturn #IPV6_EP_ARGUMENT : EndIf
+ If IPv6EndpointSpansSeparate(*ep,SizeOf(IPv6Endpoint),address,16)=0 : ProcedureReturn #IPV6_EP_ARGUMENT : EndIf
+ If IPv6EndpointSpansSeparate(*ep,SizeOf(IPv6Endpoint),mac,6)=0 : ProcedureReturn #IPV6_EP_ARGUMENT : EndIf
  If generation<=0 Or generation<=*ep\generation : ProcedureReturn #IPV6_EP_STALE : EndIf
  If now<0 Or now>$7FFFFFFEFFFFFFFF Or delay<0 Or delay>1000 : ProcedureReturn #IPV6_EP_ARGUMENT : EndIf
  If retransmit<1 Or retransmit>$FFFFFFFF Or probes<1 Or probes>3 : ProcedureReturn #IPV6_EP_ARGUMENT : EndIf
@@ -68,7 +68,7 @@ Procedure.i ipv6ep_Output(*ep.IPv6Endpoint,generation.i,out.i,capacity.i)
  If ipv6ep_Span(*ep,SizeOf(IPv6Endpoint))=0 : ProcedureReturn #IPV6_EP_ARGUMENT : EndIf
  If generation<=0 Or generation<>*ep\generation : ProcedureReturn #IPV6_EP_STALE : EndIf
  If ipv6ep_Span(out,capacity)=0 Or capacity<86 Or capacity>1514 : ProcedureReturn #IPV6_EP_ARGUMENT : EndIf
- If ipv6ep_Separate(*ep,SizeOf(IPv6Endpoint),out,capacity)=0 : ProcedureReturn #IPV6_EP_ARGUMENT : EndIf
+ If IPv6EndpointSpansSeparate(*ep,SizeOf(IPv6Endpoint),out,capacity)=0 : ProcedureReturn #IPV6_EP_ARGUMENT : EndIf
  ProcedureReturn 0
 EndProcedure
 
@@ -127,32 +127,32 @@ Procedure.i IPv6EndpointInput(*ep.IPv6Endpoint,generation.i,frame.i,bytes.i,out.
  Define rc.i,i.i,toLocal.i,toAll.i,toSolicited.i,unspecified.i,flags.i,n.i
  rc=ipv6ep_Output(*ep,generation,out,capacity) : If rc<>0 : ProcedureReturn rc : EndIf
  If ipv6ep_Span(frame,bytes)=0 Or bytes<54 Or bytes>1514 : ProcedureReturn #IPV6_EP_ARGUMENT : EndIf
- If ipv6ep_Separate(frame,bytes,out,capacity)=0 : ProcedureReturn #IPV6_EP_ARGUMENT : EndIf
- If ipv6ep_Separate(frame,bytes,*ep,SizeOf(IPv6Endpoint))=0 : ProcedureReturn #IPV6_EP_ARGUMENT : EndIf
+ If IPv6EndpointSpansSeparate(frame,bytes,out,capacity)=0 : ProcedureReturn #IPV6_EP_ARGUMENT : EndIf
+ If IPv6EndpointSpansSeparate(frame,bytes,*ep,SizeOf(IPv6Endpoint))=0 : ProcedureReturn #IPV6_EP_ARGUMENT : EndIf
  If *ep\state<>#IPV6_EP_TENTATIVE And *ep\state<>#IPV6_EP_PREFERRED : ProcedureReturn 0 : EndIf
  If NetReadBE16(frame+12)<>$86DD Or (PeekA(frame+6)&1)<>0 : ProcedureReturn 0 : EndIf
- If ipv6ep_Same(frame+6,@*ep\mac,6)<>0 : ProcedureReturn 0 : EndIf
+ If IPv6EndpointBytesEqual(frame+6,@*ep\mac,6)<>0 : ProcedureReturn 0 : EndIf
  rc=IPv6PacketParse(frame+14,bytes-14,@ip) : If rc<>0 : ProcedureReturn rc : EndIf
  If PeekA(ip\source)=255 : ProcedureReturn #IPV6_EP_ARGUMENT : EndIf
  allnodes\high=0 : allnodes\low=0 : PokeA(@allnodes,255) : PokeA(@allnodes+1,2) : PokeA(@allnodes+15,1)
  rc=IPv6SolicitedNode(@*ep\address,@solicited)
- toLocal=ipv6ep_Same(ip\destination,@*ep\address,16)
- toAll=ipv6ep_Same(ip\destination,@allnodes,16)
- toSolicited=ipv6ep_Same(ip\destination,@solicited,16)
+ toLocal=IPv6EndpointBytesEqual(ip\destination,@*ep\address,16)
+ toAll=IPv6EndpointBytesEqual(ip\destination,@allnodes,16)
+ toSolicited=IPv6EndpointBytesEqual(ip\destination,@solicited,16)
  If toLocal=0 And toAll=0 And toSolicited=0 : ProcedureReturn 0 : EndIf
  If toLocal<>0
-  If ipv6ep_Same(frame,@*ep\mac,6)=0 : ProcedureReturn 0 : EndIf
+  If IPv6EndpointBytesEqual(frame,@*ep\mac,6)=0 : ProcedureReturn 0 : EndIf
   If *ep\state=#IPV6_EP_TENTATIVE : ProcedureReturn 0 : EndIf
  Else
   If PeekA(frame)<>51 Or PeekA(frame+1)<>51 : ProcedureReturn 0 : EndIf
-  If ipv6ep_Same(frame+2,ip\destination+12,4)=0 : ProcedureReturn 0 : EndIf
+  If IPv6EndpointBytesEqual(frame+2,ip\destination+12,4)=0 : ProcedureReturn 0 : EndIf
  EndIf
  If ip\protocol<>58 Or ip\payloadBytes<8 : ProcedureReturn 0 : EndIf
  unspecified=IPv6AddressUnspecified(ip\source)
  n=PeekA(ip\payload)
  If n=135 Or n=136
   rc=IPv6NeighborParse(frame+14,bytes-14,@ip,@nd) : If rc<>0 : ProcedureReturn rc : EndIf
-  If ipv6ep_Same(nd\target,@*ep\address,16)=0 : ProcedureReturn 0 : EndIf
+  If IPv6EndpointBytesEqual(nd\target,@*ep\address,16)=0 : ProcedureReturn 0 : EndIf
   If *ep\state=#IPV6_EP_TENTATIVE
    If n=136 Or unspecified<>0 : *ep\state=#IPV6_EP_DUPLICATE : *ep\awaiting=0 : EndIf
    ProcedureReturn 0

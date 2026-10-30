@@ -1,0 +1,561 @@
+{
+  "bytes": 91566,
+  "sha256": "389bb7a985c0d855a46f82673f0d94ad722de88052085874ae27004de7895b12",
+  "checked_ranges": {
+    "code": [
+      "0x1000000",
+      "0x101652D"
+    ],
+    "bss": [
+      "0x1080000",
+      "0x1080DBF"
+    ],
+    "stack": [
+      "0x4e00000",
+      "0x4efffff"
+    ],
+    "report": [
+      "0xe1c00000",
+      "0xe1c1ffff"
+    ],
+    "tables": [
+      "0x4f80000",
+      "0x4f82fff"
+    ]
+  },
+  "source_hashes": {
+    "Anvil/Network/ipv6_host.pbi": "be6dce439abf64f9a60d1faf52391c1601af2835f457a1ad6ba073173435f76d",
+    "Anvil/Network/ipv6_endpoint.pbi": "228dd67f26083bc2fc288cb2b063f5840ead1886aace046098138554581fe1b6",
+    "Anvil/Network/ipv6_mld.pbi": "c001fe624a3128989127796db45c9c0279c001316bd2e6de4b6989b31c061972",
+    "Anvil/Network/ipv6_mld_policy.pbi": "aceda1d637e8ed476d662bdec7b08ded8dd7e0a6b0afd4de7b7f80348eb3e4d1",
+    "Anvil/Network/ipv6_mld_group.pbi": "cc3a0c536786ea9d504b75c5f3e72d776465f3af9c49798d5322699251529011",
+    "Anvil/Network/ipv6_neighbor.pbi": "b7c2facf3c44bb9a0ae7d4ead01478186bfe8bf8111c86c1c7bb68c38037ca19",
+    "Anvil/Network/ipv6_packet.pbi": "01b0621c09badc2efc3885e1ffca51248d7d713aaa0de64b1355672ab5a6abcb",
+    "RaspberryPi4/Lib/mmu.pi4": "014b7c2092426146c8e0eb6bb8dde2fb3af26cef63e55193e49c1ca826f6435a",
+    "Anvil/Network/ipv6_address.pbi": "4ee83accc377916dfc50432f5278156c7b4d74375fe89eae81bfc5eec0c156e4",
+    "Anvil/Network/byte_order.pbi": "d39666ab6746adf123cba3c12c17270ca6e5f72bb2c8ddcb3ff3a84245e1355d",
+    "Anvil/Network/internet_checksum.pbi": "a71f03b83d0b7f600eda23fcf9543af633bbe6b26bea6571dda9af1235e7c211"
+  },
+  "cases": [
+    {
+      "name": "initialize after filters",
+      "expected": [
+        0,
+        1,
+        1,
+        1,
+        0,
+        2,
+        1
+      ],
+      "wire": ""
+    },
+    {
+      "name": "initial multicast report",
+      "expected": [
+        90,
+        1,
+        1,
+        1,
+        1,
+        2,
+        1
+      ],
+      "wire": "33330000001602010203040586dd600000000024000100000000000000000000000000000000ff0200000000000000000000000000163a000502000001008f005d560000000104000000ff0200000000000000000001ff001234"
+    },
+    {
+      "name": "pending report cannot start DAD",
+      "expected": [
+        0,
+        1,
+        1,
+        1,
+        1,
+        2,
+        1
+      ],
+      "wire": ""
+    },
+    {
+      "name": "wrong completion token",
+      "expected": [
+        -801,
+        1,
+        1,
+        1,
+        1,
+        2,
+        1
+      ],
+      "wire": ""
+    },
+    {
+      "name": "definitely unsent report",
+      "expected": [
+        0,
+        1,
+        1,
+        1,
+        0,
+        2,
+        1
+      ],
+      "wire": ""
+    },
+    {
+      "name": "retry report",
+      "expected": [
+        90,
+        1,
+        1,
+        1,
+        2,
+        2,
+        1
+      ],
+      "wire": "33330000001602010203040586dd600000000024000100000000000000000000000000000000ff0200000000000000000000000000163a000502000001008f005d560000000104000000ff0200000000000000000001ff001234"
+    },
+    {
+      "name": "report confirmed starts DAD delay",
+      "expected": [
+        0,
+        2,
+        1,
+        1,
+        0,
+        2,
+        1
+      ],
+      "wire": ""
+    },
+    {
+      "name": "DAD delay preserved",
+      "expected": [
+        0,
+        2,
+        1,
+        1,
+        0,
+        2,
+        1
+      ],
+      "wire": ""
+    },
+    {
+      "name": "DAD probe",
+      "expected": [
+        78,
+        2,
+        1,
+        1,
+        3,
+        2,
+        1
+      ],
+      "wire": "3333ff00123402010203040586dd6000000000183aff00000000000000000000000000000000ff0200000000000000000001ff001234870057bf00000000fe800000000000000000000000001234"
+    },
+    {
+      "name": "DAD probe confirmed",
+      "expected": [
+        0,
+        2,
+        1,
+        0,
+        0,
+        2,
+        1
+      ],
+      "wire": ""
+    },
+    {
+      "name": "still tentative before repeat",
+      "expected": [
+        0,
+        2,
+        1,
+        0,
+        0,
+        2,
+        1
+      ],
+      "wire": ""
+    },
+    {
+      "name": "MLD repeat during DAD",
+      "expected": [
+        90,
+        2,
+        1,
+        0,
+        4,
+        2,
+        1
+      ],
+      "wire": "33330000001602010203040586dd600000000024000100000000000000000000000000000000ff0200000000000000000000000000163a000502000001008f005d560000000104000000ff0200000000000000000001ff001234"
+    },
+    {
+      "name": "repeat completion",
+      "expected": [
+        0,
+        2,
+        1,
+        0,
+        0,
+        2,
+        1
+      ],
+      "wire": ""
+    },
+    {
+      "name": "DAD full interval",
+      "expected": [
+        0,
+        2,
+        1,
+        0,
+        0,
+        2,
+        1
+      ],
+      "wire": ""
+    },
+    {
+      "name": "assigned address refresh report",
+      "expected": [
+        90,
+        3,
+        2,
+        0,
+        5,
+        2,
+        1
+      ],
+      "wire": "33330000001602010203040586dd6000000000240001fe800000000000000000000000001234ff0200000000000000000000000000163a000502000001008f004ea10000000102000000ff0200000000000000000001ff001234"
+    },
+    {
+      "name": "refresh completion",
+      "expected": [
+        0,
+        3,
+        2,
+        0,
+        0,
+        2,
+        1
+      ],
+      "wire": ""
+    },
+    {
+      "name": "ready echo",
+      "expected": [
+        76,
+        3,
+        2,
+        0,
+        0,
+        2,
+        1
+      ],
+      "wire": "02090807060502010203040586dd6000000000163a40fe800000000000000000000000001234fe8000000000000000000000000056788100680e00070009686f7374206c6966656379636c65"
+    },
+    {
+      "name": "ready neighbor response",
+      "expected": [
+        86,
+        3,
+        2,
+        0,
+        0,
+        2,
+        1
+      ],
+      "wire": "02090807060502010203040586dd6000000000203afffe800000000000000000000000001234fe8000000000000000000000000056788800973760000000fe8000000000000000000000000012340201020102030405"
+    },
+    {
+      "name": "backwards clock",
+      "expected": [
+        -800,
+        3,
+        2,
+        0,
+        0,
+        2,
+        1
+      ],
+      "wire": ""
+    },
+    {
+      "name": "checksum refusal",
+      "expected": [
+        -721,
+        3,
+        2,
+        0,
+        0,
+        2,
+        1
+      ],
+      "wire": ""
+    },
+    {
+      "name": "small output refused",
+      "expected": [
+        -800,
+        3,
+        2,
+        0,
+        0,
+        2,
+        1
+      ],
+      "wire": ""
+    },
+    {
+      "name": "generation restart",
+      "expected": [
+        0,
+        1,
+        1,
+        1,
+        0,
+        2,
+        2
+      ],
+      "wire": ""
+    },
+    {
+      "name": "new generation report",
+      "expected": [
+        90,
+        1,
+        1,
+        1,
+        1,
+        2,
+        2
+      ],
+      "wire": "33330000001602010203040586dd600000000024000100000000000000000000000000000000ff0200000000000000000000000000163a000502000001008f005d560000000104000000ff0200000000000000000001ff001234"
+    },
+    {
+      "name": "duplicate before own DAD",
+      "expected": [
+        0,
+        4,
+        3,
+        1,
+        1,
+        2,
+        2
+      ],
+      "wire": ""
+    },
+    {
+      "name": "late report cannot revive duplicate",
+      "expected": [
+        0,
+        4,
+        3,
+        1,
+        0,
+        2,
+        2
+      ],
+      "wire": ""
+    },
+    {
+      "name": "duplicate emits nothing",
+      "expected": [
+        0,
+        4,
+        3,
+        1,
+        0,
+        2,
+        2
+      ],
+      "wire": ""
+    },
+    {
+      "name": "restart third generation",
+      "expected": [
+        0,
+        1,
+        1,
+        1,
+        0,
+        2,
+        3
+      ],
+      "wire": ""
+    },
+    {
+      "name": "report before version change",
+      "expected": [
+        90,
+        1,
+        1,
+        1,
+        1,
+        2,
+        3
+      ],
+      "wire": "33330000001602010203040586dd600000000024000100000000000000000000000000000000ff0200000000000000000000000000163a000502000001008f005d560000000104000000ff0200000000000000000001ff001234"
+    },
+    {
+      "name": "v1 query while report pending",
+      "expected": [
+        0,
+        1,
+        1,
+        1,
+        1,
+        1,
+        3
+      ],
+      "wire": ""
+    },
+    {
+      "name": "old mode completion does not start DAD",
+      "expected": [
+        0,
+        1,
+        1,
+        1,
+        0,
+        1,
+        3
+      ],
+      "wire": ""
+    },
+    {
+      "name": "query response waits",
+      "expected": [
+        0,
+        1,
+        1,
+        1,
+        0,
+        1,
+        3
+      ],
+      "wire": ""
+    },
+    {
+      "name": "v1 report",
+      "expected": [
+        86,
+        1,
+        1,
+        1,
+        2,
+        1,
+        3
+      ],
+      "wire": "3333ff00123402010203040586dd600000000020000100000000000000000000000000000000ff0200000000000000000001ff0012343a0005020000010083005c3b00000000ff0200000000000000000001ff001234"
+    },
+    {
+      "name": "v1 report confirmed",
+      "expected": [
+        0,
+        2,
+        1,
+        1,
+        0,
+        1,
+        3
+      ],
+      "wire": ""
+    },
+    {
+      "name": "v1 DAD probe",
+      "expected": [
+        78,
+        2,
+        1,
+        1,
+        3,
+        1,
+        3
+      ],
+      "wire": "3333ff00123402010203040586dd6000000000183aff00000000000000000000000000000000ff0200000000000000000001ff001234870057bf00000000fe800000000000000000000000001234"
+    },
+    {
+      "name": "ambiguous DAD transmission fails host",
+      "expected": [
+        -9,
+        5,
+        1,
+        1,
+        0,
+        1,
+        3
+      ],
+      "wire": ""
+    },
+    {
+      "name": "failed host remains silent",
+      "expected": [
+        0,
+        5,
+        1,
+        1,
+        0,
+        1,
+        3
+      ],
+      "wire": ""
+    },
+    {
+      "name": "stale generation",
+      "expected": [
+        -801,
+        5,
+        1,
+        1,
+        0,
+        1,
+        3
+      ],
+      "wire": ""
+    },
+    {
+      "name": "reinitialize fourth generation",
+      "expected": [
+        0,
+        1,
+        1,
+        1,
+        0,
+        2,
+        4
+      ],
+      "wire": ""
+    },
+    {
+      "name": "context overlap rejected",
+      "expected": [
+        -800,
+        1,
+        1,
+        1,
+        0,
+        2,
+        4
+      ],
+      "wire": ""
+    },
+    {
+      "name": "owned source overlap rejected",
+      "expected": [
+        -800,
+        1,
+        1,
+        1,
+        0,
+        2,
+        4
+      ],
+      "wire": ""
+    }
+  ]
+}

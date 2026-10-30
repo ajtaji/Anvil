@@ -32,18 +32,18 @@ Structure IPv6MldGroupState
  group.IPv6AddressStorage
 EndStructure
 Procedure.i ipv6mld_GroupValid(*s.IPv6MldGroupState,generation.i,revision.i,now.i)
- If ipv6mld_Span(*s,SizeOf(IPv6MldGroupState))=0 Or ipv6mld_Time(now)=0 : ProcedureReturn #IPV6_MLD_GROUP_ARGUMENT : EndIf
+ If IPv6MldSpanValid(*s,SizeOf(IPv6MldGroupState))=0 Or IPv6MldTimeValid(now)=0 : ProcedureReturn #IPV6_MLD_GROUP_ARGUMENT : EndIf
  If generation<=0 Or generation<>*s\generation Or revision<>*s\revision : ProcedureReturn #IPV6_MLD_GROUP_STALE : EndIf
  If now<*s\lastNow : ProcedureReturn #IPV6_MLD_GROUP_ARGUMENT : EndIf
  ProcedureReturn 0
 EndProcedure
 Procedure.i IPv6MldGroupInit(*s.IPv6MldGroupState,generation.i,revision.i,version.i,group.i,storage.i,capacity.i,now.i)
  Define i.i
- If ipv6mld_Span(*s,SizeOf(IPv6MldGroupState))=0 Or ipv6mld_Time(now)=0 : ProcedureReturn #IPV6_MLD_GROUP_ARGUMENT : EndIf
+ If IPv6MldSpanValid(*s,SizeOf(IPv6MldGroupState))=0 Or IPv6MldTimeValid(now)=0 : ProcedureReturn #IPV6_MLD_GROUP_ARGUMENT : EndIf
  If generation<=0 Or generation<=*s\generation Or revision<=0 : ProcedureReturn #IPV6_MLD_GROUP_STALE : EndIf
  If version<>1 And version<>2 : ProcedureReturn #IPV6_MLD_GROUP_ARGUMENT : EndIf
  If capacity<16 Or capacity>1424 Or (capacity % 16)<>0 : ProcedureReturn #IPV6_MLD_GROUP_ARGUMENT : EndIf
- If ipv6mld_Span(storage,capacity)=0 Or ipv6mld_Span(group,16)=0 : ProcedureReturn #IPV6_MLD_GROUP_ARGUMENT : EndIf
+ If IPv6MldSpanValid(storage,capacity)=0 Or IPv6MldSpanValid(group,16)=0 : ProcedureReturn #IPV6_MLD_GROUP_ARGUMENT : EndIf
  If *s<storage+capacity And storage<*s+SizeOf(IPv6MldGroupState) : ProcedureReturn #IPV6_MLD_GROUP_ARGUMENT : EndIf
  If *s<group+16 And group<*s+SizeOf(IPv6MldGroupState) : ProcedureReturn #IPV6_MLD_GROUP_ARGUMENT : EndIf
  If storage<group+16 And group<storage+capacity : ProcedureReturn #IPV6_MLD_GROUP_ARGUMENT : EndIf
@@ -60,7 +60,7 @@ EndProcedure
 ; An interface generation change requires Init and device membership renewal.
 Procedure.i IPv6MldGroupSync(*s.IPv6MldGroupState,generation.i,revision.i,version.i,now.i)
  Define i.i,rc.i
- If ipv6mld_Span(*s,SizeOf(IPv6MldGroupState))=0 : ProcedureReturn #IPV6_MLD_GROUP_ARGUMENT : EndIf
+ If IPv6MldSpanValid(*s,SizeOf(IPv6MldGroupState))=0 : ProcedureReturn #IPV6_MLD_GROUP_ARGUMENT : EndIf
  rc=ipv6mld_GroupValid(*s,generation,*s\revision,now) : If rc<>0 : ProcedureReturn rc : EndIf
  If revision<*s\revision Or revision<=0 : ProcedureReturn #IPV6_MLD_GROUP_STALE : EndIf
  If version<>1 And version<>2 : ProcedureReturn #IPV6_MLD_GROUP_ARGUMENT : EndIf
@@ -103,10 +103,10 @@ Procedure.i IPv6MldGroupQuery(*s.IPv6MldGroupState,generation.i,revision.i,now.i
  Define rc.i,n.i,due.i,i.i
  rc=ipv6mld_GroupValid(*s,generation,revision,now) : If rc<>0 : ProcedureReturn rc : EndIf
  If *s\failed<>0 : ProcedureReturn #IPV6_MLD_GROUP_FAILED : EndIf
- If ipv6mld_Span(*query,SizeOf(IPv6MldQueryView))=0 : ProcedureReturn #IPV6_MLD_GROUP_ARGUMENT : EndIf
+ If IPv6MldSpanValid(*query,SizeOf(IPv6MldQueryView))=0 : ProcedureReturn #IPV6_MLD_GROUP_ARGUMENT : EndIf
  If *query<*s+SizeOf(IPv6MldGroupState) And *s<*query+SizeOf(IPv6MldQueryView) : ProcedureReturn #IPV6_MLD_GROUP_ARGUMENT : EndIf
  If *query<*s\sources+*s\capacity And *s\sources<*query+SizeOf(IPv6MldQueryView) : ProcedureReturn #IPV6_MLD_GROUP_ARGUMENT : EndIf
- If ipv6mld_Span(*query\group,16)=0 : ProcedureReturn #IPV6_MLD_GROUP_ARGUMENT : EndIf
+ If IPv6MldSpanValid(*query\group,16)=0 : ProcedureReturn #IPV6_MLD_GROUP_ARGUMENT : EndIf
  If *query\maxDelay<0 Or *query\maxDelay>8387584 Or delay<0 Or delay>*query\maxDelay : ProcedureReturn #IPV6_MLD_GROUP_ARGUMENT : EndIf
  If delay=0 And *query\maxDelay<>0 : ProcedureReturn #IPV6_MLD_GROUP_ARGUMENT : EndIf
  If *query\sourceCount<0 Or *query\sourceCount>89 : ProcedureReturn #IPV6_MLD_GROUP_ARGUMENT : EndIf
@@ -136,7 +136,7 @@ Procedure.i IPv6MldGroupStep(*s.IPv6MldGroupState,generation.i,revision.i,now.i,
  rc=ipv6mld_GroupValid(*s,generation,revision,now) : If rc<>0 : ProcedureReturn rc : EndIf
  If *s\failed<>0 : ProcedureReturn #IPV6_MLD_GROUP_FAILED : EndIf
  If *s\awaiting<>0 : ProcedureReturn 0 : EndIf
- If ipv6mld_Span(out,capacity)=0 : ProcedureReturn #IPV6_MLD_GROUP_ARGUMENT : EndIf
+ If IPv6MldSpanValid(out,capacity)=0 : ProcedureReturn #IPV6_MLD_GROUP_ARGUMENT : EndIf
  If out<*s+SizeOf(IPv6MldGroupState) And *s<out+capacity : ProcedureReturn #IPV6_MLD_GROUP_ARGUMENT : EndIf
  If out<*s\sources+*s\capacity And *s\sources<out+capacity : ProcedureReturn #IPV6_MLD_GROUP_ARGUMENT : EndIf
  kind=0

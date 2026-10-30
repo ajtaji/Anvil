@@ -17,13 +17,13 @@ Structure IPv6MldInterface
  lastNow.i
 EndStructure
 
-Procedure.i ipv6mld_Time(now.i)
+Procedure.i IPv6MldTimeValid(now.i)
  If now<0 Or now>$7FFFFFFEFFFFFFFF : ProcedureReturn 0 : EndIf
  ProcedureReturn 1
 EndProcedure
 Procedure.i IPv6MldInterfaceInit(*state.IPv6MldInterface,generation.i,now.i)
  Define i.i
- If ipv6mld_Span(*state,SizeOf(IPv6MldInterface))=0 Or ipv6mld_Time(now)=0 : ProcedureReturn #IPV6_MLD_POLICY_ARGUMENT : EndIf
+ If IPv6MldSpanValid(*state,SizeOf(IPv6MldInterface))=0 Or IPv6MldTimeValid(now)=0 : ProcedureReturn #IPV6_MLD_POLICY_ARGUMENT : EndIf
  If generation<=0 Or generation<=*state\generation : ProcedureReturn #IPV6_MLD_POLICY_STALE : EndIf
  For i=0 To SizeOf(IPv6MldInterface)-1 : PokeA(*state+i,0) : Next
  *state\generation=generation : *state\revision=1 : *state\version=2
@@ -33,7 +33,7 @@ Procedure.i IPv6MldInterfaceInit(*state.IPv6MldInterface,generation.i,now.i)
 EndProcedure
 
 Procedure.i IPv6MldInterfaceTick(*state.IPv6MldInterface,generation.i,now.i)
- If ipv6mld_Span(*state,SizeOf(IPv6MldInterface))=0 Or ipv6mld_Time(now)=0 : ProcedureReturn #IPV6_MLD_POLICY_ARGUMENT : EndIf
+ If IPv6MldSpanValid(*state,SizeOf(IPv6MldInterface))=0 Or IPv6MldTimeValid(now)=0 : ProcedureReturn #IPV6_MLD_POLICY_ARGUMENT : EndIf
  If generation<=0 Or generation<>*state\generation : ProcedureReturn #IPV6_MLD_POLICY_STALE : EndIf
  If now<*state\lastNow : ProcedureReturn #IPV6_MLD_POLICY_ARGUMENT : EndIf
  If *state\version=1 And now>=*state\olderUntil
@@ -51,10 +51,10 @@ EndProcedure
 Procedure.i IPv6MldInterfaceQuery(*state.IPv6MldInterface,generation.i,now.i,packet.i,bytes.i)
  Define query.IPv6MldQueryView
  Define rc.i,general.i
- If ipv6mld_Span(*state,SizeOf(IPv6MldInterface))=0 Or ipv6mld_Time(now)=0 : ProcedureReturn #IPV6_MLD_POLICY_ARGUMENT : EndIf
+ If IPv6MldSpanValid(*state,SizeOf(IPv6MldInterface))=0 Or IPv6MldTimeValid(now)=0 : ProcedureReturn #IPV6_MLD_POLICY_ARGUMENT : EndIf
  If generation<=0 Or generation<>*state\generation : ProcedureReturn #IPV6_MLD_POLICY_STALE : EndIf
  If now<*state\lastNow : ProcedureReturn #IPV6_MLD_POLICY_ARGUMENT : EndIf
- If ipv6mld_Span(packet,bytes)=0 : ProcedureReturn #IPV6_MLD_POLICY_ARGUMENT : EndIf
+ If IPv6MldSpanValid(packet,bytes)=0 : ProcedureReturn #IPV6_MLD_POLICY_ARGUMENT : EndIf
  If *state<packet+bytes And packet<*state+SizeOf(IPv6MldInterface) : ProcedureReturn #IPV6_MLD_POLICY_ARGUMENT : EndIf
  rc=IPv6MldQuery(packet,bytes,@query)
  If rc<>0 : ProcedureReturn rc : EndIf
