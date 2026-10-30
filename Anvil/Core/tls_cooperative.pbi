@@ -68,9 +68,13 @@ Procedure.i tlsw_X25519(out.i,scalar.i,point.i)
  ProcedureReturn Bool(rc=1)
 EndProcedure
 
-Procedure.i tlsc_RunCooperative()
+Procedure tlsw_SetHooks()
  X509PauseHook=@tlsw_YieldDue : TlsRootsPauseHook=@tlsw_YieldDue
  EcdsaVerifyHook=@tlsw_Ecdsa : RsaPublicHook=@tlsw_Rsa : X25519ComputeHook=@tlsw_X25519
+EndProcedure
+
+Procedure.i tlsc_RunCooperative()
+ tlsw_SetHooks()
  tlsc_AdvanceWork()
  tlsw_ClearHooks()
  ProcedureReturn 1
@@ -85,6 +89,7 @@ Procedure tlsw_Cancel(h.i)
  rc=ScReap(tlsw_handle)
  If rc=0 : tlsw_fault=1 : ProcedureReturn : EndIf
  tlsw_handle=0 : tlsw_ClearHooks()
+ TlsRootsCancelLoad()
  EcdsaJobCancel() : EcpJobCancel() : RsaJobCancel() : X25519JobCancel()
 EndProcedure
 
@@ -111,7 +116,12 @@ Procedure tlsw_Advance()
   EndIf
  EndIf
  tlsw_sliceStart=A64CounterReadOrdered()
- ran=ScRunOne() : state=SchedState(tlsw_handle)
+ ; Hooks belong only to the running worker. Leaving them installed across
+ ; a yield would let unrelated callers try to suspend the scheduler's caller.
+ tlsw_SetHooks()
+ ran=ScRunOne()
+ tlsw_ClearHooks()
+ state=SchedState(tlsw_handle)
  If state=#SCHED_DONE Or state=#SCHED_CANCELLED
   If state<>#SCHED_DONE Or ScResult(tlsw_handle)<>1
    tlsw_fault=1 : tlsc_Refuse(#SVC_EIO,"TLS cooperative worker failed")

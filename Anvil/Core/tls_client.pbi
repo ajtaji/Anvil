@@ -483,7 +483,8 @@ Procedure.i TlsClientOpen(*host, port.i)
   tlsc_ringTail = 0
   tlsc_t0 = millis()
   tlsc_state = #TLSC_PREPARE
-  tlsc_AdvanceCurrent()
+  ; Opening reserves a handle only. Preparation belongs to the bounded
+  ; progress path, not to a call promising a fresh handle at once.
   ProcedureReturn tlsc_handles[tlsc_slot]
 EndProcedure
 

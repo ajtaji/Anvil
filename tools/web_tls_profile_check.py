@@ -15,4 +15,16 @@ def check(report,cases):
    h,st,cost,closed,stale=struct.unpack_from('<5q',report,0x3000+i*64)
    assert h>0 and st==2+i and cost>=1500 and closed==0 and stale==-102,(i,h,st,cost,closed,stale)
    result['cancellation'].append(dict(handle=h,state=st,last_call_us=cost,close=closed,stale=stale))
+ if struct.unpack_from('<q',report,24)[0]==0x43414e30:
+  result['preparation_cancellation']=[]
+  for i in range(2):
+   h,st,cost,closed,stale,opened=struct.unpack_from('<6q',report,0x3000+i*64)
+   assert h>0 and st==i and closed==0 and stale==-102,(i,h,st,cost,closed,stale)
+   result['preparation_cancellation'].append(dict(handle=h,state=st,last_call_us=cost,open_us=opened,close=closed,stale=stale))
+ if struct.unpack_from('<q',report,32)[0]==0x524f4f54:
+  result['root_file_probe']=[]
+  for i in range(2):
+   opened,cost,size,read,readcost=struct.unpack_from('<5q',report,0x3100+i*64)
+   assert opened==1 and size>=4096 and read==4096,(i,opened,size,read)
+   result['root_file_probe'].append(dict(open_us=cost,bytes=size,read_us=readcost))
  return result

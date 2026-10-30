@@ -432,8 +432,8 @@ The layout gate refuses omitted working fields or an unsliced large buffer.
 
 Calls remain serialized on core 0. This is overlapping connection lifetimes,
 not concurrent execution of shared cryptographic arithmetic. NetService moves
-one allocated connection per advance in round-robin order; a handle operation
-also requests progress. With the cooperative driver, an already active worker
+one allocated connection per advance in round-robin order; State, Send and Recv
+also request progress. Open only allocates a handle. With the cooperative driver, an already active worker
 finishes its slice before another handshake enters shared scratch. Close wipes that slot's snapshot and buffers; payload return
 closes every allocated TLS handle. Diagnostics list all allocated handles.
 
@@ -621,8 +621,12 @@ The worker targets approximately 2 ms between yield checks. This is not a
 hard upper bound: a single arithmetic unit, record operation or device I/O
 can take longer, and one high-level HTTP step can call multiple services.
 Certificate parsing yields between VM/native operations and anchor scans;
-root-store parsing yields only after its shared file handle has closed.
-The initial file read remains synchronous. Trust/entropy preparation is now
+root-store reads use 4096-byte chunks, closing the shared file before each
+yield opportunity and reopening it for the next chunk. A changed file size
+or invalid read count is refused; this is not a filesystem snapshot against
+concurrent edits. Reentrant loads are refused while a suspended load owns the
+scratch. Cancellation clears that ownership and forces a later load to restart.
+Individual open/read operations remain synchronous. Trust/entropy preparation is
 part of connection progress: SVC_TLS_RESOLVING includes this preparation.
 After a positive Open handle, callers must check State for preparation errors
 and Close failed handles, just as for later DNS/TCP/handshake errors.
@@ -648,3 +652,21 @@ work, caller-slot restoration, stack locals, secret wiping and 31 RSA/X25519
 cases. The updated modular job passed all 24 independent arithmetic cases.
 Evidence is retained with the prior scheduling measurements under
 `docs/evidence/anvil-tls-jobs-20261029`.
+
+Anvil 428 separates Open from progress. Physical capture 285 measured handle
+opens at 1-7 microseconds, successful cancellation before preparation and after
+one preparation slice, stale-handle refusal, and two verified HTTP 200 gzip/
+deflate responses. The first preparation call still took 19.635 ms; subsequent
+request measurements reached 8.675 ms per call. This does not qualify TLS as
+fully nonblocking. The cold storage path and the link's transmit waits remain
+open work.
+
+Build 429 scopes cooperative callbacks to the running worker, clearing them
+when control returns to its caller and restoring them before resume. This
+prevents unrelated calls from inheriting a suspended worker's yield callbacks.
+The updated key-context fixture compiles and checks callback clearance plus
+root-load cancellation notification, but its physical run is pending. The 429
+image passed full-hash verification and startup health checks. Its following
+TLS/storage diagnostic stopped in read-only network preflight before upload:
+the console returned part of `net`, then no completed reply after recovery.
+No 429 TLS diagnostic result is claimed.

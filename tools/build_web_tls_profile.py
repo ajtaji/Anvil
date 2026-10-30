@@ -3,7 +3,7 @@ from pathlib import Path
 import argparse,hashlib,json,os,re,subprocess
 from pmf_compiler import resolve_compiler
 
-def build(compiler,out,cancel_handshakes=False):
+def build(compiler,out,cancel_handshakes=False,cancel_preparation=False,profile_root_file=False):
     root=Path(__file__).resolve().parents[1];out.mkdir(parents=True,exist_ok=False)
     cases=['gzip','deflate']
     names=['Anvil/Core/crc_constants.pbi', 'Anvil/Core/crc.pbi', 'Anvil/Network/web_url.pbi', 'Anvil/Network/web_request.pbi', 'Anvil/Network/web_response.pbi', 'Anvil/Network/web_transport.pbi', 'Anvil/Network/web_client.pbi', 'Anvil/Network/web_inflate.pbi', 'Anvil/Network/web_content.pbi', 'Anvil/Network/web_content_response.pbi', 'RaspberryPi4/Lib/mmu.pi4']
@@ -123,6 +123,40 @@ EndProcedure
   PokeI($E1C03020+i*64,webpTlsState(h))
  Next
 ''')
+    if cancel_preparation:
+        assert not cancel_handshakes
+        s=s.replace(' Define i.i,rc.i\n CaptureTable()', ' Define i.i,rc.i,h.i,st.i,began.i,cost.i\n CaptureTable()')
+        s=s.replace(' MmuEnableCached()', ''' MmuEnableCached()
+ PokeI($E1C00018,$43414E30)
+ For i=0 To 1
+  began=wireTime() : h=webpTlsOpen("httpbingo.org",443) : cost=wireTime()-began
+  PokeI($E1C03000+i*64,h) : PokeI($E1C03028+i*64,cost)
+  st=0 : cost=0
+  If i=1
+   began=wireTime() : st=webpTlsState(h) : cost=wireTime()-began
+  EndIf
+  PokeI($E1C03008+i*64,st) : PokeI($E1C03010+i*64,cost)
+  PokeI($E1C03018+i*64,webpTlsClose(h))
+  PokeI($E1C03020+i*64,webpTlsState(h))
+ Next
+''')
+    if profile_root_file:
+        assert cancel_preparation and not cancel_handshakes
+        s=s.replace('Global wtable.i','Global *rootOpen,*rootSize,*rootRead,*rootClose\nGlobal Dim rootChunk.a[4096]\nGlobal wtable.i')
+        s=s.replace(' PokeI($E1C00018,$43414E30)', ''' PokeI($E1C00020,$524F4F54)
+ rootOpen=PeekI(wtable+16+49*8) : rootSize=PeekI(wtable+16+50*8)
+ rootRead=PeekI(wtable+16+51*8) : rootClose=PeekI(wtable+16+52*8)
+ For i=0 To 1
+  began=wireTime() : rc=rootOpen("2:/tls/roots.pem") : cost=wireTime()-began
+  PokeI($E1C03100+i*64,rc) : PokeI($E1C03108+i*64,cost)
+  If rc=1
+   PokeI($E1C03110+i*64,rootSize())
+   began=wireTime() : rc=rootRead(0,@rootChunk[0],4096) : cost=wireTime()-began
+   PokeI($E1C03118+i*64,rc) : PokeI($E1C03120+i*64,cost)
+   rootClose()
+  EndIf
+ Next
+ PokeI($E1C00018,$43414E30)''')
     source=out/'proof.pi4';source.write_text(s,encoding='utf8')
     q=subprocess.run([str(resolve_compiler(compiler)),'--compile',str(source),'-t','pi4','--load-addr','0x1000000','--stack-addr','0x4f00000','--entry-returns','--wants-services','-o',str(out/'proof.img')],env=dict(os.environ,PMF_ROOT=str(root)),capture_output=True,text=True,encoding='utf8',timeout=180,creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
     log=q.stdout+q.stderr;(out/'compile.txt').write_text(log,encoding='utf8');print(log[-1800:]);assert q.returncode==0
@@ -132,4 +166,6 @@ EndProcedure
 if __name__=='__main__':
     ap=argparse.ArgumentParser(description=__doc__);ap.add_argument('--compiler',required=True);ap.add_argument('--out',type=Path,required=True)
     ap.add_argument('--cancel-handshakes',action='store_true')
-    args=ap.parse_args();build(args.compiler,args.out.resolve(),args.cancel_handshakes)
+    ap.add_argument('--cancel-preparation',action='store_true')
+    ap.add_argument('--profile-root-file',action='store_true')
+    args=ap.parse_args();build(args.compiler,args.out.resolve(),args.cancel_handshakes,args.cancel_preparation,args.profile_root_file)

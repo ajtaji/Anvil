@@ -126,6 +126,10 @@ Global Dim tlsc_handles.i[4]
 Global *tlsc_advanceHook,*tlsc_closeHook
 Global ctxKind.i,ctxV.i,ctxA.i,ctxB.i,ctxC.i,ctxVerdict.i
 Global ctxMaximum.i,ctxSteps.i,ctxOther.i,ctxCancelled.i
+Global ctxRootCancelled.i
+Procedure TlsRootsCancelLoad()
+ ctxRootCancelled=ctxRootCancelled+1
+EndProcedure
 Procedure tlsc_Select(slot.i)
  tlsc_slot=slot
 EndProcedure
@@ -150,6 +154,7 @@ Procedure KeyContextRun(kind.i,v.i,an.i,bn.i,cn.i)
  Define i.i,t.i,elapsed.i,caller.i
  ctxKind=kind : ctxV=v : ctxA=an : ctxB=bn : ctxC=cn
  ctxMaximum=0 : ctxSteps=0 : ctxOther=0 : ctxVerdict=0 : ctxCancelled=1
+ ctxRootCancelled=0
  For i=0 To cn-1 : RsaSig[i]=PeekA(v+an+bn+i) : Next
  ; Discard one suspended secret-key task and restart from original input.
  If kind=14
@@ -159,6 +164,7 @@ Procedure KeyContextRun(kind.i,v.i,an.i,bn.i,cn.i)
   Else
    tlsw_Cancel(tlsc_handles[tlsw_slot])
    If tlsw_handle<>0 Or X25519JobPhase<>0 Or X25519ComputeHook<>0 : ctxCancelled=0 : EndIf
+   If ctxRootCancelled<>1 : ctxCancelled=0 : EndIf
   EndIf
  EndIf
  Repeat
@@ -166,6 +172,9 @@ Procedure KeyContextRun(kind.i,v.i,an.i,bn.i,cn.i)
   t=timer() : tlsw_Advance() : elapsed=timer()-t
   If elapsed>ctxMaximum : ctxMaximum=elapsed : EndIf
   If tlsc_slot<>caller : ctxVerdict=-997 : Break : EndIf
+  If X509PauseHook<>0 Or TlsRootsPauseHook<>0 Or EcdsaVerifyHook<>0 Or RsaPublicHook<>0 Or X25519ComputeHook<>0
+   ctxVerdict=-995 : Break
+  EndIf
   ctxOther=ctxOther+1 : ctxSteps=ctxSteps+1 : pet()
   If tlsw_handle=0 : Break : EndIf
  Until ctxSteps>10000

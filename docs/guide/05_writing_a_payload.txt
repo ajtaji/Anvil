@@ -762,11 +762,10 @@ parsing can yield too. The worker preserves the handshake call stack and
 owns shared crypto scratch exclusively; Close cancels and reaps it. Existing
 certificate, hostname, signature and Finished checks remain required.
 
-The composition must provide a qualified cooperative context backend. The
-current AArch64 implementation requires EL3; unavailable backends retain the
-synchronous path. A roughly 2 ms scheduling target is not a hard bound on
-file I/O, a single crypto unit, or a high-level HTTP step that calls several
-services. Open returns a handle before preparation completes: check State
-and Close failed handles. RESOLVING also covers trust/entropy preparation.
-See WEB_CLIENT.md for ownership, cancellation, target limits and measured
-physical results. IPv6 and HTTP/2-3 remain separate unfinished work.
+The cooperative backend currently requires AArch64 EL3; unavailable backends
+run synchronously. Its roughly 2 ms scheduling target does not bound individual
+storage or crypto calls, or multi-service HTTP steps. Open only allocates a
+handle. Check State and Close failed handles; RESOLVING includes trust/entropy
+preparation. Root loading closes the shared file between 4096-byte reads and
+refuses reentry. See WEB_CLIENT.md for cancellation, target limits and
+measurements. IPv6 and HTTP/2-3 remain unfinished.

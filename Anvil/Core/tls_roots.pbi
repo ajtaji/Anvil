@@ -45,6 +45,7 @@ EnableExplicit
 #TLSROOT_ERR_NONE    = -4          ; the file held no usable certificate
 #TLSROOT_ERR_ARENA   = -5          ; the anchors outgrew the arena
 #TLSROOT_ERR_STORAGE = -6          ; no medium mounted
+#TLSROOT_ERR_BUSY    = -7          ; another root load owns the scratch
 
 Global Dim tlsroot_pem.a[#TLSROOT_PEM_MAX]
 Global Dim tlsroot_der.a[#TLSROOT_DER_MAX]
@@ -381,7 +382,8 @@ EndProcedure
 ;  registered at least one root.
 ; ----------------------------------------------------------------------
 Global *TlsRootsPauseHook
-Procedure.i TlsRootsLoad(*path)
+Global tlsroot_loading.i
+Procedure.i tlsroot_LoadWork(*path)
   Define size.i
   Define got.i
   Define off.i
@@ -415,26 +417,37 @@ Procedure.i TlsRootsLoad(*path)
     ProcedureReturn tlsroot_err
   EndIf
   size = HwFileSize()
+  HwFileClose()
   If size > #TLSROOT_PEM_MAX
-    HwFileClose()
     tlsroot_err = #TLSROOT_ERR_BIG
     ProcedureReturn tlsroot_err
   EndIf
   off = 0
   While off < size
     n = size - off
-    If n > 32768
-      n = 32768
+    If n > 4096
+      n = 4096
+    EndIf
+    ; Never yield with the single shared file handle open. Reopen and check
+    ; the size for each bounded read; storage is free between slices.
+    If HwFileOpen(@tlsroot_path[0]) = 0
+      tlsroot_err = #TLSROOT_ERR_NOFILE : ProcedureReturn tlsroot_err
+    EndIf
+    If HwFileSize() <> size
+      HwFileClose()
+      tlsroot_err = #TLSROOT_ERR_READ : ProcedureReturn tlsroot_err
     EndIf
     got = HwFileReadAt(off, @tlsroot_pem[off], n)
-    If got <= 0
-      HwFileClose()
+    HwFileClose()
+    If got <= 0 Or got > n
       tlsroot_err = #TLSROOT_ERR_READ
       ProcedureReturn tlsroot_err
     EndIf
     off = off + got
+    If TlsRootsPauseHook<>0
+      If TlsRootsPauseHook()=0 : tlsroot_err=#TLSROOT_ERR_READ : ProcedureReturn tlsroot_err : EndIf
+    EndIf
   Wend
-  HwFileClose()
   tlsroot_bytes = size
 
   X509ResetAnchors()
@@ -494,8 +507,27 @@ Procedure.i TlsRootsLoad(*path)
   ProcedureReturn xNumAnchors
 EndProcedure
 
+; Reentry must not overwrite a suspended load's PEM/DER/path scratch.
+Procedure.i TlsRootsLoad(*path)
+  Define rc.i
+  If tlsroot_loading<>0 : ProcedureReturn #TLSROOT_ERR_BUSY : EndIf
+  tlsroot_loading=1
+  rc=tlsroot_LoadWork(*path)
+  tlsroot_loading=0
+  ProcedureReturn rc
+EndProcedure
+
+; Only the cooperative owner calls this after cancelling/reaping its worker.
+; Every yield occurs with the file closed; no storage handle needs recovery.
+Procedure TlsRootsCancelLoad()
+  If tlsroot_loading<>0
+    tlsroot_loading=0 : tlsroot_loaded=0 : tlsroot_err=#TLSROOT_ERR_READ
+  EndIf
+EndProcedure
+
 ; Loads the store once; later calls answer from the first load.
 Procedure.i TlsRootsEnsure()
+  If tlsroot_loading<>0 : ProcedureReturn #TLSROOT_ERR_BUSY : EndIf
   If tlsroot_loaded <> 0
     ProcedureReturn xNumAnchors
   EndIf
@@ -521,6 +553,8 @@ Procedure.i TlsRootsErrorText(code.i)
       ProcedureReturn "the roots outgrew the 192 KB anchor store"
     Case #TLSROOT_ERR_STORAGE
       ProcedureReturn "no storage medium is mounted"
+    Case #TLSROOT_ERR_BUSY
+      ProcedureReturn "the root store is already being loaded"
   EndSelect
   ProcedureReturn "unknown root-store error"
 EndProcedure
