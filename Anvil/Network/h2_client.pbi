@@ -38,6 +38,10 @@ Structure H2Stream
  localClosed.i
  headOnly.i
  request.i
+ deadlineStarted.i
+ deadlineTimeout.i
+ deadlinePending.i
+ localError.i
 EndStructure
 Structure H2Buffers
  tx.i
@@ -415,8 +419,52 @@ Procedure.i H2ClientRelease(*c.H2Client,id.i)
  If *c=0 : ProcedureReturn #H2_ARGUMENT : EndIf
  *s=h2cStream(*c,id)
  If *s=0 : ProcedureReturn #H2_STATE : EndIf
- If *s\state=1 Or (*c\event<>0 And *c\eventStream=id) : ProcedureReturn #H2_BUSY : EndIf
+ If *s\state=1 Or *s\deadlinePending<>0 Or (*c\event<>0 And *c\eventStream=id) : ProcedureReturn #H2_BUSY : EndIf
  *s\state=0 : ProcedureReturn 0
+EndProcedure
+; Optional per-stream deadline, in the same modulo-32-bit units as Step.
+; Zero disables it. The connection deadline remains an independent upper bound.
+Procedure.i H2ClientDeadline(*c.H2Client,id.i,now.i,timeout.i)
+ Define *s.H2Stream
+ If *c=0 Or timeout<0 Or timeout>$7FFFFFFF : ProcedureReturn #H2_ARGUMENT : EndIf
+ If *c\state=-1 : ProcedureReturn *c\error : EndIf
+ If *c\state<>3 : ProcedureReturn #H2_STATE : EndIf
+ *s=h2cStream(*c,id) : If *s=0 : ProcedureReturn #H2_STATE : EndIf
+ If *s\state<>1 : ProcedureReturn #H2_STATE : EndIf
+ *s\deadlineStarted=now : *s\deadlineTimeout=timeout
+ ProcedureReturn 0
+EndProcedure
+; Mark expired streams without invalidating a borrowed FIELD/DATA event.
+; A full control queue defers the reset until writes free space. The stream
+; stops accepting new data immediately, and cannot be released prematurely.
+Procedure h2cDeadlines(*c.H2Client,now.i)
+ Define i.i,p.i,*s.H2Stream
+ For i=0 To *c\buffers\streamCount-1
+  *s=*c\buffers\streams+i*SizeOf(H2Stream)
+  If *s\state=1 And *s\deadlineTimeout<>0
+   If ((now-*s\deadlineStarted) & $FFFFFFFF)>=*s\deadlineTimeout
+    *s\state=3 : *s\resetCode=8 : *s\localError=#H2_TIMEOUT
+    *s\deadlinePending=1 : *s\deadlineTimeout=0 : *c\activeStreams=*c\activeStreams-1
+    If *c\finishStream=*s : *c\finishStream=0 : EndIf
+    If *c\blockStream=*s And (*c\decoding<>0 Or *c\continuation<>0)
+     *c\blockDiscard=1 : *c\blockStream=0
+    EndIf
+   EndIf
+  EndIf
+  If *s\deadlinePending=1 And *c\controlLength<=1011
+   p=h2cControl(*c,4,3,0,*s\id) : NetWriteBE32(p,8)
+   *s\deadlinePending=2
+  EndIf
+ Next
+ If *c\event=0
+  For i=0 To *c\buffers\streamCount-1
+   *s=*c\buffers\streams+i*SizeOf(H2Stream)
+   If *s\deadlinePending=2
+    *s\deadlinePending=0 : *c\event=#H2_RESET : *c\eventStream=*s\id
+    ProcedureReturn
+   EndIf
+  Next
+ EndIf
 EndProcedure
 ; Events remain stable until consumed. Body credit includes DATA padding.
 Procedure.i H2ClientConsume(*c.H2Client)
@@ -425,7 +473,7 @@ Procedure.i H2ClientConsume(*c.H2Client)
  If *c\state=-1 : ProcedureReturn *c\error : EndIf
  If *c\event=#H2_DATA And *c\credit>0
   *s=h2cStream(*c,*c\eventStream) : If *s=0 : ProcedureReturn h2cFail(*c,#H2_STATE) : EndIf
-  needed=13 : If *c\finishStream=0 : needed=26 : EndIf
+  needed=13 : If *c\finishStream=0 And *s\state=1 : needed=26 : EndIf
   If *c\controlLength+needed>1024 : ProcedureReturn h2cFail(*c,#H2_LIMIT) : EndIf
   p=h2cControl(*c,4,8,0,0) : NetWriteBE32(p,*c\credit)
   If needed=26
@@ -650,6 +698,7 @@ Procedure.i H2ClientStep(*c.H2Client,now.i)
  If *c\state=0 : ProcedureReturn #H2_STATE : EndIf
  If ((now-*c\started) & $FFFFFFFF)>=*c\timeout : ProcedureReturn h2cFail(*c,#H2_TIMEOUT) : EndIf
  If *c\state=4 : ProcedureReturn 0 : EndIf
+ If *c\state=3 : h2cDeadlines(*c,now) : EndIf
  st=WebTransportState(@*c\connection)
  If st<0 : ProcedureReturn h2cFail(*c,st) : EndIf
  If *c\state=1

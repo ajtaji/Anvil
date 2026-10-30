@@ -2681,8 +2681,8 @@ that pointer zero. Keep the origin host alive throughout the connection. Start o
 fresh or explicitly closed context; starting again does not close an old handle.
 `H2ClientStart(context, url, buffers, now, timeout)` establishes ownership.
 `now` and `timeout` use the caller's same monotonic units; elapsed time is modulo
-32 bits and timeout must be 1..2147483647. This first implementation has one
-whole-connection deadline, not independently renewable stream deadlines.
+32 bits and timeout must be 1..2147483647. The whole-connection deadline remains
+an upper bound; optional independently renewable stream deadlines are described below.
 
 State 1 waits for TLS, state 2 exchanges the preface/settings, and state 3 can
 accept requests. `H2ClientGet(context, target, bytes)` copies an origin-form
@@ -2710,8 +2710,8 @@ RST_STREAM and GOAWAY; and rejects unsolicited push. HTTP response checks includ
 lowercase field names, prohibited connection fields, pseudo-header order and
 uniqueness, status, field-value controls, content length, informational responses
 and trailers. `H2ClientCancel` cancels the entire connection, and `H2ClientClose`
-releases transport ownership. It does not yet provide per-stream deadlines,
-graceful local GOAWAY/error transmission. Opt-in automatic WebClient protocol
+releases transport ownership. It does not yet provide graceful local GOAWAY/error
+transmission. Opt-in automatic WebClient protocol
 dispatch is described below. Per-stream cancellation and minimal processing of
 late closed-stream frames are described below.
 Errors currently close the connection, including stream-local failures. The
@@ -2783,7 +2783,7 @@ was off and the temporary DNS override was removed. Shared Pi 3 compilation also
 passed, without a Pi 3 hardware claim. Evidence:
 `docs/evidence/anvil-ipv6-20261030/http2-cancel483`.
 
-Per-stream deadlines and graceful local connection
+Graceful local connection
 shutdown remain unfinished, alongside the broader TLS, IPv6 and HTTP/3 work.
 
 
@@ -2849,7 +2849,7 @@ watchdog was off, and the temporary DNS override was removed. The shared source
 also compiled for Pi 3, without claiming a physical Pi 3 run. No firmware update
 was required. Evidence: `docs/evidence/anvil-ipv6-20261030/http2-upload483`.
 
-Remaining work includes per-stream deadlines, graceful
+Remaining work includes graceful
 local connection shutdown and stream-local error isolation, as well as the
 broader remaining TLS, off-link IPv6/RDNSS qualification and HTTP/3 work.
 
@@ -2979,7 +2979,7 @@ only Pi 4 was physically tested. Captures 163-166 returned zero with cores, font
 and Vulkan healthy, watchdog off and temporary DNS overrides removed. Monitor 483
 was unchanged. Evidence: `docs/evidence/anvil-ipv6-20261030/webclient-auto483`.
 
-This is not a complete HTTP/2 implementation. Per-stream deadlines, graceful local GOAWAY and stream-local
+This is not a complete HTTP/2 implementation. Graceful local GOAWAY and stream-local
 error isolation remain work, alongside remaining TLS compatibility/blocking work,
 off-link IPv6/RDNSS qualification and HTTP/3.
 
@@ -3040,3 +3040,42 @@ These are measurements, not worst-case guarantees. Shared Pi 3 compilation passe
 physical qualification was on Pi 4. Monitor 483 remained installed, with healthy
 cores, fonts and Vulkan, watchdog off and temporary DNS overrides removed.
 Evidence: `docs/evidence/anvil-ipv6-20261030/http2-duplex483`.
+
+### Optional per-stream deadlines
+
+`H2ClientDeadline(context, streamId, now, timeout)` sets or renews a deadline for
+an active stream. Use the same monotonic units as Step. Timeout 0 disables the
+stream deadline; positive values up to 2147483647 use modulo-32-bit elapsed time.
+Invalid arguments or inactive/unknown streams are refused without changing the
+deadline. The connection deadline remains an independent upper bound; this call
+does not extend it. Streams without an explicit deadline retain prior behavior.
+
+Step checks all bounded stream slots. Expiry stops new submissions on that stream,
+queues RST_STREAM(CANCEL), and reports H2_RESET with `stream.resetCode=8` and
+`stream.localError=H2_TIMEOUT`. Other active streams and the connection remain
+usable. Read these fields before Release. The stream structure changed, so
+recompile callers and allocate stream storage using SizeOf(H2Stream).
+
+A borrowed FIELD or DATA event remains stable until consumed, even if its stream
+expires. The reset event follows consumption; late fields still update HPACK state
+while discarded content restores connection credit. Expired streams receive no
+new stream credit. If the control queue has insufficient room, the reset waits for
+transmit progress rather than closing the connection. Release refuses a stream
+whose reset notification is still pending. A caller retaining an event indefinitely
+still blocks incoming parsing by the existing event-ownership contract.
+
+Physical Anvil 483 qualification passed eight cases: isolated expiry, expiry with
+retained DATA/FIELD, disabling, renewal, clock wrap, simultaneous expiry and deferred
+reset under a saturated control queue. Exact reset frames, preserved borrowed bytes,
+HPACK continuity, completed sibling streams, credit and single close ownership were
+checked. All 46 engine and seven duplex cases also passed.
+
+A real certificate-verified HTTPS test assigned a half-second deadline to
+httpbin.org/delay/5 while receiving httpbin.org/bytes/70000 on another stream of the
+same connection. The delayed stream reported H2_TIMEOUT and the sibling completed
+HTTP 200 with all 70000 bytes. Observed total elapsed time was 1105830 microseconds,
+maximum Step 2533 and separate service call 3026 microseconds, not worst-case bounds.
+Captures 177-180 returned zero with cores, fonts and Vulkan healthy, watchdog off
+and temporary DNS settings removed. Monitor 483 was unchanged. Shared Pi 3
+compilation passed; physical proof is Pi 4 only. Evidence:
+`docs/evidence/anvil-ipv6-20261030/http2-deadlines483`.
