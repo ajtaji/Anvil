@@ -1,0 +1,286 @@
+
+XIncludeFile "RaspberryPi4/Lib/mmu.pi4"
+XIncludeFile "Anvil/Network/ipv6_rdnss_list.pbi"
+XIncludeFile "Anvil/Network/ipv6_source.pbi"
+#NET_IF_KINDS=3
+#IPV6_SERVICE_DNS=8
+#IPV6_SERVICE_ADDRESSES=4
+#IPV6_HOST_READY=3
+#IPV6_NC_FAILED=5
+Structure FixtureHost
+ phase.i
+EndStructure
+Structure FixtureLifetime
+ address.IPv6AddressStorage
+EndStructure
+Structure FixtureOwner
+ generation.i
+ lifetime.FixtureLifetime
+EndStructure
+Structure FixturePolicy
+ state.i
+EndStructure
+Structure FixtureNeighbor
+ policy.FixturePolicy
+EndStructure
+Structure IPv6DefaultRouter
+ address.IPv6AddressStorage
+EndStructure
+Global Dim ipv6svcHost.FixtureHost[3]
+Global Dim ipv6svcEpoch.i[3] : Global Dim ipv6svcState.i[3] : Global Dim ready.i[3]
+Global Dim ipv6svcDns.IPv6RdnssList[3]
+Global Dim ipv6svcDnsRows.IPv6RdnssEntry[24]
+Global Dim ipv6svcOnLink.i[3] : Global Dim ipv6svcRouters.i[3]
+Global Dim ipv6svcRouterRows.a[384] : Global Dim ipv6svcAddresses.a[48]
+Global Dim ipv6svcOwner.FixtureOwner[12] : Global Dim ipv6svcOwnerUsed.i[12]
+Global Dim ipv6svcNeighbor.FixtureNeighbor[24]
+Global *net_tcp6ScopedSelectHook
+Global now.i,preferred.i=2
+Procedure.i ipv6svc_Now()
+ ProcedureReturn now
+EndProcedure
+Procedure.i HwLinkReady(kind.i)
+ ProcedureReturn ready[kind]
+EndProcedure
+Procedure.i LinkKind()
+ ProcedureReturn preferred
+EndProcedure
+Procedure.i IPv6PrefixListMatch(s.i,gen.i,t.i,dest.i)
+ ProcedureReturn 0
+EndProcedure
+Procedure.i ipv6svc_NeighborFind(kind.i,addr.i)
+ ProcedureReturn -1
+EndProcedure
+Procedure.i IPv6DefaultRoutersSelect(s.i,gen.i,t.i,failed.i)
+ ProcedureReturn 0
+EndProcedure
+Procedure.i IPv6AddressOwnerStatus(s.i,gen.i,t.i)
+ ProcedureReturn 2
+EndProcedure
+Procedure.i WrongLink(kind.i,dest.i,source.i)
+ ProcedureReturn 3-kind
+EndProcedure
+Structure NetDns6Lease
+ kind.i
+ generation.i
+ address.IPv6AddressStorage
+EndStructure
+Global *dnsLearned6Select,*dnsLearned6Valid
+Procedure NetDnsLearned6Bind(selectFn.i,validFn.i)
+ *dnsLearned6Select=selectFn : *dnsLearned6Valid=validFn
+EndProcedure
+Procedure.i NetDnsLearned6Select(*lease.NetDns6Lease)
+ If *lease=0 Or dnsLearned6Select=0 Or dnsLearned6Valid=0 : ProcedureReturn 0 : EndIf
+ ProcedureReturn dnsLearned6Select(*lease)
+EndProcedure
+Procedure.i NetDnsLearned6Valid(*lease.NetDns6Lease)
+ If *lease=0 Or dnsLearned6Valid=0 : ProcedureReturn 0 : EndIf
+ ProcedureReturn dnsLearned6Valid(*lease)
+EndProcedure
+Procedure.i ipv6svc_Select(destination.i,source.i,requiredKind.i)
+ Define chosen.IPv6AddressStorage,candidate.IPv6AddressStorage
+ Define kind.i,now.i,route.i,bestRoute.i,bestKind.i,bestDeprecated.i
+ Define i.i,j.i,slot.i,state.i,deprecated.i,failed.i,index.i,rc.i
+ Define *router.IPv6DefaultRouter
+ If requiredKind<0 Or requiredKind>=#NET_IF_KINDS Or destination=0 Or source=0 : ProcedureReturn -881 : EndIf
+ If PeekA(destination)=255 Or IPv6AddressUnspecified(destination)<>0 : ProcedureReturn -881 : EndIf
+ If IPv6SourceLabel(destination)=0 Or IPv6SourceLabel(destination)=3 Or IPv6SourceLabel(destination)=4 : ProcedureReturn -881 : EndIf
+ now=ipv6svc_Now() : bestKind=0 : bestRoute=-1
+ For kind=1 To #NET_IF_KINDS-1
+  If (requiredKind=0 Or requiredKind=kind) And HwLinkReady(kind)<>0 And ipv6svcState[kind]=2 And ipv6svcHost[kind]\phase=#IPV6_HOST_READY
+   route=IPv6PrefixListMatch(@ipv6svcOnLink[kind],ipv6svcEpoch[kind],now,destination)
+   If IPv6SourceScope(destination)=2 : route=129 : EndIf
+   If route=0
+    failed=0
+    For j=0 To 3
+     *router=@ipv6svcRouterRows[kind*128+j*32]
+     slot=ipv6svc_NeighborFind(kind,@*router\address)
+     If slot>=0
+      If ipv6svcNeighbor[slot]\policy\state=#IPV6_NC_FAILED : failed=failed|(1<<j) : EndIf
+     EndIf
+    Next
+    index=IPv6DefaultRoutersSelect(@ipv6svcRouters[kind],ipv6svcEpoch[kind],now,failed)
+    If index<=0 : route=-1 : EndIf
+   EndIf
+   If route>=0
+    For i=0 To 15 : PokeA(@candidate+i,ipv6svcAddresses[kind*16+i]) : Next
+    deprecated=0
+    For j=0 To #IPV6_SERVICE_ADDRESSES-1
+     slot=kind*#IPV6_SERVICE_ADDRESSES+j
+     If ipv6svcOwnerUsed[slot]<>0
+      state=IPv6AddressOwnerStatus(@ipv6svcOwner[slot],ipv6svcOwner[slot]\generation,now)
+      If state=2 Or state=3
+       rc=IPv6SourceBetter(destination,@ipv6svcOwner[slot]\lifetime\address,Bool(state=3),64,@candidate,deprecated,64)
+       If rc=1
+        For i=0 To 15 : PokeA(@candidate+i,PeekA(@ipv6svcOwner[slot]\lifetime\address+i)) : Next
+        deprecated=Bool(state=3)
+       EndIf
+      EndIf
+     EndIf
+    Next
+    If IPv6SourceScope(@candidate)>=IPv6SourceScope(destination)
+     rc=0
+     If bestKind=0 Or route>bestRoute
+      rc=1
+     ElseIf route=bestRoute
+      If kind=LinkKind() And bestKind<>LinkKind() : rc=1 : EndIf
+     EndIf
+     If rc=1
+      For i=0 To 15 : PokeA(@chosen+i,PeekA(@candidate+i)) : Next
+      bestKind=kind : bestRoute=route
+     EndIf
+    EndIf
+   EndIf
+  EndIf
+ Next
+ If bestKind=0 : ProcedureReturn -883 : EndIf
+ For i=0 To 15 : PokeA(source+i,PeekA(@chosen+i)) : Next
+ ProcedureReturn bestKind
+EndProcedure
+Procedure.i IPv6ServiceSelect(destination.i,source.i)
+ ProcedureReturn ipv6svc_Select(destination,source,0)
+EndProcedure
+Procedure.i IPv6ServiceSelectOn(kind.i,destination.i,source.i)
+ If kind<1 Or kind>=#NET_IF_KINDS : ProcedureReturn -881 : EndIf
+ ProcedureReturn ipv6svc_Select(destination,source,kind)
+EndProcedure
+Procedure.i IPv6ServiceDnsSelect(*lease.NetDns6Lease)
+ Define source.IPv6AddressStorage,address.IPv6AddressStorage
+ Define kind.i,i.i,rc.i,now.i,j.i
+ If *lease=0 : ProcedureReturn 0 : EndIf
+ now=ipv6svc_Now()
+ For kind=1 To #NET_IF_KINDS-1
+  If ipv6svcState[kind]=2 And ipv6svcHost[kind]\phase=#IPV6_HOST_READY And HwLinkReady(kind)<>0
+   For i=0 To #IPV6_SERVICE_DNS-1
+    rc=IPv6RdnssListGet(@ipv6svcDns[kind],kind,ipv6svcEpoch[kind],now,i,@address)
+    If rc=16
+     If IPv6ServiceSelectOn(kind,@address,@source)=kind
+      *lease\kind=kind : *lease\generation=ipv6svcEpoch[kind]
+      For j=0 To 15 : PokeA(@*lease\address+j,PeekA(@address+j)) : Next
+      ProcedureReturn kind
+     EndIf
+    EndIf
+   Next
+  EndIf
+ Next
+ ProcedureReturn 0
+EndProcedure
+Procedure.i IPv6ServiceDnsValid(*lease.NetDns6Lease)
+ Define address.IPv6AddressStorage
+ Define kind.i,i.i,rc.i,now.i
+ If *lease=0 : ProcedureReturn 0 : EndIf
+ kind=*lease\kind
+ If kind<1 Or kind>=#NET_IF_KINDS : ProcedureReturn 0 : EndIf
+ If *lease\generation<>ipv6svcEpoch[kind] Or ipv6svcState[kind]<>2 Or HwLinkReady(kind)=0 : ProcedureReturn 0 : EndIf
+ If ipv6svcHost[kind]\phase<>#IPV6_HOST_READY : ProcedureReturn 0 : EndIf
+ now=ipv6svc_Now()
+ For i=0 To #IPV6_SERVICE_DNS-1
+  rc=IPv6RdnssListGet(@ipv6svcDns[kind],kind,ipv6svcEpoch[kind],now,i,@address)
+  If rc=16
+   If IPv6AddressPrefix(@address,@*lease\address,128)=1 : ProcedureReturn 1 : EndIf
+  EndIf
+ Next
+ ProcedureReturn 0
+EndProcedure
+Procedure NetSetTcp6ScopedSelectHook(selectSource.i)
+ *net_tcp6ScopedSelectHook=selectSource
+EndProcedure
+Procedure.i NetTcp6SelectOn(kind.i,destination.i,source.i)
+ Define rc.i
+ If kind<1 Or kind>=#NET_IF_KINDS Or destination=0 Or source=0 Or net_tcp6ScopedSelectHook=0 : ProcedureReturn -881 : EndIf
+ If source<destination+16 And destination<source+16 : ProcedureReturn -881 : EndIf
+ rc=net_tcp6ScopedSelectHook(kind,destination,source)
+ If rc>0 And rc<>kind : ProcedureReturn -883 : EndIf
+ ProcedureReturn rc
+EndProcedure
+
+Global lease.NetDns6Lease,learned.IPv6RdnssAdvertisement,dest.IPv6AddressStorage,result.IPv6AddressStorage
+Procedure Save(index.i,rc.i)
+ Define p.i,i.i
+ p=$E1C00100+index*64 : PokeI(p,rc) : PokeI(p+8,lease\kind) : PokeI(p+16,lease\generation)
+ For i=0 To 15 : PokeA(p+24+i,PeekA(@lease\address+i)) : PokeA(p+40+i,PeekA(@result+i)) : Next
+EndProcedure
+Procedure.i Main()
+ Define i.i,kind.i,rc.i
+ For i=0 To 131071 : PokeA($E1C00000+i,$A5) : Next
+ PokeI($E1C00000,$52445343)
+ MmuClearNc() : rc=MmuBuildTables($4F80000) : If rc<>0 : ProcedureReturn 2 : EndIf
+ MmuEnableCached()
+ For kind=1 To 2
+  ready[kind]=1 : ipv6svcState[kind]=2 : ipv6svcHost[kind]\phase=#IPV6_HOST_READY : ipv6svcEpoch[kind]=1
+  ipv6svcAddresses[kind*16]=$FE : ipv6svcAddresses[kind*16+1]=$80 : ipv6svcAddresses[kind*16+15]=kind
+  IPv6RdnssListInit(@ipv6svcDns[kind],kind,1,@ipv6svcDnsRows[kind*8],8,0)
+ Next
+ PokeA(@dest,$FE) : PokeA(@dest+1,$80) : PokeA(@dest+15,53)
+ For i=0 To 15 : PokeA(@learned\address+i,PeekA(@dest+i)) : Next
+ learned\seconds=1
+ For i=0 To 15 : PokeA(@result+i,$A5) : Next
+rc=NetDnsLearned6Select(@lease)
+ Save(0,rc)
+ NetDnsLearned6Bind(@IPv6ServiceDnsSelect,@IPv6ServiceDnsValid)
+ NetSetTcp6ScopedSelectHook(@IPv6ServiceSelectOn)
+ For i=0 To 15 : PokeA(@result+i,$A5) : Next
+rc=NetDnsLearned6Select(@lease)
+ Save(1,rc)
+ For i=0 To 15 : PokeA(@result+i,$A5) : Next
+rc=IPv6ServiceSelect(@dest,@result)
+ Save(2,rc)
+ For i=0 To 15 : PokeA(@result+i,$A5) : Next
+rc=NetTcp6SelectOn(1,@dest,@result)
+ Save(3,rc)
+ For i=0 To 15 : PokeA(@result+i,$A5) : Next
+ready[1]=0 : rc=NetTcp6SelectOn(1,@dest,@result)
+ Save(4,rc)
+ For i=0 To 15 : PokeA(@result+i,$A5) : Next
+rc=NetTcp6SelectOn(2,@dest,@result)
+ Save(5,rc)
+ For i=0 To 15 : PokeA(@result+i,$A5) : Next
+rc=NetTcp6SelectOn(0,@dest,@result)
+ Save(6,rc)
+ For i=0 To 15 : PokeA(@result+i,$A5) : Next
+rc=NetTcp6SelectOn(1,@dest,@dest)
+ Save(7,rc)
+ For i=0 To 15 : PokeA(@result+i,$A5) : Next
+NetSetTcp6ScopedSelectHook(@WrongLink) : rc=NetTcp6SelectOn(1,@dest,@result)
+ Save(8,rc)
+ NetSetTcp6ScopedSelectHook(@IPv6ServiceSelectOn) : ready[1]=1
+ IPv6RdnssListApply(@ipv6svcDns[1],1,1,0,@learned,1)
+ For i=0 To 15 : PokeA(@result+i,$A5) : Next
+rc=NetDnsLearned6Select(@lease)
+ Save(9,rc)
+ For i=0 To 15 : PokeA(@result+i,$A5) : Next
+rc=NetDnsLearned6Valid(@lease)
+ Save(10,rc)
+ For i=0 To 15 : PokeA(@result+i,$A5) : Next
+ready[1]=0 : rc=NetDnsLearned6Valid(@lease)
+ Save(11,rc)
+ ready[1]=1 : now=1000
+ For i=0 To 15 : PokeA(@result+i,$A5) : Next
+rc=NetDnsLearned6Valid(@lease)
+ Save(12,rc)
+ learned\seconds=$FFFFFFFF : IPv6RdnssListApply(@ipv6svcDns[1],1,1,now,@learned,1)
+ IPv6RdnssListApply(@ipv6svcDns[2],2,1,now,@learned,1)
+ For i=0 To 15 : PokeA(@result+i,$A5) : Next
+rc=NetDnsLearned6Valid(@lease)
+ Save(13,rc)
+ ipv6svcEpoch[1]=2 : IPv6RdnssListInit(@ipv6svcDns[1],1,2,@ipv6svcDnsRows[8],8,now)
+ For i=0 To 15 : PokeA(@result+i,$A5) : Next
+rc=NetDnsLearned6Valid(@lease)
+ Save(14,rc)
+ For i=0 To 15 : PokeA(@result+i,$A5) : Next
+rc=NetDnsLearned6Select(@lease)
+ Save(15,rc)
+ For i=0 To 15 : PokeA(@result+i,$A5) : Next
+rc=NetDnsLearned6Valid(@lease)
+ Save(16,rc)
+ learned\seconds=0 : IPv6RdnssListApply(@ipv6svcDns[2],2,1,now,@learned,1)
+ For i=0 To 15 : PokeA(@result+i,$A5) : Next
+rc=NetDnsLearned6Valid(@lease)
+ Save(17,rc)
+ For i=0 To 15 : PokeA(@result+i,$A5) : Next
+rc=NetDnsLearned6Select(@lease)
+ Save(18,rc)
+ PokeI($E1C00008,19)
+ MmuDisableCachedFlushed()
+ ProcedureReturn 0
+EndProcedure

@@ -39,3 +39,23 @@ Procedure.i NetDnsResolver6(destination.i)
  For i=0 To 15 : PokeA(destination+i,PeekA(@address+i)) : Next
  ProcedureReturn 16
 EndProcedure
+
+; A learned server is inseparable from its link generation. Optional provider
+; callbacks keep the resolver usable on compositions without an IPv6 service.
+Structure NetDns6Lease
+ kind.i
+ generation.i
+ address.IPv6AddressStorage
+EndStructure
+Global *dnsLearned6Select,*dnsLearned6Valid
+Procedure NetDnsLearned6Bind(selectFn.i,validFn.i)
+ *dnsLearned6Select=selectFn : *dnsLearned6Valid=validFn
+EndProcedure
+Procedure.i NetDnsLearned6Select(*lease.NetDns6Lease)
+ If *lease=0 Or dnsLearned6Select=0 Or dnsLearned6Valid=0 : ProcedureReturn 0 : EndIf
+ ProcedureReturn dnsLearned6Select(*lease)
+EndProcedure
+Procedure.i NetDnsLearned6Valid(*lease.NetDns6Lease)
+ If *lease=0 Or dnsLearned6Valid=0 : ProcedureReturn 0 : EndIf
+ ProcedureReturn dnsLearned6Valid(*lease)
+EndProcedure

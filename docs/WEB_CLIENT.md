@@ -2356,7 +2356,51 @@ aliasing, failed batch atomicity, link changes, cross-interface isolation and
 idempotent link-down cleanup. Core/font/Vulkan/watchdog checks passed.
 Evidence: docs/evidence/anvil-ipv6-20261030/rdnss-list477.
 
-This repository is not yet connected to resident RA reception or DNS selection.
-Installed monitor 477 is unchanged; automatic resolver discovery is still not
-enabled. Scoped transport, live RA ownership integration and an end-to-end
-advertisement-to-web test are the next required work.
+At the repository-only checkpoint, monitor 477 did not connect this storage
+to RA reception or DNS selection. The resident integration follows below.
+
+
+### Resident scoped DNS integration: build 478
+
+The shared IPv6 service now decodes RDNSS options after validating router
+advertisements, copies their addresses into each interface's lifetime repository,
+and clears them on link teardown or generation change. Eight entries per interface
+are retained independently of default-router lifetime. DNS queries prefer explicit
+IPv6 settings, then usable explicit/DHCP IPv4 resolvers, then routable learned
+IPv6 resolvers. An explicit unusable IPv4 setting does not silently select RDNSS.
+
+Scoped IPv6 TCP selection keeps a learned server on its receiving interface,
+including when the same link-local address exists on another link. The pending
+DNS query retains a copied address, interface and generation, and rechecks the
+lease before progressing its TCP connection. Withdrawal, expiry or link changes
+close the pending query with a state error; its original deadline is preserved.
+Existing unscoped TCP callers retain their interface-selection behavior.
+
+Physical Pi tests passed 64 transport cases, 13 resolver-start/pending-lease cases,
+the existing pending query-type checks, and 19 scoped route/lease cases. The
+controlled interface tests execute the actual selection and repository code with
+hardware-state doubles; they are not a live router-advertisement claim. Captures
+116/117 contain final scope/DNS results. The DNS host checker initially had an
+incorrect AAAA expectation after its extension; it was corrected against the same
+captured report, without rerunning or changing the physical test.
+
+Build 478 was installed after verifying the 477 rollback, candidate and boot file.
+After one restart, a 90-second quiet interval preceded readiness checks. Its full
+running image hash matched. Pi 3 build 92 compiled from the same shared changes;
+Pi 3 physical execution is not claimed.
+
+Capture 118 resolved a hostname through an explicit IPv6 DNS test server and
+retrieved the exact 20,000-byte HTTP body over LAN IPv6: status 200, 891 ms.
+Capture 119 resolved public A/AAAA records with both manual resolver settings
+absent: first AAAA 424 ms, first A 33 ms, subsequent cached results 0 ms.
+This alone does not distinguish DHCP from RDNSS selection. Capture 120 passed
+verified HTTPS, cancellation and compressed-response regression checks. Every
+physical run returned normally with cores/fonts/Vulkan healthy and watchdog off.
+Temporary resolver overrides and host test listeners were removed.
+
+Evidence: docs/evidence/anvil-ipv6-20261030/rdnss-integration478.
+Automatic RA-to-DNS-to-web selection still needs a trace that proves its resolver
+source and interface. Public off-link IPv6 and HTTP/2-3 remain unfinished, as do
+remaining atomic TLS/device work. LAN IPv6 traffic is not evidence of public IPv6
+reachability. The bounded managed application cookie library is already described
+above; broader browser cookie/site behavior is outside that implemented subset.

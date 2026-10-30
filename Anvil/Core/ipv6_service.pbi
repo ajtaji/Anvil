@@ -1,8 +1,16 @@
+XIncludeFile "Anvil/Network/ipv6_rdnss_list.pbi"
+XIncludeFile "Anvil/Core/dns_policy.pbi"
 ; Resident shared link-local IPv6 service. Compose ipv6_host.pbi, link receipts,
 ; random_service.pbi and netconsole.pbi first. All work runs on core 0 between
 ; receive dispatches. Device hooks supply generation and bounded filter setup.
 ; The service owns every host context, source list and outstanding link receipt.
 XIncludeFile "Anvil/Network/ipv6_source.pbi"
+#IPV6_SERVICE_DNS=8
+Global Dim ipv6svcDns.IPv6RdnssList[#NET_IF_KINDS]
+Global Dim ipv6svcDnsRows.IPv6RdnssEntry[#NET_IF_KINDS*#IPV6_SERVICE_DNS]
+; At most 90 addresses fit an accepted 1514-byte Ethernet frame.
+Global Dim ipv6svcDnsDecoded.IPv6RdnssAdvertisement[90]
+Global Dim ipv6svcDnsError.i[#NET_IF_KINDS]
 Global *ipv6svcGeneration,*ipv6svcPrepare
 Global ipv6svcBusy.i,ipv6svcCursor.i=1,ipv6svcClock.i,ipv6svcRaw.i,ipv6svcClockSet.i
 Global Dim ipv6svcHost.IPv6Host[#NET_IF_KINDS]
@@ -252,17 +260,17 @@ EndProcedure
 ; Route first, then RFC6724 comparison of this interface's assigned
 ; public addresses. Longest on-link route wins; selected link breaks equal
 ; route ties. Scoped literals without a zone follow that selected interface.
-Procedure.i IPv6ServiceSelect(destination.i,source.i)
+Procedure.i ipv6svc_Select(destination.i,source.i,requiredKind.i)
  Define chosen.IPv6AddressStorage,candidate.IPv6AddressStorage
  Define kind.i,now.i,route.i,bestRoute.i,bestKind.i,bestDeprecated.i
  Define i.i,j.i,slot.i,state.i,deprecated.i,failed.i,index.i,rc.i
  Define *router.IPv6DefaultRouter
- If destination=0 Or source=0 : ProcedureReturn -881 : EndIf
+ If requiredKind<0 Or requiredKind>=#NET_IF_KINDS Or destination=0 Or source=0 : ProcedureReturn -881 : EndIf
  If PeekA(destination)=255 Or IPv6AddressUnspecified(destination)<>0 : ProcedureReturn -881 : EndIf
  If IPv6SourceLabel(destination)=0 Or IPv6SourceLabel(destination)=3 Or IPv6SourceLabel(destination)=4 : ProcedureReturn -881 : EndIf
  now=ipv6svc_Now() : bestKind=0 : bestRoute=-1
  For kind=1 To #NET_IF_KINDS-1
-  If HwLinkReady(kind)<>0 And ipv6svcState[kind]=2 And ipv6svcHost[kind]\phase=#IPV6_HOST_READY
+  If (requiredKind=0 Or requiredKind=kind) And HwLinkReady(kind)<>0 And ipv6svcState[kind]=2 And ipv6svcHost[kind]\phase=#IPV6_HOST_READY
    route=IPv6PrefixListMatch(@ipv6svcOnLink[kind],ipv6svcEpoch[kind],now,destination)
    If IPv6SourceScope(destination)=2 : route=129 : EndIf
    If route=0
@@ -313,6 +321,51 @@ Procedure.i IPv6ServiceSelect(destination.i,source.i)
  ProcedureReturn bestKind
 EndProcedure
 
+Procedure.i IPv6ServiceSelect(destination.i,source.i)
+ ProcedureReturn ipv6svc_Select(destination,source,0)
+EndProcedure
+Procedure.i IPv6ServiceSelectOn(kind.i,destination.i,source.i)
+ If kind<1 Or kind>=#NET_IF_KINDS : ProcedureReturn -881 : EndIf
+ ProcedureReturn ipv6svc_Select(destination,source,kind)
+EndProcedure
+Procedure.i IPv6ServiceDnsSelect(*lease.NetDns6Lease)
+ Define source.IPv6AddressStorage,address.IPv6AddressStorage
+ Define kind.i,i.i,rc.i,now.i,j.i
+ If *lease=0 : ProcedureReturn 0 : EndIf
+ now=ipv6svc_Now()
+ For kind=1 To #NET_IF_KINDS-1
+  If ipv6svcState[kind]=2 And ipv6svcHost[kind]\phase=#IPV6_HOST_READY And HwLinkReady(kind)<>0
+   For i=0 To #IPV6_SERVICE_DNS-1
+    rc=IPv6RdnssListGet(@ipv6svcDns[kind],kind,ipv6svcEpoch[kind],now,i,@address)
+    If rc=16
+     If IPv6ServiceSelectOn(kind,@address,@source)=kind
+      *lease\kind=kind : *lease\generation=ipv6svcEpoch[kind]
+      For j=0 To 15 : PokeA(@*lease\address+j,PeekA(@address+j)) : Next
+      ProcedureReturn kind
+     EndIf
+    EndIf
+   Next
+  EndIf
+ Next
+ ProcedureReturn 0
+EndProcedure
+Procedure.i IPv6ServiceDnsValid(*lease.NetDns6Lease)
+ Define address.IPv6AddressStorage
+ Define kind.i,i.i,rc.i,now.i
+ If *lease=0 : ProcedureReturn 0 : EndIf
+ kind=*lease\kind
+ If kind<1 Or kind>=#NET_IF_KINDS : ProcedureReturn 0 : EndIf
+ If *lease\generation<>ipv6svcEpoch[kind] Or ipv6svcState[kind]<>2 Or HwLinkReady(kind)=0 : ProcedureReturn 0 : EndIf
+ If ipv6svcHost[kind]\phase<>#IPV6_HOST_READY : ProcedureReturn 0 : EndIf
+ now=ipv6svc_Now()
+ For i=0 To #IPV6_SERVICE_DNS-1
+  rc=IPv6RdnssListGet(@ipv6svcDns[kind],kind,ipv6svcEpoch[kind],now,i,@address)
+  If rc=16
+   If IPv6AddressPrefix(@address,@*lease\address,128)=1 : ProcedureReturn 1 : EndIf
+  EndIf
+ Next
+ ProcedureReturn 0
+EndProcedure
 Procedure.i IPv6ServiceEchoStart(source.i,destination.i)
  Define kind.i,found.i,now.i,rc.i,i.i,slot.i,failed.i,j.i,index.i
  Define *router.IPv6DefaultRouter
@@ -433,6 +486,7 @@ Procedure ipv6svc_EchoInput(kind.i,now.i,frame.i,bytes.i)
 EndProcedure
 Procedure ipv6svc_DiscardAddresses(kind.i)
  Define i.i,slot.i
+ IPv6RdnssListClear(@ipv6svcDns[kind],kind,ipv6svcDns[kind]\generation,ipv6svc_Now())
  For i=0 To #IPV6_SERVICE_ADDRESSES-1
   slot=kind*#IPV6_SERVICE_ADDRESSES+i
   ipv6svcOwnerUsed[slot]=0 : ipv6svcOwnerReceipt[slot]=0 : ipv6svcOwnerToken[slot]=0
@@ -622,6 +676,9 @@ Procedure.i IPv6ServiceInput(kind.i,frame.i,bytes.i,out.i,capacity.i)
        If ipv6svcRa[kind]\retransmit<>0 : ipv6svcRetransmit[kind]=ipv6svcRa[kind]\retransmit : EndIf
        If ipv6svcRa[kind]\mtu<>0 : ipv6svcMtu[kind]=ipv6svcRa[kind]\mtu : EndIf
        ipv6svc_ApplyPrefixes(kind,now)
+       rc=IPv6RdnssDecode(frame+14,bytes-14,local,@ipv6svcDnsDecoded[0],90)
+       If rc>=0 : rc=IPv6RdnssListApply(@ipv6svcDns[kind],kind,ipv6svcEpoch[kind],now,@ipv6svcDnsDecoded[0],rc) : EndIf
+       ipv6svcDnsError[kind]=rc
        local=0 : If ipv6svcRa[kind]\hasMac<>0 : local=@ipv6svcRa[kind]\mac : EndIf
        ipv6svc_NeighborLearn(kind,now,@ipv6svcRa[kind]\source,local,1)
       Else
@@ -678,6 +735,7 @@ Procedure IPv6ServiceTick()
   rc=IPv6DefaultRoutersInit(@ipv6svcRouters[kind],ipv6svcEpoch[kind],@ipv6svcRouterRows[kind*128],4,now)
   rc=IPv6PrefixListInit(@ipv6svcOnLink[kind],ipv6svcEpoch[kind],@ipv6svcOnLinkRows[kind*#IPV6_SERVICE_PREFIXES],#IPV6_SERVICE_PREFIXES,now)
   ipv6svc_DiscardAddresses(kind) : ipv6svcAddressError[kind]=0
+  ipv6svcDnsError[kind]=IPv6RdnssListInit(@ipv6svcDns[kind],kind,ipv6svcEpoch[kind],@ipv6svcDnsRows[kind*#IPV6_SERVICE_DNS],#IPV6_SERVICE_DNS,now)
   mac=HwLinkMacPtr(kind) : p=@ipv6svcAddresses[kind*16]
   If mac=0
    ipv6svcState[kind]=-1 : ipv6svcError[kind]=-800
@@ -756,6 +814,8 @@ Procedure.i IPv6ServiceBind(generation.i,prepare.i)
  NetSetIPv6InputHook(@IPv6ServiceInput)
  NetSetTcp6Hooks(@IPv6ServiceSourceValid,@IPv6ServiceResolve)
  NetSetTcp6SelectHook(@IPv6ServiceSelect)
+ NetSetTcp6ScopedSelectHook(@IPv6ServiceSelectOn)
+ NetDnsLearned6Bind(@IPv6ServiceDnsSelect,@IPv6ServiceDnsValid)
  NetSetProtocolTickHook(@IPv6ServiceTick)
  ProcedureReturn 0
 EndProcedure

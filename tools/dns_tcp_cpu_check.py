@@ -23,14 +23,18 @@ def check(data,cases):
         assert [q(8192+i*24+j*8) for j in range(3)]==[1,2,1]
     assert [q(12288+i*8) for i in range(8)]==[-103,-110,-103,28,2,-105,0,-102]
     assert data[12352:12368]==b'\xa5'*16
-    for i in range(8):
+    for i in range(13):
         p=13312+i*128
         row=[q(p+j*8) for j in range(8)]
         expected={0:[-110,5,6,1,0,0,0,6],1:[-110,5,6,1,0,0,0,6],
                   2:[-102,0,4,0,0,0,0,0],3:[-108,0,4,0,0,0,0,0],
-                  4:[-102,0,4,0,0,0,0,0],5:[-108,0,4,0,0,1,0,0],
-                  6:[-110,5,6,1,0,0,0,6],7:[-105,0,6,1,0,0,0,6]}[i]
+                  4:[-102,0,4,0,0,0,0,0],5:[-108,0,4,0,0,0,0,0],
+                  6:[-110,5,6,1,0,0,0,6],7:[-105,0,6,1,0,0,0,6],8:[-110,5,6,1,0,0,0,6],
+                  9:[-108,0,6,0,0,0,0,0],10:[-108,0,4,0,0,0,0,0],
+                  11:[-102,0,4,0,0,0,0,0],12:[-110,5,6,1,0,0,0,6]}[i]
         assert row==expected,(i,row,expected)
-        if i in (0,1,6,7):assert data[p+64:p+80]==bytes(range(32,48))
-        assert [q(p+j) for j in (80,88,96)]==[0,0,1 if i in (0,1) else 0]
-    return dict(tcp_cases=rows,pending_type_checks=9,ipv6_start_cases=8)
+        if i in (0,1,6,7,8,9,12):assert data[p+64:p+80]==bytes(range(32,48))
+        assert [q(p+j) for j in (80,88,96)]==[0,0,1 if i in (0,1,8,12) else 0]
+        assert q(p+104)==(2 if i in (0,1,6,7,8,12) else 0),(i,q(p+104))
+        if i==12:assert [q(p+112),q(p+120)]==[4,-108]
+    return dict(tcp_cases=rows,pending_type_checks=9,ipv6_start_cases=13)

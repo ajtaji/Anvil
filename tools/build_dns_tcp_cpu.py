@@ -18,10 +18,33 @@ def build(compiler,out):
     constants='\n'.join(line for line in owner.splitlines() if line.startswith('#PAYNET_'))
     needed=set(re.findall(r'#[A-Z][A-Z_0-9]*',shared))|{'#SVC_EIO','#SVC_TCP_CONNECTING','#SVC_TCP_OPEN','#SVC_TCP_PEER_CLOSED'}
     constants+='\n'+'\n'.join(line for line in (root/names[1]).read_text(encoding='utf8').splitlines() if re.match(r'^#[A-Z][A-Z_0-9]*\s*=',line) and line.split('=')[0].strip() in needed)
-    globals_=owner[owner.index('Global paynet_dnsTcp.i'):owner.index('; ---- TCP ----')]
+    lease=re.search(r'^Structure NetDns6Lease.*?^EndStructure',(root/'Anvil/Core/dns_policy.pbi').read_text(encoding='utf8'),re.M|re.S).group(0)
+    globals_=lease+'\n'+owner[owner.index('Global paynet_dnsTcp.i'):owner.index('; ---- TCP ----')]
     s='XIncludeFile "Anvil/Network/ipv6_address.pbi"\nXIncludeFile "Anvil/Network/dns_codec.pbi"\n#HW_LINK_NONE=0\n'+constants+'\n'+globals_+r'''
 Global gSvcDetail.i
 Global chosenFamily.i,openedFamily.i,resolverResult.i,routeResult.i,v4Checks.i
+Global learnedKind.i,learnedValid.i=1,static4.i,openedScope.i
+Procedure.i SettingsGet(key.i)
+ ProcedureReturn static4
+EndProcedure
+Procedure.i EthKeyDns()
+ ProcedureReturn "net.dns"
+EndProcedure
+Procedure.i NetDnsLearned6Select(*lease.NetDns6Lease)
+ Define i.i
+ If learnedKind>0
+  *lease\kind=learnedKind : *lease\generation=1
+  For i=0 To 15 : PokeA(@*lease\address+i,32+i) : Next
+ EndIf
+ ProcedureReturn learnedKind
+EndProcedure
+Procedure.i NetDnsLearned6Valid(*lease.NetDns6Lease)
+ ProcedureReturn learnedValid
+EndProcedure
+Procedure.i PayNetTcpOpen6On(kind.i,destination.i,port.i)
+ openedScope=kind
+ ProcedureReturn PayNetTcpOpen6(destination,port)
+EndProcedure
 Procedure.i NetDnsResolver6(out.i)
  Define i.i
  If resolverResult=16
@@ -130,6 +153,7 @@ EndProcedure
 '''+shared+r'''
 Procedure Run(index.i,bytes.i,qtype.i)
  Define i.i,now.i,p.i,wrong.i,host.i,transition.i
+ openedScope=0 : paynet_dnsLearned=0
  openedFamily=0 : paynet_dnsFamily=chosenFamily
  mode=index % 16 : paynet_dnsType=qtype : opens=0 : closes=0 : listeners=0 : sends=0 : received=0 : sent=0
  replyLen=bytes
@@ -202,6 +226,7 @@ Procedure Start6(index.i)
  p=$E1C03400+index*128
  For i=0 To 3 : paynet_cacheUsed[i]=0 : Next
  paynet_DnsCancel()
+ learnedKind=0 : learnedValid=1 : static4=0 : openedScope=0
  resolverResult=16 : routeResult=2 : mode=3 : v4Checks=0
  opens=0 : closes=0 : listeners=0 : openedFamily=0
  paynet_dnsErr=0 : paynet_dnsFamily=4
@@ -213,12 +238,21 @@ Procedure Start6(index.i)
  If index=5 : resolverResult=0 : EndIf
  If index=6 : mode=8 : EndIf
  If index=7 : mode=9 : EndIf
+ If index>=8 : resolverResult=0 : learnedKind=2 : EndIf
+ If index=9 : learnedValid=0 : EndIf
+ If index=10 : static4=1 : EndIf
+ If index=11 : resolverResult=-1 : EndIf
  rc=paynet_DnsResolveType(name,qtype,@pendingOut[0])
  PokeI(p,rc) : PokeI(p+8,paynet_dnsState) : PokeI(p+16,paynet_dnsFamily)
  PokeI(p+24,opens) : PokeI(p+32,listeners) : PokeI(p+40,v4Checks)
  PokeI(p+48,paynet_dnsPort) : PokeI(p+56,openedFamily)
  For i=0 To 15 : PokeA(p+64+i,paynet_dnsServer6[i]) : Next
+ If index=12
+  learnedValid=0 : paynet_DnsTcpStep(101)
+  PokeI(p+112,paynet_dnsState) : PokeI(p+120,paynet_dnsErr)
+ EndIf
  paynet_DnsCancel()
+ PokeI(p+104,openedScope)
  PokeI(p+80,paynet_dnsState) : PokeI(p+88,paynet_dnsTcp) : PokeI(p+96,closes)
 EndProcedure
 Procedure.i Main(services.i)
@@ -238,7 +272,7 @@ Procedure.i Main(services.i)
             raw=struct.pack('>H',11 if i==7 else len(raw))+raw
             index=len(cases);packets.append(raw);cases.append(index);s+=f' Restore Packet{index}\n Run({index},{len(raw)},{qtype})\n'
     s+=f' Restore UdpPacket1\n udpLen={len(udps[0])}\n For i=0 To udpLen-1 : Read.a udp[i] : Next\n'
-    s+=' ProofDnsDispatch(0) : ProofDnsDispatch(1) : ProofDnsDispatch(2)\n PendingType()\n For i=0 To 7 : Start6(i) : Next\n ProcedureReturn 0\nEndProcedure\nDataSection\n'
+    s+=' ProofDnsDispatch(0) : ProofDnsDispatch(1) : ProofDnsDispatch(2)\n PendingType()\n For i=0 To 12 : Start6(i) : Next\n ProcedureReturn 0\nEndProcedure\nDataSection\n'
     for kind,raw in zip([1,28],udps):s+=f' UdpPacket{kind}:\n Data.a '+','.join(map(str,raw))+'\n'
     for i,raw in enumerate(packets):
         s+=f'Packet{i}:\n'

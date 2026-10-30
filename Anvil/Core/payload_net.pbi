@@ -200,6 +200,8 @@ Global Dim paynet_dnsTcpRx.a[65537]
 Global paynet_dnsState.i
 Global paynet_dnsKind.i
 Global paynet_dnsFamily.i = 4
+Global paynet_dnsLearned.i
+Global paynet_dnsLease.NetDns6Lease
 Global Dim paynet_dnsServer6.a[16]
 Global paynet_dnsServer.i
 Global paynet_dnsLocalIp.i
@@ -511,6 +513,12 @@ EndProcedure
 Procedure paynet_DnsTcpStep(now.i)
   Define rc.i,st.i,n.i,i.i,capacity.i
   paynet_DnsCloseListener()
+  If paynet_dnsLearned<>0
+    If NetDnsLearned6Valid(@paynet_dnsLease)<>1
+      paynet_DnsFail(#SVC_ESTATE,"the learned IPv6 DNS resolver expired or its link changed")
+      ProcedureReturn
+    EndIf
+  EndIf
   If ((now-paynet_dnsStart) & $FFFFFFFF)>=(#PAYNET_DNS_TRY_MS * #PAYNET_DNS_TRIES)
     paynet_DnsFail(#SVC_ETIMEOUT,"the DNS TCP retry exceeded the query deadline")
     ProcedureReturn
@@ -524,7 +532,7 @@ Procedure paynet_DnsTcpStep(now.i)
     NetWriteBE16(@paynet_dnsTcpTx[0],n)
     For i=0 To n-1 : paynet_dnsTcpTx[i+2]=PeekA(DnsQueryBuf()+i) : Next
     If paynet_dnsFamily=6
-      rc=PayNetTcpOpen6(@paynet_dnsServer6[0],#DNS_PORT)
+      rc=PayNetTcpOpen6On(paynet_dnsKind,@paynet_dnsServer6[0],#DNS_PORT)
     Else
       rc=PayNetTcpOpen(paynet_dnsServer,#DNS_PORT)
     EndIf
@@ -731,7 +739,7 @@ Procedure.i paynet_DnsResolveType(*name,qtype.i,destination.i)
     gSvcDetail="net.dns6 is not a valid unicast IPv6 resolver address"
     ProcedureReturn #SVC_EARG
   EndIf
-  paynet_dnsKind=#HW_LINK_NONE
+  paynet_dnsKind=#HW_LINK_NONE : paynet_dnsLearned=0
   If code=16
     family=6
     kind=NetTcp6Select(@resolver6,@source6)
@@ -741,10 +749,7 @@ Procedure.i paynet_DnsResolveType(*name,qtype.i,destination.i)
     EndIf
     paynet_dnsKind=kind
   Else
-    If NetIfUsableCount()=0
-      gSvcDetail="no interface holds an IPv4 address and net.dns6 is not set"
-      ProcedureReturn #SVC_ESTATE
-    EndIf
+    ; Explicit IPv4 settings and usable DHCP resolvers precede learned RDNSS.
     kind=NetIfNext(0)
     While kind<>#HW_LINK_NONE
       dns=paynet_DnsFor(kind)
@@ -754,8 +759,15 @@ Procedure.i paynet_DnsResolveType(*name,qtype.i,destination.i)
       EndIf
       kind=NetIfNext(kind)
     Wend
+    If paynet_dnsKind=#HW_LINK_NONE And SettingsGet(EthKeyDns())=0
+      kind=NetDnsLearned6Select(@paynet_dnsLease)
+      If kind>0
+        family=6 : paynet_dnsLearned=1 : paynet_dnsKind=kind
+        For i=0 To 15 : PokeA(@resolver6+i,PeekA(@paynet_dnsLease\address+i)) : Next
+      EndIf
+    EndIf
     If paynet_dnsKind=#HW_LINK_NONE
-      gSvcDetail="no DNS resolver has a route: neither the lease nor net.dns names a usable resolver"
+      gSvcDetail="no configured or learned DNS resolver has a usable route"
       ProcedureReturn #SVC_ESTATE
     EndIf
   EndIf
@@ -1004,11 +1016,15 @@ EndProcedure
 
 ; Kernel IPv6 open shares the existing handle/timeout/cleanup owner.
 ; Address bytes are copied before return; callers need not retain storage.
-Procedure.i PayNetTcpOpen6(destination.i,port.i)
+Procedure.i paynet_TcpOpen6(destination.i,port.i,requiredKind.i)
  Define source.IPv6AddressStorage
  Define k.i,h.i,i.i,now.i,code.i
  If destination=0 Or port<1 Or port>65535 : ProcedureReturn #SVC_EARG : EndIf
- k=NetTcp6Select(destination,@source)
+ If requiredKind=0
+  k=NetTcp6Select(destination,@source)
+ Else
+  k=NetTcp6SelectOn(requiredKind,destination,@source)
+ EndIf
  If k<1
   gSvcDetail="no assigned IPv6 source and route can reach that destination"
   ProcedureReturn #SVC_ESTATE
@@ -1031,6 +1047,13 @@ Procedure.i PayNetTcpOpen6(destination.i,port.i)
  gSvcDetail=0 : ProcedureReturn h+1
 EndProcedure
 
+Procedure.i PayNetTcpOpen6(destination.i,port.i)
+ ProcedureReturn paynet_TcpOpen6(destination,port,0)
+EndProcedure
+Procedure.i PayNetTcpOpen6On(kind.i,destination.i,port.i)
+ If kind<=0 : ProcedureReturn #SVC_EARG : EndIf
+ ProcedureReturn paynet_TcpOpen6(destination,port,kind)
+EndProcedure
 ; Slot 86. Where the connection is - see the header for the three states.
 Procedure.i PayNetTcpState(h.i)
   Define i.i
