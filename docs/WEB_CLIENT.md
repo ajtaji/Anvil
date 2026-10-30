@@ -1882,3 +1882,37 @@ medium is not bounded by this evidence. Public off-link IPv6, IPv6 DNS transport
 full address racing, HTTP/2-3 and complete managed-cookie policy remain open.
 Evidence: `docs/evidence/anvil-ipv6-20261030/service463`, including the rejected
 MMU test-harness run and its corrected physical proof.
+
+
+### Shared checksum CPU cost reduction (build464)
+
+The shared exFAT checksum accumulator now performs four byte steps per loop,
+with the unsigned 32-bit rotate/add arithmetic inline. Byte loads require no
+alignment. Boot checksums accumulate the same three byte ranges around the
+excluded VolumeFlags and PercentInUse fields; up-case checksums use the same
+accumulator across their existing 4 KiB windows. Read counts and all validation
+checks are unchanged.
+
+Physical Pi4 tests passed all 120 boot-region cases and the full filesystem
+regression. The independent checksum oracle now covers 28 sizes, including
+four-byte tails and window boundaries. A valid 512-byte-sector boot-region
+check fell from 276.7 to 65.9 microseconds in the memory-backed fixture. The
+32 KiB up-case checksum fell from 1367.9 to 617.9 microseconds with nine reads
+in both runs. These CPU fixture timings do not represent disk throughput.
+
+After installing build464 and waiting 90 seconds before readiness checks, the
+same cold HTTPS probe passed verified public gzip/deflate content checks. The
+observed whole-service maximum fell from 5.641 to 5.067 ms; initial root-file
+open fell from 5.495 to 4.922 ms. This is about another 10% reduction in this
+cold service measurement, not a guaranteed latency bound. The filesystem open
+remains synchronous and is still the largest observed pause.
+
+Build464 passed full running-image SHA, cores, fonts, Vulkan and watchdog
+checks; build463 is retained as verified rollback. Pi3build78 compiles the
+shared change, without a physical Pi3 claim. Temporary DNS settings were
+removed. Evidence: `docs/evidence/anvil-ipv6-20261030/checksum464`. The archive
+also retains the rejected first expanded fixture: its declared case list and
+hardcoded emitted body disagreed. The corrected builder emits both from one
+list, and the rebuilt physical run passed. Networking remains incomplete;
+the remaining synchronous open and previously listed IPv6, HTTP/2-3 and cookie
+policy work are still open.

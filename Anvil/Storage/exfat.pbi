@@ -680,25 +680,29 @@ Procedure.i exfat_Ror16(value.i)
 EndProcedure
 
 Global Dim exfat_bootRegion.a[12*#EXFAT_MAX_SECTOR]
+ ; Accumulate exactly the same unsigned 32-bit rotate/add checksum. Four
+; byte steps share loop control; byte loads impose no alignment requirement.
+Procedure.i exfat_ChecksumBytes(data.i,bytes.i,sum.i)
+  While bytes >= 4
+    sum = (((sum >> 1) | ((sum & 1) << 31)) + PeekA(data)) & $FFFFFFFF
+    sum = (((sum >> 1) | ((sum & 1) << 31)) + PeekA(data+1)) & $FFFFFFFF
+    sum = (((sum >> 1) | ((sum & 1) << 31)) + PeekA(data+2)) & $FFFFFFFF
+    sum = (((sum >> 1) | ((sum & 1) << 31)) + PeekA(data+3)) & $FFFFFFFF
+    data = data + 4 : bytes = bytes - 4
+  Wend
+  While bytes > 0
+    sum = (((sum >> 1) | ((sum & 1) << 31)) + PeekA(data)) & $FFFFFFFF
+    data = data + 1 : bytes = bytes - 1
+  Wend
+  ProcedureReturn sum
+EndProcedure
+
 Procedure.i exfat_BootChecksum(data.i)
   Define checksum.i
-  Define sector.i
-  Define i.i
-  Define b.i
-  checksum = 0
-  sector = 0
-  While sector < 11
-    i = 0
-    While i < exfat_bytesPerSector
-      If sector <> 0 Or (i <> 106 And i <> 107 And i <> 112)
-        b = PeekA(data + sector*exfat_bytesPerSector + i)
-        checksum = (exfat_Ror32(checksum) + b) & $FFFFFFFF
-      EndIf
-      i = i + 1
-    Wend
-    sector = sector + 1
-  Wend
-  ProcedureReturn checksum
+  ; Only VolumeFlags (106,107) and PercentInUse (112) are excluded.
+  checksum = exfat_ChecksumBytes(data,106,0)
+  checksum = exfat_ChecksumBytes(data+108,4,checksum)
+  ProcedureReturn exfat_ChecksumBytes(data+113,11*exfat_bytesPerSector-113,checksum)
 EndProcedure
 
 Procedure.i exfat_CheckBootRegion(base.i)
@@ -1168,9 +1172,7 @@ Procedure.i exfat_UpcaseTableChecksum()
     If exfat_StreamRead(exfat_upcaseCluster, 0, exfat_upcaseLength, off, @exfat_upcaseChunk[0], take) <> take
       ProcedureReturn -1
     EndIf
-    For i = 0 To take - 1
-      sum = (exfat_Ror32(sum) + (exfat_upcaseChunk[i] & $FF)) & $FFFFFFFF
-    Next
+    sum = exfat_ChecksumBytes(@exfat_upcaseChunk[0],take,sum)
     off = off + take
   Wend
   ProcedureReturn sum

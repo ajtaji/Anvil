@@ -5,7 +5,7 @@ from pmf_compiler import resolve_compiler
 
 def build(compiler,out):
     root=Path(__file__).resolve().parents[1];out.mkdir(parents=True,exist_ok=False)
-    cases=[0,1,255,256,511,512,513,4096,8192,32768]
+    cases=[0,1,2,3,4,5,7,8,9,15,16,17,31,32,33,127,128,129,255,256,511,512,513,4095,4096,4097,8192,32768]
     names=['Anvil/Storage/exfat.pbi','Anvil/Storage/fat32.pbi','Anvil/Storage/filesystem.pbi','RaspberryPi4/Tests/exfat_emitted_gate.pi4','Anvil/Hal/aarch64_counter.pbi','RaspberryPi4/Lib/mmu.pi4']
     s=(root/names[3]).read_text(encoding='utf8').replace('Procedure.i Main()','Procedure.i GateMain()')
     s=s.replace('Global gateFlushes.i','Global gateFailLba.i=-1\nGlobal gateFlushes.i').replace('  gateReads = gateReads + 1','  If gateFailLba>=lba And gateFailLba<lba+count : ProcedureReturn 0 : EndIf\n  gateReads = gateReads + 1')
@@ -172,46 +172,7 @@ Procedure.i Main()
  exfat_Put32(@gateDisk[0]+25*512,73*4,$FFFFFFFF)
  For i=0 To 32767 : gateDisk[35*512+i]=(i*37+19) & 255 : Next
  exfat_upcaseCluster=10
- exfat_upcaseLength=0 : p=$E1C00100+0*64
- exfat_DropCaches() : start=A64CounterReadOrdered() : old=OldChecksum() : slow=A64CounterReadOrdered()-start
- exfat_DropCaches() : reads=gateReads : start=A64CounterReadOrdered() : new=exfat_UpcaseTableChecksum() : fast=A64CounterReadOrdered()-start
- PokeI(p,old) : PokeI(p+8,new) : PokeI(p+16,slow) : PokeI(p+24,fast) : PokeI(p+32,gateReads-reads)
- exfat_upcaseLength=1 : p=$E1C00100+1*64
- exfat_DropCaches() : start=A64CounterReadOrdered() : old=OldChecksum() : slow=A64CounterReadOrdered()-start
- exfat_DropCaches() : reads=gateReads : start=A64CounterReadOrdered() : new=exfat_UpcaseTableChecksum() : fast=A64CounterReadOrdered()-start
- PokeI(p,old) : PokeI(p+8,new) : PokeI(p+16,slow) : PokeI(p+24,fast) : PokeI(p+32,gateReads-reads)
- exfat_upcaseLength=255 : p=$E1C00100+2*64
- exfat_DropCaches() : start=A64CounterReadOrdered() : old=OldChecksum() : slow=A64CounterReadOrdered()-start
- exfat_DropCaches() : reads=gateReads : start=A64CounterReadOrdered() : new=exfat_UpcaseTableChecksum() : fast=A64CounterReadOrdered()-start
- PokeI(p,old) : PokeI(p+8,new) : PokeI(p+16,slow) : PokeI(p+24,fast) : PokeI(p+32,gateReads-reads)
- exfat_upcaseLength=256 : p=$E1C00100+3*64
- exfat_DropCaches() : start=A64CounterReadOrdered() : old=OldChecksum() : slow=A64CounterReadOrdered()-start
- exfat_DropCaches() : reads=gateReads : start=A64CounterReadOrdered() : new=exfat_UpcaseTableChecksum() : fast=A64CounterReadOrdered()-start
- PokeI(p,old) : PokeI(p+8,new) : PokeI(p+16,slow) : PokeI(p+24,fast) : PokeI(p+32,gateReads-reads)
- exfat_upcaseLength=511 : p=$E1C00100+4*64
- exfat_DropCaches() : start=A64CounterReadOrdered() : old=OldChecksum() : slow=A64CounterReadOrdered()-start
- exfat_DropCaches() : reads=gateReads : start=A64CounterReadOrdered() : new=exfat_UpcaseTableChecksum() : fast=A64CounterReadOrdered()-start
- PokeI(p,old) : PokeI(p+8,new) : PokeI(p+16,slow) : PokeI(p+24,fast) : PokeI(p+32,gateReads-reads)
- exfat_upcaseLength=512 : p=$E1C00100+5*64
- exfat_DropCaches() : start=A64CounterReadOrdered() : old=OldChecksum() : slow=A64CounterReadOrdered()-start
- exfat_DropCaches() : reads=gateReads : start=A64CounterReadOrdered() : new=exfat_UpcaseTableChecksum() : fast=A64CounterReadOrdered()-start
- PokeI(p,old) : PokeI(p+8,new) : PokeI(p+16,slow) : PokeI(p+24,fast) : PokeI(p+32,gateReads-reads)
- exfat_upcaseLength=513 : p=$E1C00100+6*64
- exfat_DropCaches() : start=A64CounterReadOrdered() : old=OldChecksum() : slow=A64CounterReadOrdered()-start
- exfat_DropCaches() : reads=gateReads : start=A64CounterReadOrdered() : new=exfat_UpcaseTableChecksum() : fast=A64CounterReadOrdered()-start
- PokeI(p,old) : PokeI(p+8,new) : PokeI(p+16,slow) : PokeI(p+24,fast) : PokeI(p+32,gateReads-reads)
- exfat_upcaseLength=4096 : p=$E1C00100+7*64
- exfat_DropCaches() : start=A64CounterReadOrdered() : old=OldChecksum() : slow=A64CounterReadOrdered()-start
- exfat_DropCaches() : reads=gateReads : start=A64CounterReadOrdered() : new=exfat_UpcaseTableChecksum() : fast=A64CounterReadOrdered()-start
- PokeI(p,old) : PokeI(p+8,new) : PokeI(p+16,slow) : PokeI(p+24,fast) : PokeI(p+32,gateReads-reads)
- exfat_upcaseLength=8192 : p=$E1C00100+8*64
- exfat_DropCaches() : start=A64CounterReadOrdered() : old=OldChecksum() : slow=A64CounterReadOrdered()-start
- exfat_DropCaches() : reads=gateReads : start=A64CounterReadOrdered() : new=exfat_UpcaseTableChecksum() : fast=A64CounterReadOrdered()-start
- PokeI(p,old) : PokeI(p+8,new) : PokeI(p+16,slow) : PokeI(p+24,fast) : PokeI(p+32,gateReads-reads)
- exfat_upcaseLength=32768 : p=$E1C00100+9*64
- exfat_DropCaches() : start=A64CounterReadOrdered() : old=OldChecksum() : slow=A64CounterReadOrdered()-start
- exfat_DropCaches() : reads=gateReads : start=A64CounterReadOrdered() : new=exfat_UpcaseTableChecksum() : fast=A64CounterReadOrdered()-start
- PokeI(p,old) : PokeI(p+8,new) : PokeI(p+16,slow) : PokeI(p+24,fast) : PokeI(p+32,gateReads-reads)
+__CHECKSUM_ROWS__
  exfat_upcaseLength=1024 : gateFailLba=36 : exfat_DropCaches()
  PokeI($E1C00018,exfat_UpcaseTableChecksum()) : gateFailLba=-1
  PrepareTable(255) : ValidationRow(0)
@@ -228,6 +189,14 @@ Procedure.i Main()
  MmuDisableCachedFlushed() : ProcedureReturn 0
 EndProcedure
 '''
+    rows=[]
+    for i,n in enumerate(cases):
+        rows.append(f" exfat_upcaseLength={n} : p=$E1C00100+{i}*64\n"
+            " exfat_DropCaches() : start=A64CounterReadOrdered() : old=OldChecksum() : slow=A64CounterReadOrdered()-start\n"
+            " exfat_DropCaches() : reads=gateReads : start=A64CounterReadOrdered() : new=exfat_UpcaseTableChecksum() : fast=A64CounterReadOrdered()-start\n"
+            " PokeI(p,old) : PokeI(p+8,new) : PokeI(p+16,slow) : PokeI(p+24,fast) : PokeI(p+32,gateReads-reads)\n")
+    s=s.replace('__CHECKSUM_ROWS__', ''.join(rows))
+    names.append('tools/build_exfat_checksum_cpu.py')
     source=out/'proof.pi4';source.write_text(s,encoding='utf8')
     q=subprocess.run([str(resolve_compiler(compiler)),'--compile',str(source),'-t','pi4','--load-addr','0x1000000','--stack-addr','0x4f00000','--entry-returns','--wants-services','-o',str(out/'proof.img')],env=dict(os.environ,PMF_ROOT=str(root)),capture_output=True,text=True,encoding='utf8',timeout=180,creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
     log=q.stdout+q.stderr;(out/'compile.txt').write_text(log,encoding='utf8');print(log[-1800:]);assert q.returncode==0
