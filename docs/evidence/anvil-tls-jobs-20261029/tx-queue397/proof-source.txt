@@ -1,0 +1,148 @@
+XIncludeFile "RaspberryPi4/Lib/mmu.pi4"
+XIncludeFile "Anvil/Network/link_tx_queue.pbi"
+
+Global Dim queueA.a[#LINK_TXQ_BYTES]
+Global Dim queueB.a[#LINK_TXQ_BYTES]
+Global Dim inputFrame.a[1515]
+Procedure SaveQueue(index.i,rc.i,q.i,generation.i)
+ Define i.i,p.i
+ p=$E1C00100+index*6272
+ PokeI(p,rc)
+ PokeI(p+8,LinkTxQueueCount(q,generation))
+ PokeI(p+16,LinkTxQueueLength(q,generation))
+ PokeI(p+24,LinkTxQueueTicket(q,generation))
+ For i=0 To #LINK_TXQ_BYTES-1 : PokeA(p+32+i,PeekA(q+i)) : Next
+EndProcedure
+Procedure.i Main()
+ Define i.i,rc.i,q.i
+ For i=0 To 262143 : PokeA($E1C00000+i,0) : Next
+ PokeI($E1C00000,$51554531)
+ MmuClearNc() : rc=MmuBuildTables($4F80000) : If rc<>0 : ProcedureReturn 2 : EndIf
+ MmuEnableCached()
+ q=@queueA[0]
+ rc=LinkTxQueueInit(q,1)
+ SaveQueue(0,rc,q,1)
+ q=@queueA[0]
+ For i=0 To 1514 : inputFrame[i]=(i*7+3) & 255 : Next
+ rc=LinkTxQueueSubmit(q,1,@inputFrame[0],1514)
+ For i=0 To 1514 : inputFrame[i]=$EE : Next
+ SaveQueue(1,rc,q,1)
+ q=@queueA[0]
+ For i=0 To 1514 : inputFrame[i]=(i*7+9) & 255 : Next
+ rc=LinkTxQueueSubmit(q,1,@inputFrame[0],1)
+ For i=0 To 1514 : inputFrame[i]=$EE : Next
+ SaveQueue(2,rc,q,1)
+ q=@queueA[0]
+ rc=LinkTxQueueFinish(q,1,1,0)
+ SaveQueue(3,rc,q,1)
+ q=@queueA[0]
+ For i=0 To 1514 : inputFrame[i]=(i*7+17) & 255 : Next
+ rc=LinkTxQueueSubmit(q,1,@inputFrame[0],63)
+ For i=0 To 1514 : inputFrame[i]=$EE : Next
+ SaveQueue(4,rc,q,1)
+ q=@queueA[0]
+ For i=0 To 1514 : inputFrame[i]=(i*7+33) & 255 : Next
+ rc=LinkTxQueueSubmit(q,1,@inputFrame[0],64)
+ For i=0 To 1514 : inputFrame[i]=$EE : Next
+ SaveQueue(5,rc,q,1)
+ q=@queueA[0]
+ For i=0 To 1514 : inputFrame[i]=(i*7+99) & 255 : Next
+ rc=LinkTxQueueSubmit(q,1,@inputFrame[0],25)
+ For i=0 To 1514 : inputFrame[i]=$EE : Next
+ SaveQueue(6,rc,q,1)
+ q=@queueA[0]
+ rc=LinkTxQueueFinish(q,1,9,1)
+ SaveQueue(7,rc,q,1)
+ q=@queueA[0]
+ rc=LinkTxQueueFinish(q,1,1,1)
+ SaveQueue(8,rc,q,1)
+ q=@queueA[0]
+ For i=0 To 1514 : inputFrame[i]=(i*7+44) & 255 : Next
+ rc=LinkTxQueueSubmit(q,1,@inputFrame[0],27)
+ For i=0 To 1514 : inputFrame[i]=$EE : Next
+ SaveQueue(9,rc,q,1)
+ q=@queueA[0]
+ rc=LinkTxQueueFinish(q,1,1,1)
+ SaveQueue(10,rc,q,1)
+ q=@queueA[0]
+ rc=LinkTxQueueFinish(q,1,2,-4)
+ SaveQueue(11,rc,q,1)
+ q=@queueA[0]
+ rc=LinkTxQueueFinish(q,1,3,1)
+ SaveQueue(12,rc,q,1)
+ q=@queueA[0]
+ rc=LinkTxQueueFinish(q,1,4,1)
+ SaveQueue(13,rc,q,1)
+ q=@queueA[0]
+ rc=LinkTxQueueFinish(q,1,5,1)
+ SaveQueue(14,rc,q,1)
+ q=@queueA[0]
+ rc=LinkTxQueueFinish(q,1,5,1)
+ SaveQueue(15,rc,q,1)
+ q=@queueA[0]
+ For i=0 To 1514 : inputFrame[i]=(i*7+2) & 255 : Next
+ rc=LinkTxQueueSubmit(q,1,@inputFrame[0],0)
+ For i=0 To 1514 : inputFrame[i]=$EE : Next
+ SaveQueue(16,rc,q,1)
+ q=@queueA[0]
+ For i=0 To 1514 : inputFrame[i]=(i*7+2) & 255 : Next
+ rc=LinkTxQueueSubmit(q,1,@inputFrame[0],1515)
+ For i=0 To 1514 : inputFrame[i]=$EE : Next
+ SaveQueue(17,rc,q,1)
+ q=@queueA[0]
+ rc=LinkTxQueueSubmit(q,1,q+80,16)
+ SaveQueue(18,rc,q,1)
+ q=@queueA[0]
+ For i=0 To 1514 : inputFrame[i]=(i*7+2) & 255 : Next
+ rc=LinkTxQueueSubmit(q,2,@inputFrame[0],50)
+ For i=0 To 1514 : inputFrame[i]=$EE : Next
+ SaveQueue(19,rc,q,2)
+ q=@queueA[0]
+ For i=0 To 1514 : inputFrame[i]=(i*7+72) & 255 : Next
+ rc=LinkTxQueueSubmit(q,1,@inputFrame[0],99)
+ For i=0 To 1514 : inputFrame[i]=$EE : Next
+ SaveQueue(20,rc,q,1)
+ q=@queueB[0]
+ rc=LinkTxQueueInit(q,5)
+ SaveQueue(21,rc,q,5)
+ q=@queueB[0]
+ For i=0 To 1514 : inputFrame[i]=(i*7+81) & 255 : Next
+ rc=LinkTxQueueSubmit(q,5,@inputFrame[0],33)
+ For i=0 To 1514 : inputFrame[i]=$EE : Next
+ SaveQueue(22,rc,q,5)
+ q=@queueA[0]
+ rc=LinkTxQueueFinish(q,1,6,0)
+ SaveQueue(23,rc,q,1)
+ q=@queueA[0]
+ rc=LinkTxQueueInit(q,2)
+ SaveQueue(24,rc,q,2)
+ q=@queueA[0]
+ rc=LinkTxQueueFinish(q,1,6,1)
+ SaveQueue(25,rc,q,1)
+ q=@queueA[0]
+ For i=0 To 1514 : inputFrame[i]=(i*7+90) & 255 : Next
+ rc=LinkTxQueueSubmit(q,2,@inputFrame[0],1)
+ For i=0 To 1514 : inputFrame[i]=$EE : Next
+ SaveQueue(26,rc,q,2)
+ q=@queueA[0]
+ rc=LinkTxQueueInit(q,2)
+ SaveQueue(27,rc,q,2)
+ q=@queueA[0]
+ rc=LinkTxQueueInit(q,1)
+ SaveQueue(28,rc,q,1)
+ q=@queueA[0]
+ rc=LinkTxQueueFinish(q,2,1,2)
+ SaveQueue(29,rc,q,2)
+ q=@queueB[0]
+ rc=LinkTxQueueFinish(q,5,1,1)
+ SaveQueue(30,rc,q,5)
+ q=@queueA[0]
+ rc=LinkTxQueueFinish(q,2,1,1)
+ SaveQueue(31,rc,q,2)
+ q=@queueA[0]
+ rc=LinkTxQueueInit(q,0)
+ SaveQueue(32,rc,q,0)
+ PokeI($E1C00008,33)
+ MmuDisableCachedFlushed()
+ ProcedureReturn 0
+EndProcedure

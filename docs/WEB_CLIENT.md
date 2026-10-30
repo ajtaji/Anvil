@@ -858,3 +858,28 @@ nonblocking. Existing callers still use the synchronous API, and the bus transfe
 itself remains synchronous. Pending-frame ownership, queue backpressure and wired
 DMA completion must be integrated before removing those waits. Actual IPv6 web
 traffic and HTTP/2-3 remain unfinished.
+
+
+## Owned transmit FIFO qualification
+
+`Anvil/Network/link_tx_queue.pbi` provides a shared, device-independent queue
+for cooperative link transmitters. Each caller-owned 6,224-byte context holds
+four copied Ethernet frames. Submission distinguishes accepted, full and invalid
+requests; acceptance is not transmission. A consumer observes one head and
+completes it with a generation and ticket. Would-block preserves the head;
+success or a terminal transfer error retires it and wipes its storage. A reset
+requires a newer generation and reports the number of discarded frames. Stale
+completions cannot consume a packet belonging to the new generation.
+
+The physical Pi test passed 33 operations, with independent comparisons of every
+queue byte after each operation. It covers maximum frames, caller-buffer reuse,
+full queues, ring wrap, failed transfers, repeated/stale completions, invalid
+lengths, input aliasing, two independent contexts, generation changes and wiping.
+The test returned normally; core, font and Vulkan health checks passed.
+
+This queue is not yet installed in the live networking pumps. A consuming driver
+must release its access to a frame before completion or reset: a DMA driver that
+retains the supplied pointer requires a separate hardware-completion owner.
+The existing GENET synchronous path retains the caller pointer and compares its
+wrapping consumer counter with a plain `>=`; both ownership and wrap-safe
+completion need addressing during integration. No wired hardware fix is claimed.
