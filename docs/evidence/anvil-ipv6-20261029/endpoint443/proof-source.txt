@@ -1,0 +1,195 @@
+XIncludeFile "RaspberryPi4/Lib/mmu.pi4"
+XIncludeFile "Anvil/Network/ipv6_neighbor.pbi"
+XIncludeFile "Anvil/Network/ipv6_endpoint.pbi"
+
+Global ep.IPv6Endpoint
+Global Dim output.a[1514]
+Procedure Save(index.i,rc.i)
+ Define p.i,i.i
+ p=$E1C00100+index*2048
+ PokeI(p,rc) : PokeI(p+8,ep\state) : PokeI(p+16,ep\remaining)
+ PokeI(p+24,ep\awaiting) : PokeI(p+32,ep\deadline) : PokeI(p+40,ep\generation)
+ For i=0 To 1513 : PokeA(p+64+i,output[i]) : Next
+EndProcedure
+Procedure.i Main()
+ Define i.i,rc.i
+ For i=0 To 131071 : PokeA($E1C00000+i,0) : Next
+ PokeI($E1C00000,$45503631)
+ MmuClearNc() : rc=MmuBuildTables($4F80000) : If rc<>0 : ProcedureReturn 2 : EndIf
+ MmuEnableCached()
+ For i=0 To 1513 : output[i]=$A5 : Next
+ rc=IPv6EndpointInit(@ep,1,?Local,?Mac,0,100,1000,1)
+ Save(0,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+ rc=IPv6EndpointStep(@ep,1,99,@output[0],1514)
+ Save(1,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+ rc=IPv6EndpointStep(@ep,1,100,@output[0],1514)
+ Save(2,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+ rc=IPv6EndpointStep(@ep,1,2000,@output[0],1514)
+ Save(3,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+ rc=IPv6EndpointSent(@ep,1,200,0)
+ Save(4,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+ rc=IPv6EndpointStep(@ep,1,201,@output[0],1514)
+ Save(5,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+ rc=IPv6EndpointSent(@ep,2,202,1)
+ Save(6,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+ rc=IPv6EndpointSent(@ep,1,202,1)
+ Save(7,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+ rc=IPv6EndpointSent(@ep,1,203,1)
+ Save(8,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+ rc=IPv6EndpointStep(@ep,1,1201,@output[0],1514)
+ Save(9,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+ rc=IPv6EndpointStep(@ep,1,1202,@output[0],1514)
+ Save(10,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+ rc=IPv6EndpointInput(@ep,1,?Vector0,86,@output[0],1514)
+ Save(11,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+ rc=IPv6EndpointInput(@ep,1,?Vector1,83,@output[0],1514)
+ Save(12,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+ rc=IPv6EndpointInput(@ep,1,?Vector2,83,@output[0],1514)
+ Save(13,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+ rc=IPv6EndpointInput(@ep,1,?Vector3,83,@output[0],1514)
+ Save(14,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+ rc=IPv6EndpointInput(@ep,1,?Vector4,78,@output[0],1514)
+ Save(15,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+ rc=IPv6EndpointInput(@ep,1,?Vector5,86,@output[0],1514)
+ Save(16,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+ rc=IPv6EndpointInit(@ep,2,?Local,?Mac,0,100,1000,1)
+ Save(17,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+ rc=IPv6EndpointInput(@ep,2,?Vector4,78,@output[0],1514)
+ Save(18,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+ rc=IPv6EndpointStep(@ep,2,2000,@output[0],1514)
+ Save(19,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+ rc=IPv6EndpointInit(@ep,3,?Local,?Mac,0,100,1000,1)
+ Save(20,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+ rc=IPv6EndpointInput(@ep,3,?Vector1,83,@output[0],1514)
+ Save(21,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+ rc=IPv6EndpointInput(@ep,3,?Vector0,86,@output[0],1514)
+ Save(22,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+ rc=IPv6EndpointInput(@ep,3,?Vector7,86,@output[0],1514)
+ Save(23,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+ rc=IPv6EndpointInput(@ep,3,?Vector5,86,@output[0],1514)
+ Save(24,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+ rc=IPv6EndpointInit(@ep,4,?Local,?Mac,0,100,1000,1)
+ Save(25,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+ rc=IPv6EndpointInput(@ep,4,?Vector6,86,@output[0],1514)
+ Save(26,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+ rc=IPv6EndpointStep(@ep,4,100,@output[0],1514)
+ Save(27,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+ rc=IPv6EndpointSent(@ep,4,100,-1)
+ Save(28,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+ rc=IPv6EndpointStep(@ep,4,2000,@output[0],1514)
+ Save(29,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+ rc=IPv6EndpointInit(@ep,4,?Local,?Mac,0,100,1000,1)
+ Save(30,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+ rc=IPv6EndpointInit(@ep,5,?Local,?Mac,0,0,1000,2)
+ Save(31,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+ rc=IPv6EndpointStep(@ep,5,0,@output[0],1514)
+ Save(32,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+ rc=IPv6EndpointSent(@ep,5,0,1)
+ Save(33,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+ rc=IPv6EndpointStep(@ep,5,999,@output[0],1514)
+ Save(34,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+ rc=IPv6EndpointStep(@ep,5,1000,@output[0],1514)
+ Save(35,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+ rc=IPv6EndpointSent(@ep,5,1000,1)
+ Save(36,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+ rc=IPv6EndpointStep(@ep,5,1999,@output[0],1514)
+ Save(37,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+ rc=IPv6EndpointStep(@ep,5,2000,@output[0],1514)
+ Save(38,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+ rc=IPv6EndpointInput(@ep,5,?Vector1,83,@output[0],85)
+ Save(39,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+ rc=IPv6EndpointInput(@ep,5,?Vector1,83,?Vector1,1514)
+ Save(40,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+ rc=IPv6EndpointStep(0,5,3000,@output[0],1514)
+ Save(41,rc)
+ PokeI($E1C00008,42)
+ MmuDisableCachedFlushed()
+ ProcedureReturn 0
+EndProcedure
+DataSection
+Local:
+ Data.a 254,128,0,0,0,0,0,0,0,0,0,0,0,0,18,52
+Mac:
+ Data.a 2,1,2,3,4,5
+Vector0:
+ Data.a 51,51,255,0,18,52,2,9,8,7,6,5,134,221,96,0,0,0,0,32,58,255,254,128
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,86,120,255,2,0,0,0,0,0,0,0,0
+ Data.a 0,1,255,0,18,52,135,0,241,167,0,0,0,0,254,128,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,18,52,1,1,2,9,8,7,6,5
+Vector1:
+ Data.a 2,1,2,3,4,5,2,9,8,7,6,5,134,221,96,0,0,0,0,29,58,64,254,128
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,86,120,254,128,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,18,52,128,0,122,105,0,123,1,200,101,110,100,112,111,105,110,116,32,111
+ Data.a 100,100,32,112,97,121,108,111,97,100,33
+Vector2:
+ Data.a 2,1,2,3,4,5,2,9,8,7,6,5,134,221,96,0,0,0,0,29,58,64,254,128
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,86,120,254,128,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,18,52,128,0,123,105,0,123,1,200,101,110,100,112,111,105,110,116,32,111
+ Data.a 100,100,32,112,97,121,108,111,97,100,33
+Vector3:
+ Data.a 2,153,153,153,153,153,2,9,8,7,6,5,134,221,96,0,0,0,0,29,58,64,254,128
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,86,120,254,128,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,18,52,128,0,122,105,0,123,1,200,101,110,100,112,111,105,110,116,32,111
+ Data.a 100,100,32,112,97,121,108,111,97,100,33
+Vector4:
+ Data.a 51,51,255,0,18,52,2,9,8,7,6,5,134,221,96,0,0,0,0,24,58,255,0,0
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,0,0,255,2,0,0,0,0,0,0,0,0
+ Data.a 0,1,255,0,18,52,135,0,87,191,0,0,0,0,254,128,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,18,52
+Vector5:
+ Data.a 51,51,0,0,0,1,2,9,8,7,6,5,134,221,96,0,0,0,0,32,58,255,254,128
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,18,52,255,2,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,0,1,136,0,37,33,32,0,0,0,254,128,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,18,52,2,1,2,9,8,7,6,5
+Vector6:
+ Data.a 51,51,255,0,18,52,2,1,2,3,4,5,134,221,96,0,0,0,0,32,58,255,254,128
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,86,120,255,2,0,0,0,0,0,0,0,0
+ Data.a 0,1,255,0,18,52,135,0,249,179,0,0,0,0,254,128,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,18,52,1,1,2,1,2,3,4,5
+Vector7:
+ Data.a 2,1,2,3,4,5,2,9,8,7,6,5,134,221,96,0,0,0,0,32,58,255,254,128
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,18,52,254,128,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,18,52,136,0,211,111,96,0,0,0,254,128,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,18,52,2,1,2,9,8,7,6,5
+EndDataSection

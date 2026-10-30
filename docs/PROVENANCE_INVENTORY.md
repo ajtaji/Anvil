@@ -1547,3 +1547,5 @@ text is unchanged; no new board execution or boot claim follows.
 
 | `Anvil/Crypto/gcm_job.pbi` | consulted | bearssl | MIT | Bounded orchestration of existing AES/GHASH primitives; existing BearSSL acknowledgment retained |
 | `Anvil/Crypto/gcm_job.pbi` | protocol-facts | vendor-spec | NIST specification | SP 800-38D sections 7.1 and 7.2, bounded 96-bit-IV encryption and authenticated decryption before plaintext release; no specification prose copied |
+
+| `Anvil/Network/ipv6_endpoint.pbi` | protocol-facts | ietf-rfc | IETF specification | RFC 4862 section 5.4 DAD, RFC 4861 section 7.2.4 neighbor replies, RFC 4443 section 4.2 echo; independently implemented endpoint |

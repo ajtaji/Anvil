@@ -1017,3 +1017,32 @@ the new combined dispatcher. Detailed measured counters are in the evidence.
 Remaining work includes synchronous device/storage/console paths, live Ethernet
 qualification, IPv6 web traffic and HTTP/2-3. This is not a claim that all Anvil
 networking operations are nonblocking or that the networking task is finished.
+
+
+## IPv6 address endpoint qualification
+
+The shared `ipv6_endpoint.pbi` now owns one caller-provided address through
+explicit tentative, preferred, duplicate and failed states. DAD probes require
+confirmed transmit completion followed by the retransmit interval. A queued
+packet alone cannot assign an address. Failed/ambiguous sends fail the address;
+not-sent results permit retry. Generation checks reject stale completions.
+
+The endpoint validates Ethernet and IPv6 destinations, delegates ND validation
+to the shared codec, detects duplicate NS/NA traffic while tentative, answers
+neighbor solicitations for an assigned address, and produces byte-exact unicast
+ICMPv6 echo replies. Tentative addresses never answer ordinary traffic. Caller
+storage is bounded and checked for overlap; no RX pointer is retained.
+
+All 42 physical Pi CPU cases passed with independently constructed packet bytes,
+checksums, state expectations and output guards. They cover probe retry and
+completion, two-probe timing, stale/double acknowledgements, conflicts, tentative
+silence, neighbor replies, echo payloads, checksums, destination filtering and
+alias refusals. This qualifies endpoint code, not live IPv6 connectivity.
+
+Interface binding is next: the caller must join all-nodes and solicited-node
+multicast before starting DAD, suppress local loopback appropriately, supply a
+random initial delay, and reinitialize on interface generation changes. The live
+Pi radio reports `allmulti = 0`; multicast acceptance/membership must be handled
+before enabling this endpoint. Address configuration, routes, TCP IPv6 endpoints
+and web transport binding remain incomplete. No new monitor was installed for
+this isolated CPU test; the Pi remains healthy on build 441.
