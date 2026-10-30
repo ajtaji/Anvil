@@ -2549,3 +2549,28 @@ HTTP/1-only and must not send HTTP/1 bytes after negotiating h2. Next are shared
 HTTP/2 framing, HPACK, stream state and flow control. HTTP/3, public off-link IPv6,
 automatic RDNSS-to-web qualification and remaining atomic TLS/device work remain
 open.
+
+### HTTP/2 frame foundation: physical build 483 qualification
+
+The shared `h2_frame.pbi` module decodes the nine-byte HTTP/2 frame header
+incrementally, without consuming payload bytes. It validates advertised frame
+limits, mandatory payload lengths and zero/nonzero stream rules. Unknown frame
+types and undefined receive flags remain available to the connection engine;
+the reserved stream bit is ignored. Errors latch until explicit reinitialization.
+The output helper validates before writing, clears undefined base-protocol flags
+and emits an exact connection preface with caller-provided storage.
+
+Physical Pi 4 tests passed 38 explicit cases at every header split (380 cases),
+including malformed lengths, SETTINGS acknowledgements, reserved bits, extension
+frame types, the default limit and the maximum 24-bit length. Output canaries,
+small-buffer refusals, invalid arguments and the exact preface also passed.
+Capture 138 returned zero with all cores, fonts and Vulkan healthy and watchdog
+off. The same fixture also compiles for Pi 3 (not executed there).
+No monitor update or reset was needed. The first qualification failed due
+to indexed structure storage; the implementation now uses explicitly addressed
+bounded byte storage. The rejected report is retained, not counted as a pass.
+
+Evidence: `docs/evidence/anvil-ipv6-20261030/http2-frame483`.
+This is a frame foundation, not an HTTP/2 request engine: payload semantics,
+SETTINGS application, HPACK, continuation ordering, stream state and flow control
+remain connection-layer work. Existing HTTP/1 requests are unchanged.
