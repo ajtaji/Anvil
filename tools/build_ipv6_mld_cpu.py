@@ -22,7 +22,7 @@ def build(compiler,out):
  def vector(b):
   vectors.append(b);return '?Vector'+str(len(vectors)-1)
  def add(name,code,rc,data=b'',query=None):
-  cases.append(dict(name=name,rc=rc,output=(data+b'\xa5'*(128-len(data))).hex(),query=query or [0]*5));steps.append(code)
+  cases.append(dict(name=name,rc=rc,output=(data+b'\xa5'*(1500-len(data))).hex(),query=query or [0]*5));steps.append(code)
  for ver in [1,2]:
   for mode in [2,3,4]:
    for src in [zero,ll]:
@@ -89,10 +89,48 @@ def build(compiler,out):
  policy('null context','rc=IPv6MldInterfaceTick(0,2,1)',-770,[2,1,2,0,2,125000,10000,0])
  policy('overlap context packet','rc=IPv6MldInterfaceQuery(@policyState,2,1,@policyState,64)',-770,[2,1,2,0,2,125000,10000,0])
 
+
+ final_policy=[2,1,2,0,2,125000,10000,0]
+ sources=[addr('2001:db8::'+format(i+1,'x')) for i in range(90)]
+ def sourced(name,code,rc,data=b'',storage=None):
+  add(name,code,rc,data);cases[-1]['policy']=final_policy
+  if storage is not None:cases[-1]['storage']=storage.hex()
+ for count in [1,2,89]:
+  values=b''.join(sources[:count]);body=bytes([143,0,0,0])+bytes(2)+b'\0\1'+bytes([1,0])+struct.pack('>H',count)+group+values
+  expected=packet(body,ll,addr('ff02::16'))
+  sourced(f'INCLUDE {count} sources',f'rc=IPv6MldSourceReport(@output[0],1500,{vector(ll)},{vector(group)},{vector(values)},{count})',len(expected),expected)
+ for name,values,count,cap in [('empty include',b'',0,1500),('too many',b''.join(sources),90,1500),('short MTU',b''.join(sources[:89]),89,1499),('unspecified entry',zero,1,1500),('multicast entry',group,1,1500)]:
+  sourced(name,f'rc=IPv6MldSourceReport(@output[0],{cap},{vector(ll)},{vector(group)},{vector(values or bytes(1))},{count})',-760)
+ sourced('source alias',f'rc=IPv6MldSourceReport(@output[0],1500,{vector(ll)},{vector(group)},@output[0],1)',-760)
+ def merge(name,old,new,cap=1424,alias=False):
+  before=b''.join(old)+b'\xa5'*(1424-16*len(old));after=list(old);valid=cap>=16 and cap<=1424 and cap%16==0 and len(old)<=cap//16 and len(new)<=89 and not alias
+  valid=valid and len(set(old))==len(old) and all(v!=zero and v[0]!=255 for v in old+new)
+  for value in new:
+   if value not in after:after.append(value)
+  if len(after)>cap//16:valid=False
+  expected=b''.join(after)+b'\xa5'*(1424-16*len(after)) if valid else before
+  oldptr=vector(before);newptr='@sourceStore[0]' if alias else vector(b''.join(new) or bytes(1))
+  code=f'For i=0 To 1423 : sourceStore[i]=PeekA({oldptr}+i) : Next\n rc=IPv6MldMergeSources(@sourceStore[0],{cap},{len(old)},{newptr},{len(new)})'
+  sourced(name,code,len(after) if valid else -760,storage=expected)
+ merge('copy sources',[],sources[:2])
+ merge('deduplicate input',[],[sources[0],sources[0],sources[1]])
+ merge('union preserves order',sources[:2],[sources[1],sources[2],sources[0],sources[3]])
+ merge('exact full union',sources[:88],[sources[88]])
+ merge('full duplicates accepted',sources[:89],[sources[88],sources[0]])
+ merge('overflow atomic',sources[:89],[sources[89]])
+ merge('invalid tail atomic',sources[:1],[sources[1],group])
+ merge('unspecified tail atomic',sources[:1],[sources[1],zero])
+ merge('empty add',sources[:2],[])
+ merge('duplicate existing rejected',[sources[0],sources[0]],[sources[1]])
+ merge('invalid existing rejected',[group],[sources[1]])
+ merge('input overlaps storage',sources[:2],[sources[0]],alias=True)
+ merge('unaligned capacity',[],sources[:1],cap=17)
+ merge('too large capacity',[],sources[:1],cap=1440)
+ merge('count exceeds capacity',sources[:2],[],cap=16)
  s='XIncludeFile "RaspberryPi4/Lib/mmu.pi4"\nXIncludeFile "Anvil/Network/ipv6_neighbor.pbi"\nXIncludeFile "Anvil/Network/ipv6_mld.pbi"\nXIncludeFile "Anvil/Network/ipv6_mld_policy.pbi"\n'
- s+='Global Dim output.a[128]\nGlobal queryView.IPv6MldQueryView\nGlobal policyState.IPv6MldInterface\nProcedure Save(index.i,rc.i)\n Define p.i,i.i\n p=$E1C00100+index*256\n PokeI(p,rc) : PokeI(p+8,queryView\\version) : PokeI(p+16,queryView\\maxDelay)\n PokeI(p+24,queryView\\robustness) : PokeI(p+32,queryView\\interval) : PokeI(p+40,queryView\\sourceCount)\n For i=0 To 127 : PokeA(p+64+i,output[i]) : Next\n For i=0 To 7 : PokeI(p+192+i*8,PeekI(@policyState+i*8)) : Next\nEndProcedure\n'
- s+='Procedure.i Main()\n Define i.i,rc.i\n For i=0 To 131071 : PokeA($E1C00000+i,0) : Next\n PokeI($E1C00000,$4D4C4431)\n MmuClearNc() : rc=MmuBuildTables($4F80000) : If rc<>0 : ProcedureReturn 2 : EndIf\n MmuEnableCached()\n'
- for k,code in enumerate(steps):s+='For i=0 To 127 : output[i]=$A5 : Next\n For i=0 To SizeOf(IPv6MldQueryView)-1 : PokeA(@queryView+i,0) : Next\n'+code+f'\n Save({k},rc)\n'
+ s+='Global Dim output.a[1500]\nGlobal Dim sourceStore.a[1424]\nGlobal queryView.IPv6MldQueryView\nGlobal policyState.IPv6MldInterface\nProcedure Save(index.i,rc.i)\n Define p.i,i.i\n p=$E1C00100+index*4096\n PokeI(p,rc) : PokeI(p+8,queryView\\version) : PokeI(p+16,queryView\\maxDelay)\n PokeI(p+24,queryView\\robustness) : PokeI(p+32,queryView\\interval) : PokeI(p+40,queryView\\sourceCount)\n For i=0 To 1499 : PokeA(p+64+i,output[i]) : Next\n For i=0 To 1423 : PokeA(p+1728+i,sourceStore[i]) : Next\n For i=0 To 7 : PokeI(p+1600+i*8,PeekI(@policyState+i*8)) : Next\nEndProcedure\n'
+ s+='Procedure.i Main()\n Define i.i,rc.i\n For i=0 To 524287 : PokeA($E1C00000+i,0) : Next\n PokeI($E1C00000,$4D4C4431)\n MmuClearNc() : rc=MmuBuildTables($4F80000) : If rc<>0 : ProcedureReturn 2 : EndIf\n MmuEnableCached()\n'
+ for k,code in enumerate(steps):s+='For i=0 To 1423 : sourceStore[i]=0 : Next\n For i=0 To 1499 : output[i]=$A5 : Next\n For i=0 To SizeOf(IPv6MldQueryView)-1 : PokeA(@queryView+i,0) : Next\n'+code+f'\n Save({k},rc)\n'
  s+=f' PokeI($E1C00008,{len(cases)})\n MmuDisableCachedFlushed()\n ProcedureReturn 0\nEndProcedure\nDataSection\n'
  for k,b in enumerate(vectors):
   s+=f'Vector{k}:\n'
@@ -101,7 +139,7 @@ def build(compiler,out):
  q=subprocess.run([str(resolve_compiler(compiler)),'--compile',str(source),'-t','pi4','--load-addr','0x1000000','--stack-addr','0x4f00000','--entry-returns','--wants-services','-o',str(out/'proof.img')],env=dict(os.environ,PMF_ROOT=str(root)),capture_output=True,text=True,encoding='utf8',timeout=180,creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
  log=q.stdout+q.stderr;(out/'compile.txt').write_text(log,encoding='utf8');print(log[-2000:]);assert q.returncode==0
  code=re.search(r'occupying \$([0-9A-Fa-f]+)\.\.\$([0-9A-Fa-f]+)',log);bss=re.search(r'bss \$([0-9A-Fa-f]+)\.\.\$([0-9A-Fa-f]+)',log)
- payload=(out/'proof.img.pmf').read_bytes();ranges={'code':['0x'+x for x in code.groups()],'bss':['0x'+x for x in bss.groups()],'stack':['0x4e00000','0x4efffff'],'report':['0xe1c00000','0xe1c1ffff'],'tables':['0x4f80000','0x4f82fff']}
+ payload=(out/'proof.img.pmf').read_bytes();ranges={'code':['0x'+x for x in code.groups()],'bss':['0x'+x for x in bss.groups()],'stack':['0x4e00000','0x4efffff'],'report':['0xe1c00000','0xe1c7ffff'],'tables':['0x4f80000','0x4f82fff']}
  (out/'identity.json').write_text(json.dumps(dict(bytes=len(payload),sha256=hashlib.sha256(payload).hexdigest(),checked_ranges=ranges,source_hashes={n:hashlib.sha256((root/n).read_bytes()).hexdigest() for n in names},cases=cases),indent=2),encoding='utf8')
 
 if __name__=='__main__':

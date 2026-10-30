@@ -1125,3 +1125,23 @@ interleaved v1/v2 queries, malformed input and unchanged-state refusals.
 Per-group scheduling, report retransmission, device filters and live IPv6 binding
 remain outstanding; no live multicast or web-connectivity claim follows from
 these CPU tests. The bench remains on Anvil 441.
+
+
+## Owned MLD query source lists
+
+`IPv6MldMergeSources` stores a bounded, unique unicast source set in caller-owned
+memory. It removes duplicate inputs, preserves first-seen order, and validates
+the entire union before writing. Invalid entries, aliasing and capacity overflow
+leave existing storage unchanged. No received-packet pointer is retained.
+
+`IPv6MldSourceReport` emits MODE_IS_INCLUDE records for source-specific queries
+received by an any-source listener. Between one and 89 source addresses fit in
+the 1500-byte IPv6 packet bound. The builder checks capacities and overlap before
+writing, includes Router Alert, and checksums the entire source list. An empty
+source set requires no response and is refused by this emission function.
+
+The expanded physical Pi CPU fixture passed 89 checks, retaining codec and
+interface-policy coverage and adding source unions, exact MTU output, duplicate
+handling, atomic overflow and unchanged-buffer guards. Per-group scheduling and
+live receive/filter integration remain outstanding. Anvil 441 remains installed;
+these tests establish source-list behavior, not live multicast or IPv6 web traffic.

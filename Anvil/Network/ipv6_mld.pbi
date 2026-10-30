@@ -138,3 +138,85 @@ Procedure.i IPv6MldQuery(packet.i,bytes.i,*query.IPv6MldQueryView)
  If count>0 : *query\sources=body+28 : EndIf
  ProcedureReturn 0
 EndProcedure
+
+; Emit the INCLUDE source set needed to answer a source-specific query for
+; an any-source listener (RFC 9777 section 6.3, EXCLUDE{} yields INCLUDE B).
+; One through 89 sources fit the IPv6 Ethernet MTU. Empty sets require no
+; response and are refused here. Refusal leaves output unchanged.
+Procedure.i IPv6MldSourceReport(out.i,capacity.i,source.i,group.i,sources.i,count.i)
+ Define i.i,rc.i,n.i,at.i
+ If count<1 Or count>89 : ProcedureReturn #IPV6_MLD_INVALID : EndIf
+ If ipv6mld_Span(out,capacity)=0 Or capacity>1500 : ProcedureReturn #IPV6_MLD_INVALID : EndIf
+ If capacity<76+count*16 : ProcedureReturn #IPV6_MLD_INVALID : EndIf
+ If ipv6mld_Span(sources,count*16)=0 : ProcedureReturn #IPV6_MLD_INVALID : EndIf
+ If out<sources+count*16 And sources<out+capacity : ProcedureReturn #IPV6_MLD_INVALID : EndIf
+ For i=0 To count-1
+  at=sources+i*16
+  If PeekA(at)=255 Or IPv6AddressUnspecified(at)<>0 : ProcedureReturn #IPV6_MLD_INVALID : EndIf
+ Next
+ rc=IPv6MldReport(out,capacity,source,group,2,2)
+ If rc<>76 : ProcedureReturn rc : EndIf
+ n=28+count*16
+ NetWriteBE16(out+4,n+8) : PokeA(out+56,1) : NetWriteBE16(out+58,count)
+ For i=0 To count*16-1 : PokeA(out+76+i,PeekA(sources+i)) : Next
+ NetWriteBE16(out+50,0)
+ rc=IPv6TransportChecksum(out+8,out+24,58,out+48,n)
+ NetWriteBE16(out+50,rc)
+ ProcedureReturn 48+n
+EndProcedure
+
+Procedure.i ipv6mld_SameAddress(a.i,b.i)
+ Define i.i
+ For i=0 To 15
+  If PeekA(a+i)<>PeekA(b+i) : ProcedureReturn 0 : EndIf
+ Next
+ ProcedureReturn 1
+EndProcedure
+
+; Merge queried sources into caller-owned storage, returning the new count.
+; Retains no RX pointer. Existing entries must already be a unique unicast set.
+; Input duplicates are removed while preserving first-seen order. Two passes
+; check the complete union before copying, so even capacity refusal is atomic.
+Procedure.i IPv6MldMergeSources(storage.i,capacity.i,count.i,input.i,added.i)
+ Define i.i,j.i,unique.i,found.i,at.i,total.i
+ If capacity<16 Or capacity>1424 Or (capacity % 16)<>0 : ProcedureReturn #IPV6_MLD_INVALID : EndIf
+ If ipv6mld_Span(storage,capacity)=0 : ProcedureReturn #IPV6_MLD_INVALID : EndIf
+ If count<0 Or count>capacity/16 Or added<0 Or added>89 : ProcedureReturn #IPV6_MLD_INVALID : EndIf
+ If added>0
+  If ipv6mld_Span(input,added*16)=0 : ProcedureReturn #IPV6_MLD_INVALID : EndIf
+  If storage<input+added*16 And input<storage+capacity : ProcedureReturn #IPV6_MLD_INVALID : EndIf
+ EndIf
+ For i=0 To count-1
+  at=storage+i*16
+  If PeekA(at)=255 Or IPv6AddressUnspecified(at)<>0 : ProcedureReturn #IPV6_MLD_INVALID : EndIf
+  For j=0 To i-1
+   If ipv6mld_SameAddress(at,storage+j*16)<>0 : ProcedureReturn #IPV6_MLD_INVALID : EndIf
+  Next
+ Next
+ unique=0
+ For i=0 To added-1
+  at=input+i*16
+  If PeekA(at)=255 Or IPv6AddressUnspecified(at)<>0 : ProcedureReturn #IPV6_MLD_INVALID : EndIf
+  found=0
+  For j=0 To count-1
+   If ipv6mld_SameAddress(at,storage+j*16)<>0 : found=1 : EndIf
+  Next
+  For j=0 To i-1
+   If ipv6mld_SameAddress(at,input+j*16)<>0 : found=1 : EndIf
+  Next
+  If found=0 : unique=unique+1 : EndIf
+ Next
+ If count+unique>capacity/16 : ProcedureReturn #IPV6_MLD_INVALID : EndIf
+ total=count
+ For i=0 To added-1
+  at=input+i*16 : found=0
+  For j=0 To total-1
+   If ipv6mld_SameAddress(at,storage+j*16)<>0 : found=1 : EndIf
+  Next
+  If found=0
+   For j=0 To 15 : PokeA(storage+total*16+j,PeekA(at+j)) : Next
+   total=total+1
+  EndIf
+ Next
+ ProcedureReturn total
+EndProcedure
