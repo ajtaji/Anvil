@@ -1,0 +1,145 @@
+
+>>> 
+
+pmf> 
+>>> version
+version
+build 432 date 20261029 time 194406
+PureMetal Forge - Anvil, the Raspberry Pi 4 monitor. Version 2.0,
+64-bit AArch64, running with no operating system underneath it.
+  This is build 432 of this board's monitor, made 2026-10-29 at 19:44:06.
+  The number is raised by one by every successful build, so two images
+  can be told apart from the prompt. It says WHICH build this is, not
+  WHAT is in it - a number can be reset, frozen, or carried by a source
+  somebody edited without rebuilding. The digest below is what is in it.
+  This monitor's own image is 6411124 bytes, 00200000 .. 0081D373.
+  That extent is the RUNNING IMAGE's own: the compiler marks the end
+  of the image with a symbol and this program reads it, so the length
+  is of the code that is executing and not of a file on a disk that
+  may since have been replaced. It is also why this monitor has no
+  maximum size - type map.
+  That size and the build number above are enough to tell two images
+  apart. For the digest that says WHAT is in it, type:
+    version full        - or crc32 00200000 0061D374
+  It is not done here unasked because it reads every byte of the
+  image, which is not instant on a board with its caches off.
+  Built by PureMetal Forge for target pi4.
+  This image is a kernel8.img. The firmware loads the whole file to
+  00200000 and enters it there, with no loader in between -
+  which is why its size is not capped by anything: there is nothing
+  above it in the boot path to make room for.
+  The compiler and linker versions are not stamped into the image, so -
+  unlike U-Boot's version - they are not printed here rather than
+  guessed at.
+  Type info for the board, revision and clocks, or help for the commands.
+pmf> 
+>>> map
+map
+THE MEMORY MAP, AS THIS IMAGE MEASURES IT
+  this image      00200000 to 0081D373   6411124 bytes, measured from the image itself
+  reserved        00200000 to 008FFFFF   this monitor's code, measured from the image
+  reserved        0D000000 to 0F6FFFFF   its variables, placed by --bss-addr
+  reserved        001FF000 to 001FFFFF   the autoboot record
+  reserved        08A00000 to 091FFFFF   the DSI framebuffer
+  reserved        001FC000 to 001FEFFF   the reserved raw-secondary stacks
+  reserved        09200000 to 099FFFFF   the driver-module arena and its staging window
+  reserved        001FB000 to 001FBFFF   the boot phase record
+  reserved        0B000000 to 0BBFFFFF   the screenshot capture area
+  reserved        10000000 to 13FFFFFF   the reserved Vulkan device-memory heap
+  its stack top   00100000               and it grows downwards from there
+  stage a file at 00900000               which is what the upload tools ask for
+
+Where a payload may go:
+  the low window   00900000 to 07EFFFFF   (about 118 MB)
+  the high window  40000000 to FBFFFFFF   (about 3 GB)
+  Nothing in this map is a constant this program was told. The
+  monitor's extent is the size of the image the firmware loaded, and
+  the low window begins above it, so both move when this program
+  does. There is no maximum size.
+ok
+pmf> 
+>>> shot status
+shot status
+A capture on the next payload return is not armed.
+  shot arm      arms it for the next run, once
+  shot disarm   puts it back
+  boot mem <address> shot   arms it and boots in one line
+The capture area holds picture number 302, 1280 by 800 as the
+console saw it, taken by this monitor as a payload returned (its x0 was 0000000000000000)
+from 4096000 bytes of the 800 by 1280 surface the panel was scanning, at 90 degrees.
+  shot          streams it, in the same format p streams the live screen
+pmf> 
+>>> net recv 5001 1000000
+net recv 5001 1000000
+Listening on port 5001 on every usable addressed interface for ONE connection:
+    the Wi-Fi radio at 192.168.1.114
+  Everything it sends goes to 01000000 and the last byte it may
+  write is 07EFFFFF, which is 116391936 bytes.
+  Send the file and close the connection; the length and the SHA-256 of
+  what actually landed are printed here when you do. Any key stops it.
+Received 218764 bytes from 192.168.1.104 to 01000000 in 151 ms.
+  That is 1410 KB/s.
+  sha256 87d38aa42af3c1128c844b4a3a8fcebab4cfd485b5fbd51b687cc32c58f84fcc
+  The digest is of THE MEMORY, taken after the transfer, and it took 122
+  ms. Compare it with sha256sum of the file on the host: equal means
+  the bytes in this board's DRAM are the bytes in that file.
+  Nothing has been booted and nothing has been written to the medium.
+  boot mem 01000000 enters it if it is a container; save <name>
+  01000000 0003568C writes it to the boot medium.
+pmf> 
+>>> deadman 15
+deadman 15
+The deadman watchdog is armed for 15 seconds.
+  It covers the NEXT payload only. It is armed immediately before the
+  jump and stopped immediately after, and it is never running while you
+  are sitting at this prompt - a board that reset itself while somebody
+  was reading a dump would be a rescue costing more than the thing it
+  rescued from.
+pmf> 
+>>> last run
+last run
+LASTRUN 00000132 02 00 0F 0000000000000000 0000000001000000 00000000000015B9 0000000000000000 0000000000000000 0000000000000000
+Run 306 entered the payload at 01000000 with a 15 s deadman armed.
+It RETURNED after 5.5 s, and its x0 register held 0000000000000000.
+  A host that did not see the return line lost it on the way; the
+  payload itself came back.
+pmf> 
+>>> boot mem 1000000 shot
+boot mem 1000000 shot
+The frame this payload leaves on the screen will be kept before
+anything repaints over it. Read it back afterwards with shot.
+Placing 218636 bytes at 01000000, the address the payload was built for
+  (from the container at 01000000).
+Verifying 218636 bytes at 01000000 against the container's SHA-256 ...
+  computed 1069d931e679ad6b6501020b92f94bf492035af44cea8e2b81e3e9719ae8a458
+  the digest matches the one the compiler put in the container.
+Clearing 1186416 bytes of zero-init memory at 01080000.
+This payload was built to return to the monitor, so the prompt should
+come back when it is finished.
+This payload asked for the service table, so it is entered with x0 = 0EF4A738
+  (ABI 1.10, 200 slots). It can call back into this monitor.
+Starting the payload at 01000000. Control leaves the monitor now, and
+anything printed below this line came from the payload, not from Anvil.
+The deadman watchdog is armed for 15 seconds. If the payload hangs and
+never comes back, the board will reset itself rather than sit there.
+
+>>> 
+
+pmf> 
+>>> last run
+last run
+LASTRUN 00000133 02 01 0F 0000000000000000 0000000001000000 FFFFFFFFFFFFFFFF 0000000000000000 0000000000000000 0000000000000000
+Run 307 entered the payload at 01000000 with a 15 s deadman armed.
+It RETURNED, before the board was restarted since, and its x0 register held 0000000000000000.
+  A host that did not see the return line lost it on the way; the
+  payload itself came back.
+pmf> 
+>>> sr
+sr
+!! there is no kept picture to send: the capture area holds no complete
+   capture, so nothing was streamed. Either no run has been captured
+   since this board started, or the last attempt was refused because
+   there was no screen behind the console at the time.
+   shot arm, then boot the payload, gets one. shot now takes one of the
+   screen as it is at this instant, which is what p sends live.
+pmf> 

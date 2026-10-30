@@ -1154,19 +1154,26 @@ Procedure.i exfat_SetChecksum(first.i, flags.i, length.i, index.i, secondaryCoun
   ProcedureReturn sum
 EndProcedure
 
+; Read bounded blocks instead of walking the stream anew for every byte.
+; This scratch belongs to the serialized mount operation, like exfat_sector.
+Global Dim exfat_upcaseChunk.a[512]
 Procedure.i exfat_UpcaseTableChecksum()
   Define sum.i
   Define off.i
-  Define b.i
+  Define take.i
+  Define i.i
   sum = 0
   off = 0
   While off < exfat_upcaseLength
-    b = exfat_StreamByte(exfat_upcaseCluster, 0, exfat_upcaseLength, off)
-    If b < 0
+    take = exfat_upcaseLength - off
+    If take > 512 : take = 512 : EndIf
+    If exfat_StreamRead(exfat_upcaseCluster, 0, exfat_upcaseLength, off, @exfat_upcaseChunk[0], take) <> take
       ProcedureReturn -1
     EndIf
-    sum = (exfat_Ror32(sum) + b) & $FFFFFFFF
-    off = off + 1
+    For i = 0 To take - 1
+      sum = (exfat_Ror32(sum) + (exfat_upcaseChunk[i] & $FF)) & $FFFFFFFF
+    Next
+    off = off + take
   Wend
   ProcedureReturn sum
 EndProcedure

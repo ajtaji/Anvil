@@ -778,3 +778,31 @@ failed check and corrected recheck are retained separately.
 
 These measurements are not worst-case guarantees. Cold file opening and link
 waits remain blocking work; IPv6 web traffic and HTTP/2-3 remain open.
+
+
+## Cold root-file opening: buffered exFAT checksum
+
+Build 433 reads the exFAT up-case checksum input in 512-byte blocks instead
+of repeating stream and cluster lookup for every byte. It still checks every
+byte with the same checksum and rejects a short or failed read. The shared
+filesystem change benefits all callers; it does not add a TLS-specific cache.
+
+On the physical Pi, the in-memory filesystem regression passed, as did ten
+checksum lengths through 32 KB and an injected read failure. The 8 KB case
+fell from 13,324 to 358 microseconds, and 32 KB from 181,785 to 1,671
+microseconds. These synthetic chained-volume timings are not USB timings.
+The first fixture mistakenly left caches disabled and the board restarted
+after recording a return; that run is retained as failed qualification.
+The corrected fixture returned cleanly in 1.7 seconds with capture and health
+checks passing. The legacy fixture arrays were sized to their intended counts.
+
+With the same live root-file/HTTPS probe after boot, the first file-open call
+measured 18375 us on 432 and 16484 us on 433. Gzip/deflate contents and connection
+cancellation passed. This reduces one part of cold-open work; mount/read
+ownership and synchronous device/link waits still prevent a fully nonblocking
+claim. No IPv6 web or HTTP/2-3 completion is implied.
+
+The candidate update initially hit a full boot partition. The current boot
+image was untouched. Two obsolete candidate copies were matched against their
+local archives before removal; recovery backups were retained. Candidate,
+boot file and running build 433 were then verified by full hashes.
