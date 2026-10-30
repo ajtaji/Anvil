@@ -2714,8 +2714,8 @@ releases transport ownership. Graceful NO_ERROR shutdown is described below; aut
 GOAWAY transmission remains unfinished. Opt-in automatic WebClient protocol
 dispatch is described below. Per-stream cancellation and minimal processing of
 late closed-stream frames are described below.
-Most protocol errors still close the connection. Stream WINDOW_UPDATE and response-body errors
-are isolated as described below; other stream-local failures remain unfinished. The
+Connection-level protocol errors close the connection. Stream WINDOW_UPDATE,
+response-body and field semantic errors are isolated as described below; other stream-local failures remain unfinished. The
 existing HTTP/1 WebClient remains the default; HTTP/2 is explicit opt-in.
 
 Physical qualification on Anvil 483 passed 40 cases through a fake transport
@@ -3163,9 +3163,9 @@ qualification is Pi4 only. All captures returned zero with healthy cores,
 fonts and Vulkan, watchdog off; monitor483 was unchanged. Evidence:
 `docs/evidence/anvil-ipv6-20261030/http2-stream-window483`.
 
-This change does not complete stream-local error isolation: malformed response
-fields and other stream error paths still need work. Response-body and stream
-receive-window isolation are described below. Automatic connection-error GOAWAY transmission, remaining TLS,
+This change does not complete stream-local error isolation. Response-body,
+receive-window and response-field isolation are described below; other stream
+error paths still need work. Automatic connection-error GOAWAY transmission, remaining TLS,
 off-link IPv6/RDNSS web qualification and HTTP/3 also remain unfinished.
 
 
@@ -3189,8 +3189,8 @@ also waits for pending discarded credit. No new caller buffer is required, but
 the H2Client structure changed and callers must recompile.
 
 Connection-wide receive-window exhaustion, idle-stream DATA and invalid padding
-remain connection errors. Integer resource limits and malformed field/HPACK
-handling retain their existing behavior; this is not complete stream-local
+remain connection errors. Integer resource limits and corrupt HPACK
+retain their existing behavior; field semantics are covered below, and this is not complete stream-local
 protocol-error isolation.
 
 Physical Pi 4 capture 192 reproduced three prior connection-wide failures.
@@ -3208,6 +3208,48 @@ passed; no physical Pi 3 claim. All five captures returned zero with healthy
 cores/fonts/Vulkan and watchdog off; installed Anvil 483 was unchanged. Evidence:
 `docs/evidence/anvil-ipv6-20261030/http2-body-errors483`.
 
-Malformed response-field isolation, other stream error paths and automatic
-connection-error GOAWAY transmission remain unfinished, alongside remaining TLS,
+Other stream error paths and automatic connection-error GOAWAY transmission
+remain unfinished, alongside remaining TLS,
 off-link IPv6/RDNSS web qualification and HTTP/3.
+
+
+### Malformed response-field isolation with HPACK continuity
+
+Semantic field failures now produce a stream RESET with wire PROTOCOL_ERROR (1)
+and local H2_PROTOCOL. This includes the existing field-name/value, pseudo-header,
+status and Content-Length validation failures. Missing status, an informational
+response with END_STREAM, and invalid trailer semantics use the same path.
+Previously emitted FIELD events may already have been consumed; the reset marks
+the whole response as failed. No fields from the rejected remainder are exposed.
+
+The client continues decoding the rest of the rejected compressed block. Dynamic
+insertions still update the shared HPACK table, even after the reset notification
+has been consumed and the old stream slot released. Valid sibling requests can
+therefore reference that table without reopening their connection. This also
+applies when invalid trailer framing is recognized before decoding its fields.
+Pending resets retain the existing bounded-queue behavior. Corrupt HPACK,
+interrupted CONTINUATION sequences, numeric resource limits and remaining
+frame-level errors retain their existing failure behavior.
+
+Physical Pi 4 capture 197 reproduced uppercase-name, missing-status and
+duplicate-status connection-wide failures. Capture 198 passed 18 targeted cases:
+field validity, pseudo-header/status ordering, prohibited fields, invalid and
+conflicting lengths, informational END_STREAM, invalid trailers, a continued
+malformed block, full control-queue congestion, valid fields and dynamic reuse,
+and fatal Huffman/continuation errors. The malformed-block cases append a new
+HPACK entry and make the sibling response reference it; successful sibling body
+completion checks continued decoder synchronization. Wire reset/local codes,
+completion counts, content and credit were checked. Captures 199-201 passed all
+46 engine, eight deadline and eight shutdown regressions. These are fragmented
+transport fixtures on the physical processor, not malformed public-server
+traffic. Shared Pi 3 compilation passed, without a physical Pi 3 claim. All five
+captures returned zero with healthy cores/fonts/Vulkan and watchdog off; Anvil
+483 was unchanged. Capture 200 initially suffered a stalled screenshot transfer
+and a prompt timeout. A later fresh readiness probe recovered the same retained
+capture and report without rebooting or rerunning the payload; the original
+failed transfer record is preserved alongside the recovered evidence. Evidence:
+`docs/evidence/anvil-ipv6-20261030/http2-header-errors483`.
+
+Remaining work includes other stream/frame-error classifications and automatic
+connection-error GOAWAY transmission, plus the broader TLS, off-link IPv6/RDNSS
+web qualification and HTTP/3 work. This is not a complete networking claim.

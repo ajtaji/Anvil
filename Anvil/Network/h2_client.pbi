@@ -138,45 +138,64 @@ Procedure.i h2cEqual(p.i,bytes.i,text.i)
  If PeekA(text+bytes)<>0 : ProcedureReturn 0 : EndIf
  ProcedureReturn 1
 EndProcedure
+; Defer local reset transmission/notification without invalidating borrowed data.
+; deadlinePending also carries protocol-error resets through the bounded queue.
+Procedure h2cStreamError(*c.H2Client,*s.H2Stream,code.i,error.i)
+ If *s\state<>1 : ProcedureReturn : EndIf
+ *s\state=3 : *s\resetCode=code : *s\localError=error
+ *s\deadlinePending=1 : *s\deadlineTimeout=0 : *c\activeStreams=*c\activeStreams-1
+ If *c\finishStream=*s : *c\finishStream=0 : EndIf
+ If *c\blockStream=*s And (*c\decoding<>0 Or *c\continuation<>0)
+  *c\blockDiscard=1 : *c\blockStream=0
+ EndIf
+EndProcedure
+ ; Preserve HPACK state by decoding the remainder of a malformed field block.
+Procedure.i h2cHeaderError(*c.H2Client)
+ Define *s.H2Stream
+ *s=*c\blockStream : If *s=0 : ProcedureReturn h2cFail(*c,#H2_STATE) : EndIf
+ h2cStreamError(*c,*s,1,#H2_PROTOCOL)
+ *c\blockDiscard=1 : *c\blockStream=0
+ ProcedureReturn 0
+EndProcedure
 Procedure.i h2cField(*c.H2Client)
  Define *d.HpackDecoder,*s.H2Stream,i.i,ch.i,n.q
  *d=@*c\decoder : *s=*c\blockStream
- If *d\nameLength=0 : ProcedureReturn h2cFail(*c,#H2_PROTOCOL) : EndIf
+ If *d\nameLength=0 : ProcedureReturn h2cHeaderError(*c) : EndIf
  For i=0 To *d\nameLength-1
   ch=PeekA(*d\name+i)
   If ch=58 And i=0
   Else
    If (ch<97 Or ch>122) And (ch<48 Or ch>57)
-    If ch<>33 And ch<>35 And ch<>36 And ch<>37 And ch<>38 And ch<>39 And ch<>42 And ch<>43 And ch<>45 And ch<>46 And ch<>94 And ch<>95 And ch<>96 And ch<>124 And ch<>126 : ProcedureReturn h2cFail(*c,#H2_PROTOCOL) : EndIf
+    If ch<>33 And ch<>35 And ch<>36 And ch<>37 And ch<>38 And ch<>39 And ch<>42 And ch<>43 And ch<>45 And ch<>46 And ch<>94 And ch<>95 And ch<>96 And ch<>124 And ch<>126 : ProcedureReturn h2cHeaderError(*c) : EndIf
    EndIf
   EndIf
  Next
  For i=0 To *d\valueLength-1
   ch=PeekA(*d\value+i)
-  If (ch<32 And ch<>9) Or ch=127 : ProcedureReturn h2cFail(*c,#H2_PROTOCOL) : EndIf
-  If (i=0 Or i=*d\valueLength-1) And (ch=32 Or ch=9) : ProcedureReturn h2cFail(*c,#H2_PROTOCOL) : EndIf
+  If (ch<32 And ch<>9) Or ch=127 : ProcedureReturn h2cHeaderError(*c) : EndIf
+  If (i=0 Or i=*d\valueLength-1) And (ch=32 Or ch=9) : ProcedureReturn h2cHeaderError(*c) : EndIf
  Next
  If PeekA(*d\name)=58
-  If *c\blockTrailers<>0 Or *c\blockRegular<>0 Or *c\blockStatus<>0 Or h2cEqual(*d\name,*d\nameLength,":status")=0 Or *d\valueLength<>3 : ProcedureReturn h2cFail(*c,#H2_PROTOCOL) : EndIf
+  If *c\blockTrailers<>0 Or *c\blockRegular<>0 Or *c\blockStatus<>0 Or h2cEqual(*d\name,*d\nameLength,":status")=0 Or *d\valueLength<>3 : ProcedureReturn h2cHeaderError(*c) : EndIf
   n=0
   For i=0 To 2
-   ch=PeekA(*d\value+i) : If ch<48 Or ch>57 : ProcedureReturn h2cFail(*c,#H2_PROTOCOL) : EndIf
+   ch=PeekA(*d\value+i) : If ch<48 Or ch>57 : ProcedureReturn h2cHeaderError(*c) : EndIf
    n=n*10+ch-48
   Next
-  If n<100 Or n>599 Or n=101 : ProcedureReturn h2cFail(*c,#H2_PROTOCOL) : EndIf
+  If n<100 Or n>599 Or n=101 : ProcedureReturn h2cHeaderError(*c) : EndIf
   *c\blockStatus=n
  Else
   *c\blockRegular=1
-  If h2cEqual(*d\name,*d\nameLength,"connection") Or h2cEqual(*d\name,*d\nameLength,"proxy-connection") Or h2cEqual(*d\name,*d\nameLength,"keep-alive") Or h2cEqual(*d\name,*d\nameLength,"transfer-encoding") Or h2cEqual(*d\name,*d\nameLength,"upgrade") Or h2cEqual(*d\name,*d\nameLength,"te") : ProcedureReturn h2cFail(*c,#H2_PROTOCOL) : EndIf
+  If h2cEqual(*d\name,*d\nameLength,"connection") Or h2cEqual(*d\name,*d\nameLength,"proxy-connection") Or h2cEqual(*d\name,*d\nameLength,"keep-alive") Or h2cEqual(*d\name,*d\nameLength,"transfer-encoding") Or h2cEqual(*d\name,*d\nameLength,"upgrade") Or h2cEqual(*d\name,*d\nameLength,"te") : ProcedureReturn h2cHeaderError(*c) : EndIf
   If h2cEqual(*d\name,*d\nameLength,"content-length")
-   If *c\blockTrailers<>0 Or *c\blockStatus<200 Or *c\blockStatus=204 Or *d\valueLength=0 : ProcedureReturn h2cFail(*c,#H2_PROTOCOL) : EndIf
+   If *c\blockTrailers<>0 Or *c\blockStatus<200 Or *c\blockStatus=204 Or *d\valueLength=0 : ProcedureReturn h2cHeaderError(*c) : EndIf
    n=0
    For i=0 To *d\valueLength-1
-    ch=PeekA(*d\value+i) : If ch<48 Or ch>57 : ProcedureReturn h2cFail(*c,#H2_PROTOCOL) : EndIf
+    ch=PeekA(*d\value+i) : If ch<48 Or ch>57 : ProcedureReturn h2cHeaderError(*c) : EndIf
     If n>($7FFFFFFFFFFFFFFF-(ch-48))/10 : ProcedureReturn h2cFail(*c,#H2_LIMIT) : EndIf
     n=n*10+ch-48
    Next
-   If *s\contentLength>=0 And *s\contentLength<>n : ProcedureReturn h2cFail(*c,#H2_PROTOCOL) : EndIf
+   If *s\contentLength>=0 And *s\contentLength<>n : ProcedureReturn h2cHeaderError(*c) : EndIf
    *s\contentLength=n
   EndIf
  EndIf
@@ -193,17 +212,6 @@ Procedure.i h2cControl(*c.H2Client,bytes.i,kind.i,flags.i,id.i)
  H2FrameWrite(p,1024-*c\controlLength,bytes,kind,flags,id)
  *c\controlLength=*c\controlLength+bytes+9
  ProcedureReturn p+9
-EndProcedure
-; Defer local reset transmission/notification without invalidating borrowed data.
-; deadlinePending also carries protocol-error resets through the bounded queue.
-Procedure h2cStreamError(*c.H2Client,*s.H2Stream,code.i,error.i)
- If *s\state<>1 : ProcedureReturn : EndIf
- *s\state=3 : *s\resetCode=code : *s\localError=error
- *s\deadlinePending=1 : *s\deadlineTimeout=0 : *c\activeStreams=*c\activeStreams-1
- If *c\finishStream=*s : *c\finishStream=0 : EndIf
- If *c\blockStream=*s And (*c\decoding<>0 Or *c\continuation<>0)
-  *c\blockDiscard=1 : *c\blockStream=0
- EndIf
 EndProcedure
  ; Discarded DATA still consumes connection credit, including its padding.
 ; Defer WINDOW_UPDATE if the bounded control queue is temporarily full.
@@ -529,9 +537,9 @@ Procedure.i h2cDecode(*c.H2Client)
  *s=*c\blockStream : *c\decoding=0 : *c\blockUsed=0
  If *c\blockDiscard<>0 : *c\blockStream=0 : ProcedureReturn 0 : EndIf
  If *c\blockTrailers=0
-  If *c\blockStatus=0 : ProcedureReturn h2cFail(*c,#H2_PROTOCOL) : EndIf
+  If *c\blockStatus=0 : ProcedureReturn h2cHeaderError(*c) : EndIf
   If *c\blockStatus<200
-   If *c\blockEnd<>0 : ProcedureReturn h2cFail(*c,#H2_PROTOCOL) : EndIf
+   If *c\blockEnd<>0 : ProcedureReturn h2cHeaderError(*c) : EndIf
    ProcedureReturn 0
   EndIf
   *s\status=*c\blockStatus
@@ -592,7 +600,7 @@ Procedure.i h2cFrame(*c.H2Client)
    *c\blockEnd=*h\flags & 1 : *c\blockStatus=0 : *c\blockRegular=0 : *c\blockTrailers=0
    If closed=0
     *c\blockStream=*s : If *s\status<>0 : *c\blockTrailers=1 : EndIf
-    If *c\blockTrailers<>0 And *c\blockEnd=0 : ProcedureReturn h2cFail(*c,#H2_PROTOCOL) : EndIf
+    If *c\blockTrailers<>0 And *c\blockEnd=0 : h2cHeaderError(*c) : EndIf
    EndIf
    offset=0 : padding=0
    If (*h\flags & 8)<>0 : padding=PeekA(p) : offset=1 : EndIf
