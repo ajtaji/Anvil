@@ -109,6 +109,7 @@ Structure H2Client
  data.i
  dataBytes.i
  credit.i
+ discardCredit.i
  finishStream.i
  name.i
  nameLength.i
@@ -193,10 +194,28 @@ Procedure.i h2cControl(*c.H2Client,bytes.i,kind.i,flags.i,id.i)
  *c\controlLength=*c\controlLength+bytes+9
  ProcedureReturn p+9
 EndProcedure
+; Defer local reset transmission/notification without invalidating borrowed data.
+; deadlinePending also carries protocol-error resets through the bounded queue.
+Procedure h2cStreamError(*c.H2Client,*s.H2Stream,code.i,error.i)
+ If *s\state<>1 : ProcedureReturn : EndIf
+ *s\state=3 : *s\resetCode=code : *s\localError=error
+ *s\deadlinePending=1 : *s\deadlineTimeout=0 : *c\activeStreams=*c\activeStreams-1
+ If *c\finishStream=*s : *c\finishStream=0 : EndIf
+ If *c\blockStream=*s And (*c\decoding<>0 Or *c\continuation<>0)
+  *c\blockDiscard=1 : *c\blockStream=0
+ EndIf
+EndProcedure
+ ; Discarded DATA still consumes connection credit, including its padding.
+; Defer WINDOW_UPDATE if the bounded control queue is temporarily full.
+Procedure h2cDiscard(*c.H2Client,bytes.i)
+ *c\window=*c\window-bytes : *c\discardCredit=*c\discardCredit+bytes
+EndProcedure
 Procedure.i h2cFinish(*c.H2Client,*s.H2Stream)
  Define *request.WebRequest,p.i
- If *s\state<>1 Or *s\status<200 : ProcedureReturn h2cFail(*c,#H2_PROTOCOL) : EndIf
- If *s\headOnly=0 And *s\status<>304 And *s\contentLength>=0 And *s\received<>*s\contentLength : ProcedureReturn h2cFail(*c,#H2_PROTOCOL) : EndIf
+ If *s\state<>1 : ProcedureReturn h2cFail(*c,#H2_PROTOCOL) : EndIf
+ If *s\status<200 Or (*s\headOnly=0 And *s\status<>304 And *s\contentLength>=0 And *s\received<>*s\contentLength)
+  h2cStreamError(*c,*s,1,#H2_PROTOCOL) : ProcedureReturn 0
+ EndIf
  If *s\localClosed=0
   ; A final response can arrive before the upload finishes. Preserve the
   ; response and close only the unfinished request side with NO_ERROR.
@@ -439,17 +458,6 @@ Procedure.i H2ClientDeadline(*c.H2Client,id.i,now.i,timeout.i)
  *s\deadlineStarted=now : *s\deadlineTimeout=timeout
  ProcedureReturn 0
 EndProcedure
-; Defer local reset transmission/notification without invalidating borrowed data.
-; deadlinePending also carries protocol-error resets through the bounded queue.
-Procedure h2cStreamError(*c.H2Client,*s.H2Stream,code.i,error.i)
- If *s\state<>1 : ProcedureReturn : EndIf
- *s\state=3 : *s\resetCode=code : *s\localError=error
- *s\deadlinePending=1 : *s\deadlineTimeout=0 : *c\activeStreams=*c\activeStreams-1
- If *c\finishStream=*s : *c\finishStream=0 : EndIf
- If *c\blockStream=*s And (*c\decoding<>0 Or *c\continuation<>0)
-  *c\blockDiscard=1 : *c\blockStream=0
- EndIf
-EndProcedure
 ; Mark expired streams and progress all pending local resets.
 ; A full control queue defers the reset until writes free space. The stream
 ; stops accepting new data immediately, and cannot be released prematurely.
@@ -467,6 +475,10 @@ Procedure h2cDeadlines(*c.H2Client,now.i)
    *s\deadlinePending=2
   EndIf
  Next
+ If *c\discardCredit>0 And *c\controlLength<=1011
+  p=h2cControl(*c,4,8,0,0) : NetWriteBE32(p,*c\discardCredit)
+  *c\discardCredit=0
+ EndIf
  If *c\event=0
   For i=0 To *c\buffers\streamCount-1
    *s=*c\buffers\streams+i*SizeOf(H2Stream)
@@ -605,22 +617,28 @@ Procedure.i h2cFrame(*c.H2Client)
    If (*h\flags & 8)<>0 : offset=1 : padding=PeekA(p) : EndIf
    n=*h\length-offset-padding : If n<0 : ProcedureReturn h2cFail(*c,#H2_PROTOCOL) : EndIf
    If closed<>0
-    ; Discarded content still consumes connection credit, never stream credit.
-    ; Restore receive credit only after the queued WINDOW_UPDATE is sent.
-    If *h\length>0
-     control=h2cControl(*c,4,8,0,0) : If control<0 : ProcedureReturn control : EndIf
-     NetWriteBE32(control,*h\length) : *c\window=*c\window-*h\length
-    EndIf
+    h2cDiscard(*c,*h\length)
    Else
-    If *s\status=0 : ProcedureReturn h2cFail(*c,#H2_PROTOCOL) : EndIf
-    If *h\length>*s\window : ProcedureReturn h2cFail(*c,#H2_FLOW) : EndIf
-    If n>0 And (*s\headOnly<>0 Or *s\status=204 Or *s\status=304) : ProcedureReturn h2cFail(*c,#H2_PROTOCOL) : EndIf
-    If *s\received>$7FFFFFFFFFFFFFFF-n : ProcedureReturn h2cFail(*c,#H2_LIMIT) : EndIf
-    *s\received=*s\received+n
-    If *s\contentLength>=0 And *s\status<>304 And *s\received>*s\contentLength : ProcedureReturn h2cFail(*c,#H2_PROTOCOL) : EndIf
-    *c\window=*c\window-*h\length : *s\window=*s\window-*h\length
-    *c\credit=*h\length : *c\data=p+offset : *c\dataBytes=n : *c\eventStream=*s\id : *c\event=#H2_DATA
-    If (*h\flags & 1)<>0 : *c\finishStream=*s : EndIf
+    rc=0
+    If *h\length>*s\window
+     rc=#H2_FLOW
+    ElseIf *s\status=0
+     rc=#H2_PROTOCOL
+    ElseIf n>0 And (*s\headOnly<>0 Or *s\status=204 Or *s\status=304)
+     rc=#H2_PROTOCOL
+    ElseIf *s\contentLength>=0 And *s\status<>304 And n>*s\contentLength-*s\received
+     rc=#H2_PROTOCOL
+    EndIf
+    If rc<>0
+     v=1 : If rc=#H2_FLOW : v=3 : EndIf
+     h2cStreamError(*c,*s,v,rc) : h2cDiscard(*c,*h\length)
+    Else
+     If *s\received>$7FFFFFFFFFFFFFFF-n : ProcedureReturn h2cFail(*c,#H2_LIMIT) : EndIf
+     *s\received=*s\received+n
+     *c\window=*c\window-*h\length : *s\window=*s\window-*h\length
+     *c\credit=*h\length : *c\data=p+offset : *c\dataBytes=n : *c\eventStream=*s\id : *c\event=#H2_DATA
+     If (*h\flags & 1)<>0 : *c\finishStream=*s : EndIf
+    EndIf
    EndIf
   Case 2
    If (NetReadBE32(p) & $7FFFFFFF)=*h\stream : ProcedureReturn h2cFail(*c,#H2_PROTOCOL) : EndIf
@@ -731,7 +749,7 @@ Procedure.i H2ClientStep(*c.H2Client,now.i)
    ; Server-initiated streams are disabled, so the last processed peer ID is 0.
    NetWriteBE32(p,0) : NetWriteBE32(p+4,0) : *c\shutdownQueued=1
   EndIf
-  If *c\shutdownQueued<>0 And *c\activeStreams=0 And *c\event=0 And *c\txLength=0 And *c\controlLength=0 And *c\requestHeaderBytes=0
+  If *c\shutdownQueued<>0 And *c\activeStreams=0 And *c\event=0 And *c\txLength=0 And *c\controlLength=0 And *c\requestHeaderBytes=0 And *c\discardCredit=0
    WebTransportClose(@*c\connection) : *c\state=5
    ProcedureReturn #H2_DRAINED
   EndIf

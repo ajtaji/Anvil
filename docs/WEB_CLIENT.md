@@ -2714,7 +2714,7 @@ releases transport ownership. Graceful NO_ERROR shutdown is described below; aut
 GOAWAY transmission remains unfinished. Opt-in automatic WebClient protocol
 dispatch is described below. Per-stream cancellation and minimal processing of
 late closed-stream frames are described below.
-Most protocol errors still close the connection. Stream WINDOW_UPDATE errors
+Most protocol errors still close the connection. Stream WINDOW_UPDATE and response-body errors
 are isolated as described below; other stream-local failures remain unfinished. The
 existing HTTP/1 WebClient remains the default; HTTP/2 is explicit opt-in.
 
@@ -3164,6 +3164,50 @@ fonts and Vulkan, watchdog off; monitor483 was unchanged. Evidence:
 `docs/evidence/anvil-ipv6-20261030/http2-stream-window483`.
 
 This change does not complete stream-local error isolation: malformed response
-fields, DATA semantic errors, receive-window errors and other stream error paths
-still need work. Automatic connection-error GOAWAY transmission, remaining TLS,
+fields and other stream error paths still need work. Response-body and stream
+receive-window isolation are described below. Automatic connection-error GOAWAY transmission, remaining TLS,
 off-link IPv6/RDNSS web qualification and HTTP/3 also remain unfinished.
+
+
+### Response-body errors and discarded connection credit
+
+Malformed response DATA now resets the affected stream instead of terminating
+unrelated requests: DATA before final response headers, prohibited nonempty
+content on HEAD/204/304 responses, and content exceeding its declared length
+use wire PROTOCOL_ERROR (1) with local H2_PROTOCOL. A short body detected at
+END_STREAM also yields RESET rather than END. Its earlier DATA events may
+already have been delivered; callers must treat the response as failed when
+that reset arrives. Stream receive-window exhaustion uses wire
+FLOW_CONTROL_ERROR (3) with local H2_FLOW.
+
+Rejected and late closed-stream DATA still consumes connection credit, including
+padding. A pending discard-credit counter queues a connection WINDOW_UPDATE when
+control space is available. Credit becomes available to the peer only after
+that complete frame is sent. This avoids losing credit or closing a healthy
+sibling when reset and credit frames meet a full control queue. Graceful shutdown
+also waits for pending discarded credit. No new caller buffer is required, but
+the H2Client structure changed and callers must recompile.
+
+Connection-wide receive-window exhaustion, idle-stream DATA and invalid padding
+remain connection errors. Integer resource limits and malformed field/HPACK
+handling retain their existing behavior; this is not complete stream-local
+protocol-error isolation.
+
+Physical Pi 4 capture 192 reproduced three prior connection-wide failures.
+Capture 193 passed 15 targeted cases covering the body errors above, padded
+excess and valid bodies, full control-queue congestion, fatal connection/padding
+errors, and valid empty HEAD/204 responses. HEAD metadata and reduced receive
+windows were seeded in the fixture to isolate those branches; this does not
+claim a new externally negotiated receive-window API or a real HEAD request in
+that fixture. Exact reset codes, local errors, delivered body bytes, completion
+counts, outgoing credit and restoration to 65535 connection bytes were checked.
+Captures 194-196 passed all 46 engine, eight deadline and eight shutdown cases.
+These are fragmented deterministic transport fixtures executed on the physical
+processor, not public-server malformed-traffic tests. Shared Pi 3 compilation
+passed; no physical Pi 3 claim. All five captures returned zero with healthy
+cores/fonts/Vulkan and watchdog off; installed Anvil 483 was unchanged. Evidence:
+`docs/evidence/anvil-ipv6-20261030/http2-body-errors483`.
+
+Malformed response-field isolation, other stream error paths and automatic
+connection-error GOAWAY transmission remain unfinished, alongside remaining TLS,
+off-link IPv6/RDNSS web qualification and HTTP/3.
