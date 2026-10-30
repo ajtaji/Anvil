@@ -3900,12 +3900,30 @@ Procedure NetDefaults()
 EndProcedure
 
 ; ----------------------------------------------------------------------
+; Optional IPv6 ingress handler, shared by every hardware receive pump.
+; Signature: (kind, Ethernet frame, bytes, output frame, capacity).
+; Return zero for consumed/ignored input, a negative refusal, or 54..1514
+; bytes of complete Ethernet IPv6 reply. It owns IPv6 address and multicast
+; membership filtering, checksums and protocol delivery. No RX pointer may
+; survive the call; it must not pump networking recursively. No handler means
+; IPv6 remains ignored. IPv4/ARP filtering and receive coordinates are separate.
+Global *net_ipv6InputHook=0
+Global net_ipv6InputBusy.i=0
+Procedure.i NetSetIPv6InputHook(*handler)
+ Define old.i
+ If net_ipv6InputBusy<>0 : ProcedureReturn #NET_E_ARG : EndIf
+ old=*net_ipv6InputHook : *net_ipv6InputHook=*handler
+ ProcedureReturn old
+EndProcedure
+
 Procedure.i NetInput(kind.i, *frame, length.i)
   Protected et.i
   Protected toUs.i
   Protected bcast.i
   Protected r.i
 
+  ; Refuse recursion before overwriting the outer receive/staging state.
+  If net_ipv6InputBusy<>0 : ProcedureReturn #NET_E_ARG : EndIf
   net_err = #NET_E_NONE
   net_outLen = 0
   net_lastProto = 0
@@ -3939,6 +3957,50 @@ Procedure.i NetInput(kind.i, *frame, length.i)
   EndIf
 
   net_inCount = net_inCount + 1
+
+  ; IPv6 multicast cannot pass the IPv4 unicast/broadcast filter below.
+  ; Dispatch it separately; membership belongs to the registered IPv6 owner.
+  et = net_GetBE16(*frame + 12)
+  If et = $86DD
+    net_lastProto = $86DD
+    If *net_ipv6InputHook = 0
+      net_dropCount = net_dropCount + 1
+      ProcedureReturn #NET_IN_IGNORED
+    EndIf
+    If length < 54 Or length > 1514
+      net_err = #NET_E_IP_LENGTH : net_dropCount = net_dropCount + 1
+      ProcedureReturn net_err
+    EndIf
+    toUs = net_Same(*frame, net_IfMacPtr(kind), 6)
+    If toUs = 0
+      ; IPv6 Ethernet multicast is 33:33 plus the low 32 address bits.
+      ; This checks mapping, not membership; the handler checks the latter.
+      If PeekA(*frame)<>51 Or PeekA(*frame+1)<>51 Or PeekA(*frame+38)<>255
+        net_dropCount = net_dropCount + 1 : ProcedureReturn #NET_IN_IGNORED
+      EndIf
+      If net_Same(*frame+2,*frame+50,4)=0
+        net_dropCount = net_dropCount + 1 : ProcedureReturn #NET_IN_IGNORED
+      EndIf
+    EndIf
+    net_ipv6InputBusy = 1
+    r = net_ipv6InputHook(kind,*frame,length,@net_out[0],1514)
+    net_ipv6InputBusy = 0
+    If r = 0 : ProcedureReturn #NET_IN_IGNORED : EndIf
+    If r > 0
+      If r < 54 Or r > 1514
+        r = #NET_E_IP_LENGTH
+      ElseIf net_GetBE16(@net_out[0]+12)<>$86DD
+        r = #NET_E_ARG
+      ElseIf net_Same(@net_out[0]+6,net_IfMacPtr(kind),6)=0
+        r = #NET_E_ARG
+      Else
+        net_outLen = r : net_replyCount = net_replyCount + 1
+        ProcedureReturn #NET_IN_REPLY
+      EndIf
+    EndIf
+    net_err = r : net_dropCount = net_dropCount + 1
+    ProcedureReturn r
+  EndIf
 
   ; ---- the destination filter ----
   ; The MAC hardware already does most of this, but not all of it: it

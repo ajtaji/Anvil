@@ -1194,3 +1194,31 @@ under Anvil 441, including 21 receive-report cases. The RAM payload returned
 normally; cores, fonts and Vulkan remained healthy. This adds the receive
 validator but does not yet connect multicast membership to live device filters
 or the network service loop. IPv6 web traffic and HTTP/2-3 remain unfinished.
+
+
+## Shared IPv6 ingress dispatch
+
+`NetSetIPv6InputHook` connects the common `NetInput` path to an IPv6 owner.
+IPv6 frames now reach that owner before the IPv4-only destination filter.
+Unicast must target the interface MAC; multicast must match the 33:33 mapping
+of the IPv6 destination (RFC 2464 section 7). The owner still validates exact
+IPv6 address membership, packet checksums and protocol state. Registration is
+optional; without it IPv6 remains ignored. IPv4 and ARP retain their path.
+
+The callback receives interface, frame, size, output buffer and capacity. It
+returns zero, a negative error, or a complete 54..1514-byte Ethernet reply.
+Reply size, EtherType and source MAC are checked before staging for the
+existing automatic reply dispatcher. The callback must not retain RX pointers
+or pump the network recursively; registration changes during delivery refuse.
+IPv6 transport delivery belongs inside the IPv6 owner, never in stale IPv4
+UDP/TCP receive coordinates. `NetLastProto` reports 0x86DD for this path.
+
+All 23 physical Pi ingress cases passed with the real IPv6 endpoint, including
+byte-exact echo/neighbor replies, bad checksums, multicast mapping, unjoined
+groups, interface identity, invalid output contracts and handler replacement.
+Existing IPv4 echo checksums/payload/padding and ARP reply bytes passed too.
+The initial oracle expected unpadded IPv4/ARP frames; correcting it to Ethernet's
+60-byte minimum passed against the unchanged captured payload results, without
+repeating the board run. Anvil 441 returned normally with healthy cores/fonts/
+Vulkan. This qualifies the receive seam; device filters and a resident IPv6
+membership/service owner still need binding before live IPv6 traffic works.
