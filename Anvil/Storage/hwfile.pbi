@@ -1,3 +1,4 @@
+XIncludeFile "Anvil/Storage/exfat_profile.pbi"
 ; ======================================================================
 ;  hwfile.pbi - THE FILE SEAM OVER THE SHARED FILESYSTEMS, for any board
 ;  with a block device.
@@ -241,6 +242,7 @@ Procedure.i HwFileOpen(*name)
     gHwFileErr = #HW_FILE_NOMEDIUM
     ProcedureReturn 0
   EndIf
+  ExFatProfileSetClock(@HwMicros)
   If FsOpen(*name) = 0
     gHwFileErr = hwfile_MapFat()
     ProcedureReturn 0

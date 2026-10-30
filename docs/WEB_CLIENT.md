@@ -1916,3 +1916,46 @@ hardcoded emitted body disagreed. The corrected builder emits both from one
 list, and the rebuilt physical run passed. Networking remains incomplete;
 the remaining synchronous open and previously listed IPv6, HTTP/2-3 and cookie
 policy work are still open.
+
+
+### Filesystem stage attribution (build465)
+
+Optional shared exFAT diagnostics now measure partition discovery, boot
+validation, system-directory scanning, up-case checksum and decoding, ASCII-map
+construction and path lookup. The standalone driver receives an optional clock
+callback; it does not depend on a hardware timer or output routine. The shared
+file seam binds Anvil's microsecond clock. `tls status` exposes counts, totals
+and maxima; counts include failed operations that reached the timed stage.
+Repeated binding of the same clock preserves accumulated measurements.
+
+Startup had already performed some filesystem operations, so this run records
+status before and after the cold HTTPS probe. Subtracting counts and totals
+isolates one mount and 47 path lookups during root-store loading:
+
+| Stage | Calls during probe | Total time |
+| --- | ---: | ---: |
+| Partition discovery | 1 | 0.261 ms |
+| Boot validation | 1 | 1.382 ms |
+| System directory | 1 | 0.829 ms |
+| Up-case checksum | 1 | 0.541 ms |
+| Up-case decoding | 1 | 0.487 ms |
+| ASCII map | 1 | 0.192 ms |
+| Path lookup | 47 | 53.699 ms |
+
+The 47 lookups correspond to the initial metadata open and 46 bounded root-file
+reads, each with its own reopen/close. Mean path lookup was 1.143 ms. Stored
+maxima retain startup history and must not be presented as per-request maxima.
+The observed cold root open was 4.967 ms and the whole-service maximum 5.113 ms;
+this diagnostic build is not claimed as another latency improvement.
+
+The physical filesystem fixture passed the full regression, 28 checksum lengths
+and deterministic clock/counter/invalid-input checks. Installed build465 passed
+verified public HTTPS gzip/deflate content checks, full running-image SHA,
+cores, fonts, Vulkan and watchdog checks. Build464 is the verified rollback;
+Pi3build79 compiles the shared implementation. DNS overrides were removed.
+Evidence: `docs/evidence/anvil-ipv6-20261030/mount465`.
+
+The trace identifies repeated directory reads and boot metadata work as further
+optimization targets. No validation was removed, and the initial filesystem
+open remains synchronous. Networking and the previously listed remaining
+protocol work are not complete.

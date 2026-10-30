@@ -1,3 +1,4 @@
+XIncludeFile "Anvil/Storage/exfat_profile.pbi"
 ; ============================================================================
 ; exfat.pbi - target-neutral native exFAT 1.x filesystem for Anvil
 ;
@@ -1655,7 +1656,7 @@ Procedure.i exfat_FindInDir(dirFirst.i, dirFlags.i, dirLength.i, *name, nameLeng
   ProcedureReturn 0
 EndProcedure
 
-Procedure.i exfat_FindSystemEntries()
+Procedure.i exfat_ReadSystemEntries()
   Define index.i
   Define typ.i
   Define bitmapSeen.i
@@ -1705,31 +1706,45 @@ Procedure.i exfat_FindSystemEntries()
   If upcaseSeen = 0 Or exfat_ClusterValid(exfat_upcaseCluster) = 0 Or exfat_upcaseLength < 2 Or (exfat_upcaseLength & 1) <> 0
     ProcedureReturn exfat_Fail(#EXFAT_E_UPCASE)
   EndIf
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i exfat_FindSystemEntries()
+  Define started.i,rc.i,checksum.i
+  started=ExFatProfileBegin() : rc=exfat_ReadSystemEntries() : ExFatProfileEnd(2,started)
+  If rc=0 : ProcedureReturn 0 : EndIf
+  started=ExFatProfileBegin()
   checksum = exfat_UpcaseTableChecksum()
+  ExFatProfileEnd(3,started)
   If checksum < 0 Or checksum <> exfat_upcaseChecksum
     ProcedureReturn exfat_Fail(#EXFAT_E_UPCASE_CHECKSUM)
   EndIf
-  If exfat_ValidateUpcase() = 0
+  started=ExFatProfileBegin() : rc=exfat_ValidateUpcase() : ExFatProfileEnd(4,started)
+  If rc = 0
     ProcedureReturn 0
   EndIf
   exfat_upcaseFastReady = 0
-  If exfat_BuildFastUpcase() = 0
+  started=ExFatProfileBegin() : rc=exfat_BuildFastUpcase() : ExFatProfileEnd(5,started)
+  If rc = 0
     ProcedureReturn 0
   EndIf
   ProcedureReturn 1
 EndProcedure
 
 Procedure.i ExFatMount(partition.i)
+  Define started.i,rc.i
   exfat_error = #EXFAT_OK
   exfat_DropCaches()
   exfat_mounted = 0
   exfat_upcaseFastReady = 0
   exfat_open = 0
   exfat_partBlocks = 0
-  If exfat_FindPartition(partition) = 0
+  started=ExFatProfileBegin() : rc=exfat_FindPartition(partition) : ExFatProfileEnd(0,started)
+  If rc = 0
     ProcedureReturn 0
   EndIf
-  If exfat_ReadBoot() = 0
+  started=ExFatProfileBegin() : rc=exfat_ReadBoot() : ExFatProfileEnd(1,started)
+  If rc = 0
     ProcedureReturn 0
   EndIf
   If exfat_FindSystemEntries() = 0
@@ -1806,8 +1821,10 @@ Procedure.i exfat_Resolve(*path)
 EndProcedure
 
 Procedure.i ExFatOpen(*path)
+  Define started.i,rc.i
   exfat_open = 0
-  If exfat_Resolve(*path) = 0
+  started=ExFatProfileBegin() : rc=exfat_Resolve(*path) : ExFatProfileEnd(6,started)
+  If rc = 0
     ProcedureReturn 0
   EndIf
   If (exfat_fileAttr & #EXFAT_ATTR_DIRECTORY) <> 0

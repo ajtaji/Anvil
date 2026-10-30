@@ -7,6 +7,7 @@ def build(compiler,out):
     root=Path(__file__).resolve().parents[1];out.mkdir(parents=True,exist_ok=False)
     cases=[0,1,2,3,4,5,7,8,9,15,16,17,31,32,33,127,128,129,255,256,511,512,513,4095,4096,4097,8192,32768]
     names=['Anvil/Storage/exfat.pbi','Anvil/Storage/fat32.pbi','Anvil/Storage/filesystem.pbi','RaspberryPi4/Tests/exfat_emitted_gate.pi4','Anvil/Hal/aarch64_counter.pbi','RaspberryPi4/Lib/mmu.pi4']
+    names.append('Anvil/Storage/exfat_profile.pbi')
     s=(root/names[3]).read_text(encoding='utf8').replace('Procedure.i Main()','Procedure.i GateMain()')
     s=s.replace('Global gateFlushes.i','Global gateFailLba.i=-1\nGlobal gateFlushes.i').replace('  gateReads = gateReads + 1','  If gateFailLba>=lba And gateFailLba<lba+count : ProcedureReturn 0 : EndIf\n  gateReads = gateReads + 1')
     # Legacy fixture buffers expressed inclusive maxima; provide their intended counts.
@@ -158,12 +159,26 @@ Procedure ValidationRow(index.i)
  exfat_DropCaches() : t=A64CounterReadOrdered() : rc=exfat_ValidateUpcase()
  PokeI(p+8,rc) : PokeI(p+24,A64CounterReadOrdered()-t)
 EndProcedure
+Global profileTestClock.i
+Procedure.i ProofProfileClock()
+ profileTestClock=profileTestClock+10 : ProcedureReturn profileTestClock
+EndProcedure
 Procedure.i Main()
  Define rc.i,i.i,j.i,n.i,start.i,slow.i,fast.i,old.i,new.i,p.i,reads.i
  For i=0 To 65535 : PokeA($E1C00000+i,0) : Next
  MmuClearNc() : rc=MmuBuildTables($4F80000) : If rc<>0 : ProcedureReturn 9999 : EndIf
  MmuEnableCached()
- PokeI($E1C00000,$58464331)
+ PokeI($E1C00000,$58464332)
+ PokeI($E1C00040,ExFatProfileBegin())
+ ExFatProfileSetClock(@ProofProfileClock)
+ start=ExFatProfileBegin() : ExFatProfileEnd(0,start)
+ start=ExFatProfileBegin() : ExFatProfileEnd(0,start)
+ ExFatProfileEnd(-1,0) : ExFatProfileEnd(7,0) : ExFatProfileEnd(0,-1) : ExFatProfileEnd(0,999)
+ PokeI($E1C00048,ExFatProfileValue(0,0))
+ PokeI($E1C00050,ExFatProfileValue(0,1))
+ PokeI($E1C00058,ExFatProfileValue(0,2))
+ ExFatProfileSetClock(0) : PokeI($E1C00060,ExFatProfileValue(0,0))
+ PokeI($E1C00068,ExFatProfileValue(7,0))
  rc=GateMain() : PokeI($E1C00008,rc)
  If rc<>0 : MmuDisableCachedFlushed() : ProcedureReturn rc : EndIf
  GateFormat() : ExFatSetRangeReader(@GateReader) : ExFatSetRangeWriter(0)

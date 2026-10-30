@@ -2,7 +2,8 @@
 import struct
 def check(raw,cases):
     magic,regression,hz,fault=struct.unpack_from('<4q',raw)
-    assert magic==0x58464331 and regression==0 and hz>0 and fault==-1,(magic,regression,hz,fault)
+    assert magic==0x58464332 and regression==0 and hz>0 and fault==-1,(magic,regression,hz,fault)
+    assert struct.unpack_from('<6q',raw,64)==(-1,2,20,10,0,-1),'profile clock/guard accounting failed'
     rows=[]
     for i,n in enumerate(cases):
         old,new,slow,fast,reads=struct.unpack_from('<5q',raw,256+i*64)

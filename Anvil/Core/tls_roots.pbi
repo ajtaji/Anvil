@@ -1,3 +1,4 @@
+XIncludeFile "Anvil/Storage/exfat_profile.pbi"
 ; ======================================================================
 ;  tls_roots.pbi - THE ROOT STORE. Every trust anchor a TLS connection
 ;  may chain to, read at run time from a PEM bundle on the stick and
@@ -594,9 +595,25 @@ EndProcedure
 
 ; `tls roots` - what the store holds, by kind.
 Procedure TlsRootsShow()
+  Define phase.i
   Print("Root I/O maximum microseconds (storage/open/read/close): ")
   PrintDec(tlsroot_ioMax[0]) : Print(" / ") : PrintDec(tlsroot_ioMax[1]) : Print(" / ")
   PrintDec(tlsroot_ioMax[2]) : Print(" / ") : PrintDec(tlsroot_ioMax[3]) : PrintNl()
+  If ExFatProfileValue(0,0)>0 Or ExFatProfileValue(6,0)>0
+    PrintN("exFAT timings since clock binding (calls / total us / maximum us):")
+    For phase=0 To #EXFAT_PROFILE_PHASES-1
+      If phase=0 : Print("  exFAT partition: ") : EndIf
+      If phase=1 : Print("  exFAT boot validation: ") : EndIf
+      If phase=2 : Print("  exFAT system directory: ") : EndIf
+      If phase=3 : Print("  exFAT upcase checksum: ") : EndIf
+      If phase=4 : Print("  exFAT upcase decode: ") : EndIf
+      If phase=5 : Print("  exFAT ASCII map: ") : EndIf
+      If phase=6 : Print("  exFAT path lookup: ") : EndIf
+      PrintDec(ExFatProfileValue(phase,0)) : Print(" / ")
+      PrintDec(ExFatProfileValue(phase,1)) : Print(" / ")
+      PrintDec(ExFatProfileValue(phase,2)) : PrintNl()
+    Next
+  EndIf
   Print("Root store: ")
   str_print_at(@tlsroot_path[0])
   If tlsroot_loaded = 0
