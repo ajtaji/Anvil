@@ -1,0 +1,89 @@
+#WEB_KERNEL_BINDING=0
+XIncludeFile "Anvil/Network/web_url.pbi"
+XIncludeFile "Anvil/Network/web_transport.pbi"
+XIncludeFile "Anvil/Network/h2_frame.pbi"
+XIncludeFile "Anvil/Network/hpack_decode.pbi"
+XIncludeFile "Anvil/Network/hpack_tables.pbi"
+XIncludeFile "Anvil/Network/h2_client.pbi"
+XIncludeFile "Anvil/Network/h2_request.pbi"
+XIncludeFile "Anvil/Network/web_request.pbi"
+
+Global services.i
+Global *pet,*clock
+Global c.H2Client
+Global buffers.H2Buffers
+Global url.WebUrl
+Global Dim tx.a[16384]
+Global Dim rx.a[16384]
+Global Dim block.a[65536]
+Global Dim controls.a[1024]
+Global Dim dynamic.a[4096]
+Global Dim field.a[8192]
+Global Dim streams.a[1024]
+Procedure CaptureTable()
+ ASM
+ adrp x1, global_services
+ add x1, x1, #:lo12:global_services
+ str x0, [x1]
+ EndASM
+EndProcedure
+
+Procedure.i Probe()
+ Define rc.i,now.i,started.i,before.i,cost.i,maxStep.i,maxService.i,sent.i,ended.i,i.i,id.i,slot.i,p.i,n.i,peak.i,stopping.i
+ url\secure=1 : url\host="httpbin.org" : url\hostLength=11 : url\port=443
+ buffers\tx=@tx[0] : buffers\rx=@rx[0] : buffers\controls=@controls[0] : buffers\block=@block[0] : buffers\dynamic=@dynamic[0] : buffers\field=@field[0] : buffers\streams=@streams[0] : buffers\streamCount=4
+ started=clock()
+ rc=H2ClientStart(@c,@url,@buffers,started,45000000) : If rc<>0 : ProcedureReturn rc : EndIf
+ While c\state<>5 And clock()-started<45000000
+  pet() : before=clock() : WebPayloadService(1) : cost=clock()-before
+  If cost>maxService : maxService=cost : EndIf
+  If sent=2 And stopping=0
+   rc=H2ClientShutdown(@c,clock(),5000000) : If rc<>0 : ProcedureReturn rc : EndIf
+   stopping=1
+  EndIf
+  now=clock() : rc=H2ClientStep(@c,now) : cost=clock()-now
+  If cost>maxStep : maxStep=cost : EndIf
+  If rc<0 : ProcedureReturn rc : EndIf
+  If rc=#H2_DRAINED : Break : EndIf
+  If rc>0
+   id=c\eventStream : slot=(id-1)/2
+   If slot<0 Or slot>1 : ProcedureReturn -9101 : EndIf
+   p=$E1C00100+slot*64
+   If rc=#H2_FIELD
+    PokeI(p+8,PeekI(p+8)+1)
+    If h2cEqual(c\name,c\nameLength,":status")
+     If c\valueLength<>3 : ProcedureReturn -9102 : EndIf
+     PokeI(p,(PeekA(c\value)-48)*100+(PeekA(c\value+1)-48)*10+PeekA(c\value+2)-48)
+    EndIf
+   EndIf
+   If rc=#H2_DATA
+    n=PeekI(p+16)
+    If n+c\dataBytes>131072 : ProcedureReturn -9103 : EndIf
+    For i=0 To c\dataBytes-1 : PokeA($E1C01000+slot*131072+n+i,PeekA(c\data+i)) : Next
+    PokeI(p+16,n+c\dataBytes)
+   EndIf
+   If rc=#H2_END : ended=ended+1 : PokeI(p+24,1) : EndIf
+   If rc=#H2_RESET Or rc=#H2_GOAWAY : ProcedureReturn -9104 : EndIf
+   rc=H2ClientConsume(@c) : If rc<>0 : ProcedureReturn rc : EndIf
+  EndIf
+  If c\state=3 And c\txLength=0 And c\controlLength=0 And c\event=0 And sent<2
+   If sent=0 : rc=H2ClientGet(@c,"/uuid",5) : Else : rc=H2ClientGet(@c,"/bytes/70000",12) : EndIf
+   If c\activeStreams>peak : peak=c\activeStreams : EndIf
+   If rc>0 : sent=sent+1 : Else : If rc<>#H2_BUSY : ProcedureReturn rc : EndIf : EndIf
+  EndIf
+ Wend
+ PokeI($E1C00050,c\state) : PokeI($E1C00058,c\connection\handle) : PokeI($E1C00038,peak) : PokeI($E1C00010,sent) : PokeI($E1C00018,ended) : PokeI($E1C00020,maxStep) : PokeI($E1C00028,maxService) : PokeI($E1C00030,clock()-started)
+ If ended<>2 : ProcedureReturn -9105 : EndIf
+ ProcedureReturn 0
+EndProcedure
+Procedure.i Main()
+ CaptureTable()
+ Define i.i,rc.i
+ rc=WebPayloadBind(services) : If rc<>0 : ProcedureReturn 71 : EndIf
+ pet=PeekI(services+16+6*8) : clock=PeekI(services+16+11*8)
+ For i=0 To 1048575 : PokeA($E1C00000+i,0) : Next
+ PokeI($E1C00000,$48324832)
+ rc=Probe() : PokeI($E1C00008,rc)
+ H2ClientClose(@c)
+ ProcedureReturn 0
+EndProcedure

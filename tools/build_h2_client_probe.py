@@ -6,7 +6,8 @@ from pathlib import Path
 import argparse,hashlib,json,os,re,subprocess
 from pmf_compiler import resolve_compiler
 
-def build(compiler,out,cancel_first=False,deadline_first=False):
+def build(compiler,out,cancel_first=False,deadline_first=False,shutdown=False):
+ if shutdown and (cancel_first or deadline_first):raise ValueError("Choose shutdown or cancellation/deadline qualification")
  root=Path(__file__).resolve().parents[1];out.mkdir(parents=True,exist_ok=False)
  rows=['https://httpbin.org/delay/5' if cancel_first or deadline_first else 'https://httpbin.org/uuid','https://httpbin.org/bytes/70000']
  names=['RaspberryPi4/Lib/mmu.pi4','Anvil/Network/web_url.pbi','Anvil/Network/web_transport.pbi','Anvil/Network/h2_frame.pbi','Anvil/Network/hpack_decode.pbi','Anvil/Network/hpack_tables.pbi','Anvil/Network/h2_client.pbi','Anvil/Network/h2_request.pbi','Anvil/Network/web_request.pbi']
@@ -99,6 +100,12 @@ EndProcedure
  if deadline_first:
   s=s.replace('H2ClientCancelStream(@c,1)','H2ClientDeadline(@c,1,clock(),500000)')
   s=s.replace('If slot<>0 Or cancelled<>1 : ProcedureReturn -9104 : EndIf','If slot<>0 Or cancelled<>1 : ProcedureReturn -9104 : EndIf\n    PokeI($E1C00048,PeekI(h2cStream(@c,1)+OffsetOf(H2Stream\\localError)))')
+ if shutdown:
+  s=s.replace('n.i,peak.i','n.i,peak.i,stopping.i')
+  s=s.replace('While (ended<2 Or c\\txLength<>0 Or c\\controlLength<>0)', 'While c\\state<>5')
+  s=s.replace('now=clock() : rc=H2ClientStep(@c,now)','If sent=2 And stopping=0\n   rc=H2ClientShutdown(@c,clock(),5000000) : If rc<>0 : ProcedureReturn rc : EndIf\n   stopping=1\n  EndIf\n  now=clock() : rc=H2ClientStep(@c,now)')
+  s=s.replace('  If rc>0\n','  If rc=#H2_DRAINED : Break : EndIf\n  If rc>0\n')
+  s=s.replace('PokeI($E1C00038,peak)', 'PokeI($E1C00050,c\\state) : PokeI($E1C00058,c\\connection\\handle) : PokeI($E1C00038,peak)')
  source=out/'proof.pi4';source.write_text(s,encoding='utf8')
  q=subprocess.run([str(resolve_compiler(compiler)),'--compile',str(source),'-t','pi4','--load-addr','0x1000000','--stack-addr','0x4f00000','--entry-returns','--wants-services','-o',str(out/'proof.img')],env=dict(os.environ,PMF_ROOT=str(root)),capture_output=True,text=True,encoding='utf8',timeout=180,creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
  log=q.stdout+q.stderr;(out/'compile.txt').write_text(log,encoding='utf8');print(log[-2200:]);assert q.returncode==0
@@ -106,5 +113,5 @@ EndProcedure
  payload=(out/'proof.img.pmf').read_bytes();ranges={'code':['0x'+x for x in code.groups()],'bss':['0x'+x for x in bss.groups()],'stack':['0x4e00000','0x4efffff'],'report':['0xe1c00000','0xe1cfffff'],'tables':['0x4f80000','0x4f82fff']}
  (out/'identity.json').write_text(json.dumps(dict(bytes=len(payload),sha256=hashlib.sha256(payload).hexdigest(),checked_ranges=ranges,source_hashes={n:hashlib.sha256((root/n).read_bytes()).hexdigest() for n in names},cases=rows),indent=2),encoding='utf8')
 if __name__=='__main__':
-    ap=argparse.ArgumentParser(description=__doc__);ap.add_argument('--compiler',required=True);ap.add_argument('--out',type=Path,required=True);ap.add_argument('--cancel-first',action='store_true');ap.add_argument('--deadline-first',action='store_true')
-    a=ap.parse_args();build(a.compiler,a.out.resolve(),a.cancel_first,a.deadline_first)
+    ap=argparse.ArgumentParser(description=__doc__);ap.add_argument('--compiler',required=True);ap.add_argument('--out',type=Path,required=True);ap.add_argument('--cancel-first',action='store_true');ap.add_argument('--deadline-first',action='store_true');ap.add_argument('--shutdown',action='store_true')
+    a=ap.parse_args();build(a.compiler,a.out.resolve(),a.cancel_first,a.deadline_first,a.shutdown)

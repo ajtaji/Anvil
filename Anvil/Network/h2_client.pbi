@@ -25,6 +25,7 @@ XIncludeFile "Anvil/Network/h2_request.pbi"
 #H2_END=3
 #H2_RESET=4
 #H2_GOAWAY=5
+#H2_DRAINED=6
 Structure H2Stream
  id.i
  state.i
@@ -88,6 +89,10 @@ Structure H2Client
  sendWindow.i
  peerInitialWindow.i
  goaway.i
+ shutdown.i
+ shutdownQueued.i
+ shutdownStarted.i
+ shutdownTimeout.i
  lastPeerStream.i
  peerError.i
  continuation.i
@@ -280,7 +285,7 @@ Procedure.i H2ClientGet(*c.H2Client,target.i,bytes.i)
  Define *s.H2Stream,i.i,p.i,n.i,digits.i,divisor.i,port.i,ch.i
  If *c=0 : ProcedureReturn #H2_ARGUMENT : EndIf
  If *c\state=-1 : ProcedureReturn *c\error : EndIf
- If *c\state<>3 Or *c\goaway<>0 : ProcedureReturn #H2_STATE : EndIf
+ If *c\state<>3 Or *c\goaway<>0 Or *c\shutdown<>0 : ProcedureReturn #H2_STATE : EndIf
  If *c\event<>0 Or *c\controlLength<>0 Or *c\txLength<>0 Or *c\requestHeaderBytes<>0 Or *c\activeStreams>=*c\peerStreams : ProcedureReturn #H2_BUSY : EndIf
  If target=0 Or bytes<1 Or bytes>3072 Or PeekA(target)<>47 : ProcedureReturn #H2_ARGUMENT : EndIf
  For i=0 To bytes-1
@@ -334,7 +339,7 @@ Procedure.i H2ClientRequest(*c.H2Client,*request.WebRequest)
  If *c=0 Or *request=0 : ProcedureReturn #H2_ARGUMENT : EndIf
  If *c\buffers\requestBlock=0 : ProcedureReturn #H2_ARGUMENT : EndIf
  If *c\state=-1 : ProcedureReturn *c\error : EndIf
- If *c\state<>3 Or *c\goaway<>0 : ProcedureReturn #H2_STATE : EndIf
+ If *c\state<>3 Or *c\goaway<>0 Or *c\shutdown<>0 : ProcedureReturn #H2_STATE : EndIf
  If *c\event<>0 Or *c\controlLength<>0 Or *c\txLength<>0 Or *c\requestHeaderBytes<>0 Or *c\decoding<>0 Or *c\continuation<>0 Or *c\activeStreams>=*c\peerStreams : ProcedureReturn #H2_BUSY : EndIf
  If *c\nextStream>$7FFFFFFF : ProcedureReturn #H2_STATE : EndIf
  *s=0
@@ -465,6 +470,18 @@ Procedure h2cDeadlines(*c.H2Client,now.i)
    EndIf
   Next
  EndIf
+EndProcedure
+; Graceful NO_ERROR shutdown. Existing streams remain usable; new requests are
+; refused. Repeated calls do not extend the original shutdown deadline.
+Procedure.i H2ClientShutdown(*c.H2Client,now.i,timeout.i)
+ If *c=0 Or timeout<1 Or timeout>$7FFFFFFF : ProcedureReturn #H2_ARGUMENT : EndIf
+ If *c\state=-1 : ProcedureReturn *c\error : EndIf
+ If *c\state=5 : ProcedureReturn 0 : EndIf
+ If *c\state<>3 : ProcedureReturn #H2_STATE : EndIf
+ If *c\shutdown=0
+  *c\shutdown=1 : *c\shutdownStarted=now : *c\shutdownTimeout=timeout
+ EndIf
+ ProcedureReturn 0
 EndProcedure
 ; Events remain stable until consumed. Body credit includes DATA padding.
 Procedure.i H2ClientConsume(*c.H2Client)
@@ -692,13 +709,26 @@ EndProcedure
 ; Each step performs at most one send OR receive OR bounded HPACK step.
 ; Retained events block parsing, but permit outgoing work to progress.
 Procedure.i H2ClientStep(*c.H2Client,now.i)
- Define rc.i,st.i,n.i,i.i,*s.H2Stream
+ Define rc.i,st.i,n.i,i.i,p.i,*s.H2Stream
  If *c=0 : ProcedureReturn #H2_ARGUMENT : EndIf
  If *c\state=-1 : ProcedureReturn *c\error : EndIf
  If *c\state=0 : ProcedureReturn #H2_STATE : EndIf
+ If *c\state=5 : ProcedureReturn #H2_DRAINED : EndIf
  If ((now-*c\started) & $FFFFFFFF)>=*c\timeout : ProcedureReturn h2cFail(*c,#H2_TIMEOUT) : EndIf
  If *c\state=4 : ProcedureReturn 0 : EndIf
  If *c\state=3 : h2cDeadlines(*c,now) : EndIf
+ If *c\shutdown<>0
+  If ((now-*c\shutdownStarted) & $FFFFFFFF)>=*c\shutdownTimeout : ProcedureReturn h2cFail(*c,#H2_TIMEOUT) : EndIf
+  If *c\shutdownQueued=0 And *c\controlLength<=1007
+   p=h2cControl(*c,8,7,0,0)
+   ; Server-initiated streams are disabled, so the last processed peer ID is 0.
+   NetWriteBE32(p,0) : NetWriteBE32(p+4,0) : *c\shutdownQueued=1
+  EndIf
+  If *c\shutdownQueued<>0 And *c\activeStreams=0 And *c\event=0 And *c\txLength=0 And *c\controlLength=0 And *c\requestHeaderBytes=0
+   WebTransportClose(@*c\connection) : *c\state=5
+   ProcedureReturn #H2_DRAINED
+  EndIf
+ EndIf
  st=WebTransportState(@*c\connection)
  If st<0 : ProcedureReturn h2cFail(*c,st) : EndIf
  If *c\state=1

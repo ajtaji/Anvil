@@ -2710,8 +2710,8 @@ RST_STREAM and GOAWAY; and rejects unsolicited push. HTTP response checks includ
 lowercase field names, prohibited connection fields, pseudo-header order and
 uniqueness, status, field-value controls, content length, informational responses
 and trailers. `H2ClientCancel` cancels the entire connection, and `H2ClientClose`
-releases transport ownership. It does not yet provide graceful local GOAWAY/error
-transmission. Opt-in automatic WebClient protocol
+releases transport ownership. Graceful NO_ERROR shutdown is described below; automatic connection-error
+GOAWAY transmission remains unfinished. Opt-in automatic WebClient protocol
 dispatch is described below. Per-stream cancellation and minimal processing of
 late closed-stream frames are described below.
 Errors currently close the connection, including stream-local failures. The
@@ -2783,8 +2783,8 @@ was off and the temporary DNS override was removed. Shared Pi 3 compilation also
 passed, without a Pi 3 hardware claim. Evidence:
 `docs/evidence/anvil-ipv6-20261030/http2-cancel483`.
 
-Graceful local connection
-shutdown remain unfinished, alongside the broader TLS, IPv6 and HTTP/3 work.
+Automatic connection-error GOAWAY transmission remains unfinished, alongside
+the broader TLS, IPv6 and HTTP/3 work.
 
 
 ### Shared WebRequest headers and flow-controlled uploads
@@ -2849,8 +2849,8 @@ watchdog was off, and the temporary DNS override was removed. The shared source
 also compiled for Pi 3, without claiming a physical Pi 3 run. No firmware update
 was required. Evidence: `docs/evidence/anvil-ipv6-20261030/http2-upload483`.
 
-Remaining work includes graceful
-local connection shutdown and stream-local error isolation, as well as the
+Remaining work includes automatic connection-error GOAWAY transmission
+and stream-local error isolation, as well as the
 broader remaining TLS, off-link IPv6/RDNSS qualification and HTTP/3 work.
 
 
@@ -3079,3 +3079,52 @@ Captures 177-180 returned zero with cores, fonts and Vulkan healthy, watchdog of
 and temporary DNS settings removed. Monitor 483 was unchanged. Shared Pi 3
 compilation passed; physical proof is Pi 4 only. Evidence:
 `docs/evidence/anvil-ipv6-20261030/http2-deadlines483`.
+
+
+### Graceful HTTP/2 connection shutdown
+
+`H2ClientShutdown(context, now, timeout)` starts bounded NO_ERROR shutdown on an
+established HTTP/2 connection. `now` and `timeout` use the same clock units as
+`H2ClientStep`; timeout must be 1 through 0x7fffffff. Repeated calls do not extend
+the original deadline. New GET/request submissions return `H2_STATE`, while
+existing streams can continue receiving responses and uploading through
+`H2ClientData`. Continue stepping, consuming events and servicing the network.
+The connection-wide deadline remains an independent upper bound.
+
+The client queues one GOAWAY with last processed peer stream ID zero (server
+push is disabled). A full control queue postpones that frame until space becomes
+available. Existing partial writes and request HEADERS/CONTINUATION sequences
+remain intact. Borrowed response fields and body data remain stable until
+consumed. Per-stream deadlines and cancellation continue to work during drain.
+
+Once all streams, retained events and outgoing frames have drained, the client
+closes its transport and Step returns `H2_DRAINED` (6), with state 5. This is a
+terminal status, not a retained event: it does not require Consume. Later Step
+calls keep returning that status, and Close does not close the transport twice.
+An expired shutdown deadline instead closes immediately with `H2_TIMEOUT`.
+`H2ClientCancel` and `H2ClientClose` retain their immediate behavior. This API
+belongs to the explicit H2Client interface; do not call it on the H2 context
+owned by an active automatic WebClient request.
+
+Physical Pi 4 qualification under Anvil 483 covered idle and active connections,
+shutdown expiry, immediate cancellation, peer GOAWAY, a borrowed DATA event,
+stream expiry during drain, and a full 1020-byte control queue. Eight upload
+cases passed with shutdown requested before body submission, including a
+70000-byte flow-controlled upload, unknown-length bodies, empty END_STREAM,
+HEAD, large request headers and early rejection. All 46 engine and eight
+stream-deadline regression cases passed. Captures 181-185 used deterministic
+transport fixtures on the physical processor.
+
+Capture 186 used actual certificate-verified HTTPS to httpbin.org: /uuid and
+/bytes/70000 completed concurrently on one connection after shutdown began,
+then the transport closed gracefully. Total response bytes were 70053; observed
+elapsed time was 1008747 microseconds, maximum Step 2446 microseconds and separate
+network service 2718 microseconds. These observations are not worst-case bounds.
+All six captures returned zero with cores/fonts/Vulkan healthy, watchdog off and
+temporary DNS settings restored. Shared Pi 3 compilation passed; hardware
+qualification remains Pi 4 only. No monitor update was required. Evidence:
+`docs/evidence/anvil-ipv6-20261030/http2-shutdown483`.
+
+Automatic connection-error GOAWAY transmission and stream-local protocol-error
+isolation remain unfinished, alongside broader TLS, off-link IPv6/RDNSS web
+qualification and HTTP/3 work.
