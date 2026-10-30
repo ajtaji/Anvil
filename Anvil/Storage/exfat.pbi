@@ -679,7 +679,8 @@ Procedure.i exfat_Ror16(value.i)
   ProcedureReturn ((value & $FFFF) >> 1) | ((value & 1) << 15)
 EndProcedure
 
-Procedure.i exfat_BootChecksum(base.i)
+Global Dim exfat_bootRegion.a[12*#EXFAT_MAX_SECTOR]
+Procedure.i exfat_BootChecksum(data.i)
   Define checksum.i
   Define sector.i
   Define i.i
@@ -687,13 +688,10 @@ Procedure.i exfat_BootChecksum(base.i)
   checksum = 0
   sector = 0
   While sector < 11
-    If exfat_ReadSector(base + sector, @exfat_sector[0]) = 0
-      ProcedureReturn -1
-    EndIf
     i = 0
     While i < exfat_bytesPerSector
       If sector <> 0 Or (i <> 106 And i <> 107 And i <> 112)
-        b = PeekA(@exfat_sector[0] + i)
+        b = PeekA(data + sector*exfat_bytesPerSector + i)
         checksum = (exfat_Ror32(checksum) + b) & $FFFFFFFF
       EndIf
       i = i + 1
@@ -706,50 +704,49 @@ EndProcedure
 Procedure.i exfat_CheckBootRegion(base.i)
   Define checksum.i
   Define i.i
-  checksum = exfat_BootChecksum(base)
-  If checksum < 0
-    ProcedureReturn 0
+  Define data.i
+  If exfat_bytesPerSector<512 Or exfat_bytesPerSector>#EXFAT_MAX_SECTOR Or exfat_bytesPerSector<>exfat_blocksPerSector*512
+    ProcedureReturn exfat_Fail(#EXFAT_E_GEOMETRY)
   EndIf
-  If exfat_ReadSector(base + 11, @exfat_sector[0]) = 0
+  ; One bounded range read per region. Validate every byte/signature from
+  ; that same snapshot, retaining all checksum exclusions and refusal paths.
+  If exfat_ReadSectors(base,12,@exfat_bootRegion[0])=0 : ProcedureReturn 0 : EndIf
+  data=@exfat_bootRegion[0]
+  checksum = exfat_BootChecksum(data)
+  If checksum < 0
     ProcedureReturn 0
   EndIf
   i = 0
   While i < exfat_bytesPerSector
-    If exfat_U32(@exfat_sector[0], i) <> checksum
+    If exfat_U32(data+11*exfat_bytesPerSector, i) <> checksum
       ProcedureReturn exfat_Fail(#EXFAT_E_BOOT_CHECKSUM)
     EndIf
     i = i + 4
   Wend
   ; The boot and every extended boot sector carry mandatory signatures.
-  If exfat_ReadSector(base, @exfat_sector[0]) = 0
-    ProcedureReturn 0
-  EndIf
-  If PeekA(@exfat_sector[0]) <> $EB Or PeekA(@exfat_sector[0] + 1) <> $76 Or PeekA(@exfat_sector[0] + 2) <> $90
+  If PeekA(data) <> $EB Or PeekA(data + 1) <> $76 Or PeekA(data + 2) <> $90
     ProcedureReturn exfat_Fail(#EXFAT_E_BOOT)
   EndIf
   i = 0
   While i < 8
-    If PeekA(@exfat_sector[0] + 3 + i) <> PeekA(?exfat_signature + i)
+    If PeekA(data + 3 + i) <> PeekA(?exfat_signature + i)
       ProcedureReturn exfat_Fail(#EXFAT_E_BOOT)
     EndIf
     i = i + 1
   Wend
   i = 11
   While i <= 63
-    If PeekA(@exfat_sector[0] + i) <> 0
+    If PeekA(data + i) <> 0
       ProcedureReturn exfat_Fail(#EXFAT_E_BOOT)
     EndIf
     i = i + 1
   Wend
-  If exfat_U16(@exfat_sector[0], 510) <> $AA55
+  If exfat_U16(data, 510) <> $AA55
     ProcedureReturn exfat_Fail(#EXFAT_E_BOOT)
   EndIf
   i = 1
   While i <= 8
-    If exfat_ReadSector(base + i, @exfat_sector[0]) = 0
-      ProcedureReturn 0
-    EndIf
-    If exfat_U32(@exfat_sector[0], exfat_bytesPerSector - 4) <> $AA550000
+    If exfat_U32(data+i*exfat_bytesPerSector, exfat_bytesPerSector - 4) <> $AA550000
       ProcedureReturn exfat_Fail(#EXFAT_E_BOOT)
     EndIf
     i = i + 1
@@ -1156,7 +1153,8 @@ EndProcedure
 
 ; Read bounded blocks instead of walking the stream anew for every byte.
 ; This scratch belongs to the serialized mount operation, like exfat_sector.
-Global Dim exfat_upcaseChunk.a[512]
+#EXFAT_UPCASE_CHUNK_BYTES = 4096
+Global Dim exfat_upcaseChunk.a[#EXFAT_UPCASE_CHUNK_BYTES]
 Procedure.i exfat_UpcaseTableChecksum()
   Define sum.i
   Define off.i
@@ -1166,7 +1164,7 @@ Procedure.i exfat_UpcaseTableChecksum()
   off = 0
   While off < exfat_upcaseLength
     take = exfat_upcaseLength - off
-    If take > 512 : take = 512 : EndIf
+    If take > #EXFAT_UPCASE_CHUNK_BYTES : take = #EXFAT_UPCASE_CHUNK_BYTES : EndIf
     If exfat_StreamRead(exfat_upcaseCluster, 0, exfat_upcaseLength, off, @exfat_upcaseChunk[0], take) <> take
       ProcedureReturn -1
     EndIf
@@ -1266,10 +1264,10 @@ Procedure.i exfat_MountUpcaseWord(offset.i)
   If offset<0 Or (offset & 1)<>0 Or offset+1>=exfat_upcaseLength
     exfat_Fail(#EXFAT_E_UPCASE) : ProcedureReturn -1
   EndIf
-  at=(offset/512)*512
+  at=(offset/#EXFAT_UPCASE_CHUNK_BYTES)*#EXFAT_UPCASE_CHUNK_BYTES
   If exfat_upcaseChunkAt<>at
     exfat_upcaseChunkAt=-1 : exfat_upcaseChunkCount=0
-    take=exfat_upcaseLength-at : If take>512 : take=512 : EndIf
+    take=exfat_upcaseLength-at : If take>#EXFAT_UPCASE_CHUNK_BYTES : take=#EXFAT_UPCASE_CHUNK_BYTES : EndIf
     If exfat_StreamRead(exfat_upcaseCluster,0,exfat_upcaseLength,at,@exfat_upcaseChunk[0],take)<>take
       ProcedureReturn -1
     EndIf

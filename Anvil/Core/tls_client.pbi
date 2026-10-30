@@ -697,4 +697,27 @@ Procedure TlsClientShow()
   Next
   If count=0 : PrintN("TLS connections: none") : EndIf
   tlsc_Select(previous)
+  PrintN("Network service timings since boot (microseconds):")
+  PrintN("  phase: calls / total / maximum / in slowest whole call")
+  For slot=0 To #NET_SERVICE_PHASES-1
+    Select slot
+      Case 0 : Print("  whole service")
+      Case 1 : Print("  message begin")
+      Case 2 : Print("  Wi-Fi maintenance")
+      Case 3 : Print("  lease and protocols")
+      Case 4 : Print("  NTP")
+      Case 5 : Print("  console rearm")
+      Case 6 : Print("  console receive")
+      Case 7 : Print("  console link-local")
+      Case 8 : Print("  HTTP server and TCP")
+      Case 9 : Print("  DNS")
+      Case 10 : Print("  TCP handles")
+      Case 11 : Print("  TLS")
+      Case 12 : Print("  receive drain")
+      Case 13 : Print("  message end")
+    EndSelect
+    Print(": ") : PrintDec(netprof_count[slot]) : Print(" / ")
+    PrintDec(netprof_total[slot]) : Print(" / ")
+    PrintDec(netprof_max[slot]) : Print(" / ") : PrintDec(netprof_worst[slot]) : PrintNl()
+  Next
 EndProcedure

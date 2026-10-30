@@ -1,3 +1,4 @@
+XIncludeFile "Anvil/Core/network_service_profile.pbi"
 XIncludeFile "Anvil/Core/dns_policy.pbi"
 XIncludeFile "Anvil/Services/wifi_maintenance.pbi"
 XIncludeFile "Anvil/Network/ipv6_address.pbi"
@@ -1145,6 +1146,7 @@ EndProcedure
 ;  what it costs.
 ; ----------------------------------------------------------------------
 Procedure.i PayNetService(sliceMs.i)
+  Define profiling.i,profileStart.i,phaseStart.i
   Define t0.i
   Define frames.i
   Define before.i
@@ -1156,32 +1158,59 @@ Procedure.i PayNetService(sliceMs.i)
   If sliceMs > #PAYNET_SLICE_MAX
     sliceMs = #PAYNET_SLICE_MAX
   EndIf
+  profiling=NetServiceProfileBegin()
+  profileStart=HwMicros()
   t0 = millis()
   frames = LinkRxFrames()
+  phaseStart=HwMicros()
   UartMessageBegin()
+  NetServiceProfileRecord(profiling,1,phaseStart)
   ; ---- THE PROMPT'S NETWORK SERVICES. The same calls, in the same order,
   ; as AnvilPromptServiceOne's slots 2 and 4 in Anvil/Core/parse.pbi; the
   ; desk gate compares the two lists. Slots 0, 1 and 3 there are the
   ; mouse, touch, screen, fan and temperature - the payload's, or not the
   ; network's - and are deliberately absent.
+  phaseStart=HwMicros()
   WifiMaintenanceTick()
+  NetServiceProfileRecord(profiling,2,phaseStart)
+  phaseStart=HwMicros()
   NetDhcpTick()
+  NetServiceProfileRecord(profiling,3,phaseStart)
   CompilerIf #CAP_NET = 1
+    phaseStart=HwMicros()
     NtpServiceTick()
+    NetServiceProfileRecord(profiling,4,phaseStart)
   CompilerEndIf
+  phaseStart=HwMicros()
   NetConsoleRearm()
+  NetServiceProfileRecord(profiling,5,phaseStart)
+  phaseStart=HwMicros()
   NetConsolePump()
+  NetServiceProfileRecord(profiling,6,phaseStart)
+  phaseStart=HwMicros()
   NetConsoleLlTick()
+  NetServiceProfileRecord(profiling,7,phaseStart)
   CompilerIf #CAP_NET = 1
+    phaseStart=HwMicros()
     HttpServerPoll()
+    NetServiceProfileRecord(profiling,8,phaseStart)
   CompilerElse
+    phaseStart=HwMicros()
     TcpTick()
+    NetServiceProfileRecord(profiling,8,phaseStart)
   CompilerEndIf
   ; ---- the payload's own: a query to send or retry, connects to start.
+  phaseStart=HwMicros()
   paynet_DnsStep(millis())
+  NetServiceProfileRecord(profiling,9,phaseStart)
+  phaseStart=HwMicros()
   paynet_TcpAdvanceAll(millis())
+  NetServiceProfileRecord(profiling,10,phaseStart)
+  phaseStart=HwMicros()
   TlsClientAdvance()                ; the TLS connection, if one is open
+  NetServiceProfileRecord(profiling,11,phaseStart)
   ; ---- the rest of the slice: drain while frames keep coming.
+  phaseStart=HwMicros()
   passes = 0
   While sliceMs > 0 And (millis() - t0) < sliceMs And passes < #PAYNET_DRAIN_PASSES
     before = LinkRxFrames()
@@ -1191,13 +1220,23 @@ Procedure.i PayNetService(sliceMs.i)
       Break
     EndIf
   Wend
+  NetServiceProfileRecord(profiling,12,phaseStart)
   If passes > 0
+    phaseStart=HwMicros()
     paynet_DnsStep(millis())
+    NetServiceProfileRecord(profiling,9,phaseStart)
+    phaseStart=HwMicros()
     paynet_TcpAdvanceAll(millis())
+    NetServiceProfileRecord(profiling,10,phaseStart)
+    phaseStart=HwMicros()
     TlsClientAdvance()
+    NetServiceProfileRecord(profiling,11,phaseStart)
   EndIf
+  phaseStart=HwMicros()
   UartMessageEnd()
+  NetServiceProfileRecord(profiling,13,phaseStart)
   gSvcDetail = 0
+  NetServiceProfileEnd(profiling,profileStart)
   ProcedureReturn LinkRxFrames() - frames
 EndProcedure
 

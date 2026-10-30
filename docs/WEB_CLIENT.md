@@ -1836,3 +1836,49 @@ Still open: public off-link IPv6, DNS transport over IPv6, multiple addresses
 per DNS answer and full address racing, remaining service stalls, HTTP/2-3,
 and a complete managed-cookie policy. IPv6 literal certificate identities are
 not added by this hostname-dialing change.
+
+
+### Cold TLS storage pause qualification (build463)
+
+Network service diagnostics now separate 14 phases and retain the phase timings
+inside the slowest whole call. Root-store diagnostics measure storage readiness,
+file open, read and close. On a cold Pi4, build460's 15.772 ms service maximum
+contained 15.657 ms in TLS, including a 14.252 ms root-file open. This identified
+filesystem mount work rather than handshake arithmetic as the dominant pause.
+
+The shared exFAT implementation now reads each 12-sector boot region in one
+bounded request, retaining checksums, signatures, reserved-byte and geometry
+checks for primary and backup regions. Its up-case table uses 4 KiB read windows;
+validation still resets the cache and checks the entire table. The 32 KiB table
+fixture uses nine reads instead of 65. Root loading also yields after the initial
+metadata open/close when its budget expires, before starting a data read. No file
+handle remains open at that yield point.
+
+| Cold physical run | Whole service maximum | Root-file open maximum |
+| --- | ---: | ---: |
+| build460, instrumented baseline | 15.772 ms | 14.252 ms |
+| build461, boot-region batching | 9.627 ms | 8.058 ms |
+| build463, 4 KiB up-case windows and initial yield | 5.641 ms | 5.495 ms |
+
+These are observed maxima for these runs, not guaranteed latency bounds. The
+final run passed certificate-verified public HTTPS gzip/deflate body checks.
+A separate cold restart confirmed cancellation at the new preparation yield:
+state remained preparing, close succeeded, the stale handle was rejected, and
+subsequent verified HTTPS requests completed. All 120 boot-region cases passed
+on physical Pi4, including 512/1024/2048/4096-byte sectors and error paths; the
+full filesystem regression and buffered up-case validation also passed.
+
+Build463 was installed with a verified build461 rollback and checked by full
+running-image SHA after a 90-second quiet boot interval. Cores, fonts, Vulkan and
+watchdog state passed. Pi3build77 compiles the shared changes; Pi3 was not
+physically tested. LAN IPv6 TLS was rechecked using an encrypted-byte relay:
+Anvil verified the public server certificate and received the expected HTTP200
+body. The relay did not terminate TLS; public off-link IPv6 remains unproven.
+Temporary DNS overrides and relay processes were removed.
+
+The initial filesystem open remains synchronous (about 5.5 ms in this cold run),
+so TLS blocking is reduced, not finished. Storage bring-up on an unavailable
+medium is not bounded by this evidence. Public off-link IPv6, IPv6 DNS transport,
+full address racing, HTTP/2-3 and complete managed-cookie policy remain open.
+Evidence: `docs/evidence/anvil-ipv6-20261030/service463`, including the rejected
+MMU test-harness run and its corrected physical proof.

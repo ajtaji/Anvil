@@ -96,6 +96,8 @@ NET_SLOTS = {
     10: ("SvcTlsRecv", "TlsClientRecv"),
     11: ("SvcTlsClose", "TlsClientClose"),
     15: ("SvcTlsState", "TlsClientState"),
+    16: ("SvcTcpOpen6", "PayNetTcpOpen6"),
+    17: ("SvcDnsResolve6", "PayNetDnsResolve6"),
 }
 
 MUTATIONS = {
@@ -229,7 +231,7 @@ def static_checks() -> int:
     begin = service.find("UartMessageBegin()")
     mine_end = service.find("paynet_DnsStep(")
     mine = calls(code_lines(service[begin:mine_end]))
-    mine = [c for c in mine if c not in ("UartMessageBegin",)]
+    mine = [c for c in mine if c not in ("UartMessageBegin", "HwMicros", "NetServiceProfileRecord")]
     if mine != prompt_net:
         raise GateFailure(f"PayNetService runs {mine} but the prompt's network slots run "
                           f"{prompt_net}; the two lists must be the same calls in the same order")

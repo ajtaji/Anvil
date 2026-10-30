@@ -383,6 +383,34 @@ EndProcedure
 ; ----------------------------------------------------------------------
 Global *TlsRootsPauseHook
 Global tlsroot_loading.i
+; Timing remains outside the storage call; no file is kept open by diagnostics.
+Global Dim tlsroot_ioMax.i[4]
+Global Dim tlsroot_ioCount.i[4]
+Procedure tlsroot_IoTime(kind.i,started.i)
+ Define elapsed.i
+ elapsed=HwMicros()-started
+ tlsroot_ioCount[kind]=tlsroot_ioCount[kind]+1
+ If elapsed>tlsroot_ioMax[kind] : tlsroot_ioMax[kind]=elapsed : EndIf
+EndProcedure
+Procedure.i tlsroot_StorageUp()
+ Define started.i,rc.i
+ started=HwMicros() : rc=HwStorageUp() : tlsroot_IoTime(0,started)
+ ProcedureReturn rc
+EndProcedure
+Procedure.i tlsroot_Open(path.i)
+ Define started.i,rc.i
+ started=HwMicros() : rc=HwFileOpen(path) : tlsroot_IoTime(1,started)
+ ProcedureReturn rc
+EndProcedure
+Procedure.i tlsroot_ReadAt(offset.i,dst.i,bytes.i)
+ Define started.i,rc.i
+ started=HwMicros() : rc=HwFileReadAt(offset,dst,bytes) : tlsroot_IoTime(2,started)
+ ProcedureReturn rc
+EndProcedure
+Procedure tlsroot_Close()
+ Define started.i
+ started=HwMicros() : HwFileClose() : tlsroot_IoTime(3,started)
+EndProcedure
 Procedure.i tlsroot_LoadWork(*path)
   Define size.i
   Define got.i
@@ -408,19 +436,24 @@ Procedure.i tlsroot_LoadWork(*path)
   Wend
   tlsroot_path[k] = 0
 
-  If HwStorageUp() = 0
+  If tlsroot_StorageUp() = 0
     tlsroot_err = #TLSROOT_ERR_STORAGE
     ProcedureReturn tlsroot_err
   EndIf
-  If HwFileOpen(@tlsroot_path[0]) = 0
+  If tlsroot_Open(@tlsroot_path[0]) = 0
     tlsroot_err = #TLSROOT_ERR_NOFILE
     ProcedureReturn tlsroot_err
   EndIf
   size = HwFileSize()
-  HwFileClose()
+  tlsroot_Close()
   If size > #TLSROOT_PEM_MAX
     tlsroot_err = #TLSROOT_ERR_BIG
     ProcedureReturn tlsroot_err
+  EndIf
+  ; Initial open can include mounting another volume. Honor the cooperative
+  ; budget after closing that metadata handle, before opening the first read.
+  If TlsRootsPauseHook<>0
+    If TlsRootsPauseHook()=0 : tlsroot_err=#TLSROOT_ERR_READ : ProcedureReturn tlsroot_err : EndIf
   EndIf
   off = 0
   While off < size
@@ -430,15 +463,15 @@ Procedure.i tlsroot_LoadWork(*path)
     EndIf
     ; Never yield with the single shared file handle open. Reopen and check
     ; the size for each bounded read; storage is free between slices.
-    If HwFileOpen(@tlsroot_path[0]) = 0
+    If tlsroot_Open(@tlsroot_path[0]) = 0
       tlsroot_err = #TLSROOT_ERR_NOFILE : ProcedureReturn tlsroot_err
     EndIf
     If HwFileSize() <> size
-      HwFileClose()
+      tlsroot_Close()
       tlsroot_err = #TLSROOT_ERR_READ : ProcedureReturn tlsroot_err
     EndIf
-    got = HwFileReadAt(off, @tlsroot_pem[off], n)
-    HwFileClose()
+    got = tlsroot_ReadAt(off, @tlsroot_pem[off], n)
+    tlsroot_Close()
     If got <= 0 Or got > n
       tlsroot_err = #TLSROOT_ERR_READ
       ProcedureReturn tlsroot_err
@@ -561,6 +594,9 @@ EndProcedure
 
 ; `tls roots` - what the store holds, by kind.
 Procedure TlsRootsShow()
+  Print("Root I/O maximum microseconds (storage/open/read/close): ")
+  PrintDec(tlsroot_ioMax[0]) : Print(" / ") : PrintDec(tlsroot_ioMax[1]) : Print(" / ")
+  PrintDec(tlsroot_ioMax[2]) : Print(" / ") : PrintDec(tlsroot_ioMax[3]) : PrintNl()
   Print("Root store: ")
   str_print_at(@tlsroot_path[0])
   If tlsroot_loaded = 0

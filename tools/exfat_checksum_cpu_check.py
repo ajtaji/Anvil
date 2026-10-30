@@ -9,7 +9,7 @@ def check(raw,cases):
         expected=0
         for j in range(n): expected=(((expected>>1)|((expected&1)<<31))+((j*37+19)&255))&0xffffffff
         assert old==new==expected,(n,old,new,expected)
-        assert reads<=n//512+3,(n,reads)
+        assert reads<=(n+4095)//4096+3,(n,reads)
         rows.append(dict(bytes=n,old_us=slow*1000000/hz,new_us=fast*1000000/hz,reads=reads))
     validation=[]
     for i in range(7):
