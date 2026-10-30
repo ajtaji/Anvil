@@ -407,6 +407,7 @@ EndProcedure
  ; Optional cooperative driver installed by the target composition. The
 ; arithmetic implementation remains independent of scheduler/target details.
 Global *tlsc_advanceHook
+Global *tlsc_profileHook
 Global *tlsc_closeHook
 Procedure tlsc_AdvanceCurrent()
  If tlsc_advanceHook<>0
@@ -681,6 +682,7 @@ Procedure tlsc_ShowCurrent()
 EndProcedure
 
 Procedure TlsClientShow()
+  If tlsc_profileHook<>0 : tlsc_profileHook() : EndIf
   If tlsc_advanceHook<>0
     PrintN("TLS scheduling: cooperative arithmetic")
   Else

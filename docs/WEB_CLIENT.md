@@ -2146,3 +2146,38 @@ only Pi4 is physically validated. Evidence: docs/evidence/anvil-ipv6-20261030/tl
 Remaining TLS atomic work and synchronous device callbacks are not fully bounded.
 IPv6 off-link/PMTU, IPv6 DNS transport/address selection, HTTP/2-3 and managed
 cookies remain open. This is not a claim that networking is finished.
+
+
+### TLS arithmetic measurements and shorter slices (installed 474)
+
+The shared cooperative TLS driver now records count, total time and maximum
+atomic time for each P256, wide-curve, RSA, X25519 and GCM Begin/Step operation.
+Intervals between yield checks are timed separately; final474 also includes
+worker-entry and worker-return boundaries. These timings do not include time
+spent suspended. Status dispatch uses an optional hook, so targets without the
+cooperative driver retain their existing implementation.
+
+The physical 473 HTTPS profile did not use RSA. P256 steps peaked at 609 us,
+wide-curve Begin at 986 us, wide-curve Step at 182 us, X25519 Step at 212 us and GCM
+decrypt Step at 411 us. The longest interval between checks was 2392 us, showing
+that individual arithmetic jobs alone do not account for all uninterrupted work.
+The cooperative policy now uses a 1 ms soft slice instead of 2 ms. It still allows
+an indivisible operation to exceed the remaining slice; no hard deadline is claimed.
+
+On the same cancellation/verified-HTTPS workload, maximum whole service call
+was 2823 us on 473 and 2846 us on 474. Final maximum
+interval without a yield check was 2393 us. Network
+traffic varies between runs, so this is measured evidence rather than a universal
+latency guarantee or a reduction in total cryptographic computation.
+
+Both runs cancelled unopened and suspended-preparation TLS handles, rejected
+stale handles and then completed certificate-verified gzip/deflate HTTP 200
+requests. Core/font/Vulkan/watchdog checks passed. Pi 3 build 88 compiles; only
+Pi 4 build 474 was physically validated. Evidence:
+`docs/evidence/anvil-ipv6-20261030/tls-slices474`.
+
+Interval endpoint labels in diagnostics: -1 worker entry, 0 roots, 1 X509,
+2 P256, 3 wide EC, 4 RSA, 5 X25519, 6 decrypt, 7 encrypt, 8 worker return.
+A long interval identifies where to investigate; it does not by itself identify
+which internal operation consumed the time. Remaining TLS atomic gaps,
+IPv6 off-link/PMTU/DNS transport, HTTP/2-3 and managed cookies remain open.

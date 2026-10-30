@@ -22,4 +22,19 @@ def check(text):
  if storage:
   assert len(storage)==7,storage
   result['exfat_phases']=storage
+ if 'TLS arithmetic steps (calls / total us / maximum us):' in text:
+  names=['P256 begin','P256 step','P384/P521 begin','P384/P521 step','RSA begin','RSA step','X25519 begin','X25519 step','GCM decrypt begin','GCM decrypt step','GCM encrypt begin','GCM encrypt step']
+  jobs=[]
+  for name in names:
+   matches=re.findall(r'^  '+re.escape(name)+r': (\d+) / (\d+) / (\d+)$',text,re.M)
+   assert len(matches)==1,(name,matches)
+   calls,total,maximum=map(int,matches[0])
+   assert maximum<=total and (calls>0 or total==maximum==0),(name,matches)
+   jobs.append(dict(operation=name,calls=calls,total_us=total,max_us=maximum))
+  result['tls_arithmetic']=jobs
+  gap=re.search(r'TLS longest interval (?:between yield checks|without a yield check), microseconds: (\d+)',text)
+  assert gap is not None
+  result['tls_yield_check_gap_max_us']=int(gap[1])
+  endpoint=re.search(r'TLS longest interval endpoints: (-?\d+) -> (-?\d+)',text)
+  if endpoint:result['tls_yield_check_gap_endpoints']=list(map(int,endpoint.groups()))
  return result
