@@ -829,3 +829,32 @@ recovery backups and verified the candidate, boot image and running image by
 hash; startup waited 90 seconds before readiness checks. Cores, fonts and Vulkan
 remained healthy. Device waits and mount ownership are still synchronous;
 this is reduced blocking work, not completion of nonblocking networking.
+
+
+## Wi-Fi transmit credit primitive (build 435)
+
+The shared CYW43 driver exposes `Cyw43TrySend(length)`. Callers stage their
+Ethernet frame through the existing data-buffer API. The new operation validates
+length, checks firmware credit once, then attempts at most one bus transfer.
+`CYW43_IO_AGAIN` means no credit: the operation has not modified the TX buffer,
+advanced the sequence or attempted a transfer. A bus failure is returned without
+replaying the frame. The existing `Cyw43Send` compatibility API shares this code
+and retains its bounded credit wait.
+
+Fourteen physical Pi CPU cases passed: minimum and maximum frames, padding,
+sequence wrap, closed/stale/ambiguous credit windows, invalid lengths, bus
+failure, successful credit acquisition and timeout. The independent oracle checks
+the entire transmit buffer and counters. Credit and bus outcomes are controlled
+in this fixture; it is not a physical SDIO fault-injection test. The tested source
+is retained verbatim; only explanatory comments moved afterward.
+
+Build 435 was installed with a verified 434 recovery image, and its running image
+was verified by hash after a 90-second boot interval. Live HTTPS gzip/deflate and
+cancellation tests passed; cores, fonts and Vulkan remained healthy.
+
+This primitive is shared by targets using the CYW43 driver. It is a prerequisite
+for queued transmission, not a claim that the networking callers are now
+nonblocking. Existing callers still use the synchronous API, and the bus transfer
+itself remains synchronous. Pending-frame ownership, queue backpressure and wired
+DMA completion must be integrated before removing those waits. Actual IPv6 web
+traffic and HTTP/2-3 remain unfinished.

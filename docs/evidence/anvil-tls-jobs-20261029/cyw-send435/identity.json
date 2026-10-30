@@ -1,0 +1,298 @@
+{
+  "bytes": 7592,
+  "sha256": "d89404ee62ba30f2727dbc80c8eef6bf350103e31dff0a343573839a377143bd",
+  "checked_ranges": {
+    "code": [
+      "0x1000000",
+      "0x1001D27"
+    ],
+    "bss": [
+      "0x1080000",
+      "0x10806FF"
+    ],
+    "stack": [
+      "0x4e00000",
+      "0x4efffff"
+    ],
+    "report": [
+      "0xe1c00000",
+      "0xe1c0ffff"
+    ],
+    "tables": [
+      "0x4f80000",
+      "0x4f82fff"
+    ]
+  },
+  "source_hashes": {
+    "Anvil/Net/cyw43.pbi": "298564a63600a9a628852427ded6077ea5ddee47c810fe7f7f31bce6891c0c64",
+    "RaspberryPi4/Lib/mmu.pi4": "014b7c2092426146c8e0eb6bb8dde2fb3af26cef63e55193e49c1ca826f6435a"
+  },
+  "cases": [
+    {
+      "name": "try one byte",
+      "input": [
+        0,
+        1,
+        0,
+        1,
+        1,
+        1
+      ],
+      "expected": [
+        0,
+        1,
+        0,
+        1,
+        1,
+        0
+      ]
+    },
+    {
+      "name": "try padded",
+      "input": [
+        0,
+        63,
+        7,
+        8,
+        8,
+        1
+      ],
+      "expected": [
+        0,
+        1,
+        0,
+        8,
+        1,
+        0
+      ]
+    },
+    {
+      "name": "try max",
+      "input": [
+        0,
+        1514,
+        254,
+        255,
+        255,
+        1
+      ],
+      "expected": [
+        0,
+        1,
+        0,
+        255,
+        1,
+        0
+      ]
+    },
+    {
+      "name": "try wrap",
+      "input": [
+        0,
+        64,
+        255,
+        0,
+        0,
+        1
+      ],
+      "expected": [
+        0,
+        1,
+        0,
+        0,
+        1,
+        0
+      ]
+    },
+    {
+      "name": "try closed",
+      "input": [
+        0,
+        64,
+        7,
+        7,
+        8,
+        1
+      ],
+      "expected": [
+        -8,
+        0,
+        0,
+        7,
+        0,
+        0
+      ]
+    },
+    {
+      "name": "try stale",
+      "input": [
+        0,
+        64,
+        8,
+        7,
+        9,
+        1
+      ],
+      "expected": [
+        -8,
+        0,
+        0,
+        8,
+        0,
+        0
+      ]
+    },
+    {
+      "name": "try ambiguous half",
+      "input": [
+        0,
+        64,
+        0,
+        128,
+        1,
+        1
+      ],
+      "expected": [
+        -8,
+        0,
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    {
+      "name": "try bus failed",
+      "input": [
+        0,
+        64,
+        9,
+        10,
+        10,
+        0
+      ],
+      "expected": [
+        -4,
+        1,
+        0,
+        9,
+        0,
+        0
+      ]
+    },
+    {
+      "name": "try empty",
+      "input": [
+        0,
+        0,
+        0,
+        1,
+        1,
+        1
+      ],
+      "expected": [
+        -2,
+        0,
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    {
+      "name": "try too large",
+      "input": [
+        0,
+        1515,
+        0,
+        1,
+        1,
+        1
+      ],
+      "expected": [
+        -2,
+        0,
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    {
+      "name": "sync ready",
+      "input": [
+        1,
+        64,
+        0,
+        1,
+        1,
+        1
+      ],
+      "expected": [
+        0,
+        1,
+        0,
+        1,
+        1,
+        0
+      ]
+    },
+    {
+      "name": "sync earns credit",
+      "input": [
+        1,
+        64,
+        0,
+        0,
+        1,
+        1
+      ],
+      "expected": [
+        0,
+        1,
+        1,
+        1,
+        1,
+        0
+      ]
+    },
+    {
+      "name": "sync timeout",
+      "input": [
+        1,
+        64,
+        0,
+        0,
+        0,
+        1
+      ],
+      "expected": [
+        -1,
+        0,
+        1,
+        0,
+        0,
+        1
+      ]
+    },
+    {
+      "name": "sync bus no replay",
+      "input": [
+        1,
+        64,
+        0,
+        0,
+        1,
+        0
+      ],
+      "expected": [
+        -4,
+        1,
+        1,
+        0,
+        0,
+        0
+      ]
+    }
+  ]
+}

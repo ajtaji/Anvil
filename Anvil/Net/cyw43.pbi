@@ -1388,6 +1388,7 @@
 ; A destructive transport-generation change was refused while the optional
 ; readiness callback still owns card/host state from the old generation.
 #CYW43_IO_OWNED   = -7
+#CYW43_IO_AGAIN   = -8       ; no credit; no TX mutation or transfer attempted
 
 ; What Cyw43ScanPoll returns.
 #CYW43_SCAN_RUNNING = 0
@@ -10298,7 +10299,9 @@ Procedure.i cyw43_DataCreditReady()
   ProcedureReturn Bool(available <> 0 And available < $80)
 EndProcedure
 
-Procedure.i Cyw43Send(length.i)
+; One credit check, then at most one bus transfer. This removes the credit
+; wait only; the installed SDIO transfer itself may still be synchronous.
+Procedure.i Cyw43TrySend(length.i)
   Define total.i
   Define padded.i
   Define i.i
@@ -10311,6 +10314,9 @@ Procedure.i Cyw43Send(length.i)
   If padded > #CYW43_TXBUF
     ProcedureReturn #CYW43_IO_TOOBIG
   EndIf
+
+  ; A refusal to wait leaves sequence, TX bytes and firmware untouched.
+  If cyw43_DataCreditReady() = 0 : ProcedureReturn #CYW43_IO_AGAIN : EndIf
 
   ; The BDC header, four bytes, immediately after the SDPCM one.
   PokeB(@cyw43_tx[0] + #CYW43_SDPCM_HDRLEN + #CYW43_BDC_OFF_FLAGS, #CYW43_BDC_FLAGS)
@@ -10338,22 +10344,29 @@ Procedure.i Cyw43Send(length.i)
   PokeB(@cyw43_tx[0] + #CYW43_SDPCM_OFF_FC, 0)
   PokeB(@cyw43_tx[0] + #CYW43_SDPCM_OFF_WIN, 0)
 
-  If cyw43_DataCreditReady() = 0
-    cyw43_creditPolls = cyw43_creditPolls + 1
-    cyw43_Trace(#CYW43_TR_IOCTL_STALL)
-    cyw43_Poll(-1, 0, 100, #CYW43_POLL_CREDIT)
-    If cyw43_DataCreditReady() = 0
-      cyw43_stalls = cyw43_stalls + 1
-      ProcedureReturn #CYW43_IO_TIMEOUT
-    EndIf
-  EndIf
-
   If cyw43_F2Xfer(1, @cyw43_tx[0], padded) = 0
     ProcedureReturn #CYW43_IO_BADFRAME
   EndIf
   cyw43_seq = (cyw43_seq + 1) & $FF
   cyw43_txFrames = cyw43_txFrames + 1
   ProcedureReturn #CYW43_IO_OK
+EndProcedure
+
+; Compatibility path. Only lack of credit can be retried; after a bus transfer
+; has been attempted, its failure is returned without replaying the frame.
+Procedure.i Cyw43Send(length.i)
+  Define rc.i
+  rc=Cyw43TrySend(length)
+  If rc<>#CYW43_IO_AGAIN : ProcedureReturn rc : EndIf
+  cyw43_creditPolls=cyw43_creditPolls+1
+  cyw43_Trace(#CYW43_TR_IOCTL_STALL)
+  cyw43_Poll(-1,0,100,#CYW43_POLL_CREDIT)
+  rc=Cyw43TrySend(length)
+  If rc=#CYW43_IO_AGAIN
+    cyw43_stalls=cyw43_stalls+1
+    ProcedureReturn #CYW43_IO_TIMEOUT
+  EndIf
+  ProcedureReturn rc
 EndProcedure
 
 ; ----------------------------------------------------------------------

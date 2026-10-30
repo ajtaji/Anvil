@@ -1,0 +1,161 @@
+XIncludeFile "RaspberryPi4/Lib/mmu.pi4"
+#CYW43_SDPCM_PROT_VERSION = 4         ; c:290
+#CYW43_SDPCM_HWHDR    = 4          ; c:1328
+#CYW43_SDPCM_SWHDR    = 8          ; c:1330
+#CYW43_SDPCM_HDRLEN   = 12         ; c:1331
+#CYW43_SDPCM_OFF_LEN  = 0
+#CYW43_SDPCM_OFF_COMP = 2
+#CYW43_SDPCM_OFF_SEQ  = 4          ; c:1333
+#CYW43_SDPCM_OFF_CHAN = 5          ; c:1335-1336
+#CYW43_SDPCM_OFF_NEXT = 6          ; c:1343-1344
+#CYW43_SDPCM_OFF_DOFF = 7          ; c:1345-1346
+#CYW43_SDPCM_OFF_FC   = 8          ; c:1347
+#CYW43_SDPCM_OFF_WIN  = 9          ; c:1348-1349
+#CYW43_SDPCM_CHAN_MASK = $0F       ; c:1335, after the shift
+#CYW43_SDPCM_GLOMDESC  = $80       ; SDPCM_GLOMDESC: channel-3 descriptor
+#CYW43_CHAN_DATA    = 2            ; SDPCM_DATA_CHANNEL      c:1339
+#CYW43_TXBUF     = 1536
+#CYW43_IO_OK      = 0
+#CYW43_IO_TIMEOUT = -1
+#CYW43_IO_TOOBIG  = -2
+#CYW43_IO_STATUS  = -3   ; well-framed reply, firmware said no
+#CYW43_IO_BADFRAME = -4
+#CYW43_IO_CLMBAD  = -5
+#CYW43_IO_PENDING = -6       ; received data retained; caller must drain it
+#CYW43_IO_AGAIN   = -8       ; no credit; no TX mutation or transfer attempted
+#CYW43_IO_OWNED   = -7
+#CYW43_TR_IOCTL_STALL  = 9    ; no credit; draining to earn one
+#CYW43_POLL_CREDIT  = 2
+#CYW43_BDC_HDRLEN  = 4
+#CYW43_BDC_FLAGS   = $20     ; BDC_PROTO_VER 2, shifted into the top
+#CYW43_BDC_OFF_FLAGS = 0
+#CYW43_BDC_OFF_PRIO  = 1
+#CYW43_BDC_OFF_FLAG2 = 2
+#CYW43_BDC_OFF_DOFF  = 3
+#CYW43_ETH_MAX = 1514
+
+Global cyw43_credit.i,cyw43_seq.i,cyw43_creditPolls.i,cyw43_stalls.i,cyw43_txFrames.i
+Global Dim cyw43_tx.a[#CYW43_TXBUF]
+Global fakeCredit.i,fakeBus.i,transfers.i,polls.i
+Procedure cyw43_Trace(code.i)
+EndProcedure
+Procedure.i cyw43_Poll(id.i,event.i,ms.i,context.i)
+ polls=polls+1 : cyw43_credit=fakeCredit : ProcedureReturn 0
+EndProcedure
+Procedure.i cyw43_F2Xfer(write.i,p.i,n.i)
+ transfers=transfers+1 : ProcedureReturn fakeBus
+EndProcedure
+Procedure.i cyw43_DataCreditReady()
+  Define available.i
+  available = (cyw43_credit - cyw43_seq) & $FF
+  ProcedureReturn Bool(available <> 0 And available < $80)
+EndProcedure
+Procedure.i Cyw43TrySend(length.i)
+  Define total.i
+  Define padded.i
+  Define i.i
+
+  If length < 1 Or length > #CYW43_ETH_MAX
+    ProcedureReturn #CYW43_IO_TOOBIG
+  EndIf
+  total = #CYW43_SDPCM_HDRLEN + #CYW43_BDC_HDRLEN + length
+  padded = (total + 3) & (~3)
+  If padded > #CYW43_TXBUF
+    ProcedureReturn #CYW43_IO_TOOBIG
+  EndIf
+
+  ; A refusal to wait leaves sequence, TX bytes and firmware untouched.
+  If cyw43_DataCreditReady() = 0 : ProcedureReturn #CYW43_IO_AGAIN : EndIf
+
+  ; The BDC header, four bytes, immediately after the SDPCM one.
+  PokeB(@cyw43_tx[0] + #CYW43_SDPCM_HDRLEN + #CYW43_BDC_OFF_FLAGS, #CYW43_BDC_FLAGS)
+  PokeB(@cyw43_tx[0] + #CYW43_SDPCM_HDRLEN + #CYW43_BDC_OFF_PRIO, 0)
+  PokeB(@cyw43_tx[0] + #CYW43_SDPCM_HDRLEN + #CYW43_BDC_OFF_FLAG2, 0)
+  PokeB(@cyw43_tx[0] + #CYW43_SDPCM_HDRLEN + #CYW43_BDC_OFF_DOFF, 0)
+
+  ; The pad, so the bus moves whole words and the slack is zero rather
+  ; than whatever the last frame left behind.
+  For i = total To padded - 1
+    PokeB(@cyw43_tx[0] + i, 0)
+  Next
+
+  ; The SDPCM header. Same fields as an ioctl's, channel 2 instead of 0,
+  ; and the data offset is 12 because the BDC header is the payload's
+  ; first four bytes rather than part of the header.
+  PokeB(@cyw43_tx[0] + #CYW43_SDPCM_OFF_LEN, total & $FF)
+  PokeB(@cyw43_tx[0] + #CYW43_SDPCM_OFF_LEN + 1, (total >> 8) & $FF)
+  PokeB(@cyw43_tx[0] + #CYW43_SDPCM_OFF_COMP, (~total) & $FF)
+  PokeB(@cyw43_tx[0] + #CYW43_SDPCM_OFF_COMP + 1, ((~total) >> 8) & $FF)
+  PokeB(@cyw43_tx[0] + #CYW43_SDPCM_OFF_SEQ, cyw43_seq & $FF)
+  PokeB(@cyw43_tx[0] + #CYW43_SDPCM_OFF_CHAN, #CYW43_CHAN_DATA)
+  PokeB(@cyw43_tx[0] + #CYW43_SDPCM_OFF_NEXT, 0)
+  PokeB(@cyw43_tx[0] + #CYW43_SDPCM_OFF_DOFF, #CYW43_SDPCM_HDRLEN)
+  PokeB(@cyw43_tx[0] + #CYW43_SDPCM_OFF_FC, 0)
+  PokeB(@cyw43_tx[0] + #CYW43_SDPCM_OFF_WIN, 0)
+
+  If cyw43_F2Xfer(1, @cyw43_tx[0], padded) = 0
+    ProcedureReturn #CYW43_IO_BADFRAME
+  EndIf
+  cyw43_seq = (cyw43_seq + 1) & $FF
+  cyw43_txFrames = cyw43_txFrames + 1
+  ProcedureReturn #CYW43_IO_OK
+EndProcedure
+Procedure.i Cyw43Send(length.i)
+  Define rc.i
+  rc=Cyw43TrySend(length)
+  If rc<>#CYW43_IO_AGAIN : ProcedureReturn rc : EndIf
+  cyw43_creditPolls=cyw43_creditPolls+1
+  cyw43_Trace(#CYW43_TR_IOCTL_STALL)
+  cyw43_Poll(-1,0,100,#CYW43_POLL_CREDIT)
+  rc=Cyw43TrySend(length)
+  If rc=#CYW43_IO_AGAIN
+    cyw43_stalls=cyw43_stalls+1
+    ProcedureReturn #CYW43_IO_TIMEOUT
+  EndIf
+  ProcedureReturn rc
+EndProcedure
+
+Procedure SendFixture(index.i,row.i)
+ Define rc.i,p.i,i.i
+ cyw43_seq=PeekI(row+16) : cyw43_credit=PeekI(row+24)
+ fakeCredit=PeekI(row+32) : fakeBus=PeekI(row+40)
+ transfers=0 : polls=0 : cyw43_creditPolls=0 : cyw43_stalls=0 : cyw43_txFrames=0
+ For i=0 To #CYW43_TXBUF-1 : cyw43_tx[i]=$A5 : Next
+ For i=0 To 1513 : cyw43_tx[16+i]=(i*7+3) & 255 : Next
+ If PeekI(row)=0 : rc=Cyw43TrySend(PeekI(row+8)) : Else : rc=Cyw43Send(PeekI(row+8)) : EndIf
+ p=$E1C00100+index*2048
+ PokeI(p,rc) : PokeI(p+8,transfers) : PokeI(p+16,polls)
+ PokeI(p+24,cyw43_seq) : PokeI(p+32,cyw43_txFrames) : PokeI(p+40,cyw43_stalls)
+ PokeI(p+48,cyw43_creditPolls)
+ For i=0 To #CYW43_TXBUF-1 : PokeA(p+64+i,cyw43_tx[i]) : Next
+EndProcedure
+Procedure.i Main()
+ Define i.i,rc.i
+ For i=0 To 65535 : PokeA($E1C00000+i,0) : Next
+ PokeI($E1C00000,$54525931)
+ MmuClearNc() : rc=MmuBuildTables($4F80000) : If rc<>0 : ProcedureReturn 2 : EndIf
+ MmuEnableCached()
+ For i=0 To 13
+ SendFixture(i,?SendVectors+i*48)
+ Next
+ PokeI($E1C00008,14)
+ MmuDisableCachedFlushed()
+ ProcedureReturn 0
+EndProcedure
+DataSection
+SendVectors:
+ Data.q 0,1,0,1,1,1
+ Data.q 0,63,7,8,8,1
+ Data.q 0,1514,254,255,255,1
+ Data.q 0,64,255,0,0,1
+ Data.q 0,64,7,7,8,1
+ Data.q 0,64,8,7,9,1
+ Data.q 0,64,0,128,1,1
+ Data.q 0,64,9,10,10,0
+ Data.q 0,0,0,1,1,1
+ Data.q 0,1515,0,1,1,1
+ Data.q 1,64,0,1,1,1
+ Data.q 1,64,0,0,1,1
+ Data.q 1,64,0,0,0,1
+ Data.q 1,64,0,0,1,0
+EndDataSection
