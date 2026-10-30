@@ -1075,3 +1075,27 @@ cases and 44 DMA provider cases, with controlled bus/driver outcomes. Existing
 frame-copy, padding, queue, timeout and console-interleaving coverage remains.
 Pi 4 build 443 and Pi 3 build 60 compile. These images were not installed in this
 step; the bench remains on 441. No new Ethernet-wire or IPv6-web pass is claimed.
+
+
+## MLD wire codec for multicast membership
+
+The shared `ipv6_mld.pbi` builds MLDv2 any-source current-state, join and leave
+records, plus compatible MLDv1 Report and Done packets. Reports contain a
+Hop-by-Hop Router Alert, hop limit one and the ICMPv6 pseudo-header checksum.
+The caller may use an unspecified source before acquiring a link-local address;
+it must choose the assigned link-local source once available. All-nodes and
+interface-local groups are not emitted as reportable memberships.
+
+Query validation supports v1/v2 lengths, exponential v2 response and interval
+fields, source-list bounds, and checksum-covered trailing data. Invalid router
+sources, hop limits, missing/duplicate/incorrect Router Alerts, malformed source
+lists and bad checksums are refused. Failure leaves the output view unchanged;
+a successful view borrows packet storage. Interface destination ownership is
+checked by the caller, allowing queries addressed to its unicast address.
+
+The codec is independently implemented from RFC 9777, RFC 2710 and RFC 3590
+protocol facts. Physical Pi CPU cases compare output bytes and guards against
+independent packet construction. These tests do not establish live membership:
+listener timers, version compatibility state, retransmission, device filters,
+receive dispatch and endpoint binding still need integration. Anvil 441 remains
+installed; no new monitor or reset was needed for this codec qualification.
