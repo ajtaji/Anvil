@@ -269,6 +269,81 @@ EndProcedure
 ;  It used to sit in link.pi4 with a comment explaining which board it
 ;  was for; it belongs beside the buffer it writes into.
 ; ----------------------------------------------------------------------
+; Completion latch for the shared DMA queue. No MDIO/PHY wait in this path.
+Global hwLinkDmaActive.i,hwLinkDmaResult.i,hwLinkDmaEpoch.i
+Global Dim hwLinkDmaShort.a[60]
+
+Procedure.i HwLinkDmaReady()
+ CompilerIf #PMF_CHIP = 2712
+  ProcedureReturn GemStarted()
+ CompilerElse
+  ProcedureReturn GenetStarted()
+ CompilerEndIf
+EndProcedure
+
+Procedure.i HwLinkDmaGeneration()
+ CompilerIf #PMF_CHIP = 2712
+  ProcedureReturn GemStartCount()
+ CompilerElse
+  ProcedureReturn GenetStartCount()
+ CompilerEndIf
+EndProcedure
+
+Procedure.i HwLinkDmaPoll()
+ Define rc.i
+ If hwLinkDmaActive=0 : ProcedureReturn -1 : EndIf
+ If HwLinkDmaReady()=0 Or HwLinkDmaGeneration()<>hwLinkDmaEpoch
+  hwLinkDmaResult=-1
+ EndIf
+ If hwLinkDmaResult<>0 : ProcedureReturn hwLinkDmaResult : EndIf
+ CompilerIf #PMF_CHIP = 2712
+  rc=GemPollSend()
+ CompilerElse
+  rc=GenetPollSend()
+ CompilerEndIf
+ If rc<>0 : hwLinkDmaResult=rc : EndIf
+ ProcedureReturn rc
+EndProcedure
+
+Procedure.i HwLinkDmaTry(frame.i,bytes.i)
+ Define rc.i,i.i
+ If frame=0 Or bytes<14 Or bytes>1514 : ProcedureReturn -1 : EndIf
+ If hwLinkDmaActive<>0
+  If HwLinkDmaPoll()=0 : ProcedureReturn 0 : EndIf
+ EndIf
+ hwLinkDmaActive=0 : hwLinkDmaResult=0
+ ; GENET requires a padded Ethernet frame; both drivers copy before return.
+ If bytes<60
+  For i=0 To 59 : hwLinkDmaShort[i]=0 : Next
+  For i=0 To bytes-1 : hwLinkDmaShort[i]=PeekA(frame+i) : Next
+  frame=@hwLinkDmaShort[0] : bytes=60
+ EndIf
+ CompilerIf #PMF_CHIP = 2712
+  rc=GemTrySend(frame,bytes)
+ CompilerElse
+  rc=GenetTrySend(frame,bytes)
+ CompilerEndIf
+ If rc=1
+  hwLinkDmaActive=1 : hwLinkDmaEpoch=HwLinkDmaGeneration()
+  ProcedureReturn 1
+ EndIf
+ If rc=-1 : ProcedureReturn 0 : EndIf
+ ProcedureReturn -1
+EndProcedure
+
+; Legacy console sends can wait, but must harvest the queued frame's result
+; before their own send changes the driver's current completion state.
+Procedure.i HwLinkDmaDrain(ms.i)
+ Define start.i
+ If ms<=0 : ProcedureReturn 0 : EndIf
+ start=millis()
+ While hwLinkDmaActive<>0
+  If HwLinkDmaPoll()<>0 : ProcedureReturn 1 : EndIf
+  If ((millis()-start) & $FFFFFFFF)>=ms : ProcedureReturn 0 : EndIf
+ Wend
+ ProcedureReturn 1
+EndProcedure
+
 Procedure.i HwLinkSend(kind.i, buf.i, n.i, ms.i)
   Define dst.i
   Define i.i
@@ -276,6 +351,7 @@ Procedure.i HwLinkSend(kind.i, buf.i, n.i, ms.i)
     ProcedureReturn 0
   EndIf
   If kind = #HW_LINK_WIRED
+    If HwLinkDmaDrain(ms)=0 : ProcedureReturn 0 : EndIf
     CompilerIf #PMF_CHIP = 2712
     ; GemSend copies into its own DMA buffer and waits for the GEM to
     ; hand the descriptor back, the same 1/0 contract as GenetSend.

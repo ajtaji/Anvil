@@ -981,3 +981,39 @@ the included network ABI. Full Pi 4 build 440 also passes. Neither new monitor
 was installed: the bench remains on verified Pi 4 build 438, healthy after the
 returning test. IPv6 web traffic and HTTP/2-3 remain open, as do the remaining
 synchronous device, console and storage paths.
+
+
+## Shared DMA transmission service (installed Pi 4 build 441)
+
+Ethernet protocol traffic now uses the same service-loop hook as queued Wi-Fi.
+The new shared DMA queue calls bounded backend submit/completion callbacks;
+one progress call submits or polls at most one head. It does not wait for the
+wire, poll the PHY, or consume received packets. Pi 4 binds GENET, Pi 5 binds
+GEM, and the queue policy has no hardware dependency. Other targets can bind
+the same copy-owning completion contract.
+
+Frames remain pending after driver acceptance and are counted complete only
+when polled. Full queues refuse new work. A 100 ms deadline and address/device/
+readiness changes retire obsolete queued packets. The driver retains its own
+copy until completion or checked stop, even after the queue drops a request;
+there is no ambiguous retransmission or overwrite of DMA-owned storage.
+
+A board completion latch preserves the queued result when synchronous console
+output harvests it before sending its own packet. Console output may still
+wait, and queued protocol output can interleave with it. It cannot steal the
+completion or substitute the outcome of its later frame. Short frames are
+zero-padded to 60 bytes before the GENET backend.
+
+All 31 physical Pi CPU cases passed with controlled driver outcomes, including
+FIFO/full behavior, exact copied bytes, console interleaving, completion failure,
+address/device/down changes, timer wrap, deadlines and ambiguous submissions.
+These do not establish Ethernet wire behavior: the current bench uses Wi-Fi.
+Full Pi 4 build 441 and Pi 5 build 442 compile; only 441 was installed, with
+verified backup, candidate, boot-file and running-image hashes. After a full
+90-second boot interval, core/font/Vulkan and networking checks passed. Live
+Wi-Fi HTTPS gzip/deflate, cancellation and exact 32 KiB upload echo passed through
+the new combined dispatcher. Detailed measured counters are in the evidence.
+
+Remaining work includes synchronous device/storage/console paths, live Ethernet
+qualification, IPv6 web traffic and HTTP/2-3. This is not a claim that all Anvil
+networking operations are nonblocking or that the networking task is finished.

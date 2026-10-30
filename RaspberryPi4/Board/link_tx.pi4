@@ -1,0 +1,17 @@
+; Compose shared queue policies with this board's bounded driver callbacks.
+Procedure.i BoardLinkTxSubmit(kind.i,frame.i,bytes.i)
+ Define rc.i
+ rc=LinkDmaTxSubmit(kind,frame,bytes)
+ If rc<>-2 : ProcedureReturn rc : EndIf
+ ProcedureReturn LinkCywTxSubmit(kind,frame,bytes)
+EndProcedure
+
+Procedure BoardLinkTxProgress(kind.i)
+ LinkDmaTxProgress(kind)
+ LinkCywTxProgress(kind)
+EndProcedure
+
+Procedure BoardLinkTxInstall()
+ LinkDmaTxConfigure(#HW_LINK_WIRED,@HwLinkDmaTry,@HwLinkDmaPoll,@HwLinkDmaReady,@HwLinkDmaGeneration)
+ LinkTxSetHooks(@BoardLinkTxSubmit,@BoardLinkTxProgress)
+EndProcedure
