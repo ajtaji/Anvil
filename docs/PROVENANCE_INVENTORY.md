@@ -1591,3 +1591,6 @@ text is unchanged; no new board execution or boot claim follows.
 | `docs/evidence/anvil-ipv6-20261030/tls458/web738/proof.pi4` | protocol-facts | ietf-rfc | IETF specification | Shared TLS/HTTP physical lifecycle proof |
 
 | `Anvil/Network/h2_frame.pbi` | protocol-facts | ietf-rfc | IETF specification | RFC 9113 sections 3.4, 4 and 6; independently implemented incremental frame header decoder, bounded writer and connection preface. |
+
+| `Anvil/Network/hpack_tables.pbi` | protocol-facts | ietf-rfc | IETF specification | RFC 7541 Appendices A/B static fields and Huffman codes, independently arranged into lookup tables; no implementation copied. |
+| `Anvil/Network/hpack_decode.pbi` | protocol-facts | ietf-rfc | IETF specification | RFC 7541 sections 4-6; original bounded decoder, dynamic-table handling, integers, strings and padding validation. |

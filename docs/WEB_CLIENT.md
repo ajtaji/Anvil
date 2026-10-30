@@ -2604,3 +2604,60 @@ uses the already installed 483 TLS ABI. Evidence:
 HTTP/2 payload handling, HPACK, continuation sequencing, stream state and flow
 control remain unfinished. Negotiation and frame helpers do not by themselves
 constitute HTTP/2 request support.
+
+### Bounded HPACK decoding and a real HTTP/2 GET
+
+`hpack_decode.pbi` provides a caller-owned decoding context with the RFC 7541
+static table, dynamic entries, all literal forms and indexed fields, integer
+bounds, table-size changes and Huffman decoding. The immutable lookup tables
+are independently arranged from Appendix A/B protocol constants. No external
+HPACK implementation is copied into or linked into Anvil.
+
+Initialize with `HpackInit(context, table, capacity)` using 4096..16384 bytes of
+table storage. The initial permitted/chosen table size is 4096. Apply effective
+local SETTINGS changes between blocks with `HpackSetLimit`; a pending minimum
+survives later increases until the peer sends the required update. `HpackBegin`
+takes a complete compressed block, independent field-output storage and a header
+list limit. Buffers must remain valid and nonoverlapping during decoding.
+`HpackNext` returns 1 for a complete field, 2 for more bounded work, 0 at block
+completion, or a latched negative error. Names and values are opaque byte spans,
+not terminated strings; the spans remain valid until the next call. Never-indexed
+literals expose the sensitive flag. HTTP/2 field semantics remain the client's
+responsibility.
+
+String steps consume at most 128 encoded input bytes. Eviction scans the retained
+prefix once. Decoded names are copied before eviction can invalidate their source.
+The implementation caps compressed blocks and decoded header-list accounting at
+65536 bytes, per-field workspace at 32768 bytes, dynamic storage at 16384 bytes,
+integers at signed-31-bit values/five continuation octets, and leading table-size
+updates at two. Invalid indexes, required-update omissions, invalid Huffman EOS
+or padding and exceeded limits fail closed. A decoder error requires discarding
+the connection/context; it is not a recoverable per-header warning.
+
+The final physical Pi 4 run passed 59 cases and 751 exact decoded fields against
+independent vectors, including all 256 Huffman byte values, duplicate entries,
+name references surviving eviction, an 8 KiB decoded field, a 512-entry table,
+large eviction/insertion and 18 malformed-or-limit refusals. Input consumption,
+dynamic references, table accounting and output guards passed. The longest observed step
+was 97 microseconds; that is an observation, not a worst-case guarantee. The same
+shared codec compiles for Pi 3 with the Pi 4-only MMU harness omitted. It was not
+run on Pi 3. The optional host vector generator uses hpack 4.2.0 only as a test
+oracle. Both generators reproduced the qualified tables/vectors exactly.
+
+A separate physical probe composed the shared transport, frame and HPACK code
+for a certificate-verified HTTP/2 GET of `https://httpbin.org/uuid`. It negotiated
+h2, exchanged SETTINGS, sent request headers, decoded eight response fields and
+received HTTP 200 with a 53-byte valid JSON UUID body. Six received frames were
+processed; the longest observed response decode step was 13 microseconds.
+Capture 145 returned zero with healthy cores, fonts and Vulkan, watchdog off and
+the temporary DNS override removed. The first probe incorrectly treated an empty
+receive queue as EOF; topic 1534 records the correction to check connection state
+before reading. Its rejected report is retained separately.
+
+This proves an actual HTTP/2 request/response through the shared building blocks.
+The probe's bounded polling loops are qualification code, not the reusable
+asynchronous connection engine. Production stream lifecycle, semantic header
+validation, full control-frame rules, flow control, multiplexing and WebClient
+integration remain unfinished. Existing HTTP/1 behavior is unchanged. HTTP/3 and
+the broader networking gaps remain open. Evidence:
+`docs/evidence/anvil-ipv6-20261030/hpack-http2-483`.
