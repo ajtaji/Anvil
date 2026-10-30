@@ -1213,6 +1213,9 @@ EndProcedure
 ; ----------------------------------------------------------------------
 Procedure PayNetCommandPump(sliceMs.i)
   TcpPoll(sliceMs)
+  ; Lease and protocol progress includes IPv6 neighbor discovery. This does
+  ; not re-enter the console dispatcher while its command owns the output.
+  NetDhcpTick()
   paynet_DnsStep(millis())
   paynet_TcpAdvanceAll(millis())
   TlsClientAdvance()

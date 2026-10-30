@@ -1774,3 +1774,31 @@ actual DNS and TCP traffic. Public off-link IPv6, DNS transport over IPv6,
 IPv6 TLS, complete multi-address racing, remaining TLS blocking and HTTP/2-3
 remain open. Native console HTTP command integration requires a separate
 coverage audit; a library client proof must not be treated as that audit.
+
+
+### Native console HTTP on the shared client
+
+Anvil457 moves `http get` onto the shared WebClient, including its IPv4/IPv6
+connection adapter and response framing. Plain HTTP still refuses HTTPS URLs;
+redirects are displayed without following them. The command streams the body,
+retains a bounded preview, supports cancellation and applies a30-second deadline.
+Failure or completion closes the connection. It no longer uses the legacy
+IPv4-only HttpGet path. The implementation is shared Core code; Pi3build72
+compiles it, with physical acceptance on Pi4.
+
+The actual procedure first passed a20,000-byte IPv6 exchange as a RAM payload.
+After verified installation and90seconds of boot time, six native prompt cases
+passed: IPv6 literal, IPv6 hostname, IPv4 chunked response, redirect without a
+follow-up request, truncated-body refusal, and HTTPS-scheme refusal. The two
+IPv6 cases received20,000 bytes. Temporary DNS selection was removed without
+saving settings, and local test servers closed. The rollback is build456;
+full running-image hash, cores, fonts and Vulkan checks passed. Evidence:
+`docs/evidence/anvil-ipv6-20261030/native457`.
+
+The first installed candidate456 exposed missing IPv6 neighbor progress in
+the command pump and timed out before connecting. Build457 advances shared
+lease/protocol services without re-entering the console dispatcher.
+
+This closes native plain-HTTP integration coverage. TLS still needs dual-family
+connection support; public off-link IPv6, IPv6 DNS transport, full multi-address
+racing, remaining service stalls and HTTP/2-3 remain open.

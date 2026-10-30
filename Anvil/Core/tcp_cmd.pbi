@@ -751,124 +751,77 @@ EndProcedure
 ; ======================================================================
 ;  CmdHttp - http get <url>
 ; ======================================================================
+XIncludeFile "Anvil/Core/web_transport.pbi"
+Global httpc_url.WebUrl,httpc_request.WebRequest,httpc_response.WebResponse,httpc_client.WebClient
+Global Dim httpc_host.a[256]
+Global Dim httpc_target.a[#WEB_URL_TARGET]
+Global Dim httpc_headers.a[4096]
+Global Dim httpc_line.a[4096]
+Global Dim httpc_metadata.a[#WEB_RESPONSE_MAX_METADATA]
+Global Dim httpc_tx.a[2048]
+Global Dim httpc_rx.a[2048]
+Global Dim httpc_output.a[2048]
+
 Procedure http_Get()
-  Define url.i
-  Define ip.i
-  Define rc.i
-  Define t0.i
-  Define ms.i
-  Define show.i
-
-  url = ArgRest()
-  If url = 0
-    PrintN("!! http get needs a URL, so nothing was fetched.")
-    PrintN("   http get http://example.com/")
-    ProcedureReturn
+ Define url.i,n.i,rc.i,start.i,total.i,shown.i,i.i,headerShown.i
+ url=ArgRest()
+ If url=0
+  PrintN("!! http get needs a URL, so nothing was fetched.")
+  PrintN("   http get http://example.com/") : ProcedureReturn
+ EndIf
+ n=0 : While n<=#WEB_URL_LIMIT And PeekA(url+n)<>0 : n=n+1 : Wend
+ httpc_url\host=@httpc_host[0] : httpc_url\hostCapacity=256
+ httpc_url\target=@httpc_target[0] : httpc_url\targetCapacity=#WEB_URL_TARGET
+ rc=WebUrlParse(url,n,0,@httpc_url)
+ If rc=0 And httpc_url\secure<>0 : rc=#WEB_URL_SCHEME : EndIf
+ If rc<0
+  Print("!! Invalid or unsupported plain HTTP URL (code ") : PrintDec(rc) : PrintN(").")
+  ProcedureReturn
+ EndIf
+ rc=WebRequestInit(@httpc_request,@httpc_url,"GET",3,0,0,@httpc_headers[0],4096)
+ If rc=0 : rc=WebRequestHeader(@httpc_request,"Accept-Encoding",15,"identity",8) : EndIf
+ If rc=0 : rc=WebRequestHeader(@httpc_request,"User-Agent",10,"Anvil",5) : EndIf
+ If rc=0 : rc=WebRequestFinishHeaders(@httpc_request) : EndIf
+ If rc=0 : rc=WebResponseInit(@httpc_response,@httpc_line[0],4096,@httpc_metadata[0],#WEB_RESPONSE_MAX_METADATA,0) : EndIf
+ If rc<0
+  Print("!! HTTP request setup refused (code ") : PrintDec(rc) : PrintN(").") : ProcedureReturn
+ EndIf
+ If HwLinkOpen(1)=0 : ProcedureReturn : EndIf
+ Print("GET ") : UartWriteStr(httpc_url\target) : Print(" from ") : UartWriteStr(httpc_url\host)
+ PrintN(". Press a key to stop.") : UartDrain()
+ start=millis()
+ rc=WebClientStart(@httpc_client,@httpc_url,@httpc_request,@httpc_response,@httpc_tx[0],2048,@httpc_rx[0],2048,start,30000)
+ While rc=0
+  If NetBreakCheck()
+   rc=WebClientCancel(@httpc_client) : Break
   EndIf
-
-  rc = HttpParseUrl(url)
-  If rc <> #HTTP_OK
-    Print("!! ")
-    UartWriteStr(HttpErrorText(rc))
-    PrintNl()
-    ProcedureReturn
-  EndIf
-
-  If HwLinkOpen(1) = 0
-    ProcedureReturn
-  EndIf
-
-  ip = ParseDotted(HttpHost())
-  If ip <= 0
-    ip = ResolveName(HttpHost())
-    If ip <= 0
-      ProcedureReturn                  ; ResolveName has already said why
-    EndIf
-  EndIf
-
-  Print("GET ")
-  UartWriteStr(HttpPath())
-  Print(" from ")
-  UartWriteStr(HttpHost())
-  Print(" at ")
-  PutIp(ip)
-  Print(" port ")
-  PrintDec(HttpUrlPort())
-  PrintN(",")
-  Print("  over ")
-  UartWriteStr(LinkName())
-  PrintN(". Press a key to stop.")
-  UartDrain()
-
-  t0 = millis()
-  rc = HttpGet(ip, @gHttpBody[0], #TCPCMD_BODY_MAX)
-  ms = millis() - t0
-
-  If rc <> #HTTP_OK And rc <> #HTTP_E_TRUNC
-    Print("!! ")
-    UartWriteStr(HttpErrorText(rc))
-    PrintNl()
-    If HttpTcpError() <> 0
-      Print("   Underneath it: ")
-      UartWriteStr(TcpErrorText(HttpTcpError()))
-      PrintNl()
-    EndIf
-    ProcedureReturn
-  EndIf
-
-  Print("HTTP/1.1 ")
-  PrintDec(HttpStatus())
-  Print("  -  ")
-  PrintDec(HttpHeaderCount())
-  Print(" header lines, framed by ")
-  UartWriteStr(HttpFramingName(HttpFraming()))
-  PrintN(",")
-  Print("  ")
-  PrintDec(HttpBodySeen())
-  Print(" body bytes in ")
-  PrintDec(ms)
-  Print(" ms over ")
-  PrintDec(HttpRxBytes())
-  PrintN(" bytes of response.")
-  If HttpContentLength() >= 0
-    Print("  Content-Length said ")
-    PrintDec(HttpContentLength())
-    PrintN(".")
-  EndIf
-  If HttpHeadersDropped() > 0
-    Print("  ")
-    PrintDec(HttpHeadersDropped())
-    PrintN(" header lines were longer than the buffer and were NOT parsed.")
-    PrintN("  They are counted rather than truncated, because half a header read")
-    PrintN("  as a whole one is worse than a header nobody read.")
-  EndIf
-  If HttpIsRedirect() <> 0
-    Print("  This is a redirect and it was NOT followed. Location: ")
-    UartWriteStr(HttpLocation())
-    PrintNl()
-    PrintN("  Fetch that URL yourself if you want it.")
-  EndIf
-  If rc = #HTTP_E_TRUNC
-    Print("  ")
-    UartWriteStr(HttpErrorText(rc))
-    PrintNl()
-  EndIf
-
-  show = HttpBodyLen()
-  If show > #TCPCMD_BODY_SHOW
-    show = #TCPCMD_BODY_SHOW
-  EndIf
-  If show > 0
-    Print("--- the first ")
-    PrintDec(show)
-    Print(" of ")
-    PrintDec(HttpBodyLen())
-    PrintN(" body bytes ---")
-    tcp_PutBytes(@gHttpBody[0], show)
-    PrintN("--- end ---")
-  Else
-    PrintN("The response carried no body.")
-  EndIf
+  PayNetCommandPump(1)
+  rc=WebClientStep(@httpc_client,0,0,1,@httpc_output[0],2048,millis())
+  total=total+httpc_client\written
+  For i=0 To httpc_client\written-1
+   If shown<#TCPCMD_BODY_SHOW
+    gHttpBody[shown]=httpc_output[i] : shown=shown+1
+   EndIf
+  Next
+ Wend
+ WebClientClose(@httpc_client)
+ If rc<0
+  Print("!! HTTP exchange refused or incomplete (code ") : PrintDec(rc) : PrintN(").")
+  ProcedureReturn
+ EndIf
+ Print("HTTP/1.1 ") : PrintDec(httpc_response\status)
+ Print(" - ") : PrintDec(total) : Print(" body bytes in ") : PrintDec((millis()-start) & $FFFFFFFF)
+ Print(" ms over ") : PrintDec(httpc_client\received) : PrintN(" bytes of response.")
+ If httpc_response\status>=300 And httpc_response\status<400
+  PrintN("This redirect was NOT followed. Response headers:")
+  tcp_PutBytes(@httpc_metadata[0],httpc_response\headerLength)
+ EndIf
+ If shown>0
+  Print("--- the first ") : PrintDec(shown) : PrintN(" body bytes ---")
+  tcp_PutBytes(@gHttpBody[0],shown) : PrintN("--- end ---")
+ Else
+  PrintN("The response carried no body.")
+ EndIf
 EndProcedure
 
 Procedure CmdHttp()

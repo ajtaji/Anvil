@@ -1,0 +1,145 @@
+#WEB_KERNEL_BINDING=0
+XIncludeFile "Anvil/Network/web_client.pbi"
+XIncludeFile "RaspberryPi4/Lib/mmu.pi4"
+
+Global url.WebUrl,request.WebRequest,response.WebResponse,client.WebClient
+Global Dim host.a[256]
+Global Dim target.a[3072]
+Global Dim headers.a[1024]
+Global Dim metadata.a[4096]
+Global Dim line.a[1024]
+Global Dim tx.a[512]
+Global Dim rx.a[512]
+Global Dim output.a[512]
+Global table.i
+Global *livePet,*liveTime
+Procedure CaptureTable()
+ ASM
+ adrp x1, global_table
+ add x1, x1, #:lo12:global_table
+ str x0, [x1]
+ EndASM
+EndProcedure
+
+#TCPCMD_BODY_SHOW=600
+Global Dim gHttpBody.a[600]
+Global nativeUrl.i
+Procedure.i millis()
+ ProcedureReturn liveTime()/1000
+EndProcedure
+Procedure.i ArgRest()
+ ProcedureReturn nativeUrl
+EndProcedure
+Procedure.i HwLinkOpen(kind.i)
+ ProcedureReturn 1
+EndProcedure
+Procedure.i NetBreakCheck()
+ ProcedureReturn 0
+EndProcedure
+Procedure PayNetCommandPump(ms.i)
+ livePet() : WebPayloadService(ms)
+EndProcedure
+Procedure UartDrain()
+EndProcedure
+Procedure UartWriteStr(p.i)
+EndProcedure
+Procedure tcp_PutBytes(p.i,n.i)
+EndProcedure
+Procedure str_print_at(p.i)
+EndProcedure
+Procedure PrintNl()
+EndProcedure
+Procedure PrintDec(n.i)
+EndProcedure
+Global httpc_url.WebUrl,httpc_request.WebRequest,httpc_response.WebResponse,httpc_client.WebClient
+Global Dim httpc_host.a[256]
+Global Dim httpc_target.a[#WEB_URL_TARGET]
+Global Dim httpc_headers.a[4096]
+Global Dim httpc_line.a[4096]
+Global Dim httpc_metadata.a[#WEB_RESPONSE_MAX_METADATA]
+Global Dim httpc_tx.a[2048]
+Global Dim httpc_rx.a[2048]
+Global Dim httpc_output.a[2048]
+
+Procedure http_Get()
+ Define url.i,n.i,rc.i,start.i,total.i,shown.i,i.i,headerShown.i
+ url=ArgRest()
+ If url=0
+  PrintN("!! http get needs a URL, so nothing was fetched.")
+  PrintN("   http get http://example.com/") : ProcedureReturn
+ EndIf
+ n=0 : While n<=#WEB_URL_LIMIT And PeekA(url+n)<>0 : n=n+1 : Wend
+ httpc_url\host=@httpc_host[0] : httpc_url\hostCapacity=256
+ httpc_url\target=@httpc_target[0] : httpc_url\targetCapacity=#WEB_URL_TARGET
+ rc=WebUrlParse(url,n,0,@httpc_url)
+ If rc=0 And httpc_url\secure<>0 : rc=#WEB_URL_SCHEME : EndIf
+ If rc<0
+  Print("!! Invalid or unsupported plain HTTP URL (code ") : PrintDec(rc) : PrintN(").")
+  ProcedureReturn
+ EndIf
+ rc=WebRequestInit(@httpc_request,@httpc_url,"GET",3,0,0,@httpc_headers[0],4096)
+ If rc=0 : rc=WebRequestHeader(@httpc_request,"Accept-Encoding",15,"identity",8) : EndIf
+ If rc=0 : rc=WebRequestHeader(@httpc_request,"User-Agent",10,"Anvil",5) : EndIf
+ If rc=0 : rc=WebRequestFinishHeaders(@httpc_request) : EndIf
+ If rc=0 : rc=WebResponseInit(@httpc_response,@httpc_line[0],4096,@httpc_metadata[0],#WEB_RESPONSE_MAX_METADATA,0) : EndIf
+ If rc<0
+  Print("!! HTTP request setup refused (code ") : PrintDec(rc) : PrintN(").") : ProcedureReturn
+ EndIf
+ If HwLinkOpen(1)=0 : ProcedureReturn : EndIf
+ Print("GET ") : UartWriteStr(httpc_url\target) : Print(" from ") : UartWriteStr(httpc_url\host)
+ PrintN(". Press a key to stop.") : UartDrain()
+ start=millis()
+ rc=WebClientStart(@httpc_client,@httpc_url,@httpc_request,@httpc_response,@httpc_tx[0],2048,@httpc_rx[0],2048,start,30000)
+ While rc=0
+  If NetBreakCheck()
+   rc=WebClientCancel(@httpc_client) : Break
+  EndIf
+  PayNetCommandPump(1)
+  rc=WebClientStep(@httpc_client,0,0,1,@httpc_output[0],2048,millis())
+  total=total+httpc_client\written
+  For i=0 To httpc_client\written-1
+   If shown<#TCPCMD_BODY_SHOW
+    gHttpBody[shown]=httpc_output[i] : shown=shown+1
+   EndIf
+  Next
+ Wend
+ WebClientClose(@httpc_client)
+ If rc<0
+  Print("!! HTTP exchange refused or incomplete (code ") : PrintDec(rc) : PrintN(").")
+  ProcedureReturn
+ EndIf
+ Print("HTTP/1.1 ") : PrintDec(httpc_response\status)
+ Print(" - ") : PrintDec(total) : Print(" body bytes in ") : PrintDec((millis()-start) & $FFFFFFFF)
+ Print(" ms over ") : PrintDec(httpc_client\received) : PrintN(" bytes of response.")
+ If httpc_response\status>=300 And httpc_response\status<400
+  PrintN("This redirect was NOT followed. Response headers:")
+  tcp_PutBytes(@httpc_metadata[0],httpc_response\headerLength)
+ EndIf
+ If shown>0
+  Print("--- the first ") : PrintDec(shown) : PrintN(" body bytes ---")
+  tcp_PutBytes(@gHttpBody[0],shown) : PrintN("--- end ---")
+ Else
+  PrintN("The response carried no body.")
+ EndIf
+EndProcedure
+
+Procedure.i Main()
+ Define i.i,rc.i
+ CaptureTable()
+ For i=0 To 131071 : PokeA($E1C00000+i,$A5) : Next
+ rc=WebPayloadBind(table)
+ If rc<>0 : ProcedureReturn 1 : EndIf
+ livePet=PeekI(table+16+6*8) : liveTime=PeekI(table+16+11*8)
+ MmuClearNc() : MmuAddNc($08A00000,$09200000) : MmuAddNc($08100000,$08180000)
+ rc=MmuBuildTables($4F80000) : If rc<>0 : ProcedureReturn 2 : EndIf
+ MmuEnableCached()
+ nativeUrl="http://[fd3f:f605:b7f1:cfd6:f0d4:2621:4d4:d168]:18080/ipv6-proof"
+ http_Get()
+ PokeI($E1C00000,httpc_response\status)
+ PokeI($E1C00008,httpc_response\bodyBytes)
+ PokeI($E1C00010,httpc_client\received)
+ PokeI($E1C00018,httpc_client\error)
+ For i=0 To 599 : PokeA($E1C00100+i,gHttpBody[i]) : Next
+ MmuDisableCachedFlushed()
+ ProcedureReturn 0
+EndProcedure
