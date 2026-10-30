@@ -1454,3 +1454,36 @@ being interpreted as an expired lifetime after the nested engine refuses it.
 Both initialization and existing-owner calls reject that boundary unchanged.
 All 36 physical Pi CPU cases passed on Anvil 447, including two new upper-clock
 refusal cases. The payload returned normally with cores, fonts and Vulkan healthy.
+
+
+## Resident SLAAC address assignment
+
+Anvil now merges validated Router Advertisement prefixes into a persistent
+on-link list and up to four independent SLAAC address owners per interface.
+Each /64 address uses the confirmed link-local IID and exact solicited-node
+membership. The service keeps address validity, preferred lifetime, duplicate
+checks and transmission receipts separate. Omitted prefixes survive later
+advertisements. Link loss or failed link-local ownership discards address use.
+Non-/64 prefixes remain eligible for on-link routing without creating a SLAAC
+address. Eight on-link prefixes fit per interface; full tables retain live entries.
+
+Address work runs cooperatively between receive dispatches. Pending DAD receipts
+are checked before scheduling at most one new address probe per service turn;
+no nested receive pump or wait is introduced. Received Neighbor Solicitations
+and echo requests dispatch to the appropriate assigned address. Router
+Advertisements may target a preferred or deprecated local address. Unauthenticated
+advertisements retain the RFC 4862 two-hour validity rule. Status reports show
+individual tentative, preferred, deprecated, duplicate, failed or expired states.
+
+Installed Pi 4 builds 448 and 449 learned the real router's ULA prefix and
+completed DAD. Each build answered all six host IPv6 echo requests, using
+32-byte and 1,200-byte payloads, with zero loss. The host neighbor entry resolved
+the learned address to the Pi's actual Wi-Fi MAC. Full running-image hashes,
+cores, fonts and Vulkan were checked after installation. Build 449 is the final
+installed image; its verified 448 backup remains on the boot drive. The shared
+composition also builds for Pi 3 (build 65); its resident IPv6 activation still
+requires a board entropy provider.
+
+This proves live address assignment and inbound neighbor/echo traffic. Outbound
+neighbor-cache ownership, IPv6 TCP/DNS and web requests remain unfinished, as do
+remaining TLS blocking work and HTTP/2-3. No IPv6 web result is claimed here.

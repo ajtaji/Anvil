@@ -32,6 +32,19 @@ Global Dim ipv6svcHop.i[#NET_IF_KINDS]
 Global Dim ipv6svcReachable.i[#NET_IF_KINDS]
 Global Dim ipv6svcRetransmit.i[#NET_IF_KINDS]
 Global Dim ipv6svcMtu.i[#NET_IF_KINDS]
+; Four independently owned SLAAC addresses and eight on-link prefixes per link.
+; Every address uses the confirmed LL membership's IID/group. No extra filter
+; setup or borrowed receive storage is needed for these addresses.
+#IPV6_SERVICE_ADDRESSES=4
+#IPV6_SERVICE_PREFIXES=8
+Global Dim ipv6svcOnLink.IPv6PrefixList[#NET_IF_KINDS]
+Global Dim ipv6svcOnLinkRows.IPv6OnLinkPrefix[#NET_IF_KINDS*#IPV6_SERVICE_PREFIXES]
+Global Dim ipv6svcOwner.IPv6AddressOwner[#NET_IF_KINDS*#IPV6_SERVICE_ADDRESSES]
+Global Dim ipv6svcOwnerUsed.i[#NET_IF_KINDS*#IPV6_SERVICE_ADDRESSES]
+Global Dim ipv6svcOwnerReceipt.i[#NET_IF_KINDS*#IPV6_SERVICE_ADDRESSES]
+Global Dim ipv6svcOwnerToken.i[#NET_IF_KINDS*#IPV6_SERVICE_ADDRESSES]
+Global Dim ipv6svcOwnerCursor.i[#NET_IF_KINDS]
+Global Dim ipv6svcAddressError.i[#NET_IF_KINDS]
 Procedure.i ipv6svc_Now()
  Define raw.i,elapsed.i
  raw=millis()&$FFFFFFFF
@@ -50,6 +63,123 @@ Procedure.i ipv6svc_Delay(limit.i)
  rc=RandomServiceBytes(@value,4)
  If rc<>4 : ProcedureReturn -810 : EndIf
  ProcedureReturn 1+((value&$FFFFFFFF) % limit)
+EndProcedure
+Procedure ipv6svc_DiscardAddresses(kind.i)
+ Define i.i,slot.i
+ For i=0 To #IPV6_SERVICE_ADDRESSES-1
+  slot=kind*#IPV6_SERVICE_ADDRESSES+i
+  ipv6svcOwnerUsed[slot]=0 : ipv6svcOwnerReceipt[slot]=0 : ipv6svcOwnerToken[slot]=0
+ Next
+ ipv6svcOwnerCursor[kind]=0
+EndProcedure
+; Merge only the advertised information. Omission never withdraws another
+; router's address/prefix, and L/A are independently applied.
+Procedure ipv6svc_ApplyPrefixes(kind.i,now.i)
+ Define *pio.IPv6RouterPrefix
+ Define i.i,j.i,slot.i,found.i,empty.i,rc.i,state.i,delay.i,generation.i
+ ipv6svcAddressError[kind]=0
+ For i=0 To ipv6svcRa[kind]\prefixCount-1
+  *pio=@ipv6svcPrefixes[kind*2520+i*SizeOf(IPv6RouterPrefix)]
+  rc=IPv6PrefixListApply(@ipv6svcOnLink[kind],ipv6svcEpoch[kind],now,@*pio\prefix,*pio\length,*pio\onlink,*pio\valid)
+  If rc<>0 : ipv6svcAddressError[kind]=rc : EndIf
+  If *pio\autonomous=1 And *pio\length=64 And *pio\preferred<=*pio\valid
+   found=-1 : empty=-1
+   For j=0 To #IPV6_SERVICE_ADDRESSES-1
+    slot=kind*#IPV6_SERVICE_ADDRESSES+j
+    If ipv6svcOwnerUsed[slot]<>0
+     If IPv6EndpointBytesEqual(@ipv6svcOwner[slot]\lifetime\address,@*pio\prefix,8)<>0
+      found=slot
+     Else
+      state=IPv6AddressOwnerStatus(@ipv6svcOwner[slot],ipv6svcOwner[slot]\generation,now)
+      If state=0 : ipv6svcOwnerUsed[slot]=0 : ipv6svcOwnerReceipt[slot]=0 : EndIf
+     EndIf
+    EndIf
+    If ipv6svcOwnerUsed[slot]=0 And empty<0 : empty=slot : EndIf
+   Next
+   If found<0 And *pio\valid>0
+    If empty<0
+     ipv6svcAddressError[kind]=1
+    Else
+     generation=ipv6svcOwner[empty]\generation+1
+     rc=IPv6AddressOwnerInit(@ipv6svcOwner[empty],generation,@*pio\prefix,@ipv6svcAddresses[kind*16],@ipv6svcHost[kind]\membership\group,HwLinkMacPtr(kind),now)
+     If rc=0
+      found=empty : ipv6svcOwnerUsed[found]=1 : ipv6svcOwnerReceipt[found]=0 : ipv6svcOwnerToken[found]=0
+     Else
+      ipv6svcAddressError[kind]=rc
+     EndIf
+    EndIf
+   EndIf
+   If found>=0
+    delay=ipv6svc_Delay(1000)
+    If delay<0
+     ipv6svcAddressError[kind]=delay
+    Else
+     ; Wi-Fi authentication is not SEND authentication. Preserve RFC4862's
+     ; two-hour lifetime rule for all ordinary Router Advertisements.
+     rc=IPv6AddressOwnerApply(@ipv6svcOwner[found],ipv6svcOwner[found]\generation,now,*pio\valid,*pio\preferred,0,delay,ipv6svcRetransmit[kind])
+     If rc<0 : ipv6svcAddressError[kind]=rc : EndIf
+     If rc=1 : ipv6svcOwnerReceipt[found]=0 : ipv6svcOwnerToken[found]=0 : EndIf
+    EndIf
+   EndIf
+  EndIf
+ Next
+EndProcedure
+Procedure ipv6svc_AddressTick(kind.i,now.i)
+ Define i.i,slot.i,rc.i,n.i,state.i,token.i
+ If ipv6svcHost[kind]\phase<>#IPV6_HOST_READY
+  ipv6svc_DiscardAddresses(kind) : ProcedureReturn
+ EndIf
+ rc=IPv6PrefixListTick(@ipv6svcOnLink[kind],ipv6svcEpoch[kind],now)
+ ; Consume all receipts before issuing at most one new DAD frame. Never let
+ ; later frames displace an unobserved completion in the bounded link queue.
+ For i=0 To #IPV6_SERVICE_ADDRESSES-1
+  slot=kind*#IPV6_SERVICE_ADDRESSES+i
+  If ipv6svcOwnerUsed[slot]<>0
+   state=IPv6AddressOwnerStatus(@ipv6svcOwner[slot],ipv6svcOwner[slot]\generation,now)
+   If state=0
+    ipv6svcOwnerUsed[slot]=0 : ipv6svcOwnerReceipt[slot]=0
+   ElseIf ipv6svcOwnerReceipt[slot]>0
+    rc=LinkTxReceipt(kind,ipv6svcOwnerReceipt[slot])
+    If rc<>0
+     ipv6svcOwnerReceipt[slot]=0
+     rc=IPv6AddressOwnerSent(@ipv6svcOwner[slot],ipv6svcOwner[slot]\generation,now,ipv6svcOwnerToken[slot],rc)
+     If rc<0 And rc<>#IPV6_OWNER_STALE : ipv6svcAddressError[kind]=rc : EndIf
+    EndIf
+   EndIf
+  EndIf
+ Next
+ slot=kind*#IPV6_SERVICE_ADDRESSES+ipv6svcOwnerCursor[kind]
+ ipv6svcOwnerCursor[kind]=(ipv6svcOwnerCursor[kind]+1) % #IPV6_SERVICE_ADDRESSES
+ If ipv6svcOwnerUsed[slot]=0 Or ipv6svcOwnerReceipt[slot]<>0 : ProcedureReturn : EndIf
+ n=IPv6AddressOwnerStep(@ipv6svcOwner[slot],ipv6svcOwner[slot]\generation,now,@ipv6svcFrame[0],1514)
+ If n>0
+  token=ipv6svcOwner[slot]\awaiting
+  rc=LinkSendTracked(kind,@ipv6svcFrame[0],n)
+  If rc>0
+   ipv6svcOwnerReceipt[slot]=rc : ipv6svcOwnerToken[slot]=token
+  Else
+   rc=IPv6AddressOwnerSent(@ipv6svcOwner[slot],ipv6svcOwner[slot]\generation,now,token,rc)
+   If rc<0 : ipv6svcAddressError[kind]=rc : EndIf
+  EndIf
+ ElseIf n<0
+  ipv6svcAddressError[kind]=n
+ EndIf
+EndProcedure
+; An RA may be unicast to any assigned address, including a deprecated one.
+Procedure.i ipv6svc_RaLocal(kind.i,now.i,destination.i)
+ Define i.i,slot.i,state.i
+ For i=0 To #IPV6_SERVICE_ADDRESSES-1
+  slot=kind*#IPV6_SERVICE_ADDRESSES+i
+  If ipv6svcOwnerUsed[slot]<>0
+   state=IPv6AddressOwnerStatus(@ipv6svcOwner[slot],ipv6svcOwner[slot]\generation,now)
+   If state=2 Or state=3
+    If IPv6EndpointBytesEqual(destination,@ipv6svcOwner[slot]\lifetime\address,16)<>0
+     ProcedureReturn @ipv6svcOwner[slot]\lifetime\address
+    EndIf
+   EndIf
+  EndIf
+ Next
+ ProcedureReturn @ipv6svcAddresses[kind*16]
 EndProcedure
 Procedure ipv6svc_DiscoveryTick(kind.i,now.i)
  Define rc.i,n.i,mac.i,p.i,i.i,delay.i
@@ -90,7 +220,7 @@ Procedure ipv6svc_DiscoveryTick(kind.i,now.i)
 EndProcedure
 Procedure.i IPv6ServiceInput(kind.i,frame.i,bytes.i,out.i,capacity.i)
  Define query.IPv6MldQueryView,ip.IPv6PacketView
- Define delay.i,rc.i,now.i
+ Define delay.i,rc.i,now.i,i.i,slot.i,local.i
  If kind<1 Or kind>=#NET_IF_KINDS : ProcedureReturn -800 : EndIf
  If ipv6svcState[kind]<>2 : ProcedureReturn 0 : EndIf
  ; Never configure filters or receive another frame while this RX span lives.
@@ -101,7 +231,8 @@ Procedure.i IPv6ServiceInput(kind.i,frame.i,bytes.i,out.i,capacity.i)
     rc=IPv6PacketParse(frame+14,bytes-14,@ip)
     If rc=0 And ip\protocol=58 And ip\payloadBytes>=1
      If PeekA(ip\payload)=134
-      rc=IPv6RouterDecode(frame+14,bytes-14,@ipv6svcAddresses[kind*16],HwLinkTxMax(kind)-14,@ipv6svcRa[kind],@ipv6svcPrefixes[kind*2520],45)
+      local=ipv6svc_RaLocal(kind,now,ip\destination)
+      rc=IPv6RouterDecode(frame+14,bytes-14,local,HwLinkTxMax(kind)-14,@ipv6svcRa[kind],@ipv6svcPrefixes[kind*2520],45)
       If rc=0
        rc=IPv6DefaultRoutersApply(@ipv6svcRouters[kind],ipv6svcEpoch[kind],now,@ipv6svcRa[kind]\source,ipv6svcRa[kind]\lifetime,ipv6svcRa[kind]\flags)
        ipv6svcRaError[kind]=rc
@@ -111,6 +242,7 @@ Procedure.i IPv6ServiceInput(kind.i,frame.i,bytes.i,out.i,capacity.i)
        If ipv6svcRa[kind]\reachable>0 And ipv6svcRa[kind]\reachable<=3600000 : ipv6svcReachable[kind]=ipv6svcRa[kind]\reachable : EndIf
        If ipv6svcRa[kind]\retransmit<>0 : ipv6svcRetransmit[kind]=ipv6svcRa[kind]\retransmit : EndIf
        If ipv6svcRa[kind]\mtu<>0 : ipv6svcMtu[kind]=ipv6svcRa[kind]\mtu : EndIf
+       ipv6svc_ApplyPrefixes(kind,now)
       Else
        ipv6svcRaError[kind]=rc
       EndIf
@@ -126,7 +258,19 @@ Procedure.i IPv6ServiceInput(kind.i,frame.i,bytes.i,out.i,capacity.i)
    delay=ipv6svc_Delay(query\maxDelay) : If delay<0 : ProcedureReturn delay : EndIf
   EndIf
  EndIf
- ProcedureReturn IPv6HostInput(@ipv6svcHost[kind],ipv6svcEpoch[kind],now,frame,bytes,out,capacity,delay)
+ rc=IPv6HostInput(@ipv6svcHost[kind],ipv6svcEpoch[kind],now,frame,bytes,out,capacity,delay)
+ If ipv6svcHost[kind]\phase<>#IPV6_HOST_READY
+  ipv6svc_DiscardAddresses(kind) : ProcedureReturn rc
+ EndIf
+ If rc<>0 : ProcedureReturn rc : EndIf
+ For i=0 To #IPV6_SERVICE_ADDRESSES-1
+  slot=kind*#IPV6_SERVICE_ADDRESSES+i
+  If ipv6svcOwnerUsed[slot]<>0
+   rc=IPv6AddressOwnerInput(@ipv6svcOwner[slot],ipv6svcOwner[slot]\generation,now,frame,bytes,out,capacity)
+   If rc<>0 : ProcedureReturn rc : EndIf
+  EndIf
+ Next
+ ProcedureReturn 0
 EndProcedure
 Procedure IPv6ServiceTick()
  Define kind.i,now.i,generation.i,mac.i,p.i,i.i,rc.i,n.i,delay.i,token.i
@@ -138,6 +282,7 @@ Procedure IPv6ServiceTick()
  generation=ipv6svcGeneration(kind)
  If generation<=0
   ipv6svcState[kind]=0 : ipv6svcPhysical[kind]=0 : ipv6svcReceipt[kind]=0
+  ipv6svc_DiscardAddresses(kind)
   ipv6svcBusy=0 : ProcedureReturn
  EndIf
  If generation<>ipv6svcPhysical[kind]
@@ -148,6 +293,8 @@ Procedure IPv6ServiceTick()
   ipv6svcRsSent[kind]=0 : ipv6svcRsRouterSeen[kind]=0
   ipv6svcHop[kind]=64 : ipv6svcReachable[kind]=30000 : ipv6svcRetransmit[kind]=1000 : ipv6svcMtu[kind]=HwLinkTxMax(kind)-14
   rc=IPv6DefaultRoutersInit(@ipv6svcRouters[kind],ipv6svcEpoch[kind],@ipv6svcRouterRows[kind*128],4,now)
+  rc=IPv6PrefixListInit(@ipv6svcOnLink[kind],ipv6svcEpoch[kind],@ipv6svcOnLinkRows[kind*#IPV6_SERVICE_PREFIXES],#IPV6_SERVICE_PREFIXES,now)
+  ipv6svc_DiscardAddresses(kind) : ipv6svcAddressError[kind]=0
   mac=HwLinkMacPtr(kind) : p=@ipv6svcAddresses[kind*16]
   If mac=0
    ipv6svcState[kind]=-1 : ipv6svcError[kind]=-800
@@ -202,8 +349,21 @@ Procedure IPv6ServiceTick()
    EndIf
   EndIf
  EndIf
- If ipv6svcState[kind]=2 : ipv6svc_DiscoveryTick(kind,now) : EndIf
+ If ipv6svcState[kind]=2
+  ipv6svc_AddressTick(kind,now)
+  ipv6svc_DiscoveryTick(kind,now)
+ ElseIf ipv6svcState[kind]<0
+  ipv6svc_DiscardAddresses(kind)
+ EndIf
  ipv6svcBusy=0
+EndProcedure
+Procedure.i IPv6ServiceAddressStatus(kind.i,index.i)
+ Define slot.i
+ If kind<1 Or kind>=#NET_IF_KINDS Or index<0 Or index>=#IPV6_SERVICE_ADDRESSES : ProcedureReturn -800 : EndIf
+ If ipv6svcState[kind]<>2 Or ipv6svcHost[kind]\phase<>#IPV6_HOST_READY : ProcedureReturn 0 : EndIf
+ slot=kind*#IPV6_SERVICE_ADDRESSES+index
+ If ipv6svcOwnerUsed[slot]=0 : ProcedureReturn 0 : EndIf
+ ProcedureReturn IPv6AddressOwnerStatus(@ipv6svcOwner[slot],ipv6svcOwner[slot]\generation,ipv6svc_Now())
 EndProcedure
 Procedure.i IPv6ServiceBind(generation.i,prepare.i)
  If generation=0 Or prepare=0 Or ipv6svcGeneration<>0 : ProcedureReturn -800 : EndIf
