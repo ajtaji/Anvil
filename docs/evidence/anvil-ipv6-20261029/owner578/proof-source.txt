@@ -1,0 +1,150 @@
+XIncludeFile "RaspberryPi4/Lib/mmu.pi4"
+XIncludeFile "Anvil/Network/ipv6_neighbor.pbi"
+XIncludeFile "Anvil/Network/ipv6_endpoint.pbi"
+XIncludeFile "Anvil/Network/ipv6_slaac.pbi"
+XIncludeFile "Anvil/Network/ipv6_address_owner.pbi"
+
+Global owner.IPv6AddressOwner
+Global Dim output.a[1514]
+Procedure Save(index.i,rc.i)
+ Define p.i,i.i
+ p=$E1C00100+index*2048
+ PokeI(p,rc) : PokeI(p+8,owner\generation) : PokeI(p+16,owner\serial) : PokeI(p+24,owner\awaiting)
+ PokeI(p+32,owner\endpointGeneration) : PokeI(p+40,owner\endpoint\state)
+ PokeI(p+48,owner\lifetime\validUntil) : PokeI(p+56,owner\lifetime\preferredUntil)
+ For i=0 To 1513 : PokeA(p+64+i,output[i]) : Next
+EndProcedure
+Procedure.i Main()
+ Define rc.i,i.i
+ For i=0 To 131071 : PokeA($E1C00000+i,$A5) : Next
+ PokeI($E1C00000,$4F574E52)
+ MmuClearNc() : rc=MmuBuildTables($4F80000) : If rc<>0 : ProcedureReturn 2 : EndIf
+ MmuEnableCached()
+ For i=0 To 1513 : output[i]=$A5 : Next
+rc=IPv6AddressOwnerInit(@owner,1,?Prefix,?LinkLocal,?Group,?Mac,0)
+ Save(0,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+rc=IPv6AddressOwnerApply(@owner,1,0,4,2,0,50,1000)
+ Save(1,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+rc=IPv6AddressOwnerStep(@owner,1,49,@output[0],1514)
+ Save(2,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+rc=IPv6AddressOwnerStep(@owner,1,50,@output[0],1514)
+ Save(3,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+rc=IPv6AddressOwnerStep(@owner,1,1000,@output[0],1514)
+ Save(4,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+rc=IPv6AddressOwnerSent(@owner,1,1000,1,1)
+ Save(5,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+rc=IPv6AddressOwnerStep(@owner,1,1999,@output[0],1514)
+ Save(6,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+rc=IPv6AddressOwnerStep(@owner,1,2000,@output[0],1514)
+ Save(7,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+rc=IPv6AddressOwnerStatus(@owner,1,2000)
+ Save(8,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+rc=IPv6AddressOwnerInput(@owner,1,2001,?V0,75,@output[0],1514)
+ Save(9,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+rc=IPv6AddressOwnerStatus(@owner,1,4000)
+ Save(10,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+rc=IPv6AddressOwnerSent(@owner,1,4001,1,1)
+ Save(11,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+rc=IPv6AddressOwnerApply(@owner,1,4002,10,10,0,0,1000)
+ Save(12,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+rc=IPv6AddressOwnerStep(@owner,1,4002,@output[0],1514)
+ Save(13,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+rc=IPv6AddressOwnerSent(@owner,1,4003,1,1)
+ Save(14,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+rc=IPv6AddressOwnerInput(@owner,1,4004,?V1,78,@output[0],1514)
+ Save(15,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+rc=IPv6AddressOwnerSent(@owner,1,4005,2,1)
+ Save(16,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+rc=IPv6AddressOwnerApply(@owner,1,4006,100,50,0,0,1000)
+ Save(17,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+rc=IPv6AddressOwnerStatus(@owner,1,4006)
+ Save(18,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+rc=IPv6AddressOwnerInit(@owner,2,?Prefix,?LinkLocal,?Group,?Mac,0)
+ Save(19,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+rc=IPv6AddressOwnerApply(@owner,2,0,1,1,0,0,1000)
+ Save(20,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+rc=IPv6AddressOwnerStep(@owner,2,0,@output[0],1514)
+ Save(21,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+rc=IPv6AddressOwnerStatus(@owner,2,1000)
+ Save(22,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+rc=IPv6AddressOwnerSent(@owner,2,1001,1,1)
+ Save(23,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+rc=IPv6AddressOwnerApply(@owner,2,1002,10,10,0,0,1000)
+ Save(24,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+rc=IPv6AddressOwnerStep(@owner,2,1002,@output[0],1514)
+ Save(25,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+rc=IPv6AddressOwnerSent(@owner,2,1003,2,0)
+ Save(26,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+rc=IPv6AddressOwnerStep(@owner,2,1004,@output[0],1514)
+ Save(27,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+rc=IPv6AddressOwnerSent(@owner,2,1005,3,-9)
+ Save(28,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+rc=IPv6AddressOwnerStatus(@owner,2,1006)
+ Save(29,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+rc=IPv6AddressOwnerStatus(@owner,1,1006)
+ Save(30,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+rc=IPv6AddressOwnerInit(@owner,3,?Prefix,?LinkLocal,?WrongGroup,?Mac,0)
+ Save(31,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+rc=IPv6AddressOwnerStep(@owner,2,1007,@owner,1514)
+ Save(32,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+rc=IPv6AddressOwnerStatus(@owner,2,999)
+ Save(33,rc)
+ PokeI($E1C00008,34)
+ MmuDisableCachedFlushed()
+ ProcedureReturn 0
+EndProcedure
+DataSection
+Prefix:
+ Data.a 32,1,13,184,0,1,0,2,0,0,0,0,0,0,0,0
+LinkLocal:
+ Data.a 254,128,0,0,0,0,0,0,0,0,0,0,0,0,18,52
+Group:
+ Data.a 255,2,0,0,0,0,0,0,0,0,0,1,255,0,18,52
+Mac:
+ Data.a 2,1,2,3,4,5
+WrongGroup:
+ Data.a 255,2,0,0,0,0,0,0,0,0,0,1,255,0,85,85
+V0:
+ Data.a 2,1,2,3,4,5,2,9,8,7,6,5,134,221,96,0,0,0,0,21,58,64,254,128
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,86,120,32,1,13,184,0,1,0,2,0,0
+ Data.a 0,0,0,0,18,52,128,0,10,111,0,7,0,9,111,119,110,101,100,32,97,100,100,114
+ Data.a 101,115,115
+V1:
+ Data.a 51,51,255,0,18,52,2,9,8,7,6,5,134,221,96,0,0,0,0,24,58,255,0,0
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,0,0,255,2,0,0,0,0,0,0,0,0
+ Data.a 0,1,255,0,18,52,135,0,40,132,0,0,0,0,32,1,13,184,0,1,0,2,0,0
+ Data.a 0,0,0,0,18,52
+EndDataSection

@@ -1423,3 +1423,24 @@ arguments. Exact table bytes and guards were checked. The payload returned
 normally and cores, fonts and Vulkan remained healthy. This policy is ready for
 resident integration; the installed service still reports latest-prefix snapshots
 and does not yet assign routed IPv6 addresses or open IPv6 web connections.
+
+
+## SLAAC address ownership and duplicate-address detection
+
+`Anvil/Network/ipv6_address_owner.pbi` combines shared SLAAC lifetime policy
+with duplicate-address detection. A new address remains tentative until its
+probe is confirmed sent and the DAD interval completes. Expiry, duplicate
+conflicts and link generations invalidate pending receipts; late completions
+cannot revive an address. Deprecated addresses retain receive service until
+valid lifetime expires. Refreshing a duplicate does not make it usable.
+
+The caller must keep link-local ownership and membership ready. This owner
+copies its IID and verifies the exact solicited-node group, permitting reuse
+of the existing membership only while that prerequisite holds. Independent
+on-link routing policy remains separate.
+
+All 34 physical Pi CPU cases passed on installed Anvil 447, including exact
+DAD and echo packets, pending/failed/retried receipts, lifetime transitions,
+conflicts, stale generations, buffer overlap and clock validation. The payload
+returned normally; cores, fonts and Vulkan remained healthy. This is shared
+library qualification, not yet resident address assignment or IPv6 web traffic.
