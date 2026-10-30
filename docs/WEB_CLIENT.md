@@ -2574,3 +2574,33 @@ Evidence: `docs/evidence/anvil-ipv6-20261030/http2-frame483`.
 This is a frame foundation, not an HTTP/2 request engine: payload semantics,
 SETTINGS application, HPACK, continuation ordering, stream state and flow control
 remain connection-layer work. Existing HTTP/1 requests are unchanged.
+
+### Explicit protocol negotiation through the web transport
+
+`WebTransportOpenAlpn(connection, protocols, bytes)` adds opt-in ALPN using
+owned TLS offer storage; `WebTransportAlpn(connection, destination, capacity)`
+reads the selected opaque protocol without advancing network work. The legacy
+`WebTransportOpen` continues to offer nothing. Protocol-aware callers must check
+the negotiated value before sending bytes in that protocol. No HTTP/1 client
+call opts into h2 implicitly.
+
+Payload binding requires ABI minor 13 and at least 92 entries for the optional
+ALPN pair. Older tables still bind for existing operations; an explicit ALPN
+request/getter returns the unsupported-service error. Kernel binding calls the
+same TLS owner directly. A missing connection, missing host, invalid offer span
+or nonempty offer on plaintext is refused before opening a connection.
+
+On the physical Pi 4 running 483, overlapping verified h2 and http/1.1
+connections passed through these transport APIs after their caller offer buffer
+was overwritten. Pending selection, short-buffer canaries, close/stale selection,
+legacy no-offer behavior and older-table rebinding/refusal passed. A rebuilt
+HTTP/1 HTTPS gzip/deflate and preparation-cancellation regression also passed.
+Captures 139 and 140 returned zero with healthy cores, fonts and Vulkan, watchdog
+off, and the temporary DNS override removed. Pi 4 monitor 484 and Pi 3 monitor
+98 compile; those new monitor images were not installed. Payload-side testing
+uses the already installed 483 TLS ABI. Evidence:
+`docs/evidence/anvil-ipv6-20261030/web-alpn483`.
+
+HTTP/2 payload handling, HPACK, continuation sequencing, stream state and flow
+control remain unfinished. Negotiation and frame helpers do not by themselves
+constitute HTTP/2 request support.

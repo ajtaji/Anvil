@@ -22,6 +22,7 @@ Global *webpDns,*webpOpen,*webpState,*webpSend,*webpRecv,*webpClose
 Global *webpTlsOpen,*webpTlsState,*webpTlsSend,*webpTlsRecv,*webpTlsClose
 Global *webpService
 Global *webpOpen6,*webpDns6,*webpTime
+Global *webpTlsOpenAlpn,*webpTlsAlpn
 Global webpBound.i
 
 Procedure.i webpWord(table.i,offset.i)
@@ -31,6 +32,7 @@ EndProcedure
 Procedure.i WebPayloadBind(table.i)
   webpBound=0
   *webpOpen6=0 : *webpDns6=0 : *webpTime=0
+  *webpTlsOpenAlpn=0 : *webpTlsAlpn=0
   If table=0 : ProcedureReturn -109 : EndIf
   If webpWord(table,0)<>$53564E41 Or webpWord(table,4)<>1 Or webpWord(table,8)<6 Or webpWord(table,12)<88 : ProcedureReturn -109 : EndIf
   *webpDns=PeekI(table+16+75*8)
@@ -43,6 +45,9 @@ Procedure.i WebPayloadBind(table.i)
   *webpTlsState=PeekI(table+16+87*8)
   If webpWord(table,8)>=11 And webpWord(table,12)>=89 : *webpOpen6=PeekI(table+16+88*8) : EndIf
   If webpWord(table,8)>=12 And webpWord(table,12)>=90 : *webpDns6=PeekI(table+16+89*8) : EndIf
+  If webpWord(table,8)>=13 And webpWord(table,12)>=92
+    *webpTlsOpenAlpn=PeekI(table+16+90*8) : *webpTlsAlpn=PeekI(table+16+91*8)
+  EndIf
   If *webpTime=0 Or *webpDns=0 Or *webpOpen=0 Or *webpSend=0 Or *webpRecv=0 Or *webpClose=0 Or *webpTlsOpen=0 Or *webpTlsSend=0 Or *webpTlsRecv=0 Or *webpTlsClose=0 Or *webpState=0 Or *webpService=0 Or *webpTlsState=0 : ProcedureReturn -109 : EndIf
   webpBound=1 : ProcedureReturn 0
 EndProcedure
@@ -54,9 +59,12 @@ EndProcedure
 
 CompilerEndIf
 
-Procedure.i WebTransportOpen(*c.WebConnection)
+Procedure.i webtOpen(*c.WebConnection,protocols.i,bytes.i)
   Define literal.IPv6AddressStorage
   Define n.i,rc.i
+  If *c=0 : ProcedureReturn -102 : EndIf
+  If *c\host=0 Or bytes<0 Or bytes>256 Or (bytes>0 And protocols=0) : ProcedureReturn -102 : EndIf
+  If bytes>0 And *c\secure=0 : ProcedureReturn -102 : EndIf
   *c\handle=0 : *c\address=0
   For n=0 To SizeOf(TcpDial)-1 : PokeA(@*c\dial+n,0) : Next
   If PeekA(*c\host)=91
@@ -81,9 +89,18 @@ Procedure.i WebTransportOpen(*c.WebConnection)
   CompilerEndIf
   If *c\secure
   CompilerIf #WEB_KERNEL_BINDING=1
-    *c\handle=TlsClientOpen(*c\host,*c\port)
+    If bytes>0
+      *c\handle=TlsClientOpenAlpn(*c\host,*c\port,protocols,bytes)
+    Else
+      *c\handle=TlsClientOpen(*c\host,*c\port)
+    EndIf
   CompilerElse
-    *c\handle=webpTlsOpen(*c\host,*c\port)
+    If bytes>0
+      If *webpTlsOpenAlpn=0 : ProcedureReturn -109 : EndIf
+      *c\handle=webpTlsOpenAlpn(*c\host,*c\port,protocols,bytes)
+    Else
+      *c\handle=webpTlsOpen(*c\host,*c\port)
+    EndIf
   CompilerEndIf
     If *c\handle<0 : ProcedureReturn *c\handle : EndIf
   EndIf
@@ -98,6 +115,28 @@ Procedure.i WebTransportOpen(*c.WebConnection)
   CompilerEndIf
   EndIf
   ProcedureReturn 0
+EndProcedure
+
+; Legacy callers retain no-offer behavior. Only a protocol-aware caller opts in.
+Procedure.i WebTransportOpen(*c.WebConnection)
+  ProcedureReturn webtOpen(*c,0,0)
+EndProcedure
+
+Procedure.i WebTransportOpenAlpn(*c.WebConnection,protocols.i,bytes.i)
+  ProcedureReturn webtOpen(*c,protocols,bytes)
+EndProcedure
+
+; Returns opaque selected bytes, zero for no selection, or a service error.
+; Does not advance the handshake. Service/State retain progress ownership.
+Procedure.i WebTransportAlpn(*c.WebConnection,destination.i,capacity.i)
+  If *c=0 : ProcedureReturn -102 : EndIf
+  If *c\secure=0 : ProcedureReturn -102 : EndIf
+  CompilerIf #WEB_KERNEL_BINDING=1
+    ProcedureReturn TlsClientAlpn(*c\handle,destination,capacity)
+  CompilerElse
+    If webpBound=0 Or *webpTlsAlpn=0 : ProcedureReturn -109 : EndIf
+    ProcedureReturn webpTlsAlpn(*c\handle,destination,capacity)
+  CompilerEndIf
 EndProcedure
 
 Procedure.i WebTransportState(*c.WebConnection)
