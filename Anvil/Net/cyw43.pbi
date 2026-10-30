@@ -6767,6 +6767,14 @@ Procedure.i cyw43_Poll(wantId.i, wantEvent.i, timeoutMs.i, context.i)
       ; Keep the request synchronous. The queue metadata records that this
       ; ordinary frame's sequence and credit were already accounted here.
     EndIf
+    ; Credit waits have no ioctl id or requested event to satisfy. A received
+    ; header may reopen the TX window: return after retaining its data rather
+    ; than waiting out the entire credit timeout with permission already here.
+    If context = #CYW43_POLL_CREDIT
+      If cyw43_DataCreditReady() <> 0
+        ProcedureReturn #CYW43_IO_OK
+      EndIf
+    EndIf
     If r = 6
       ; A finite, fully validated aggregate is now retained. Inspect its head
       ; before applying the caller's wall-clock deadline.

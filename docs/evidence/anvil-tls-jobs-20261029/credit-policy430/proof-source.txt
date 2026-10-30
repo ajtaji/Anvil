@@ -1,0 +1,166 @@
+XIncludeFile "RaspberryPi4/Lib/mmu.pi4"
+#CYW43_CHAN_EVENT=1
+#CYW43_IO_OK=0
+#CYW43_IO_TIMEOUT=-1
+#CYW43_IO_BADFRAME=-4
+#CYW43_TR_POLL_ENTER=20
+#CYW43_TR_POLL_TIMEOUT=21
+#CYW43_POLL_CREDIT=2
+#CYW43_POLL_EVENT=3
+
+Global cyw43_hz.i=1000,cyw43_rxqCount.i,cyw43_rxFrameLen.i=4
+Global cyw43_rxDataPollCredit.i,cyw43_rxDataPollEvent.i,cyw43_rxDataPollControl.i
+Global cyw43_credit.i,cyw43_seq.i
+Global Dim cyw43_rx.a[4]
+Global fakeClock.i,fakeRx.i,fakeCredit.i,fakePushOk.i,reads.i,pushes.i
+Global wtable.i
+Global *pet
+Procedure.i cyw43_Ticks()
+ fakeClock=fakeClock+1 : ProcedureReturn fakeClock
+EndProcedure
+Procedure cyw43_TraceIo(code.i)
+EndProcedure
+Procedure.i cyw43_RxqHeadChannel()
+ ProcedureReturn 2
+EndProcedure
+Procedure.i cyw43_RxqCanPoll()
+ ProcedureReturn 1
+EndProcedure
+Procedure.i cyw43_RxFrame(want.i,queued.i)
+ reads=reads+1 : cyw43_credit=fakeCredit : ProcedureReturn fakeRx
+EndProcedure
+Procedure.i cyw43_RxqPush(data.i,n.i,a.i,b.i)
+ pushes=pushes+1
+ If fakePushOk<>0 : cyw43_rxqCount=cyw43_rxqCount+1 : EndIf
+ ProcedureReturn fakePushOk
+EndProcedure
+Procedure.i cyw43_DataCreditReady()
+  Define available.i
+  available = (cyw43_credit - cyw43_seq) & $FF
+  ProcedureReturn Bool(available <> 0 And available < $80)
+EndProcedure
+Procedure.i cyw43_Poll(wantId.i, wantEvent.i, timeoutMs.i, context.i)
+  Define t0.i
+  Define budget.i
+  Define r.i
+
+  budget = (cyw43_hz / 1000) * timeoutMs
+  If budget < 1
+    budget = 1
+  EndIf
+  t0 = cyw43_Ticks()
+
+  cyw43_TraceIo(#CYW43_TR_POLL_ENTER)
+
+  Repeat
+    ; Retained events may satisfy this wait and are dispatched in wire order.
+    ; Data remains queued for the top-level network consumer. While one full
+    ; maximum aggregate still fits, continue reading F2 so unrelated data in
+    ; front of a synchronous ioctl reply cannot turn that request into a
+    ; failure/resend with a different id.
+    If cyw43_rxqCount > 0
+      If cyw43_RxqHeadChannel() = #CYW43_CHAN_EVENT
+        r = cyw43_RxFrame(wantId, 1)
+      ElseIf cyw43_RxqCanPoll() <> 0
+        r = cyw43_RxFrame(wantId, 0)
+      Else
+        ProcedureReturn #CYW43_IO_BADFRAME
+      EndIf
+    Else
+      r = cyw43_RxFrame(wantId, 0)
+    EndIf
+    If r = -1
+      ProcedureReturn #CYW43_IO_BADFRAME
+    EndIf
+    If r = 1
+      ProcedureReturn #CYW43_IO_OK
+    EndIf
+    If r = 2 And wantEvent <> 0
+      ProcedureReturn 2
+    EndIf
+    If r = 5
+      If cyw43_RxqPush(@cyw43_rx[0], cyw43_rxFrameLen, 1, 1) = 0
+        ProcedureReturn #CYW43_IO_BADFRAME
+      EndIf
+      If context = #CYW43_POLL_CREDIT
+        cyw43_rxDataPollCredit = cyw43_rxDataPollCredit + 1
+      ElseIf context = #CYW43_POLL_EVENT
+        cyw43_rxDataPollEvent = cyw43_rxDataPollEvent + 1
+      Else
+        cyw43_rxDataPollControl = cyw43_rxDataPollControl + 1
+      EndIf
+      ; Keep the request synchronous. The queue metadata records that this
+      ; ordinary frame's sequence and credit were already accounted here.
+    EndIf
+    ; Credit waits have no ioctl id or requested event to satisfy. A received
+    ; header may reopen the TX window: return after retaining its data rather
+    ; than waiting out the entire credit timeout with permission already here.
+    If context = #CYW43_POLL_CREDIT
+      If cyw43_DataCreditReady() <> 0
+        ProcedureReturn #CYW43_IO_OK
+      EndIf
+    EndIf
+    If r = 6
+      ; A finite, fully validated aggregate is now retained. Inspect its head
+      ; before applying the caller's wall-clock deadline.
+      Continue
+    EndIf
+    If (cyw43_Ticks() - t0) > budget
+      cyw43_TraceIo(#CYW43_TR_POLL_TIMEOUT)
+      ProcedureReturn #CYW43_IO_TIMEOUT
+    EndIf
+  ForEver
+EndProcedure
+
+Procedure CaptureTable()
+ ASM
+ adrp x1, global_wtable
+ add x1, x1, #:lo12:global_wtable
+ str x0, [x1]
+ EndASM
+EndProcedure
+Procedure CreditFixture(index.i,row.i)
+ Define rc.i,p.i
+ fakeClock=0 : reads=0 : pushes=0 : cyw43_rxqCount=0
+ cyw43_rxDataPollCredit=0 : cyw43_rxDataPollEvent=0 : cyw43_rxDataPollControl=0
+ fakeRx=PeekI(row+16) : cyw43_seq=PeekI(row+24) : fakeCredit=PeekI(row+32) : fakePushOk=PeekI(row+40)
+ cyw43_credit=cyw43_seq
+ rc=cyw43_Poll(-1,PeekI(row+8),3,PeekI(row))
+ p=$E1C00100+index*64
+ PokeI(p,rc) : PokeI(p+8,reads) : PokeI(p+16,pushes)
+ PokeI(p+24,cyw43_rxDataPollCredit) : PokeI(p+32,cyw43_rxDataPollEvent) : PokeI(p+40,cyw43_rxDataPollControl)
+ pet()
+EndProcedure
+Procedure.i Main()
+ Define i.i,rc.i
+ CaptureTable()
+ For i=0 To 65535 : PokeA($E1C00000+i,0) : Next
+ PokeI($E1C00000,$43524431)
+ pet=PeekI(wtable+16+6*8)
+ MmuClearNc() : MmuAddNc($08A00000,$09200000) : MmuAddNc($08100000,$08180000)
+ rc=MmuBuildTables($4F80000) : If rc<>0 : ProcedureReturn 2 : EndIf
+ MmuEnableCached()
+ For i=0 To 13
+ CreditFixture(i,?CreditVectors+i*48)
+ Next
+ PokeI($E1C00008,14)
+ MmuDisableCachedFlushed()
+ ProcedureReturn 0
+EndProcedure
+DataSection
+CreditVectors:
+ Data.q 2,0,0,0,1,1
+ Data.q 2,0,0,255,0,1
+ Data.q 2,0,0,7,7,1
+ Data.q 2,0,0,8,7,1
+ Data.q 2,0,0,0,128,1
+ Data.q 2,0,5,9,10,1
+ Data.q 2,0,5,9,10,0
+ Data.q 2,0,-1,9,10,1
+ Data.q 2,0,6,255,0,1
+ Data.q 2,1,2,0,1,1
+ Data.q 0,0,1,0,0,1
+ Data.q 0,0,0,0,1,1
+ Data.q 0,0,5,0,1,1
+ Data.q 3,0,5,0,1,1
+EndDataSection

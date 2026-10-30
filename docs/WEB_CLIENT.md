@@ -670,3 +670,15 @@ image passed full-hash verification and startup health checks. Its following
 TLS/storage diagnostic stopped in read-only network preflight before upload:
 the console returned part of `net`, then no completed reply after recovery.
 No 429 TLS diagnostic result is claimed.
+
+
+The shared CYW43 credit-poll loop had no success condition for a newly opened
+TX window: its wait used no ioctl id and requested no event, so receiving
+permission to transmit could still leave it polling until the 100 ms timeout.
+Build 430 adds the credit-ready exit after retaining received data and before
+continuing an aggregate. Malformed frames and queue failures still take
+precedence. Control/event waits retain their existing completion rules.
+The full image and a 14-case controlled-RX policy fixture compile, but neither
+has run on the Pi; build 430 is not installed. No measured latency reduction
+or fix for the console outage is claimed. Waiting when credits remain absent
+and synchronous low-level transfers are still separate blocking work.
