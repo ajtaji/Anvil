@@ -1364,3 +1364,36 @@ equal-rank rotation, generation reset and invalid argument preservation. Exact
 router slots, revisions and output guards were checked. The payload returned
 normally, with healthy cores, fonts and Vulkan. This policy is not yet wired to
 resident RA input or outbound IPv6 connections.
+
+
+## Resident router discovery on Wi-Fi
+
+Installed Anvil 447 integrates RA copy-out and the four-entry default-router
+list into the shared resident IPv6 service. Once link-local DAD succeeds, the
+service sends a randomized Router Solicitation and tracks its driver receipt.
+Unanswered solicitations are spaced at least four seconds after confirmed
+completion, with at most three confirmed sends. A valid RA with nonzero router
+lifetime stops further sends after at least one solicitation has completed;
+zero-lifetime advertisements do not stop discovery. A generation change clears
+pending receipts and learned state. Control frames use the existing tracked
+link queue, without recursive receive pumping.
+
+Valid live RAs update independent default-router lifetimes and nonzero hop,
+reachability, retransmit and MTU configuration. The latest prefix records are
+copied into owned storage for subsequent address-management integration. They
+are diagnostic snapshots, not a complete installed prefix list. `net` now
+reports RA count, errors, confirmed solicitations, live default routers and
+whether address configuration remains pending.
+
+On the physical Pi 4, the final image was hash-verified after a 90-second boot
+interval. The service confirmed one solicitation and learned the LAN's IPv6
+default router and an advertised prefix. IPv4 console, cores, fonts and Vulkan
+remained healthy. Build 446 first demonstrated live RA reception; build 447
+corrected zero-lifetime/early-advertisement solicitation stopping and added the
+confirmed-send diagnostic. Pi 3 build 63 compiles the final shared composition,
+but activation still awaits its resident entropy provider. Pi 4/5 share the
+active CYW43 composition; other link adapters remain unfinished.
+
+This establishes live router discovery, not routed web access. Prefix-table
+union, global-address DAD/membership, neighbor-cache ownership and IPv6 TCP/DNS
+integration remain required. The existing TLS and HTTP/2-3 gaps remain open.
