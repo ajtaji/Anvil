@@ -66,6 +66,8 @@ def build(compiler,out):
  add('wrong joined group refused','rc=IPv6AddressOwnerInit(@owner,3,?Prefix,?LinkLocal,?WrongGroup,?Mac,0)',-860)
  add('whole owner output alias refused','rc=IPv6AddressOwnerStep(@owner,2,1007,@owner,1514)',-860)
  add('backwards clock refused',status(999,2),-860)
+ add('SLAAC clock ceiling refused',status(0x7ffff00000000001,2),-860)
+ add('initial clock ceiling refused','rc=IPv6AddressOwnerInit(@owner,3,?Prefix,?LinkLocal,?Group,?Mac,$7FFFF00000000001)',-860)
  s='XIncludeFile "RaspberryPi4/Lib/mmu.pi4"\nXIncludeFile "Anvil/Network/ipv6_neighbor.pbi"\nXIncludeFile "Anvil/Network/ipv6_endpoint.pbi"\nXIncludeFile "Anvil/Network/ipv6_slaac.pbi"\nXIncludeFile "Anvil/Network/ipv6_address_owner.pbi"\n'+r'''
 Global owner.IPv6AddressOwner
 Global Dim output.a[1514]

@@ -23,7 +23,7 @@ EndProcedure
 Procedure.i ipv6owner_Valid(*s.IPv6AddressOwner,generation.i,now.i)
  If ipv6owner_Span(*s,SizeOf(IPv6AddressOwner))=0 : ProcedureReturn #IPV6_OWNER_ARGUMENT : EndIf
  If generation<=0 Or generation<>*s\generation : ProcedureReturn #IPV6_OWNER_STALE : EndIf
- If now<0 Or now>$7FFFFFFEFFFFFFFF Or now<*s\lifetime\lastNow : ProcedureReturn #IPV6_OWNER_ARGUMENT : EndIf
+ If now<0 Or now>$7FFFF00000000000 Or now<*s\lifetime\lastNow : ProcedureReturn #IPV6_OWNER_ARGUMENT : EndIf
  ProcedureReturn 0
 EndProcedure
 Procedure.i IPv6AddressOwnerInit(*s.IPv6AddressOwner,generation.i,prefix.i,linklocal.i,joinedGroup.i,mac.i,now.i)
@@ -31,7 +31,7 @@ Procedure.i IPv6AddressOwnerInit(*s.IPv6AddressOwner,generation.i,prefix.i,linkl
  Define rc.i,i.i,nonzero.i
  If ipv6owner_Span(*s,SizeOf(IPv6AddressOwner))=0 : ProcedureReturn #IPV6_OWNER_ARGUMENT : EndIf
  If generation<=0 Or generation<=*s\generation : ProcedureReturn #IPV6_OWNER_STALE : EndIf
- If now<0 Or now>$7FFFFFFEFFFFFFFF : ProcedureReturn #IPV6_OWNER_ARGUMENT : EndIf
+ If now<0 Or now>$7FFFF00000000000 : ProcedureReturn #IPV6_OWNER_ARGUMENT : EndIf
  If ipv6owner_Span(prefix,16)=0 Or ipv6owner_Span(linklocal,16)=0 Or ipv6owner_Span(joinedGroup,16)=0 Or ipv6owner_Span(mac,6)=0 : ProcedureReturn #IPV6_OWNER_ARGUMENT : EndIf
  If IPv6EndpointSpansSeparate(*s,SizeOf(IPv6AddressOwner),prefix,16)=0 Or IPv6EndpointSpansSeparate(*s,SizeOf(IPv6AddressOwner),linklocal,16)=0 Or IPv6EndpointSpansSeparate(*s,SizeOf(IPv6AddressOwner),joinedGroup,16)=0 Or IPv6EndpointSpansSeparate(*s,SizeOf(IPv6AddressOwner),mac,6)=0 : ProcedureReturn #IPV6_OWNER_ARGUMENT : EndIf
  If PeekA(linklocal)<>254 Or PeekA(linklocal+1)<>128 Or (PeekA(mac)&1)<>0 : ProcedureReturn #IPV6_OWNER_ARGUMENT : EndIf

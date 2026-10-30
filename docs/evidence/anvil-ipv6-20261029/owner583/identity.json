@@ -1,0 +1,543 @@
+{
+  "bytes": 58902,
+  "sha256": "fbcd52b8973d480ba80584e35e406d18f559163237fbf193d048758e33db7f09",
+  "checked_ranges": {
+    "code": [
+      "0x1000000",
+      "0x100E595"
+    ],
+    "bss": [
+      "0x1080000",
+      "0x108074F"
+    ],
+    "stack": [
+      "0x4e00000",
+      "0x4efffff"
+    ],
+    "report": [
+      "0xe1c00000",
+      "0xe1c1ffff"
+    ],
+    "tables": [
+      "0x4f80000",
+      "0x4f82fff"
+    ]
+  },
+  "source_hashes": {
+    "Anvil/Network/ipv6_address_owner.pbi": "4ff02006adb76a6c24fbc0f0bc97c4c2cd6ead8614bc97c8e818378532e3723b",
+    "Anvil/Network/ipv6_slaac.pbi": "f9be3afafd76427d2b975c5926eef6df7b90d29b4ae43cdcd7e096be97c01371",
+    "Anvil/Network/ipv6_endpoint.pbi": "12e1c5c02f75fe620d25f009aa654ec8a7b8de22bd969548f272a5ac964a0ccb",
+    "Anvil/Network/ipv6_neighbor.pbi": "b7c2facf3c44bb9a0ae7d4ead01478186bfe8bf8111c86c1c7bb68c38037ca19",
+    "Anvil/Network/ipv6_packet.pbi": "01b0621c09badc2efc3885e1ffca51248d7d713aaa0de64b1355672ab5a6abcb",
+    "Anvil/Network/ipv6_address.pbi": "4ee83accc377916dfc50432f5278156c7b4d74375fe89eae81bfc5eec0c156e4",
+    "Anvil/Network/byte_order.pbi": "d39666ab6746adf123cba3c12c17270ca6e5f72bb2c8ddcb3ff3a84245e1355d",
+    "Anvil/Network/internet_checksum.pbi": "a71f03b83d0b7f600eda23fcf9543af633bbe6b26bea6571dda9af1235e7c211",
+    "RaspberryPi4/Lib/mmu.pi4": "014b7c2092426146c8e0eb6bb8dde2fb3af26cef63e55193e49c1ca826f6435a"
+  },
+  "cases": [
+    {
+      "name": "initialize with confirmed shared group",
+      "expected": [
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "wire": ""
+    },
+    {
+      "name": "new address starts tentative",
+      "expected": [
+        1,
+        1,
+        0,
+        0,
+        1,
+        1,
+        4000,
+        2000
+      ],
+      "wire": ""
+    },
+    {
+      "name": "random delay",
+      "expected": [
+        0,
+        1,
+        0,
+        0,
+        1,
+        1,
+        4000,
+        2000
+      ],
+      "wire": ""
+    },
+    {
+      "name": "DAD frame",
+      "expected": [
+        78,
+        1,
+        1,
+        1,
+        1,
+        1,
+        4000,
+        2000
+      ],
+      "wire": "3333ff00123402010203040586dd6000000000183aff00000000000000000000000000000000ff0200000000000000000001ff001234870028840000000020010db8000100020000000000001234"
+    },
+    {
+      "name": "pending receipt does not assign",
+      "expected": [
+        0,
+        1,
+        1,
+        1,
+        1,
+        1,
+        4000,
+        2000
+      ],
+      "wire": ""
+    },
+    {
+      "name": "confirmed DAD starts full interval",
+      "expected": [
+        0,
+        1,
+        1,
+        0,
+        1,
+        1,
+        4000,
+        2000
+      ],
+      "wire": ""
+    },
+    {
+      "name": "interval not elapsed",
+      "expected": [
+        0,
+        1,
+        1,
+        0,
+        1,
+        1,
+        4000,
+        2000
+      ],
+      "wire": ""
+    },
+    {
+      "name": "DAD complete",
+      "expected": [
+        0,
+        1,
+        1,
+        0,
+        1,
+        2,
+        4000,
+        2000
+      ],
+      "wire": ""
+    },
+    {
+      "name": "preferred expiry yields deprecated",
+      "expected": [
+        3,
+        1,
+        1,
+        0,
+        1,
+        2,
+        4000,
+        2000
+      ],
+      "wire": ""
+    },
+    {
+      "name": "deprecated address still receives echo",
+      "expected": [
+        75,
+        1,
+        1,
+        0,
+        1,
+        2,
+        4000,
+        2000
+      ],
+      "wire": "02090807060502010203040586dd6000000000153a4020010db8000100020000000000001234fe8000000000000000000000000056788100096f000700096f776e65642061646472657373"
+    },
+    {
+      "name": "valid expiry removes address",
+      "expected": [
+        0,
+        1,
+        1,
+        0,
+        1,
+        0,
+        4000,
+        2000
+      ],
+      "wire": ""
+    },
+    {
+      "name": "late receipt cannot revive",
+      "expected": [
+        -861,
+        1,
+        1,
+        0,
+        1,
+        0,
+        4000,
+        2000
+      ],
+      "wire": ""
+    },
+    {
+      "name": "recreated address needs new DAD",
+      "expected": [
+        1,
+        1,
+        1,
+        0,
+        2,
+        1,
+        14002,
+        14002
+      ],
+      "wire": ""
+    },
+    {
+      "name": "new DAD token",
+      "expected": [
+        78,
+        1,
+        2,
+        2,
+        2,
+        1,
+        14002,
+        14002
+      ],
+      "wire": "3333ff00123402010203040586dd6000000000183aff00000000000000000000000000000000ff0200000000000000000001ff001234870028840000000020010db8000100020000000000001234"
+    },
+    {
+      "name": "old token refused",
+      "expected": [
+        -861,
+        1,
+        2,
+        2,
+        2,
+        1,
+        14002,
+        14002
+      ],
+      "wire": ""
+    },
+    {
+      "name": "conflict cancels pending assignment",
+      "expected": [
+        0,
+        1,
+        2,
+        0,
+        2,
+        3,
+        14002,
+        14002
+      ],
+      "wire": ""
+    },
+    {
+      "name": "late conflict receipt refused",
+      "expected": [
+        -861,
+        1,
+        2,
+        0,
+        2,
+        3,
+        14002,
+        14002
+      ],
+      "wire": ""
+    },
+    {
+      "name": "refresh cannot clear duplicate",
+      "expected": [
+        0,
+        1,
+        2,
+        0,
+        2,
+        3,
+        104006,
+        54006
+      ],
+      "wire": ""
+    },
+    {
+      "name": "duplicate status",
+      "expected": [
+        4,
+        1,
+        2,
+        0,
+        2,
+        3,
+        104006,
+        54006
+      ],
+      "wire": ""
+    },
+    {
+      "name": "new link generation resets",
+      "expected": [
+        0,
+        2,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "wire": ""
+    },
+    {
+      "name": "short lifetime",
+      "expected": [
+        1,
+        2,
+        0,
+        0,
+        1,
+        1,
+        1000,
+        1000
+      ],
+      "wire": ""
+    },
+    {
+      "name": "short lifetime pending DAD",
+      "expected": [
+        78,
+        2,
+        1,
+        1,
+        1,
+        1,
+        1000,
+        1000
+      ],
+      "wire": "3333ff00123402010203040586dd6000000000183aff00000000000000000000000000000000ff0200000000000000000001ff001234870028840000000020010db8000100020000000000001234"
+    },
+    {
+      "name": "expiry while DAD pending",
+      "expected": [
+        0,
+        2,
+        1,
+        0,
+        1,
+        0,
+        1000,
+        1000
+      ],
+      "wire": ""
+    },
+    {
+      "name": "expired receipt refused",
+      "expected": [
+        -861,
+        2,
+        1,
+        0,
+        1,
+        0,
+        1000,
+        1000
+      ],
+      "wire": ""
+    },
+    {
+      "name": "another DAD generation",
+      "expected": [
+        1,
+        2,
+        1,
+        0,
+        2,
+        1,
+        11002,
+        11002
+      ],
+      "wire": ""
+    },
+    {
+      "name": "second token",
+      "expected": [
+        78,
+        2,
+        2,
+        2,
+        2,
+        1,
+        11002,
+        11002
+      ],
+      "wire": "3333ff00123402010203040586dd6000000000183aff00000000000000000000000000000000ff0200000000000000000001ff001234870028840000000020010db8000100020000000000001234"
+    },
+    {
+      "name": "definitely unsent retry allowed",
+      "expected": [
+        0,
+        2,
+        2,
+        0,
+        2,
+        1,
+        11002,
+        11002
+      ],
+      "wire": ""
+    },
+    {
+      "name": "retry gets unique token",
+      "expected": [
+        78,
+        2,
+        3,
+        3,
+        2,
+        1,
+        11002,
+        11002
+      ],
+      "wire": "3333ff00123402010203040586dd6000000000183aff00000000000000000000000000000000ff0200000000000000000001ff001234870028840000000020010db8000100020000000000001234"
+    },
+    {
+      "name": "ambiguous transmission fails address",
+      "expected": [
+        0,
+        2,
+        3,
+        0,
+        2,
+        4,
+        11002,
+        11002
+      ],
+      "wire": ""
+    },
+    {
+      "name": "failed status",
+      "expected": [
+        5,
+        2,
+        3,
+        0,
+        2,
+        4,
+        11002,
+        11002
+      ],
+      "wire": ""
+    },
+    {
+      "name": "stale link generation refused",
+      "expected": [
+        -861,
+        2,
+        3,
+        0,
+        2,
+        4,
+        11002,
+        11002
+      ],
+      "wire": ""
+    },
+    {
+      "name": "wrong joined group refused",
+      "expected": [
+        -860,
+        2,
+        3,
+        0,
+        2,
+        4,
+        11002,
+        11002
+      ],
+      "wire": ""
+    },
+    {
+      "name": "whole owner output alias refused",
+      "expected": [
+        -860,
+        2,
+        3,
+        0,
+        2,
+        4,
+        11002,
+        11002
+      ],
+      "wire": ""
+    },
+    {
+      "name": "backwards clock refused",
+      "expected": [
+        -860,
+        2,
+        3,
+        0,
+        2,
+        4,
+        11002,
+        11002
+      ],
+      "wire": ""
+    },
+    {
+      "name": "SLAAC clock ceiling refused",
+      "expected": [
+        -860,
+        2,
+        3,
+        0,
+        2,
+        4,
+        11002,
+        11002
+      ],
+      "wire": ""
+    },
+    {
+      "name": "initial clock ceiling refused",
+      "expected": [
+        -860,
+        2,
+        3,
+        0,
+        2,
+        4,
+        11002,
+        11002
+      ],
+      "wire": ""
+    }
+  ]
+}

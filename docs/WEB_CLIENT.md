@@ -1444,3 +1444,13 @@ DAD and echo packets, pending/failed/retried receipts, lifetime transitions,
 conflicts, stale generations, buffer overlap and clock validation. The payload
 returned normally; cores, fonts and Vulkan remained healthy. This is shared
 library qualification, not yet resident address assignment or IPv6 web traffic.
+
+
+## Address-owner clock boundary
+
+The composed address owner now uses the SLAAC lifetime engine's stricter clock
+ceiling before any mutation. This prevents an out-of-range timestamp from
+being interpreted as an expired lifetime after the nested engine refuses it.
+Both initialization and existing-owner calls reject that boundary unchanged.
+All 36 physical Pi CPU cases passed on Anvil 447, including two new upper-clock
+refusal cases. The payload returned normally with cores, fonts and Vulkan healthy.
