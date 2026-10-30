@@ -578,6 +578,32 @@ EndProcedure
 ;  The check is here as well as in the backend because the ceiling is
 ;  the seam's promise and the seam is what upstream reads.
 ; ----------------------------------------------------------------------
+; Optional owned-transmit provider. -2 means this kind is not supported by
+; that provider; other results are final (1 accepted, 0 refused). Progress
+; never consumes RX frames. Console byte-stream output retains HwLinkSend's
+; synchronous contract; protocol replies use this shared submission path.
+Global *gLinkTxSubmitHook = 0
+Global *gLinkTxProgressHook = 0
+Global gLinkTxPending.i,gLinkTxCompleted.i,gLinkTxDropped.i,gLinkTxBusy.i
+
+Procedure LinkTxSetHooks(*submit, *progress)
+  *gLinkTxSubmitHook = *submit : *gLinkTxProgressHook = *progress
+EndProcedure
+
+Procedure LinkTxProgress(kind.i)
+  If *gLinkTxProgressHook <> 0 : gLinkTxProgressHook(kind) : EndIf
+EndProcedure
+
+Procedure.i LinkSendFrame(kind.i, frame.i, bytes.i)
+  Define rc.i
+  If frame=0 Or bytes<14 Or bytes>LinkTxMaxOn(kind) : ProcedureReturn 0 : EndIf
+  If *gLinkTxSubmitHook <> 0
+    rc=gLinkTxSubmitHook(kind,frame,bytes)
+    If rc<>-2 : ProcedureReturn rc : EndIf
+  EndIf
+  ProcedureReturn HwLinkSend(kind,frame,bytes,100)
+EndProcedure
+
 Procedure.i LinkTxStagedOn(kind.i)
   Define n.i
   n = NetOutLen()
@@ -592,7 +618,7 @@ Procedure.i LinkTxStagedOn(kind.i)
     gLinkTxFail = gLinkTxFail + 1
     ProcedureReturn 0
   EndIf
-  If HwLinkSend(kind, NetOutBuf(), n, 100) <> 1
+  If LinkSendFrame(kind, NetOutBuf(), n) <> 1
     gLinkTxFail = gLinkTxFail + 1
     ProcedureReturn 0
   EndIf
@@ -687,7 +713,9 @@ Procedure.i LinkPumpKind(kind.i, ms.i)
     ProcedureReturn #LINK_RX_NONE
   EndIf
 
+  LinkTxProgress(kind)
   n = HwLinkRecv(kind, @gLinkRx[0], #LINK_FRAME_MAX, ms)
+  LinkTxProgress(kind)
   If n < 14
     ; Shorter than an Ethernet header is not a frame. The wired driver
     ; already refuses those; a radio hands back the runts it was given.

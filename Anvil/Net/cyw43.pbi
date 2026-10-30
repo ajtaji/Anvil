@@ -2026,10 +2026,16 @@ EndProcedure
 ;  and discovered three procedures later, because "the chip ID reads as
 ;  zero" is a much worse symptom than "you did not wire the bus up".
 ; ======================================================================
+Global cyw43_txGeneration.i = 1
+Procedure.i Cyw43TxGeneration()
+  ProcedureReturn cyw43_txGeneration
+EndProcedure
+
 Procedure.i Cyw43SetIo(*rb, *wb, *rd, *wr)
   If cyw43_RxIrqGenerationOwned() <> 0
     ProcedureReturn cyw43_Fail(#CYW43_ERR_RXIRQ_OWNED)
   EndIf
+  cyw43_txGeneration = cyw43_txGeneration + 1
   If *rb = 0 Or *wb = 0 Or *rd = 0 Or *wr = 0
     *cyw43_rb = 0
     *cyw43_wb = 0
@@ -2688,6 +2694,7 @@ Procedure.i Cyw43Attach()
     ProcedureReturn cyw43_Fail(#CYW43_ERR_RXIRQ_OWNED)
   EndIf
 
+  cyw43_txGeneration = cyw43_txGeneration + 1
   cyw43_attached = 0
   cyw43_err = #CYW43_ERR_NONE
   cyw43_windowOk = 0
@@ -3927,6 +3934,7 @@ Procedure.i Cyw43PrepareDownload()
     ProcedureReturn cyw43_Fail(#CYW43_ERR_NOT_ATTACHED)
   EndIf
 
+  cyw43_txGeneration = cyw43_txGeneration + 1
   idx = Cyw43FindCore(#CYW43_CORE_ARM_CM3)
   If idx >= 0 And cyw43_chip = #CYW43_CHIP_43430
     ; brcmf_chip_cm3_set_passive(), downstream chip.c 1203-1221.
@@ -5804,6 +5812,7 @@ Procedure.i Cyw43TransportReset()
   If cyw43_RxIrqGenerationOwned() <> 0
     ProcedureReturn cyw43_Fail(#CYW43_ERR_RXIRQ_OWNED)
   EndIf
+  cyw43_txGeneration = cyw43_txGeneration + 1
   cyw43_seq = 0
   cyw43_credit = 1
   cyw43_reqid = 0
@@ -9429,6 +9438,7 @@ Procedure.i Cyw43JoinStart(*ssid, len.i, timeoutMs.i)
     ProcedureReturn #CYW43_IO_TOOBIG
   EndIf
 
+  cyw43_txGeneration = cyw43_txGeneration + 1
   For i = 0 To #CYW43_SSID_STRUCT - 1
     PokeB(@cyw43_arg[0] + i, 0)
   Next
@@ -10297,6 +10307,11 @@ Procedure.i cyw43_DataCreditReady()
   Define available.i
   available = (cyw43_credit - cyw43_seq) & $FF
   ProcedureReturn Bool(available <> 0 And available < $80)
+EndProcedure
+
+ ; Public non-mutating readiness query for cooperative transmit adapters.
+Procedure.i Cyw43CanSend()
+  ProcedureReturn cyw43_DataCreditReady()
 EndProcedure
 
 ; One credit check, then at most one bus transfer. This removes the credit

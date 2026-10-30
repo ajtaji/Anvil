@@ -533,7 +533,7 @@ Procedure.i netcon_SendStaged(kind.i)
     gConTxFail = gConTxFail + 1
     ProcedureReturn 0
   EndIf
-  If HwLinkSend(kind, NetOutBuf(), n, 100) <> 1
+  If LinkSendFrame(kind, NetOutBuf(), n) <> 1
     gConTxFail = gConTxFail + 1
     ProcedureReturn 0
   EndIf
@@ -1495,6 +1495,7 @@ Procedure netcon_PumpOne(kind.i)
   If NetIfRxOwner() = kind
     ProcedureReturn
   EndIf
+  LinkTxProgress(kind)
   took = 0
   While took < #LINK_RX_BUDGET
     nRx = HwLinkRecv(kind, @gConRx[0], #NETCON_RX_MAX, 0)
@@ -1516,6 +1517,7 @@ Procedure netcon_PumpOne(kind.i)
     HwLinkNoteRx(kind, rc)
     NetServiceInput(kind, p, rc)
   Wend
+  LinkTxProgress(kind)
   If took >= #LINK_RX_BUDGET
     gConRxFull = gConRxFull + 1
   EndIf

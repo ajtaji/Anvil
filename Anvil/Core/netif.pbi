@@ -148,6 +148,7 @@
 #NET_ADDR_SAVED     = 2    ; it was in the settings store
 #NET_ADDR_LINKLOCAL = 3    ; RFC 3927, picked and probed by this board
 
+Global Dim netif_generation.i[#NETIF_KINDS]
 Global Dim netif_src.i[#NETIF_KINDS]
 Global Dim netif_leaseSecs.i[#NETIF_KINDS]
 Global Dim netif_leaseAt.i[#NETIF_KINDS]
@@ -161,6 +162,11 @@ Procedure.i netif_Valid(kind.i)
     ProcedureReturn 0
   EndIf
   ProcedureReturn 1
+EndProcedure
+
+Procedure.i NetIfGeneration(kind.i)
+  If netif_Valid(kind)=0 : ProcedureReturn 0 : EndIf
+  ProcedureReturn netif_generation[kind]
 EndProcedure
 
 ; ----------------------------------------------------------------------
@@ -202,6 +208,7 @@ Procedure.i NetIfSet(kind.i, ip.i, mask.i, gw.i, src.i)
   If NetSetIPv4(kind, ip, mask, gw) = 0
     ProcedureReturn 0
   EndIf
+  netif_generation[kind] = netif_generation[kind] + 1
   netif_src[kind] = src
   ProcedureReturn 1
 EndProcedure
@@ -219,7 +226,9 @@ Procedure.i NetIfSetAlt(kind.i, ip.i, mask.i)
   If netif_Valid(kind) = 0
     ProcedureReturn 0
   EndIf
-  ProcedureReturn NetSetIPv4Alt(kind, ip, mask)
+  If NetSetIPv4Alt(kind, ip, mask)=0 : ProcedureReturn 0 : EndIf
+  netif_generation[kind] = netif_generation[kind] + 1
+  ProcedureReturn 1
 EndProcedure
 
 ; Record what a DHCP server granted, so `net` can say how much of the
@@ -257,6 +266,7 @@ Procedure NetIfClear(kind.i)
   If netif_Valid(kind) = 0
     ProcedureReturn
   EndIf
+  netif_generation[kind] = netif_generation[kind] + 1
   NetClearIPv4(kind)
   netif_src[kind] = #NET_ADDR_NONE
   netif_leaseSecs[kind] = 0
@@ -551,6 +561,7 @@ EndProcedure
 Procedure NetIfReset()
   Define k.i
   For k = 0 To #NETIF_KINDS - 1
+    netif_generation[k] = netif_generation[k] + 1
     netif_src[k] = #NET_ADDR_NONE
     netif_leaseSecs[k] = 0
     netif_leaseAt[k] = 0

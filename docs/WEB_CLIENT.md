@@ -911,3 +911,43 @@ Build 436 was installed and verified by running-image hash after the full boot
 interval. Actual Wi-Fi HTTPS gzip/deflate and cancellation tests passed, along
 with core/font/Vulkan health checks. Queue-to-driver integration, other backends'
 completion ownership, SDIO waits, IPv6 web traffic and HTTP/2-3 remain unfinished.
+
+
+## Live Wi-Fi protocol transmit queue (build 438)
+
+Protocol sends and receive-generated replies now enter the same optional shared
+submission interface. Both network pumps progress pending frames before/after
+receive work. The CYW43 provider owns copied frames and attempts one head at a
+time, without polling for credit or consuming receive traffic. Its public
+`Cyw43CanSend` query leaves unavailable-credit submissions untouched. The SDIO
+transfer itself remains synchronous.
+
+The provider is composed into both Pi 3 and Pi 4/5 board roots. Pi 3 monitor 59
+compiled successfully; physical acceptance here is on the Pi 4. Other hardware
+kinds retain their existing backend. Console text output retains its synchronous
+drain contract; protocol replies dispatched by that service use the queued path.
+
+Address, radio transport/rejoin and readiness generations invalidate old pending
+packets. Four slots provide explicit backpressure; a 100 ms packet deadline
+expires stale work without a blocking wait. Terminal bus failures retire a frame
+without replay. `net` reports pending, completed, dropped and credit-busy counts.
+These distinguish accepted submissions from completed transfers.
+
+All 26 physical adapter cases passed, including copied packet bytes, busy credit,
+FIFO order, a full queue, address/radio/down transitions, wrapping deadlines,
+backend fallback and bus failure without replay. An initial layering check
+rejected a private readiness-helper call; the public API version passed the gate
+and the physical suite. The final Pi 4 monitor is 438, with verified recovery and
+running-image hashes and healthy core/font/Vulkan checks.
+
+Actual gzip/deflate HTTPS and cancellation passed with
+119 additional queued completions
+and no added queue drops. A 32,768-byte HTTPS POST was echoed byte-for-byte by the
+server with 134 additional queued
+completions and no added drops. That run measured 727 ms overall,
+maximum step 6695 us and maximum service 3503 us;
+these are observations, not worst-case bounds.
+
+Remaining work includes SDIO/device waits, other transmit backends, synchronous
+console/storage paths, actual IPv6 web traffic and HTTP/2-3. This removes Wi-Fi
+credit polling from the integrated protocol path, not all networking blocking.

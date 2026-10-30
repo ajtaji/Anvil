@@ -49,9 +49,9 @@ StackAddress $1F00000
 ;  other two Pi 3 board files, so three programs on one board keep three
 ;  numbers and none of them moves when another is built.
 ; ----------------------------------------------------------------------
-#ANVIL_BUILD = 57 ; pmf:build
+#ANVIL_BUILD = 59 ; pmf:build
 #ANVIL_BUILD_DATE = 20261029 ; pmf:builddate
-#ANVIL_BUILD_TIME = 124506 ; pmf:buildtime
+#ANVIL_BUILD_TIME = 210404 ; pmf:buildtime
 
 ; ======================================================================
 ;  1. THIS BOARD'S LOW-LEVEL LIBRARIES.
@@ -360,6 +360,8 @@ XIncludeFile "Anvil/Core/dhcpd.pbi"
 ; Shared policy owns link selection, frame ceilings and staged sends.
 ; The Pi 3 hardware provider still exposes only its Wi-Fi interface.
 XIncludeFile "Anvil/Network/link.pbi"
+XIncludeFile "Anvil/Network/link_tx_queue.pbi"
+XIncludeFile "Anvil/Network/link_cyw_tx.pbi"
 XIncludeFile "Anvil/Core/netconsole.pbi"
 ; Pi 3 serves the shared UDP network console only; it has no TCP/HTTP
 ; listener. The shared polling boundary remains unregistered and inactive.
@@ -1268,6 +1270,7 @@ Procedure Main()
     UartDrain()
     Pi3Park()
   EndIf
+  LinkCywTxInstall()
   PrintN("Anvil starting.")
 
   ; ------------------------------------------------------------------
