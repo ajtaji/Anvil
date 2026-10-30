@@ -1,3 +1,4 @@
+XIncludeFile "Anvil/Core/dns_policy.pbi"
 XIncludeFile "Anvil/Services/wifi_maintenance.pbi"
 XIncludeFile "Anvil/Network/ipv6_address.pbi"
 ; ======================================================================
@@ -373,28 +374,9 @@ EndProcedure
 ;  DNS
 ; ======================================================================
 
-; The resolver for one interface: the one its lease named, else the
-; operator's net.dns if that address is reached through this interface.
-; The same rule ntp_service.pbi's ntps_DnsForKind applies.
+; Shared explicit-override/lease policy, also used by console DNS and NTP.
 Procedure.i paynet_DnsFor(kind.i)
-  Define ip.i
-  Define *s
-  ip = NetIfDns(kind)
-  If ip <> 0
-    ProcedureReturn ip
-  EndIf
-  *s = SettingsGet(EthKeyDns())
-  If *s = 0
-    ProcedureReturn 0
-  EndIf
-  ip = ParseDotted(*s)
-  If ip <= 0
-    ProcedureReturn 0
-  EndIf
-  If NetIfForDest(ip) <> kind
-    ProcedureReturn 0
-  EndIf
-  ProcedureReturn ip
+  ProcedureReturn NetDnsResolverFor(kind)
 EndProcedure
 
 Procedure paynet_DnsCloseListener()

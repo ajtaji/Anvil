@@ -1724,3 +1724,53 @@ still uses IPv4 for hostname resolution and IPv6 for explicit HTTP literals.
 Connecting the new resolver to automatic dual-stack HTTP/TLS, multi-address
 selection, off-link IPv6 validation, remaining TLS blocking and HTTP/2-3
 remains open.
+
+
+### Dual-family plain HTTP and explicit DNS selection
+
+The shared HTTP transport can now resolve AAAA hostnames through ABI1.12 and
+race IPv4/IPv6 connections. IPv4 starts immediately. IPv6 becomes eligible
+after 250ms or IPv4 failure; both handles are polled on every subsequent step.
+The winner closes the other handle, and cancellation closes both. Numeric IPv4
+addresses never become AAAA queries. Older ABI1.6/1.11 bindings retain IPv4
+hostname support. TLS connections retain the existing verified TLS adapter;
+this change does not add IPv6 TLS.
+
+This is an IPv4-first bounded fallback, not full RFC8305 Happy Eyeballs.
+The resident resolver still serializes uncached queries, each family currently
+provides its first answer, and the WebClient deadline bounds the exchange.
+Parallel DNS queries and complete destination ordering remain future work.
+Eighteen physical transport scenarios passed, including competing attempts,
+cleanup/cancellation, busy handles, DNS contention, older bindings, literal
+addresses, TLS delegation and timer wrap. The eight existing HTTP lifecycle
+regressions also passed.
+
+A source review found that an explicit net.dns setting was ignored whenever
+DHCP supplied a resolver. A shared Core policy now selects the explicit
+resolver on its routed interface; removing net.dns restores per-interface
+DHCP selection. Invalid or unreachable explicit values return no resolver
+instead of silently using another. Console DNS, payload DNS and NTP use this
+one policy. It affects new lookups, without changing address leases, routes,
+persisted settings or already cached/in-flight query results. Twelve physical
+policy cases passed, with lease and route inputs unchanged.
+
+On installed Pi4 build455, the real payload resolved a hostname through a
+temporarily selected public DNS resolver, opened the resulting LAN IPv6 ULA,
+and fetched HTTP200 with all20,000 expected bytes in450ms. The PC verified the
+106-byte request and exact hostname Host header, and the complete20,101-byte
+response matched its body hash. The initial run through the LAN's default
+resolver produced no usable DNS answer; it is retained as a failed result,
+not a pass. The explicit-resolver run also verified native console DNS.
+The temporary net.dns setting was removed and the PC server closed afterward.
+A separate literal-IPv6 run with the updated adapter also verified20,000 bytes.
+
+Build455 is installed and its full live image hash checked after90seconds
+of boot time. A verified453 rollback remains on the stick. Pi3build70 compiles;
+cores/fonts/Vulkan/watchdog checks passed on the Pi4. Build454 was an intermediate
+compile only. Evidence is under docs/evidence/anvil-ipv6-20261030/web455.
+
+Proven here: physical library/ABI hostname-based HTTP over LAN IPv6, with
+actual DNS and TCP traffic. Public off-link IPv6, DNS transport over IPv6,
+IPv6 TLS, complete multi-address racing, remaining TLS blocking and HTTP/2-3
+remain open. Native console HTTP command integration requires a separate
+coverage audit; a library client proof must not be treated as that audit.

@@ -4,7 +4,7 @@ import argparse,hashlib,json,os,re,subprocess
 from pmf_compiler import resolve_compiler
 def build(compiler,out,url):
  root=Path(__file__).resolve().parents[1];out.mkdir(parents=True,exist_ok=False)
- assert url.startswith('http://[') and len(url)<200 and '"' not in url
+ assert url.startswith('http://') and len(url)<200 and '"' not in url
  names=['Anvil/Network/web_client.pbi','Anvil/Network/web_transport.pbi','Anvil/Network/web_url.pbi','Anvil/Network/web_request.pbi','Anvil/Network/web_response.pbi','Anvil/Network/ipv6_address.pbi','RaspberryPi4/Lib/mmu.pi4']
  s='#WEB_KERNEL_BINDING=0\nXIncludeFile "Anvil/Network/web_client.pbi"\nXIncludeFile "RaspberryPi4/Lib/mmu.pi4"\n'+r'''
 Global url.WebUrl,request.WebRequest,response.WebResponse,client.WebClient

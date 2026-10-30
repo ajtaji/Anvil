@@ -1,3 +1,4 @@
+XIncludeFile "Anvil/Core/dns_policy.pbi"
 ; ======================================================================
 ; ntp_service.pbi - nonblocking wall-clock synchronization over IPv4.
 ;
@@ -186,16 +187,7 @@ Procedure ntps_ScheduleFailure(code.i, now.i)
 EndProcedure
 
 Procedure.i ntps_DnsForKind(kind.i)
-  Define ip.i
-  Define *s
-  ip = NetIfDns(kind)
-  If ip <> 0 : ProcedureReturn ip : EndIf
-  *s = SettingsGet(EthKeyDns())
-  If *s = 0 : ProcedureReturn 0 : EndIf
-  ip = ParseDotted(*s)
-  If ip <= 0 : ProcedureReturn 0 : EndIf
-  If NetIfForDest(ip) <> kind : ProcedureReturn 0 : EndIf
-  ProcedureReturn ip
+  ProcedureReturn NetDnsResolverFor(kind)
 EndProcedure
 
 ; Selects one request path without sending. A DHCP-provided NTP address stays

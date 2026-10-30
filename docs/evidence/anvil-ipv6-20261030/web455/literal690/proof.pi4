@@ -1,0 +1,57 @@
+#WEB_KERNEL_BINDING=0
+XIncludeFile "Anvil/Network/web_client.pbi"
+XIncludeFile "RaspberryPi4/Lib/mmu.pi4"
+
+Global url.WebUrl,request.WebRequest,response.WebResponse,client.WebClient
+Global Dim host.a[256]
+Global Dim target.a[3072]
+Global Dim headers.a[1024]
+Global Dim metadata.a[4096]
+Global Dim line.a[1024]
+Global Dim tx.a[512]
+Global Dim rx.a[512]
+Global Dim output.a[512]
+Global table.i
+Global *livePet,*liveTime
+Procedure CaptureTable()
+ ASM
+ adrp x1, global_table
+ add x1, x1, #:lo12:global_table
+ str x0, [x1]
+ EndASM
+EndProcedure
+Procedure.i Main()
+ Define i.i,n.i,rc.i,start.i,step.i,total.i,text.i
+ CaptureTable()
+ For i=0 To 131071 : PokeA($E1C00000+i,$A5) : Next
+ PokeI($E1C00000,$48545436)
+ rc=WebPayloadBind(table) : If rc<>0 : PokeI($E1C00008,rc) : ProcedureReturn 0 : EndIf
+ livePet=PeekI(table+16+6*8) : liveTime=PeekI(table+16+11*8)
+ MmuClearNc() : MmuAddNc($08A00000,$09200000) : MmuAddNc($08100000,$08180000)
+ rc=MmuBuildTables($4F80000) : If rc<>0 : ProcedureReturn 2 : EndIf
+ MmuEnableCached()
+ url\host=@host[0] : url\hostCapacity=256 : url\target=@target[0] : url\targetCapacity=3072
+ text="http://[fd3f:f605:b7f1:cfd6:f0d4:2621:4d4:d168]:18080/ipv6-proof"
+
+ n=0 : While PeekA(text+n)<>0 : n=n+1 : Wend
+ rc=WebUrlParse(text,n,0,@url)
+ If rc=0 : rc=WebRequestInit(@request,@url,"GET",3,0,0,@headers[0],1024) : EndIf
+ If rc=0 : rc=WebRequestFinishHeaders(@request) : EndIf
+ If rc=0 : rc=WebResponseInit(@response,@line[0],1024,@metadata[0],4096,0) : EndIf
+ start=liveTime()/1000
+ If rc=0 : rc=WebClientStart(@client,@url,@request,@response,@tx[0],512,@rx[0],512,start,10000) : EndIf
+ While rc=0
+  livePet() : WebPayloadService(1)
+  step=WebClientStep(@client,0,0,1,@output[0],512,liveTime()/1000)
+  If step<0 : rc=step : Break : EndIf
+  If total+client\written>65536 : rc=-999 : Break : EndIf
+  For i=0 To client\written-1 : PokeA($E1C00100+total+i,output[i]) : Next
+  total=total+client\written
+  If step=1 : Break : EndIf
+ Wend
+ PokeI($E1C00008,rc) : PokeI($E1C00010,response\status) : PokeI($E1C00018,total)
+ PokeI($E1C00020,liveTime()/1000-start) : PokeI($E1C00028,client\sent) : PokeI($E1C00030,client\received)
+ WebClientClose(@client)
+ MmuDisableCachedFlushed()
+ ProcedureReturn 0
+EndProcedure

@@ -1,0 +1,93 @@
+Procedure.i ParseDotted(*s)
+  Define i.i
+  Define c.i
+  Define part.i
+  Define digits.i
+  Define fields.i
+  Define ip.i
+
+  If *s = 0
+    ProcedureReturn -1
+  EndIf
+  ip = 0
+  part = 0
+  digits = 0
+  fields = 0
+  i = 0
+  Repeat
+    c = PeekA(*s + i) & $FF
+    If c >= 48 And c <= 57                 ; 48..57 are the digits 0..9
+      If digits >= 3
+        ProcedureReturn -1
+      EndIf
+      part = part * 10 + (c - 48)
+      digits = digits + 1
+      If part > 255
+        ProcedureReturn -1
+      EndIf
+    ElseIf c = 46 Or c = 0                 ; 46 is a full stop
+      If digits = 0
+        ProcedureReturn -1                 ; "1..2" or a leading dot
+      EndIf
+      ; (ip << 8) - the parentheses are load bearing. & | ! bind TIGHTER
+      ; than << on this compiler, so "ip << 8 | part" would parse as
+      ; "ip << (8 | part)". See the LANGUAGE FACTS note in the header.
+      ip = (ip << 8) | part
+      fields = fields + 1
+      part = 0
+      digits = 0
+      If c = 0
+        Break
+      EndIf
+      If fields >= 4
+        ProcedureReturn -1                 ; a fifth field
+      EndIf
+    Else
+      ProcedureReturn -1
+    EndIf
+    i = i + 1
+  ForEver
+  If fields <> 4
+    ProcedureReturn -1
+  EndIf
+  ProcedureReturn ip
+EndProcedure
+XIncludeFile "Anvil/Core/dns_policy.pbi"
+
+Global fixtureSetting.i,fixtureRoute.i,fixtureLease.i
+Procedure.i SettingsGet(key.i)
+ ProcedureReturn fixtureSetting
+EndProcedure
+Procedure.i EthKeyDns()
+ ProcedureReturn "net.dns"
+EndProcedure
+Procedure.i NetIfForDest(ip.i)
+ ProcedureReturn fixtureRoute
+EndProcedure
+Procedure.i NetIfDns(kind.i)
+ ProcedureReturn fixtureLease
+EndProcedure
+Procedure PolicyFixture(index.i,setting.i,route.i,lease.i,kind.i)
+ Define p.i
+ fixtureSetting=setting : fixtureRoute=route : fixtureLease=lease
+ p=$E1C00100+index*32
+ PokeI(p,NetDnsResolverFor(kind)) : PokeI(p+8,fixtureLease) : PokeI(p+16,fixtureRoute)
+EndProcedure
+Procedure.i Main()
+ Define i.i
+ For i=0 To 131071 : PokeA($E1C00000+i,$A5) : Next
+ PokeI($E1C00000,$444E5350) : PokeI($E1C00008,12)
+ PolicyFixture(0,0,1,$08080808,1)
+ PolicyFixture(1,"1.1.1.1",1,$08080808,1)
+ PolicyFixture(2,"1.1.1.1",2,$08080808,1)
+ PolicyFixture(3,"1.1.1.1",2,$08080808,2)
+ PolicyFixture(4,"bad",1,$08080808,1)
+ PolicyFixture(5,"255.255.255.255",1,$08080808,1)
+ PolicyFixture(6,"0.0.0.0",1,$08080808,1)
+ PolicyFixture(7,"1.1.1.1",0,$08080808,1)
+ PolicyFixture(8,0,1,$08080808,1)
+ PolicyFixture(9,0,1,0,1)
+ PolicyFixture(10,"1.1.1.1",0,$08080808,0)
+ PolicyFixture(11,0,2,$08080404,2)
+ ProcedureReturn 0
+EndProcedure

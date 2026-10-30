@@ -1,3 +1,4 @@
+XIncludeFile "Anvil/Core/dns_policy.pbi"
 ; ======================================================================
 ;  THE LINK, AS THE COMMANDS SEE IT - 2026-09-05
 ; ======================================================================
@@ -2196,7 +2197,6 @@ EndProcedure
 ;  as a made-up address.
 ; ----------------------------------------------------------------------
 Procedure.i ResolveName(name.i)
-  Define dnsStr.i
   Define dnsIp.i
   Define qid.i
   Define srcPort.i
@@ -2206,29 +2206,12 @@ Procedure.i ResolveName(name.i)
   Define r.i
   Define c.i
 
-  ; A leased resolver belongs to the interface that granted it. Fall back
-  ; to the stored resolver only when this interface has none of its own.
-  dnsIp = NetIfDns(LinkKind())
-  dnsStr = 0
-  If dnsIp = 0
-    dnsStr = SettingsGet(EthKeyDns())
-  EndIf
-  If dnsIp = 0 And dnsStr = 0
-    Print("!! ")
-    UartWriteStr(name)
-    PrintN(" is a name, not an address, and no DNS server is set, so it")
-    PrintN("   could not be looked up and nothing was done. Set one with net dns")
-    PrintN("   <a.b.c.d>, or type dhcp to be given one, or give a dotted-quad")
-    PrintN("   address instead.")
+  dnsIp=NetDnsResolverFor(LinkKind())
+  If dnsIp=0
+    PrintN("!! no usable DNS resolver is selected on this interface.")
+    PrintN("   Set net dns to a reachable address, or remove net.dns from")
+    PrintN("   settings to use the resolver supplied by DHCP.")
     ProcedureReturn -1
-  EndIf
-  If dnsIp = 0
-    dnsIp = ParseDotted(dnsStr)
-    If dnsIp <= 0
-      PrintN("!! the stored DNS server address is not a usable dotted-quad, so")
-      PrintN("   nothing was done. Set it again with net dns <a.b.c.d>.")
-      ProcedureReturn -1
-    EndIf
   EndIf
 
   ; This lookup pumps its own interface from here on, so it owns that

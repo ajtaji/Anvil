@@ -9,7 +9,8 @@ r=Path(__file__).resolve().parents[1];d=args.out.resolve();d.mkdir(parents=True,
 names=['Anvil/Network/byte_order.pbi','Anvil/Network/ipv6_address.pbi','Anvil/Network/web_url.pbi','Anvil/Network/web_request.pbi','Anvil/Network/web_response.pbi','Anvil/Network/web_client.pbi']
 contract=(r/'Anvil/Network/web_transport.pbi').read_text(encoding='utf8')
 connection=re.search(r'Structure WebConnection.*?EndStructure',contract,re.S).group(0)
-s=connection+'\n'+'\n'.join(x for n in names for x in (r/n).read_text(encoding='utf8').splitlines() if not x.startswith('XIncludeFile'))+'''
+chunks=['\n'.join(x for x in (r/n).read_text(encoding='utf8').splitlines() if not x.startswith('XIncludeFile')) for n in names]
+s='\n'.join(chunks[:2])+'\n'+connection+'\n'+'\n'.join(chunks[2:])+'''
 Global u.WebUrl,q.WebRequest,a.WebResponse,client.WebClient,q2.WebRequest,a2.WebResponse
 Global Dim host.a[256]
 Global Dim target.a[3072]
