@@ -9,7 +9,7 @@ from pmf_compiler import resolve_compiler
 def build(compiler,out,cancel_first=False):
  root=Path(__file__).resolve().parents[1];out.mkdir(parents=True,exist_ok=False)
  rows=['https://httpbin.org/delay/5' if cancel_first else 'https://httpbin.org/uuid','https://httpbin.org/bytes/70000']
- names=['RaspberryPi4/Lib/mmu.pi4','Anvil/Network/web_url.pbi','Anvil/Network/web_transport.pbi','Anvil/Network/h2_frame.pbi','Anvil/Network/hpack_decode.pbi','Anvil/Network/hpack_tables.pbi','Anvil/Network/h2_client.pbi']
+ names=['RaspberryPi4/Lib/mmu.pi4','Anvil/Network/web_url.pbi','Anvil/Network/web_transport.pbi','Anvil/Network/h2_frame.pbi','Anvil/Network/hpack_decode.pbi','Anvil/Network/hpack_tables.pbi','Anvil/Network/h2_client.pbi','Anvil/Network/h2_request.pbi','Anvil/Network/web_request.pbi']
  s='#WEB_KERNEL_BINDING=0\n'+'\n'.join('XIncludeFile "'+n+'"' for n in names)+r'''
 
 Global services.i

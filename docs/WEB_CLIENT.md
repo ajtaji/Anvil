@@ -2685,8 +2685,8 @@ whole-connection deadline, not independently renewable stream deadlines.
 State 1 waits for TLS, state 2 exchanges the preface/settings, and state 3 can
 accept requests. `H2ClientGet(context, target, bytes)` copies an origin-form
 GET target (use the validated output of `WebUrlParse`) and returns a positive
-stream ID or `H2_BUSY`. Requests use static/literal HPACK and END_STREAM; there
-is no request body or arbitrary request-header API yet. The peer concurrency
+stream ID or `H2_BUSY`. GET uses static/literal HPACK and END_STREAM. General methods, headers and
+request bodies use the shared WebRequest API described below. The peer concurrency
 limit and header-list limit are respected. Multiple requests can be active on
 one connection, and response HPACK state persists across streams.
 
@@ -2708,7 +2708,7 @@ lowercase field names, prohibited connection fields, pseudo-header order and
 uniqueness, status, field-value controls, content length, informational responses
 and trailers. `H2ClientCancel` cancels the entire connection, and `H2ClientClose`
 releases transport ownership. It does not yet provide per-stream deadlines,
-request DATA uploads, graceful local GOAWAY/error transmission, or automatic
+graceful local GOAWAY/error transmission, or automatic
 WebClient protocol dispatch. Per-stream cancellation and minimal processing of
 late closed-stream frames are described below.
 Errors currently close the connection, including stream-local failures. The
@@ -2780,5 +2780,72 @@ was off and the temporary DNS override was removed. Shared Pi 3 compilation also
 passed, without a Pi 3 hardware claim. Evidence:
 `docs/evidence/anvil-ipv6-20261030/http2-cancel483`.
 
-WebClient dispatch, uploads, per-stream deadlines and graceful local connection
+WebClient dispatch, per-stream deadlines and graceful local connection
 shutdown remain unfinished, alongside the broader TLS, IPv6 and HTTP/3 work.
+
+
+### Shared WebRequest headers and flow-controlled uploads
+
+`H2ClientRequest(context, request)` accepts a fresh, finalized `WebRequest`
+and returns a positive stream ID, BUSY, or a negative error. It supports the
+existing request methods, custom headers, fixed lengths and unknown lengths.
+The request context remains caller-owned and must live until the stream closes.
+Its header offset advances on acceptance; remaining body bytes and completion
+state are maintained as DATA is queued. Use the DATA call's return count to
+advance input. The request's consumed field changes only on accepted DATA calls.
+Refused requests leave their request context and stream allocation untouched.
+
+The pure `H2RequestEncode` helper translates the bounded WebRequest header
+buffer to HTTP/2 pseudo-fields and lowercase regular fields. It checks the
+Host/port against the TLS connection, removes HTTP/1 connection and chunking
+framing, permits only `TE: trailers`, and enforces the peer header-list limit.
+It expects a WebRequest-built input, not arbitrary untrusted HTTP/1 wire input.
+All output fields are literal never-indexed fields; there is no encoder dynamic
+table or Huffman encoding. Cookie and authorization values therefore are not
+inserted into an encoder table. Header blocks may span HEADERS/CONTINUATION;
+outgoing fragments stay contiguous before any unrelated frame can be queued.
+The existing 32768-byte WebRequest header limit and 65536-byte encoded block
+storage apply. Buffers must be disjoint, persistent caller-owned storage.
+
+`H2ClientData(context, streamId, body, bytes, endBody)` copies and queues at most
+16375 body bytes per call, limited by both stream and connection send credit.
+The positive return is the accepted byte count; retain the remaining input and
+retry after BUSY. Continue pumping Step and network service between calls.
+Repeat endBody when retrying the final input span: END_STREAM is queued only
+when that final span is fully accepted. A known length ends automatically at
+zero remaining bytes; inconsistent final lengths are refused. Unknown-length
+bodies use DATA, without HTTP/1 chunk framing. A zero-byte final call can queue
+END_STREAM even with no send credit; its zero return is successful acceptance.
+Acceptance means queued, not yet transmitted. Once final response headers are
+known, further body calls return BUSY while the response is drained. If the
+response completes before the upload, only that unfinished request side is
+closed with RST_STREAM(NO_ERROR); the complete response is preserved.
+
+HEAD responses may describe a representation Content-Length without delivering
+that many body bytes. Nonempty response DATA for HEAD is rejected. Other stream
+events, cancellation, release and connection ownership retain their contracts.
+Automatic integration with WebClient is still pending; the HTTP/1 default has
+not been changed and HTTP/2 remains explicitly selected.
+
+On physical Anvil 483, all 46 existing engine regression cases and eight new
+upload cases passed. The new cases cover connection-credit exhaustion during a
+70000-byte body; five-byte stream windows with binary unknown-length input;
+zero-credit empty termination; HEAD metadata; a roughly 31 KB header block
+requiring CONTINUATION; an early 413 stopping a partially sent body; and refusal
+of a foreign origin or invalid TE. Independent host HPACK decoding checks the
+exact outgoing fields, DATA bytes, flags and early-response reset. The fake
+transport uses short writes/reads and injected pending results on the Pi.
+
+A separate certificate-verified HTTPS POST to httpbin.org uploaded 70000 bytes.
+The 70314-byte JSON response echoed every body byte and the custom request
+header. Elapsed time was 1994279 microseconds, maximum observed H2ClientStep
+2529 and separate network service call 2447 microseconds. These measurements
+exclude the separate Request/Data calls and are not worst-case guarantees.
+Captures 154 through 156 returned zero; cores, fonts and Vulkan stayed healthy,
+watchdog was off, and the temporary DNS override was removed. The shared source
+also compiled for Pi 3, without claiming a physical Pi 3 run. No firmware update
+was required. Evidence: `docs/evidence/anvil-ipv6-20261030/http2-upload483`.
+
+Remaining work includes WebClient ALPN dispatch, per-stream deadlines, graceful
+local connection shutdown and stream-local error isolation, as well as the
+broader remaining TLS, off-link IPv6/RDNSS qualification and HTTP/3 work.

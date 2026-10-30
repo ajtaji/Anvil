@@ -1,14 +1,15 @@
 ; SPDX-License-Identifier: MIT
-; Incremental HTTP/2 HTTPS GET connections, independently implemented from
+; Incremental HTTP/2 HTTPS connections, independently implemented from
 ; RFC 9113 sections 3-8: https://www.rfc-editor.org/rfc/rfc9113.html
 ; Caller pumps network service and consumes events; no waits or polling loops.
 ; Caller buffers: tx/rx 16384 each, compressed headers 65536, dynamic table4096,
 ; field workspace8192, and streamCount*SizeOf(H2Stream) bytes. Keep disjoint.
-; GET request uploads are closed with HEADERS. General upload support is separate.
+; WebRequest supplies methods/fields and fixed or unknown body lengths.
 XIncludeFile "Anvil/Network/web_url.pbi"
 XIncludeFile "Anvil/Network/web_transport.pbi"
 XIncludeFile "Anvil/Network/h2_frame.pbi"
 XIncludeFile "Anvil/Network/hpack_decode.pbi"
+XIncludeFile "Anvil/Network/h2_request.pbi"
 #H2_ARGUMENT=-3250
 #H2_STATE=-3251
 #H2_PROTOCOL=-3252
@@ -32,6 +33,10 @@ Structure H2Stream
  window.i
  sendWindow.i
  resetCode.i
+ uploadRemaining.i
+ localClosed.i
+ headOnly.i
+ request.i
 EndStructure
 Structure H2Buffers
  tx.i
@@ -54,6 +59,10 @@ Structure H2Client
  hostLength.i
  txLength.i
  txOffset.i
+ requestHeaderBytes.i
+ requestHeaderOffset.i
+ requestHeaderStream.i
+ requestHeaderEnd.i
  payloadUsed.i
  settingsSeen.i
  settingsPending.i
@@ -156,8 +165,17 @@ Procedure.i h2cField(*c.H2Client)
  ProcedureReturn *c\event
 EndProcedure
 Procedure.i h2cFinish(*c.H2Client,*s.H2Stream)
+ Define *request.WebRequest
  If *s\state<>1 Or *s\status<200 : ProcedureReturn h2cFail(*c,#H2_PROTOCOL) : EndIf
- If *s\status<>304 And *s\contentLength>=0 And *s\received<>*s\contentLength : ProcedureReturn h2cFail(*c,#H2_PROTOCOL) : EndIf
+ If *s\headOnly=0 And *s\status<>304 And *s\contentLength>=0 And *s\received<>*s\contentLength : ProcedureReturn h2cFail(*c,#H2_PROTOCOL) : EndIf
+ If *s\localClosed=0
+  ; A final response can arrive before the upload finishes. Preserve the
+  ; response and close only the unfinished request side with NO_ERROR.
+  H2FrameWrite(*c\buffers\tx,16384,4,3,0,*s\id)
+  NetWriteBE32(*c\buffers\tx+9,0) : *c\txLength=13 : *c\txOffset=0
+  *s\localClosed=1
+ EndIf
+ *request=*s\request : If *request<>0 : *request\state=2 : EndIf
  *s\state=2 : *c\activeStreams=*c\activeStreams-1
  *c\event=#H2_END : *c\eventStream=*s\id : *c\finishStream=0
  ProcedureReturn *c\event
@@ -210,7 +228,7 @@ Procedure.i H2ClientGet(*c.H2Client,target.i,bytes.i)
  If *c=0 : ProcedureReturn #H2_ARGUMENT : EndIf
  If *c\state=-1 : ProcedureReturn *c\error : EndIf
  If *c\state<>3 Or *c\goaway<>0 : ProcedureReturn #H2_STATE : EndIf
- If *c\event<>0 Or *c\txLength<>0 Or *c\activeStreams>=*c\peerStreams : ProcedureReturn #H2_BUSY : EndIf
+ If *c\event<>0 Or *c\txLength<>0 Or *c\requestHeaderBytes<>0 Or *c\activeStreams>=*c\peerStreams : ProcedureReturn #H2_BUSY : EndIf
  If target=0 Or bytes<1 Or bytes>3072 Or PeekA(target)<>47 : ProcedureReturn #H2_ARGUMENT : EndIf
  For i=0 To bytes-1
   ch=PeekA(target+i) : If ch<=32 Or ch=127 Or ch=35 : ProcedureReturn #H2_ARGUMENT : EndIf
@@ -237,10 +255,91 @@ Procedure.i H2ClientGet(*c.H2Client,target.i,bytes.i)
  PokeA(*c\buffers\tx+9,$82) : PokeA(*c\buffers\tx+10,$87) : *c\txLength=11
  h2cLiteral(*c,4,target,bytes) : h2cLiteral(*c,1,p,n)
  For i=0 To SizeOf(H2Stream)-1 : PokeA(*s+i,0) : Next
- *s\id=*c\nextStream : *c\nextStream=*c\nextStream+2 : *s\state=1 : *s\contentLength=-1 : *s\window=65535 : *s\sendWindow=*c\peerInitialWindow
+ *s\id=*c\nextStream : *c\nextStream=*c\nextStream+2 : *s\state=1 : *s\localClosed=1 : *s\contentLength=-1 : *s\window=65535 : *s\sendWindow=*c\peerInitialWindow
  *c\activeStreams=*c\activeStreams+1
  H2FrameWrite(*c\buffers\tx,16384,*c\txLength-9,1,5,*s\id)
  ProcedureReturn *s\id
+EndProcedure
+
+Procedure h2cRequestHeaderFrame(*c.H2Client)
+ Define n.i,kind.i,flags.i,i.i
+ n=*c\requestHeaderBytes-*c\requestHeaderOffset
+ If n>16375 : n=16375 : EndIf
+ kind=9 : flags=0
+ If *c\requestHeaderOffset=0 : kind=1 : flags=*c\requestHeaderEnd : EndIf
+ If *c\requestHeaderOffset+n=*c\requestHeaderBytes : flags=flags|4 : EndIf
+ H2FrameWrite(*c\buffers\tx,16384,n,kind,flags,*c\requestHeaderStream)
+ For i=0 To n-1 : PokeA(*c\buffers\tx+9+i,PeekA(*c\buffers\block+*c\requestHeaderOffset+i)) : Next
+ *c\requestHeaderOffset=*c\requestHeaderOffset+n
+ *c\txLength=9+n : *c\txOffset=0
+ If *c\requestHeaderOffset=*c\requestHeaderBytes : *c\requestHeaderBytes=0 : EndIf
+EndProcedure
+; Same finalized WebRequest used by HTTP/1. Headers are copied before return.
+; It remains caller-owned for upload counters until the stream is closed.
+Procedure.i H2ClientRequest(*c.H2Client,*request.WebRequest)
+ Define encoded.H2RequestHeaders,*s.H2Stream,i.i,p.i,rc.i
+ If *c=0 Or *request=0 : ProcedureReturn #H2_ARGUMENT : EndIf
+ If *c\state=-1 : ProcedureReturn *c\error : EndIf
+ If *c\state<>3 Or *c\goaway<>0 : ProcedureReturn #H2_STATE : EndIf
+ If *c\event<>0 Or *c\txLength<>0 Or *c\requestHeaderBytes<>0 Or *c\decoding<>0 Or *c\continuation<>0 Or *c\activeStreams>=*c\peerStreams : ProcedureReturn #H2_BUSY : EndIf
+ If *c\nextStream>$7FFFFFFF : ProcedureReturn #H2_STATE : EndIf
+ *s=0
+ For i=0 To *c\buffers\streamCount-1
+  p=*c\buffers\streams+i*SizeOf(H2Stream)
+  If PeekI(p+OffsetOf(H2Stream\state))=0 : *s=p : Break : EndIf
+ Next
+ If *s=0 : ProcedureReturn #H2_BUSY : EndIf
+ rc=H2RequestEncode(*request,*c\connection\host,*c\hostLength,*c\connection\port,*c\buffers\block,65536,*c\peerHeaderLimit,@encoded)
+ If rc<>0 : ProcedureReturn rc : EndIf
+ For i=0 To SizeOf(H2Stream)-1 : PokeA(*s+i,0) : Next
+ *s\id=*c\nextStream : *c\nextStream=*c\nextStream+2 : *s\state=1
+ *s\contentLength=-1 : *s\window=65535 : *s\sendWindow=*c\peerInitialWindow
+ *s\uploadRemaining=*request\remaining : *s\localClosed=Bool(*request\remaining=0)
+ *s\headOnly=encoded\headOnly : *s\request=*request
+ *request\offset=*request\length : If *s\localClosed<>0 : *request\state=2 : EndIf
+ *c\activeStreams=*c\activeStreams+1
+ *c\requestHeaderBytes=encoded\length : *c\requestHeaderOffset=0
+ *c\requestHeaderStream=*s\id : *c\requestHeaderEnd=*s\localClosed
+ h2cRequestHeaderFrame(*c)
+ ProcedureReturn *s\id
+EndProcedure
+; Returns copied body bytes, BUSY, or an argument/state error. END with zero
+; bytes is permitted even with zero send credit. Unknown lengths use DATA,
+; never HTTP/1 chunk framing. Retain unconsumed input and repeat endBody.
+Procedure.i H2ClientData(*c.H2Client,id.i,body.i,bytes.i,endBody.i)
+ Define *s.H2Stream,*request.WebRequest,n.i,i.i,ending.i
+ If *c=0 Or bytes<0 Or (bytes>0 And body=0) Or (endBody<>0 And endBody<>1) : ProcedureReturn #H2_ARGUMENT : EndIf
+ If *c\state=-1 : ProcedureReturn *c\error : EndIf
+ If *c\state<>3 : ProcedureReturn #H2_STATE : EndIf
+ *s=h2cStream(*c,id) : If *s=0 : ProcedureReturn #H2_STATE : EndIf
+ If *s\state<>1 Or *s\localClosed<>0 : ProcedureReturn #H2_STATE : EndIf
+ If *c\event<>0 Or *c\txLength<>0 Or *c\requestHeaderBytes<>0 Or *s\status>=200 : ProcedureReturn #H2_BUSY : EndIf
+ If *s\uploadRemaining>=0
+  If bytes>*s\uploadRemaining : ProcedureReturn #H2_ARGUMENT : EndIf
+  If endBody<>0 And bytes<>*s\uploadRemaining : ProcedureReturn #H2_ARGUMENT : EndIf
+ EndIf
+ If bytes=0 And endBody=0 : ProcedureReturn 0 : EndIf
+ n=bytes : If n>16375 : n=16375 : EndIf
+ If n>*c\sendWindow : n=*c\sendWindow : EndIf
+ If n>*s\sendWindow : n=*s\sendWindow : EndIf
+ If bytes>0 And n<=0 : ProcedureReturn #H2_BUSY : EndIf
+ If bytes=0 : n=0 : EndIf
+ ending=Bool(endBody<>0 And n=bytes)
+ If *s\uploadRemaining>=0
+  *s\uploadRemaining=*s\uploadRemaining-n
+  If *s\uploadRemaining=0 : ending=1 : EndIf
+ EndIf
+ H2FrameWrite(*c\buffers\tx,16384,n,0,ending,id)
+ For i=0 To n-1 : PokeA(*c\buffers\tx+9+i,PeekA(body+i)) : Next
+ *c\txLength=9+n : *c\txOffset=0
+ *c\sendWindow=*c\sendWindow-n : *s\sendWindow=*s\sendWindow-n
+ If ending<>0 : *s\localClosed=1 : EndIf
+ *request=*s\request
+ If *request<>0
+  *request\consumed=n : *request\remaining=*s\uploadRemaining
+  If ending<>0 : *request\state=2 : EndIf
+ EndIf
+ ProcedureReturn n
 EndProcedure
  ; Cancellation queues RST_STREAM(CANCEL); consume the RESET event normally.
 ; BUSY preserves all state: finish pending output/events, then retry.
@@ -251,7 +350,7 @@ Procedure.i H2ClientCancelStream(*c.H2Client,id.i)
  If *c\state<>3 : ProcedureReturn #H2_STATE : EndIf
  *s=h2cStream(*c,id) : If *s=0 : ProcedureReturn #H2_STATE : EndIf
  If *s\state<>1 : ProcedureReturn #H2_STATE : EndIf
- If *c\txLength<>0 Or *c\event<>0 Or *c\finishStream=*s : ProcedureReturn #H2_BUSY : EndIf
+ If *c\txLength<>0 Or *c\requestHeaderBytes<>0 Or *c\event<>0 Or *c\finishStream=*s : ProcedureReturn #H2_BUSY : EndIf
  H2FrameWrite(*c\buffers\tx,16384,4,3,0,id)
  NetWriteBE32(*c\buffers\tx+9,8) : *c\txLength=13 : *c\txOffset=0
  *s\state=3 : *s\resetCode=8 : *c\activeStreams=*c\activeStreams-1
@@ -305,7 +404,7 @@ Procedure.i h2cDecode(*c.H2Client)
   EndIf
   *s\status=*c\blockStatus
  EndIf
- If *c\blockEnd<>0 : ProcedureReturn h2cFinish(*c,*s) : EndIf
+ If *c\blockEnd<>0 : *c\finishStream=*s : EndIf
  ProcedureReturn 0
 EndProcedure
 Procedure.i h2cFrame(*c.H2Client)
@@ -395,7 +494,7 @@ Procedure.i h2cFrame(*c.H2Client)
    Else
     If *s\status=0 : ProcedureReturn h2cFail(*c,#H2_PROTOCOL) : EndIf
     If *h\length>*s\window : ProcedureReturn h2cFail(*c,#H2_FLOW) : EndIf
-    If n>0 And (*s\status=204 Or *s\status=304) : ProcedureReturn h2cFail(*c,#H2_PROTOCOL) : EndIf
+    If n>0 And (*s\headOnly<>0 Or *s\status=204 Or *s\status=304) : ProcedureReturn h2cFail(*c,#H2_PROTOCOL) : EndIf
     If *s\received>$7FFFFFFFFFFFFFFF-n : ProcedureReturn h2cFail(*c,#H2_LIMIT) : EndIf
     *s\received=*s\received+n
     If *s\contentLength>=0 And *s\status<>304 And *s\received>*s\contentLength : ProcedureReturn h2cFail(*c,#H2_PROTOCOL) : EndIf
@@ -461,7 +560,7 @@ Procedure.i H2ClientStep(*c.H2Client,now.i)
  If *c\state=0 : ProcedureReturn #H2_STATE : EndIf
  If ((now-*c\started) & $FFFFFFFF)>=*c\timeout : ProcedureReturn h2cFail(*c,#H2_TIMEOUT) : EndIf
  If *c\event<>0 : ProcedureReturn *c\event : EndIf
- If *c\finishStream<>0 : ProcedureReturn h2cFinish(*c,*c\finishStream) : EndIf
+ If *c\finishStream<>0 And *c\txLength=0 And *c\requestHeaderBytes=0 : ProcedureReturn h2cFinish(*c,*c\finishStream) : EndIf
  If *c\goaway<>0
   For i=0 To *c\buffers\streamCount-1
    *s=*c\buffers\streams+i*SizeOf(H2Stream)
@@ -494,6 +593,9 @@ Procedure.i H2ClientStep(*c.H2Client,now.i)
    If *c\txOffset=*c\txLength : *c\txOffset=0 : *c\txLength=0 : EndIf
   EndIf
   ProcedureReturn 0
+ EndIf
+ If *c\requestHeaderBytes<>0
+  h2cRequestHeaderFrame(*c) : ProcedureReturn 0
  EndIf
  If *c\frame\used<9
   n=9-*c\frame\used

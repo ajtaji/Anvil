@@ -1596,3 +1596,5 @@ text is unchanged; no new board execution or boot claim follows.
 | `Anvil/Network/hpack_decode.pbi` | protocol-facts | ietf-rfc | IETF specification | RFC 7541 sections 4-6; original bounded decoder, dynamic-table handling, integers, strings and padding validation. |
 
 | `Anvil/Network/h2_client.pbi` | protocol-facts | ietf-rfc | IETF specification | RFC 9113 sections 3-8; original asynchronous GET connection engine, stream state, receive credit and response validation. |
+
+| `Anvil/Network/h2_request.pbi` | protocol-facts | ietf-rfc | IETF specification | RFC 9113 sections 8.2/8.3 and RFC 7541 sections 5/6; original conversion of finalized WebRequest headers into bounded never-indexed HPACK fields. |
