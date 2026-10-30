@@ -1579,3 +1579,4 @@ text is unchanged; no new board execution or boot claim follows.
 | `Anvil/Network/ipv6_source.pbi` | protocol-facts | ietf-rfc | IETF specification | source comparison for assigned public addresses; RFC 6724 |
 | `docs/evidence/anvil-ipv6-20261030/client452/client-regression639/proof.pi4` | protocol-facts | ietf-rfc | IETF specification | Generated HTTP/IPv6 protocol test source |
 | `docs/evidence/anvil-ipv6-20261030/client452/url634/proof.pi4` | protocol-facts | ietf-rfc | IETF specification | Generated HTTP/IPv6 protocol test source |
+| `docs/evidence/anvil-ipv6-20261030/dns653/proof.pi4` | protocol-facts | ietf-rfc | IETF specification | Generated DNS codec/cache qualification source |

@@ -23,8 +23,8 @@ def build(compiler, out):
     a=lambda owner=ptr,ttl=60:answer(owner,1,ip,ttl)
     cn=lambda owner=ptr,target=alias,ttl=7:answer(owner,5,target,ttl)
     cases=[]
-    def add(label, raw, rc, ttl=0, expected='example.test'):
-        cases.append(dict(name=label,packet=raw.hex(),expected=expected,rc=rc,ttl=ttl,ip=0x01020304 if rc>0 else 0))
+    def add(label, raw, rc, ttl=0, expected='example.test', qtype=1, ip6=''):
+        cases.append(dict(name=label,packet=raw.hex(),expected=expected,rc=rc,ttl=ttl,ip=0x01020304 if rc>0 and qtype==1 else 0,qtype=qtype,ip6=ip6 if rc>0 else ''))
     add('matching',packet([a()]),1,60)
     add('case-and-trailing-dot',packet([a()],question='ExAmPlE.TeSt'),1,60,'EXAMPLE.TEST.')
     add('wrong-question',packet([a()],question='another.test'),-208)
@@ -55,6 +55,25 @@ def build(compiler, out):
     add('too-many-answers',packet([a()]*65),-207)
     add('wrong-id',b'\x43\x21'+packet([a()])[2:],-204)
     add('short-header',b'\0'*11,-203)
+    ip6=bytes.fromhex('20010db800000000123456789abcdef0')
+    a6=lambda owner=ptr,ttl=60,data=ip6:answer(owner,28,data,ttl)
+    def add6(label,records,rc=1,ttl=60,**kw):
+        add(label,packet(records,qtype=28,**kw),rc,ttl if rc>0 else 0,qtype=28,ip6=ip6.hex())
+    add6('aaaa-direct',[a6()])
+    add6('aaaa-alias',[cn(),a6(alias)],ttl=7)
+    add6('aaaa-order',[a6(alias),cn()],ttl=7)
+    add6('aaaa-ignore-a',[a(),a6()])
+    add6('aaaa-only-a',[a()],rc=0)
+    add6('aaaa-short',[a6(data=ip6[:-1])],rc=-207)
+    add6('aaaa-long',[a6(data=ip6+b'\0')],rc=-207)
+    add6('aaaa-wrong-host',[a6()],rc=-208,question='wrong.test')
+    add6('aaaa-unrelated',[a6(name('wrong.test'))],rc=0)
+    add6('aaaa-alias-conflict',[cn(),a6()],rc=-210)
+    add6('aaaa-cycle',[cn(),cn(alias,name('example.test'))],rc=-210)
+    add6('aaaa-truncated',[a6()],rc=-209,flags=0x8380)
+    add6('aaaa-ttl-zero',[a6(ttl=0)],ttl=0)
+    add6('aaaa-minimum-ninth',[a6()]*8+[a6(ttl=2)],rc=8,ttl=2)
+    add('aaaa-question-a',packet([a6()]),-208,qtype=28)
     names=['Anvil/Network/byte_order.pbi','Anvil/Network/dns_codec.pbi','Anvil/Core/payload_net.pbi']
     owner=(root/names[2]).read_text(encoding='utf8')
     start=owner.index('Procedure.i paynet_Lower(')
@@ -74,14 +93,16 @@ Global Dim paynet_cacheUsed.i[4]
 Global paynet_cacheNext.i
 Global Dim wire.a[4096]
 '''+cache+r'''
-Procedure Run(index.i,bytes.i,expected.i)
+Procedure Run(index.i,bytes.i,expected.i,qtype.i)
  Define i.i,p.i,rc.i
  For i=0 To bytes-1 : Read.a wire[i] : Next
  p=$E1C00100+index*64
- rc=DnsParseReplyFor(@wire[0],bytes,$1234,expected)
+ rc=DnsParseReplyTypeFor(@wire[0],bytes,$1234,expected,qtype)
  PokeI(p,rc) : PokeI(p+8,DnsError()) : PokeI(p+16,DnsResultCount())
  PokeI(p+24,DnsResultIp(0)) : PokeI(p+32,DnsResultTtl(0))
  PokeI(p+40,DnsResultTtl(-1)) : PokeI(p+48,DnsResultTtl(DnsResultCount()))
+ p=$E1C02000+index*32
+ PokeI(p,DnsResultIp6(0,p+8))
 EndProcedure
 Procedure Cache(index.i,ttl.i,at.i,first.i,second.i)
  Define i.i,p.i
@@ -99,7 +120,10 @@ Procedure.i Main(services.i)
 '''
     s+=f' PokeI($E1C00008,{len(cases)})\n'
     for i,c in enumerate(cases):
-        s+=f' Restore Packet{i}\n Run({i},{len(bytes.fromhex(c["packet"]))},"{c["expected"]}")\n'
+        s+=f' Restore Packet{i}\n Run({i},{len(bytes.fromhex(c["packet"]))},"{c["expected"]}",{c["qtype"]})\n'
+    queries=[('example.test',28,30,0),('example.test',1,30,0),('example.test',15,0,-200),('a'*64,28,0,-202),('.bad',28,0,-202),('bad..name',28,0,-202),('.'.join(['a'*63]*3+['a'*61]),28,271,0),('.'.join(['a'*63]*3+['a'*62]),28,0,-201)]
+    for i,(text,kind,want,err) in enumerate(queries):
+        s+=f' PokeI($E1C03000+{i}*32,DnsBuildQueryType("{text}",$1234,{kind}))\n PokeI($E1C03008+{i}*32,DnsError())\n PokeI($E1C03010+{i}*32,DnsQueryLen())\n'
     s+=''' Cache(0,2,1000,2999,3000)
  Cache(1,0,1000,1001,1002)
  Cache(2,0,1000,5500,5501)

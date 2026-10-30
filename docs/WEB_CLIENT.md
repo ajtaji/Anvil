@@ -1673,3 +1673,20 @@ Live local-link HTTP now works in both directions over IPv6. AAAA DNS and
 dual-stack selection, IPv6 TLS/literal certificate verification, scoped URI
 zones, off-link validation, path-MTU handling, remaining TLS blocking and
 HTTP/2-3 are still incomplete.
+
+
+### Shared AAAA DNS codec qualification
+
+The shared DNS codec now provides DnsBuildQueryType and DnsParseReplyTypeFor
+for A and AAAA records. Existing A-only entry points retain their signatures.
+AAAA answers preserve all 16 network-order bytes through DnsResultIp6; query
+name/type matching, CNAME ownership and minimum TTL checks share the existing
+parser. Wrong-family and failed results cannot expose stale addresses.
+Query building now refuses oversized labels and wire names before writing
+them, including the 255-byte wire-name boundary.
+
+Physical Pi 4 build 452 ran the new codec in a returning RAM payload: 45 reply
+cases, eight query-boundary cases, and five existing cache cases passed.
+Evidence is in docs/evidence/anvil-ipv6-20261030/dns653. This qualifies the codec;
+the resident DNS owner and web adapter still need AAAA integration. The boot
+image remains 452, and this codec change has not been installed in that image.

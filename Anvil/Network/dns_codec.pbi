@@ -12,7 +12,7 @@ XIncludeFile "Anvil/Network/byte_order.pbi"
 ;  byte-exact vectors and no device underneath.
 ;
 ;  WHAT IT DOES AND DOES NOT DO.
-;    * It asks for an A record (IPv4) only. QTYPE=1, QCLASS=IN. No AAAA,
+;    * Typed queries support A and AAAA (RFC 3596 section 2). QCLASS=IN;
 ;      no MX, no CNAME chasing OF ITS OWN - though it DOES read through
 ;      the compression pointers a CNAME answer uses, so a name that is a
 ;      CNAME to a host with an A record resolves, because the server put
@@ -48,6 +48,7 @@ XIncludeFile "Anvil/Network/byte_order.pbi"
 #DNS_PORT        = 53
 #DNS_HDR         = 12         ; ID, flags, and the four count fields
 #DNS_QTYPE_A     = 1          ; a host address
+#DNS_QTYPE_AAAA  = 28         ; RFC 3596, 16 network-order address bytes
 #DNS_QCLASS_IN   = 1          ; the Internet class
 #DNS_TYPE_A      = 1
 #DNS_TYPE_CNAME  = 5
@@ -67,6 +68,8 @@ Global dns_outLen.i
 
 ; ---- what the last parsed reply yielded ----
 Global Dim dns_ip.i[#DNS_MAX_RESULTS]
+Global Dim dns_ip6.a[#DNS_MAX_RESULTS*16]
+Global dns_resultType.i
 Global dns_count.i            ; how many A records were found
 Global dns_rcode.i            ; the reply's RCODE, 0 = no error
 Global dns_err.i              ; the last refusal, a #DNS_E_*
@@ -96,7 +99,7 @@ Global dns_err.i              ; the last refusal, a #DNS_E_*
 ;  refused, because each would produce a packet a server rejects and the
 ;  refusal here names which.
 ; ----------------------------------------------------------------------
-Procedure.i DnsBuildQuery(name.i, qid.i)
+Procedure.i DnsBuildQueryType(name.i, qid.i, qtype.i)
   Protected p.i
   Protected labelStart.i
   Protected i.i
@@ -106,6 +109,10 @@ Procedure.i DnsBuildQuery(name.i, qid.i)
 
   dns_err = #DNS_E_NONE
   dns_outLen = 0
+  If qtype<>#DNS_QTYPE_A And qtype<>#DNS_QTYPE_AAAA
+    dns_err=#DNS_E_ARG
+    ProcedureReturn 0
+  EndIf
   If name = 0
     dns_err = #DNS_E_ARG
     ProcedureReturn 0
@@ -171,6 +178,12 @@ Procedure.i DnsBuildQuery(name.i, qid.i)
       p = p + 1
       labLen = 0
     Else
+      If labLen>=#DNS_MAX_LABEL
+        dns_err=#DNS_E_LABEL : ProcedureReturn 0
+      EndIf
+      If total+labLen+3>#DNS_MAX_NAME
+        dns_err=#DNS_E_NAME_LONG : ProcedureReturn 0
+      EndIf
       dns_out[p] = c & $FF
       p = p + 1
       labLen = labLen + 1
@@ -180,13 +193,17 @@ Procedure.i DnsBuildQuery(name.i, qid.i)
 
   dns_out[p] = 0                            ; the root label ends the name
   p = p + 1
-  NetWriteBE16(@dns_out[p], #DNS_QTYPE_A)
+  NetWriteBE16(@dns_out[p], qtype)
   p = p + 2
   NetWriteBE16(@dns_out[p], #DNS_QCLASS_IN)
   p = p + 2
 
   dns_outLen = p
   ProcedureReturn p
+EndProcedure
+
+Procedure.i DnsBuildQuery(name.i,qid.i)
+  ProcedureReturn DnsBuildQueryType(name,qid,#DNS_QTYPE_A)
 EndProcedure
 
 Procedure.i DnsQueryBuf()
@@ -332,11 +349,12 @@ EndProcedure
 
 ; expectedName binds the answer to the outstanding host query. Zero retains
 ; the packet-only API, still restricting answers to its single IN/A question.
-Procedure.i DnsParseReplyFor(*p,n.i,qid.i,expectedName.i)
+Procedure.i DnsParseReplyTypeFor(*p,n.i,qid.i,expectedName.i,qtype.i)
   Define flags.i,an.i,pos.i,i.i,j.i,length.i,currentLength.i,aliasLength.i
   Define kind.i,klass.i,size.i,ttl.i,hops.i,aliasAt.i,aliasTtl.i,chainTtl.i
   Define answerTtl.i,count.i
-  dns_err=0 : dns_count=0 : dns_rcode=0
+  dns_err=0 : dns_count=0 : dns_rcode=0 : dns_resultType=0
+  If qtype<>#DNS_QTYPE_A And qtype<>#DNS_QTYPE_AAAA : ProcedureReturn dns_Reject(#DNS_E_ARG) : EndIf
   If *p=0 Or n<#DNS_HDR : ProcedureReturn dns_Reject(#DNS_E_SHORT) : EndIf
   If NetReadBE16(*p)<>(qid & $FFFF) : ProcedureReturn dns_Reject(#DNS_E_ID) : EndIf
   flags=NetReadBE16(*p+2)
@@ -346,7 +364,7 @@ Procedure.i DnsParseReplyFor(*p,n.i,qid.i,expectedName.i)
   If currentLength<0 : ProcedureReturn dns_Reject(currentLength) : EndIf
   pos=dns_nameEnd
   If pos+4>n : ProcedureReturn dns_Reject(#DNS_E_MALFORMED) : EndIf
-  If NetReadBE16(*p+pos)<>#DNS_QTYPE_A Or NetReadBE16(*p+pos+2)<>#DNS_QCLASS_IN : ProcedureReturn dns_Reject(#DNS_E_QUESTION) : EndIf
+  If NetReadBE16(*p+pos)<>qtype Or NetReadBE16(*p+pos+2)<>#DNS_QCLASS_IN : ProcedureReturn dns_Reject(#DNS_E_QUESTION) : EndIf
   If expectedName<>0
     If dns_TextNameMatches(@dns_current[0],expectedName)=0 : ProcedureReturn dns_Reject(#DNS_E_QUESTION) : EndIf
   EndIf
@@ -367,6 +385,7 @@ Procedure.i DnsParseReplyFor(*p,n.i,qid.i,expectedName.i)
     pos=pos+10
     If pos+size>n : ProcedureReturn dns_Reject(#DNS_E_MALFORMED) : EndIf
     If klass=#DNS_QCLASS_IN And kind=#DNS_TYPE_A And size<>4 : ProcedureReturn dns_Reject(#DNS_E_MALFORMED) : EndIf
+    If klass=#DNS_QCLASS_IN And kind=#DNS_QTYPE_AAAA And size<>16 : ProcedureReturn dns_Reject(#DNS_E_MALFORMED) : EndIf
     If klass=#DNS_QCLASS_IN And kind=#DNS_TYPE_CNAME
       length=dns_ReadName(*p,n,pos,@dns_name[0])
       If length<0 : ProcedureReturn dns_Reject(length) : EndIf
@@ -382,10 +401,15 @@ Procedure.i DnsParseReplyFor(*p,n.i,qid.i,expectedName.i)
       If dns_rrClass[i]=#DNS_QCLASS_IN
         length=dns_ReadName(*p,n,dns_rrOwner[i],@dns_name[0])
         If length=currentLength And dns_EqualName(@dns_current[0],@dns_name[0],length)
-          If dns_rrType[i]=#DNS_TYPE_A
+          If dns_rrType[i]=qtype
             If dns_rrTtl[i]<answerTtl : answerTtl=dns_rrTtl[i] : EndIf
             If count<#DNS_MAX_RESULTS
-              dns_ip[count]=NetReadBE32(*p+dns_rrData[i]) : count=count+1
+              If qtype=#DNS_QTYPE_A
+                dns_ip[count]=NetReadBE32(*p+dns_rrData[i])
+              Else
+                For j=0 To 15 : dns_ip6[count*16+j]=PeekA(*p+dns_rrData[i]+j) : Next
+              EndIf
+              count=count+1
             EndIf
           ElseIf dns_rrType[i]=#DNS_TYPE_CNAME
             length=dns_ReadName(*p,n,dns_rrData[i],@dns_name[0])
@@ -403,7 +427,7 @@ Procedure.i DnsParseReplyFor(*p,n.i,qid.i,expectedName.i)
     If count>0
       If aliasAt<>0 : ProcedureReturn dns_Reject(#DNS_E_ALIAS) : EndIf
       For i=0 To count-1 : dns_ttl[i]=answerTtl : Next
-      dns_count=count : ProcedureReturn count
+      dns_count=count : dns_resultType=qtype : ProcedureReturn count
     EndIf
     If aliasAt=0 : ProcedureReturn 0 : EndIf
     If aliasTtl<chainTtl : chainTtl=aliasTtl : EndIf
@@ -411,6 +435,10 @@ Procedure.i DnsParseReplyFor(*p,n.i,qid.i,expectedName.i)
     currentLength=aliasLength
   Next
   ProcedureReturn dns_Reject(#DNS_E_ALIAS)
+EndProcedure
+
+Procedure.i DnsParseReplyFor(*p,n.i,qid.i,expectedName.i)
+  ProcedureReturn DnsParseReplyTypeFor(*p,n,qid,expectedName,#DNS_QTYPE_A)
 EndProcedure
 
 Procedure.i DnsParseReply(*p,n.i,qid.i)
@@ -427,10 +455,18 @@ Procedure.i DnsResultCount()
 EndProcedure
 
 Procedure.i DnsResultIp(i.i)
-  If i < 0 Or i >= dns_count
+  If dns_resultType<>#DNS_QTYPE_A Or i < 0 Or i >= dns_count
     ProcedureReturn 0
   EndIf
   ProcedureReturn dns_ip[i]
+EndProcedure
+
+; Copies one AAAA result; never exposes storage from an earlier parse.
+Procedure.i DnsResultIp6(i.i,destination.i)
+  Define j.i
+  If destination=0 Or dns_resultType<>#DNS_QTYPE_AAAA Or i<0 Or i>=dns_count : ProcedureReturn #DNS_E_ARG : EndIf
+  For j=0 To 15 : PokeA(destination+j,dns_ip6[i*16+j]) : Next
+  ProcedureReturn 16
 EndProcedure
 
 Procedure.i DnsRcode()
