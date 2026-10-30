@@ -114,7 +114,7 @@ Procedure.i Main()
   s=s[:pos]+'\n'.join('XIncludeFile "'+n+'"' for n in extra)+'\n'+r'''
 #TLSC_CONNECTIONS=4
 #TLSC_PREPARE=7
-Global *X509PauseHook,*TlsRootsPauseHook,*TlsRecDecryptHook
+Global *X509PauseHook,*TlsRootsPauseHook,*TlsRecDecryptHook,*TlsRecEncryptHook
 #TLSC_RESOLVING=1
 #TLSC_TCP=2
 #TLSC_HS=3
@@ -172,7 +172,7 @@ Procedure KeyContextRun(kind.i,v.i,an.i,bn.i,cn.i)
   t=timer() : tlsw_Advance() : elapsed=timer()-t
   If elapsed>ctxMaximum : ctxMaximum=elapsed : EndIf
   If tlsc_slot<>caller : ctxVerdict=-997 : Break : EndIf
-  If TlsRecDecryptHook<>0 Or X509PauseHook<>0 Or TlsRootsPauseHook<>0 Or EcdsaVerifyHook<>0 Or RsaPublicHook<>0 Or X25519ComputeHook<>0
+  If TlsRecEncryptHook<>0 Or TlsRecDecryptHook<>0 Or X509PauseHook<>0 Or TlsRootsPauseHook<>0 Or EcdsaVerifyHook<>0 Or RsaPublicHook<>0 Or X25519ComputeHook<>0
    ctxVerdict=-995 : Break
   EndIf
   ctxOther=ctxOther+1 : ctxSteps=ctxSteps+1 : pet()

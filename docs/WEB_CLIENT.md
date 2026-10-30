@@ -738,3 +738,43 @@ not worst-case guarantees. Capture 295 passed four overlapping verified HTTPS
 connections, including an event stream delivered before completion. Capture
 293 passed the cooperative worker's 31 context cases with the new hook scope.
 All runs returned with cores, fonts and Vulkan healthy, and watchdog off.
+
+
+## Bounded encryption and accepted application sends (build 432)
+
+The shared GCM job also encrypts in steps of at most 256 bytes, emitting the
+final tag only when complete. Result 1 means successful encryption or authentic
+decryption. Cancellation can leave partial ciphertext in caller buffers; it
+must never be transmitted without the final tag. AES-128/192/256 are supported.
+The cooperative TLS worker scopes the encryption hook just like decryption.
+
+TlsClientSend now copies accepted application bytes into a per-connection
+16 KB queue. The caller may reuse its buffer after acceptance. Progress
+protects the queued record and only then sends it; sequence numbers advance
+only after successful protection. Close discards pending bytes and wipes the
+queue. Keep servicing an accepted send until completion; acceptance alone is
+not a delivery acknowledgement. Four queues add 64 KB of plaintext storage.
+Compositions without a cooperative driver keep synchronous progress behavior.
+
+Physical capture 296 passed 217 independent-vector cases, including encryption,
+decryption, in-place buffers, cancellation/restart and shared scratch changes
+between every step. The maximum observed call was 673 us. The fixture's old
+one-past-end initialization was corrected, and the expanded suite re-ran the
+original cases. Captures 297 and 298 passed copied-buffer/connection isolation,
+queue wiping and cooperative hook/context checks.
+
+Build 432 was installed with a verified 431 backup, one reset, a 90-second boot
+interval and live-image hash verification. Capture 301 sent 32,768 bytes to an
+HTTPS echo endpoint and checked every echoed byte: 815 ms overall, 6,733 us
+maximum WebClientStep and 3,154 us maximum service call. The first request
+without User-Agent received HTTP 402 and is retained as a failed qualification;
+the request with User-Agent passed. This does not establish the server's reason
+for rejecting the first request. Capture 300 passed gzip/deflate contents with
+a 3,603 us largest observed call. Its cancellation checker originally assumed
+one progress call could not get past resolving; a cached lookup can reach TCP
+connecting. The corrected checker permits connecting/handshake states while
+still requiring successful close and rejection of the stale handle. The original
+failed check and corrected recheck are retained separately.
+
+These measurements are not worst-case guarantees. Cold file opening and link
+waits remain blocking work; IPv6 web traffic and HTTP/2-3 remain open.

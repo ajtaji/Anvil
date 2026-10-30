@@ -19,7 +19,10 @@ def check(report,cases):
   result['preparation_cancellation']=[]
   for i in range(2):
    h,st,cost,closed,stale,opened=struct.unpack_from('<6q',report,0x3000+i*64)
-   assert h>0 and st==i and closed==0 and stale==-102,(i,h,st,cost,closed,stale)
+   # A single progress call may finish preparation and a cached DNS lookup.
+   # The cancellation target is unopened or still connecting, never open.
+   allowed=(0,) if i==0 else (1,2,3)
+   assert h>0 and st in allowed and closed==0 and stale==-102,(i,h,st,cost,closed,stale)
    result['preparation_cancellation'].append(dict(handle=h,state=st,last_call_us=cost,open_us=opened,close=closed,stale=stale))
  if struct.unpack_from('<q',report,32)[0]==0x524f4f54:
   result['root_file_probe']=[]

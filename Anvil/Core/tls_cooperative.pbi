@@ -9,7 +9,7 @@ Global tlsw_sliceStart.i
 Global tlsw_sliceTicks.i
 
 Procedure tlsw_ClearHooks()
- X509PauseHook=0 : TlsRootsPauseHook=0 : TlsRecDecryptHook=0
+ X509PauseHook=0 : TlsRootsPauseHook=0 : TlsRecDecryptHook=0 : TlsRecEncryptHook=0
  EcdsaVerifyHook=0 : RsaPublicHook=0 : X25519ComputeHook=0
 EndProcedure
 
@@ -79,8 +79,18 @@ Procedure.i tlsw_GcmDecrypt(key.i,nonce.i,aad.i,aadBytes.i,cipher.i,bytes.i,plai
  ProcedureReturn $FFFFFFFF
 EndProcedure
 
+Procedure.i tlsw_GcmEncrypt(key.i,nonce.i,aad.i,aadBytes.i,plain.i,bytes.i,cipher.i,tag.i)
+ Define rc.i
+ rc=GcmJobBeginEncrypt(key,16,nonce,aad,aadBytes,plain,bytes,cipher,tag)
+ While rc=0
+  If tlsw_YieldDue()=0 : GcmJobCancel() : ProcedureReturn 0 : EndIf
+  rc=GcmJobStep()
+ Wend
+ ProcedureReturn Bool(rc=1 And GcmJobResult=1)
+EndProcedure
+
 Procedure tlsw_SetHooks()
- X509PauseHook=@tlsw_YieldDue : TlsRootsPauseHook=@tlsw_YieldDue : TlsRecDecryptHook=@tlsw_GcmDecrypt
+ X509PauseHook=@tlsw_YieldDue : TlsRootsPauseHook=@tlsw_YieldDue : TlsRecDecryptHook=@tlsw_GcmDecrypt : TlsRecEncryptHook=@tlsw_GcmEncrypt
  EcdsaVerifyHook=@tlsw_Ecdsa : RsaPublicHook=@tlsw_Rsa : X25519ComputeHook=@tlsw_X25519
 EndProcedure
 

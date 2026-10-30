@@ -131,6 +131,7 @@
 ;  Named refusals. Every one is a REASON; the caller drops the connection.
 ; ----------------------------------------------------------------------
 #TLSREC_OK                 = 0
+#TLSREC_ERR_CRYPTO         = 10  ; cooperative protection job refused
 #TLSREC_ERR_NO_KEY         = 1   ; asked to protect/unprotect unkeyed
 #TLSREC_ERR_TOO_LONG       = 2   ; over an RFC 8446 5.1/5.2 size limit
 #TLSREC_ERR_SEQ_OVERFLOW   = 3   ; 64-bit sequence number would wrap
@@ -164,7 +165,7 @@ Global Dim TlsTag.a[16]              ; tag scratch                 (public)
 Global TlsRecInnerType.i             ; recovered content type of the last record
 Global Tls13RecErr.i                 ; named reason for the last refusal
 ; Optional serialized decrypt driver; key/nonce spans are borrowed for the call.
-Global *TlsRecDecryptHook
+Global *TlsRecDecryptHook,*TlsRecEncryptHook
 Global TlsCipherInstalled.i          ; 0 none, 1 write key loaded, 2 read key
 
 ; ----------------------------------------------------------------------
@@ -350,6 +351,7 @@ Procedure.i Tls13RecProtect(ctype.i, plain.i, plen.i, padlen.i, dst.i, dstmax.i)
   Protected i.i
   Protected innerlen.i
   Protected fraglen.i
+  Protected protectedOk.i
 
   Tls13RecErr = #TLSREC_OK
 
@@ -401,7 +403,13 @@ Procedure.i Tls13RecProtect(ctype.i, plain.i, plen.i, padlen.i, dst.i, dstmax.i)
   ; ---- seal in place, tag straight after the ciphertext
   TlsRecUseWriteKey()
   TlsRecNonce(@secTlsWIv[0], TlsWSeqHi, TlsWSeqLo)
+  If TlsRecEncryptHook<>0
+    protectedOk=TlsRecEncryptHook(@secTlsWKey[0],@TlsNonce[0],@TlsAad[0],#TLS_REC_HDR,dst+#TLS_REC_HDR,innerlen,dst+#TLS_REC_HDR,dst+#TLS_REC_HDR+innerlen)
+    Tls13RecInvalidateCipher()
+    If protectedOk<>1 : Tls13RecErr=#TLSREC_ERR_CRYPTO : ProcedureReturn 0 : EndIf
+  Else
   GcmEncrypt(@TlsNonce[0], 12, @TlsAad[0], #TLS_REC_HDR, dst + #TLS_REC_HDR, innerlen, dst + #TLS_REC_HDR, dst + #TLS_REC_HDR + innerlen)
+  EndIf
 
   If TlsRecWriteSeqNext() = 0
     ProcedureReturn 0

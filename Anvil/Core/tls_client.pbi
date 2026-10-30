@@ -92,6 +92,9 @@ Global Dim tlsc_name.a[#TLSC_CONNECTIONS*#TLSC_NAME_MAX]
 Global Dim tlsc_hs.a[#TLSC_CONNECTIONS*#TLSC_HS_BUF]
 Global Dim tlsc_recv.a[#TLSC_CONNECTIONS*#TLSC_RECV_BUF]
 Global Dim tlsc_tx.a[#TLSC_CONNECTIONS*#TLSC_TX_BUF]
+; Accepted application bytes belong to the connection until protection ends.
+Global Dim tlsc_plain.a[#TLSC_CONNECTIONS*#TLSC_APP_CHUNK]
+Global Dim tlsc_appPending.i[#TLSC_CONNECTIONS]
 Global Dim tlsc_in.a[#TLSC_CONNECTIONS*#TLSC_IN_BUF]
 Global Dim tlsc_ring.a[#TLSC_CONNECTIONS*#TLSC_RING]
 
@@ -264,6 +267,7 @@ EndProcedure
 ;  Signature/key-share arithmetic is synchronous; not a frame-time guarantee.
 ; ----------------------------------------------------------------------
 Procedure tlsc_AdvanceWork()
+  Define i.i
   Define r.i
   Define st.i
   Define n.i
@@ -334,6 +338,18 @@ Procedure tlsc_AdvanceWork()
     If tlsc_state = #TLSC_FAILED
       ProcedureReturn
     EndIf
+  EndIf
+
+  ; Only the progress worker protects accepted application data. Pending stays
+  ; nonzero across yields, so another Send cannot overwrite its plaintext.
+  If tlsc_state=#TLSC_OPEN And tlsc_appPending[tlsc_slot]>0 And tlsc_txLen=0
+    n=Tls13BuildAppRecord(@tlsc_tx[tlsc_slot*#TLSC_TX_BUF],#TLSC_TX_BUF,@tlsc_plain[tlsc_slot*#TLSC_APP_CHUNK],tlsc_appPending[tlsc_slot])
+    For i=0 To tlsc_appPending[tlsc_slot]-1 : tlsc_plain[tlsc_slot*#TLSC_APP_CHUNK+i]=0 : Next
+    tlsc_appPending[tlsc_slot]=0
+    If n<=0 : tlsc_Refuse(#SVC_EIO,"TLS could not protect the queued bytes") : ProcedureReturn : EndIf
+    tlsc_txLen=n : tlsc_txOff=0
+    tlsc_Flush()
+    ProcedureReturn
   EndIf
 
   ; Send what is queued, then read and feed.
@@ -482,6 +498,7 @@ Procedure.i TlsClientOpen(*host, port.i)
   tlsc_ringHead = 0
   tlsc_ringTail = 0
   tlsc_t0 = millis()
+  tlsc_appPending[tlsc_slot]=0
   tlsc_state = #TLSC_PREPARE
   ; Opening reserves a handle only. Preparation belongs to the bounded
   ; progress path, not to a call promising a fresh handle at once.
@@ -516,6 +533,7 @@ EndProcedure
 ; Plaintext in; bytes taken, 0..n (0 while the handshake runs or the last
 ; record is still going out).
 Procedure.i TlsClientSend(h.i, *b, n.i)
+  Define i.i
   Define r.i
   Define take.i
   r = tlsc_Handle(h)
@@ -531,22 +549,15 @@ Procedure.i TlsClientSend(h.i, *b, n.i)
     gSvcDetail = tlsc_why
     ProcedureReturn tlsc_fail
   EndIf
-  If tlsc_state <> #TLSC_OPEN Or tlsc_txLen > 0 Or n = 0
+  If tlsc_state <> #TLSC_OPEN Or tlsc_txLen > 0 Or tlsc_appPending[tlsc_slot]>0 Or n = 0
     ProcedureReturn 0
   EndIf
   take = n
   If take > #TLSC_APP_CHUNK
     take = #TLSC_APP_CHUNK
   EndIf
-  r = Tls13BuildAppRecord(@tlsc_tx[tlsc_slot*#TLSC_TX_BUF+0], #TLSC_TX_BUF, *b, take)
-  If r <= 0
-    tlsc_Refuse(#SVC_EIO, "TLS could not protect the bytes to send")
-    gSvcDetail = tlsc_why
-    ProcedureReturn tlsc_fail
-  EndIf
-  tlsc_txLen = r
-  tlsc_txOff = 0
-  tlsc_Flush()
+  For i=0 To take-1 : tlsc_plain[tlsc_slot*#TLSC_APP_CHUNK+i]=PeekA(*b+i) : Next
+  tlsc_appPending[tlsc_slot]=take
   ProcedureReturn take
 EndProcedure
 
@@ -602,6 +613,7 @@ Procedure.i TlsClientClose(h.i)
   tlsc_inLen = 0
   tlsc_ringHead = 0
   tlsc_ringTail = 0
+  tlsc_appPending[tlsc_slot]=0
   tlsc_handles[tlsc_slot]=0
   r=Tls13ContextWipe(@tlsc_context[tlsc_slot*#TLS13_CONTEXT_SIZE],#TLS13_CONTEXT_SIZE)
   r=Tls13ContextRestore(@tlsc_context[tlsc_slot*#TLS13_CONTEXT_SIZE],#TLS13_CONTEXT_SIZE)
@@ -609,6 +621,7 @@ Procedure.i TlsClientClose(h.i)
   For i=0 To #TLSC_NAME_MAX-1 : tlsc_name[tlsc_slot*#TLSC_NAME_MAX+i]=0 : Next
   For i=0 To #TLSC_HS_BUF-1 : tlsc_hs[tlsc_slot*#TLSC_HS_BUF+i]=0 : Next
   For i=0 To #TLSC_RECV_BUF-1 : tlsc_recv[tlsc_slot*#TLSC_RECV_BUF+i]=0 : Next
+  For i=0 To #TLSC_APP_CHUNK-1 : tlsc_plain[tlsc_slot*#TLSC_APP_CHUNK+i]=0 : Next
   For i=0 To #TLSC_TX_BUF-1 : tlsc_tx[tlsc_slot*#TLSC_TX_BUF+i]=0 : Next
   For i=0 To #TLSC_IN_BUF-1 : tlsc_in[tlsc_slot*#TLSC_IN_BUF+i]=0 : Next
   For i=0 To #TLSC_RING-1 : tlsc_ring[tlsc_slot*#TLSC_RING+i]=0 : Next

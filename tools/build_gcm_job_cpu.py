@@ -1,4 +1,4 @@
-"""Build physical bounded GCM decryption tests against independent AES-GCM."""
+"""Build physical bounded GCM encryption/decryption tests against independent AES-GCM."""
 from pathlib import Path
 import argparse,hashlib,json,os,re,subprocess
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -18,7 +18,7 @@ Global wtable.i
 Global *pet,*timer
 Global Dim output.a[16642]
 Global Dim baseline.a[16642]
-Global Dim tag.a[16]
+Global Dim tag.a[17]
 Global Dim junk.a[32]
 Procedure CaptureTable()
  ASM
@@ -28,28 +28,44 @@ Procedure CaptureTable()
  EndASM
 EndProcedure
 Procedure GcmJobFixture(index.i,v.i,keylen.i,aadlen.i,n.i,mode.i)
- Define i.i,key.i,nonce.i,aad.i,plain.i,cipher.i,ct.i,rc.i,busy.i,t.i,cost.i,maximum.i,steps.i,bad.i,wipe.i,guard.i,expected.i,baseus.i,verdict.i,cancelled.i
+ Define i.i,key.i,nonce.i,aad.i,plain.i,cipher.i,ct.i,rc.i,busy.i,t.i,cost.i,maximum.i,steps.i,bad.i,wipe.i,guard.i,expected.i,baseus.i,verdict.i,cancelled.i,isEncrypt.i
+ isEncrypt=Bool(mode>=4)
  key=v : nonce=key+keylen : aad=nonce+12 : plain=aad+aadlen : cipher=plain+n
- For i=0 To 16642 : output[i]=$A5 : baseline[i]=$A5 : Next
+ For i=0 To 16641 : output[i]=$A5 : baseline[i]=$A5 : Next
  For i=0 To 15 : tag[i]=PeekA(cipher+n+i) : Next
  If mode=2 : tag[7]=tag[7] ! 1 : EndIf
- ct=cipher
- If mode=1
-  For i=0 To n-1 : output[1+i]=PeekA(cipher+i) : Next
+ tag[16]=$A5
+ ct=cipher : If isEncrypt<>0 : ct=plain : EndIf
+ If mode=1 Or mode=5
+  For i=0 To n-1 : output[1+i]=PeekA(ct+i) : Next
   ct=@output[1]
  EndIf
  t=timer() : rc=GcmInit(key,keylen)
- rc=GcmDecrypt(nonce,12,aad,aadlen,cipher,n,@baseline[1],@tag[0])
+ If isEncrypt<>0
+  GcmEncrypt(nonce,12,aad,aadlen,plain,n,@baseline[1],@tag[0])
+  For i=0 To 15 : tag[i]=$A5 : Next
+ Else
+  rc=GcmDecrypt(nonce,12,aad,aadlen,cipher,n,@baseline[1],@tag[0])
+ EndIf
  baseus=timer()-t
- t=timer() : rc=GcmJobBeginDecrypt(key,keylen,nonce,aad,aadlen,ct,n,@output[1],@tag[0])
+ t=timer()
+ If isEncrypt<>0
+  rc=GcmJobBeginEncrypt(key,keylen,nonce,aad,aadlen,ct,n,@output[1],@tag[0])
+ Else
+  rc=GcmJobBeginDecrypt(key,keylen,nonce,aad,aadlen,ct,n,@output[1],@tag[0])
+ EndIf
  maximum=timer()-t
  cancelled=1
- If mode=3
+ If mode=3 Or mode=6
   rc=GcmJobStep() : GcmJobCancel()
   If GcmJobStep()<>-1 Or GcmJobResult<>-1 : cancelled=0 : EndIf
   For i=0 To 31 : If gcmj_key[i]<>0 : cancelled=0 : EndIf : Next
   For i=0 To 15 : If gcmj_h[i]<>0 Or gcmj_y[i]<>0 Or gcmj_tag[i]<>0 : cancelled=0 : EndIf : Next
-  rc=GcmJobBeginDecrypt(key,keylen,nonce,aad,aadlen,ct,n,@output[1],@tag[0])
+  If isEncrypt<>0
+   rc=GcmJobBeginEncrypt(key,keylen,nonce,aad,aadlen,ct,n,@output[1],@tag[0])
+  Else
+   rc=GcmJobBeginDecrypt(key,keylen,nonce,aad,aadlen,ct,n,@output[1],@tag[0])
+  EndIf
  EndIf
  busy=GcmJobBeginDecrypt(0,0,0,0,0,0,0,0,0)
  steps=0
@@ -65,10 +81,14 @@ Procedure GcmJobFixture(index.i,v.i,keylen.i,aadlen.i,n.i,mode.i)
  verdict=GcmJobResult : bad=0 : guard=cancelled
  For i=0 To n-1
   expected=PeekA(plain+i)
+  If isEncrypt<>0 : expected=PeekA(cipher+i) : EndIf
   If mode=2 : expected=$A5 : EndIf
   If output[1+i]<>expected : bad=bad+1 : EndIf
  Next
- If output[0]<>$A5 Or output[n+1]<>$A5 : guard=0 : EndIf
+ If output[0]<>$A5 Or output[n+1]<>$A5 Or tag[16]<>$A5 : guard=0 : EndIf
+ If isEncrypt<>0
+  For i=0 To 15 : If tag[i]<>PeekA(cipher+n+i) : bad=bad+1 : EndIf : Next
+ EndIf
  wipe=0
  For i=0 To 31 : wipe=wipe | gcmj_key[i] : Next
  For i=0 To 15 : wipe=wipe | gcmj_h[i] | gcmj_y[i] | gcmj_tag[i] : Next
@@ -94,7 +114,7 @@ Procedure.i Main()
  PokeI($E1C00000,$47434D31)
 """
  for i,(k,iv,a,p,c,t) in enumerate(vectors):
-  for mode in (0,1,2,3):
+  for mode in (0,1,2,3,4,5,6):
    j=len(cases);cases.append(dict(keybytes=len(k),aadbytes=len(a),bytes=len(p),mode=mode))
    s+=f' GcmJobFixture({j},?GcmJobVector{i},{len(k)},{len(a)},{len(p)},{mode})\n'
  s+=f' PokeI($E1C00008,{len(cases)})\n MmuDisableCachedFlushed()\n ProcedureReturn 0\nEndProcedure\nDataSection\n'

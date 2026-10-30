@@ -1,0 +1,62 @@
+#WEB_KERNEL_BINDING=0
+XIncludeFile "Anvil/Network/web_url.pbi"
+XIncludeFile "Anvil/Network/web_request.pbi"
+XIncludeFile "Anvil/Network/web_response.pbi"
+XIncludeFile "Anvil/Network/web_transport.pbi"
+XIncludeFile "Anvil/Network/web_client.pbi"
+XIncludeFile "RaspberryPi4/Lib/mmu.pi4"
+Global u.WebUrl,q.WebRequest,a.WebResponse,c.WebClient
+Global Dim host.a[256]
+Global Dim target.a[1024]
+Global Dim qh.a[1024]
+Global Dim ah.a[4096]
+Global Dim line.a[1024]
+Global Dim tx.a[16384]
+Global Dim rx.a[4096]
+Global Dim out.a[1024]
+Global Dim body.a[32768]
+Global *pet,*clock
+Global table.i
+Procedure CaptureTable()
+ ASM
+ adrp x1, global_table
+ add x1, x1, #:lo12:global_table
+ str x0, [x1]
+ EndASM
+EndProcedure
+Procedure.i Main()
+ Define i.i,j.i,rc.i,v.i,n.i,start.i,offset.i,total.i,t.i,elapsed.i,maxStep.i,maxService.i
+ CaptureTable()
+ For i=0 To 65535 : PokeA($E1C00000+i,0) : Next
+ PokeI($E1C00000,$54534E31)
+ rc=WebPayloadBind(table) : If rc<>0 : ProcedureReturn 1 : EndIf
+ pet=PeekI(table+16+6*8) : clock=PeekI(table+16+11*8)
+ MmuClearNc() : MmuAddNc($08A00000,$09200000) : MmuAddNc($08100000,$08180000)
+ rc=MmuBuildTables($4F80000) : If rc<>0 : ProcedureReturn 2 : EndIf
+ MmuEnableCached()
+ For i=0 To 32767 : body[i]=65+(i % 26) : Next
+ u\host=@host[0] : u\hostCapacity=256 : u\target=@target[0] : u\targetCapacity=1024
+ v="https://httpbingo.org/post" : n=0 : While PeekA(v+n)<>0 : n=n+1 : Wend
+ rc=WebUrlParse(v,n,1,@u)
+ If rc=0 : rc=WebRequestInit(@q,@u,"POST",4,32768,0,@qh[0],1024) : EndIf
+ If rc=0 : rc=WebRequestHeader(@q,"Content-Type",12,"text/plain",10) : EndIf
+ If rc=0 : rc=WebRequestHeader(@q,"Accept-Encoding",15,"identity",8) : EndIf
+ If rc=0 : rc=WebRequestFinishHeaders(@q) : EndIf
+ If rc=0 : rc=WebResponseInit(@a,@line[0],1024,@ah[0],4096,0) : EndIf
+ start=clock()/1000
+ If rc=0 : rc=WebClientStart(@c,@u,@q,@a,@tx[0],16384,@rx[0],4096,start,30000) : EndIf
+ While rc=0
+  pet() : t=clock() : WebPayloadService(1) : elapsed=clock()-t
+  If elapsed>maxService : maxService=elapsed : EndIf
+  t=clock() : rc=WebClientStep(@c,@body[0]+offset,32768-offset,1,@out[0],1024,clock()/1000)
+  elapsed=clock()-t : If elapsed>maxStep : maxStep=elapsed : EndIf
+  offset=offset+c\consumed
+  If total+c\written>60000 : rc=-999 : Break : EndIf
+  For j=0 To c\written-1 : PokeA($E1C00100+total+j,out[j]) : Next
+  total=total+c\written
+ Wend
+ PokeI($E1C00008,rc) : PokeI($E1C00010,a\status) : PokeI($E1C00018,offset)
+ PokeI($E1C00020,total) : PokeI($E1C00028,maxStep) : PokeI($E1C00030,maxService)
+ PokeI($E1C00038,clock()/1000-start)
+ WebClientClose(@c) : MmuDisableCachedFlushed() : ProcedureReturn 0
+EndProcedure

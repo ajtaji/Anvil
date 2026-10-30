@@ -2,13 +2,15 @@
 import struct
 
 def check(raw,cases=None):
-    top=struct.unpack_from('<7q',raw)
-    assert top==(0x54504C31,-103,-102,5,-102,1,1),top
+    top=struct.unpack_from('<8q',raw)
+    assert top==(0x54504C31,-103,-102,5,-102,1,1,1),top
     rows=[]
     for i in range(4):
-        row=struct.unpack_from('<7q',raw,256+i*64)
-        assert row==(i+1,4,500+i,71+i,1,1,91+i),(i,row)
+        row=struct.unpack_from('<8q',raw,256+i*64)
+        assert row==(i+1,4,500+i,71+i,1,1,91+i,1),(i,row)
         sent=struct.unpack_from('<q',raw,2048+i*8)[0]
         assert sent==31+i,(i,sent)
+        accepted=struct.unpack_from('<q',raw,2304+i*8)[0]
+        assert accepted==111+i,(i,accepted)
         rows.append(row)
     return {'connections':4,'isolated_rows':rows,'stale_handle_refused':True,'all_snapshots_wiped_on_return':True}

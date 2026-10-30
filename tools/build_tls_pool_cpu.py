@@ -172,6 +172,7 @@ Procedure.i Tls13Connected()
  ProcedureReturn Bool(Tls13State=#TLS13_ST_CONNECTED)
 EndProcedure
 Procedure.i Tls13BuildAppRecord(p.i,n.i,b.i,l.i)
+ PokeI($E1C00900+(secTlsWKey[0]-31)*8,PeekA(b) & 255)
  PokeA(p,secTlsWKey[0]) : ProcedureReturn 1
 EndProcedure
 Procedure.i Tls13BuildAlert(p.i,n.i,level.i,description.i)
@@ -213,7 +214,10 @@ Procedure.i Main(services.i)
  For i=0 To 3
   p=$E1C00100+i*64 : h=handles[i]
   PokeI(p+8,TlsClientState(h)) : PokeI(p+16,TlsWSeqLo) : PokeI(p+24,TlsTrSnap[0])
+  result[0]=111+i
   PokeI(p+32,TlsClientSend(h,@result[0],1))
+  PokeI(p+56,tlsc_appPending[tlsc_slot])
+  result[0]=0
   PokeI(p+40,TlsClientRecv(h,@result[0],1)) : PokeI(p+48,result[0])
  Next
  old=handles[1] : rc=TlsClientClose(old)
@@ -227,6 +231,10 @@ Procedure.i Main(services.i)
  ok=1
  For i=0 To #TLSC_CONNECTIONS*#TLS13_CONTEXT_SIZE-1 : If tlsc_context[i]<>0 : ok=0 : EndIf : Next
  PokeI($E1C00030,ok)
+ ok=1
+ For i=0 To #TLSC_CONNECTIONS*#TLSC_APP_CHUNK-1 : If tlsc_plain[i]<>0 : ok=0 : EndIf : Next
+ For i=0 To #TLSC_CONNECTIONS-1 : If tlsc_appPending[i]<>0 : ok=0 : EndIf : Next
+ PokeI($E1C00038,ok)
  ProcedureReturn 0
 EndProcedure
 '''

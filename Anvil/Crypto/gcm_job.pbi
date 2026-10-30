@@ -1,7 +1,7 @@
-; NIST SP 800-38D section 7.2; uses the existing BearSSL-derived AES/GHASH
+; NIST SP 800-38D sections 7.1 and 7.2; uses the existing BearSSL-derived AES/GHASH
 ; primitives (licenses/BearSSL-LICENSE.txt). Scheduling and private state here
 ; are separate from those primitives; no upstream code is copied here.
-; Bounded AES-GCM decryption with a 96-bit nonce. Include aes and gcm first.
+; Bounded AES-GCM encryption/decryption with a 96-bit nonce. Include aes and gcm first.
 ; One job owns its copied key, nonce, tag, H and accumulator. Each step moves
 ; at most 256 bytes and retains no dependency on shared AES/GHASH scratch.
 ; Input/AAD/output spans stay alive until completion or cancellation. Cipher
@@ -10,6 +10,7 @@
 ; complete authentication tag matches. Cancellation does not erase caller data.
 ; Begin/Step: 0 pending, 1 complete, negative refused. Result: 1 authentic,
 ; 0 forged, -1 cancelled/idle. A second Begin returns -2 without changing owner.
+Global gcmj_encrypt.i,gcmj_tagOut.i
 Global GcmJobResult.i=-1
 Global gcmj_phase.i,gcmj_keyBytes.i,gcmj_aad.i,gcmj_aadBytes.i
 Global gcmj_cipher.i,gcmj_plain.i,gcmj_bytes.i,gcmj_offset.i
@@ -24,12 +25,13 @@ Procedure GcmJobCancel()
  For i=0 To 31 : gcmj_key[i]=0 : Next
  For i=0 To 11 : gcmj_nonce[i]=0 : Next
  For i=0 To 15 : gcmj_tag[i]=0 : gcmj_h[i]=0 : gcmj_y[i]=0 : Next
+ gcmj_encrypt=0 : gcmj_tagOut=0
  gcmj_phase=0 : gcmj_keyBytes=0 : gcmj_aad=0 : gcmj_aadBytes=0
  gcmj_cipher=0 : gcmj_plain=0 : gcmj_bytes=0 : gcmj_offset=0
  GcmJobResult=-1
 EndProcedure
 
-Procedure.i GcmJobBeginDecrypt(key.i,keyBytes.i,nonce.i,aad.i,aadBytes.i,cipher.i,bytes.i,plain.i,tag.i)
+Procedure.i gcmj_Begin(key.i,keyBytes.i,nonce.i,aad.i,aadBytes.i,cipher.i,bytes.i,plain.i,tag.i,encrypt.i)
  Define i.i
  If gcmj_phase<>0 : ProcedureReturn -2 : EndIf
  GcmJobCancel()
@@ -44,9 +46,16 @@ Procedure.i GcmJobBeginDecrypt(key.i,keyBytes.i,nonce.i,aad.i,aadBytes.i,cipher.
    If cipher<plain+bytes And plain<cipher+bytes : ProcedureReturn -1 : EndIf
   EndIf
  EndIf
+ If encrypt<>0
+  If tag<plain+bytes And plain<tag+16 : ProcedureReturn -1 : EndIf
+  If tag<cipher+bytes And cipher<tag+16 : ProcedureReturn -1 : EndIf
+ EndIf
+ gcmj_encrypt=encrypt : gcmj_tagOut=tag
  For i=0 To keyBytes-1 : gcmj_key[i]=PeekA(key+i) : Next
  For i=0 To 11 : gcmj_nonce[i]=PeekA(nonce+i) : Next
- For i=0 To 15 : gcmj_tag[i]=PeekA(tag+i) : Next
+ If encrypt=0
+  For i=0 To 15 : gcmj_tag[i]=PeekA(tag+i) : Next
+ EndIf
  gcmj_keyBytes=keyBytes : gcmj_aad=aad : gcmj_aadBytes=aadBytes
  gcmj_cipher=cipher : gcmj_plain=plain : gcmj_bytes=bytes
  If GcmInit(@gcmj_key[0],keyBytes)=0 : GcmJobCancel() : ProcedureReturn -1 : EndIf
@@ -54,6 +63,17 @@ Procedure.i GcmJobBeginDecrypt(key.i,keyBytes.i,nonce.i,aad.i,aadBytes.i,cipher.
  GcmWipe() : AesWipe()
  gcmj_phase=1
  ProcedureReturn 0
+EndProcedure
+
+Procedure.i GcmJobBeginDecrypt(key.i,keyBytes.i,nonce.i,aad.i,aadBytes.i,cipher.i,bytes.i,plain.i,tag.i)
+ ProcedureReturn gcmj_Begin(key,keyBytes,nonce,aad,aadBytes,cipher,bytes,plain,tag,0)
+EndProcedure
+
+; Tag is written only on completion and must not overlap either data span.
+; Encryption inputs are plaintext; output is ciphertext. Cancellation may
+; leave partial ciphertext, which must not be sent without the final tag.
+Procedure.i GcmJobBeginEncrypt(key.i,keyBytes.i,nonce.i,aad.i,aadBytes.i,plain.i,bytes.i,cipher.i,tag.i)
+ ProcedureReturn gcmj_Begin(key,keyBytes,nonce,aad,aadBytes,plain,bytes,cipher,tag,1)
 EndProcedure
 
 Procedure.i GcmJobStep()
@@ -65,6 +85,11 @@ Procedure.i GcmJobStep()
   If n>0
    If gcmj_phase=1
     GhashRun(@gcmj_y[0],@gcmj_h[0],gcmj_aad+gcmj_offset,n)
+   ElseIf gcmj_encrypt<>0
+    rc=AesCtrInit(@gcmj_key[0],gcmj_keyBytes)
+    rc=AesCtrCore(@gcmj_nonce[0],2+(gcmj_offset/16),gcmj_cipher+gcmj_offset,gcmj_plain+gcmj_offset,n)
+    AesWipe()
+    GhashRun(@gcmj_y[0],@gcmj_h[0],gcmj_plain+gcmj_offset,n)
    Else
     GhashRun(@gcmj_y[0],@gcmj_h[0],gcmj_cipher+gcmj_offset,n)
    EndIf
@@ -83,6 +108,10 @@ Procedure.i GcmJobStep()
   rc=AesCtrInit(@gcmj_key[0],gcmj_keyBytes)
   rc=AesCtrCore(@gcmj_nonce[0],1,@gcmj_y[0],@gcmj_y[0],16)
   AesWipe()
+  If gcmj_encrypt<>0
+   For i=0 To 15 : PokeA(gcmj_tagOut+i,gcmj_y[i]) : Next
+   GcmJobCancel() : GcmJobResult=1 : ProcedureReturn 1
+  EndIf
   diff=0
   For i=0 To 15 : diff=diff | (gcmj_y[i] ! gcmj_tag[i]) : Next
   If diff<>0
