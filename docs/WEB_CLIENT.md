@@ -2714,7 +2714,8 @@ releases transport ownership. Graceful NO_ERROR shutdown is described below; aut
 GOAWAY transmission remains unfinished. Opt-in automatic WebClient protocol
 dispatch is described below. Per-stream cancellation and minimal processing of
 late closed-stream frames are described below.
-Errors currently close the connection, including stream-local failures. The
+Most protocol errors still close the connection. Stream WINDOW_UPDATE errors
+are isolated as described below; other stream-local failures remain unfinished. The
 existing HTTP/1 WebClient remains the default; HTTP/2 is explicit opt-in.
 
 Physical qualification on Anvil 483 passed 40 cases through a fake transport
@@ -3128,3 +3129,41 @@ qualification remains Pi 4 only. No monitor update was required. Evidence:
 Automatic connection-error GOAWAY transmission and stream-local protocol-error
 isolation remain unfinished, alongside broader TLS, off-link IPv6/RDNSS web
 qualification and HTTP/3 work.
+
+
+### Isolating stream window-update errors
+
+A zero WINDOW_UPDATE increment on an active stream now resets that stream with
+wire PROTOCOL_ERROR (1) and `localError=H2_PROTOCOL`. An increment that would
+overflow its send window instead uses wire FLOW_CONTROL_ERROR (3) and
+`localError=H2_FLOW`. The caller receives H2_RESET, consumes it and can release
+the failed stream; other requests keep their connection and make progress.
+Invalid idle/future or even stream IDs remain connection protocol errors. A zero
+connection-window increment is now H2_PROTOCOL, and connection-window overflow
+remains H2_FLOW; both still terminate the connection.
+
+Local reset transmission and notification use the same bounded pending-reset
+mechanism as stream deadlines. A full control queue postpones the reset without
+closing siblings. A stream awaiting notification cannot be released. Partial
+outbound frames remain intact. Closed-stream frames receive the existing minimal
+processing: ignored response fields still update HPACK state, and discarded
+DATA restores connection credit without restoring stream credit.
+
+Physical Pi 4 capture187 reproduced the previous connection-wide failure for
+both zero and overflowing stream increments. Capture188 passed nine targeted
+cases: those errors with a valid sibling, control-queue congestion, late HPACK
+and DATA plus a closed-stream update, connection-window zero/overflow, invalid
+idle/even IDs, and a valid increment with two successful responses. Wire reset
+codes, local errors, complete sibling content, credit and one final transport
+close were independently checked. Captures189-191 passed all46 engine cases,
+eight stream-deadline cases and eight graceful-shutdown cases. These use
+deterministic transport fixtures on the physical processor, not an external
+server serving malformed traffic. Shared Pi3 compilation passed; physical
+qualification is Pi4 only. All captures returned zero with healthy cores,
+fonts and Vulkan, watchdog off; monitor483 was unchanged. Evidence:
+`docs/evidence/anvil-ipv6-20261030/http2-stream-window483`.
+
+This change does not complete stream-local error isolation: malformed response
+fields, DATA semantic errors, receive-window errors and other stream error paths
+still need work. Automatic connection-error GOAWAY transmission, remaining TLS,
+off-link IPv6/RDNSS web qualification and HTTP/3 also remain unfinished.

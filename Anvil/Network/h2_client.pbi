@@ -439,7 +439,18 @@ Procedure.i H2ClientDeadline(*c.H2Client,id.i,now.i,timeout.i)
  *s\deadlineStarted=now : *s\deadlineTimeout=timeout
  ProcedureReturn 0
 EndProcedure
-; Mark expired streams without invalidating a borrowed FIELD/DATA event.
+; Defer local reset transmission/notification without invalidating borrowed data.
+; deadlinePending also carries protocol-error resets through the bounded queue.
+Procedure h2cStreamError(*c.H2Client,*s.H2Stream,code.i,error.i)
+ If *s\state<>1 : ProcedureReturn : EndIf
+ *s\state=3 : *s\resetCode=code : *s\localError=error
+ *s\deadlinePending=1 : *s\deadlineTimeout=0 : *c\activeStreams=*c\activeStreams-1
+ If *c\finishStream=*s : *c\finishStream=0 : EndIf
+ If *c\blockStream=*s And (*c\decoding<>0 Or *c\continuation<>0)
+  *c\blockDiscard=1 : *c\blockStream=0
+ EndIf
+EndProcedure
+; Mark expired streams and progress all pending local resets.
 ; A full control queue defers the reset until writes free space. The stream
 ; stops accepting new data immediately, and cannot be released prematurely.
 Procedure h2cDeadlines(*c.H2Client,now.i)
@@ -448,16 +459,11 @@ Procedure h2cDeadlines(*c.H2Client,now.i)
   *s=*c\buffers\streams+i*SizeOf(H2Stream)
   If *s\state=1 And *s\deadlineTimeout<>0
    If ((now-*s\deadlineStarted) & $FFFFFFFF)>=*s\deadlineTimeout
-    *s\state=3 : *s\resetCode=8 : *s\localError=#H2_TIMEOUT
-    *s\deadlinePending=1 : *s\deadlineTimeout=0 : *c\activeStreams=*c\activeStreams-1
-    If *c\finishStream=*s : *c\finishStream=0 : EndIf
-    If *c\blockStream=*s And (*c\decoding<>0 Or *c\continuation<>0)
-     *c\blockDiscard=1 : *c\blockStream=0
-    EndIf
+    h2cStreamError(*c,*s,8,#H2_TIMEOUT)
    EndIf
   EndIf
   If *s\deadlinePending=1 And *c\controlLength<=1011
-   p=h2cControl(*c,4,3,0,*s\id) : NetWriteBE32(p,8)
+   p=h2cControl(*c,4,3,0,*s\id) : NetWriteBE32(p,*s\resetCode)
    *s\deadlinePending=2
   EndIf
  Next
@@ -641,20 +647,21 @@ Procedure.i h2cFrame(*c.H2Client)
    *c\event=#H2_GOAWAY : *c\eventStream=0
   Case 8
    n=NetReadBE32(p) & $7FFFFFFF
-   If n=0 : ProcedureReturn h2cFail(*c,#H2_FLOW) : EndIf
    If *h\stream=0
+    If n=0 : ProcedureReturn h2cFail(*c,#H2_PROTOCOL) : EndIf
     If *c\sendWindow>$7FFFFFFF-n : ProcedureReturn h2cFail(*c,#H2_FLOW) : EndIf
     *c\sendWindow=*c\sendWindow+n
    Else
-    If *s<>0
-     If *s\state=1
-      If *s\sendWindow>$7FFFFFFF-n : ProcedureReturn h2cFail(*c,#H2_FLOW) : EndIf
+    If closed=-1 : ProcedureReturn h2cFail(*c,#H2_PROTOCOL) : EndIf
+    If closed=0
+     If n=0
+      h2cStreamError(*c,*s,1,#H2_PROTOCOL)
+     ElseIf *s\sendWindow>$7FFFFFFF-n
+      h2cStreamError(*c,*s,3,#H2_FLOW)
+     Else
       *s\sendWindow=*s\sendWindow+n
      EndIf
     EndIf
-   EndIf
-   If *h\stream<>0 And *s=0
-    If *h\stream>=*c\nextStream Or (*h\stream & 1)=0 : ProcedureReturn h2cFail(*c,#H2_PROTOCOL) : EndIf
    EndIf
  EndSelect
  If *c\decoding<>0

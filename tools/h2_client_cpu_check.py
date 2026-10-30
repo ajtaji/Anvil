@@ -28,5 +28,7 @@ def check(data,cases):
   if c['name']=='PING acknowledged':assert ping
   if c['name']=='body exceeds initial receive window':assert credit==70000
   if 'cancel_rst' in c:assert resets==([(1,8)] if c['cancel_rst'] else []),(c['name'],resets)
+  if 'resets' in c:assert resets==[tuple(x) for x in c['resets']],(c['name'],resets)
+  if 'ended' in c:assert q(p+24)==c['ended'],(c['name'],'ended',q(p+24))
   if 'credit' in c:assert credit==c['credit'],(c['name'],'credit',credit)
  return dict(cases=len(cases),refusals=sum(x['result']<0 for x in cases),fragmented_send_bytes=3,fragmented_receive_bytes=5,complete_http2_client=False)
