@@ -1222,3 +1222,31 @@ The initial oracle expected unpadded IPv4/ARP frames; correcting it to Ethernet'
 repeating the board run. Anvil 441 returned normally with healthy cores/fonts/
 Vulkan. This qualifies the receive seam; device filters and a resident IPv6
 membership/service owner still need binding before live IPv6 traffic works.
+
+
+## CYW43 multicast filter controls
+
+`Anvil/Net/cyw43_multicast.pbi` provides bounded, serialized control-plane
+operations for the existing shared CYW43 driver. `Cyw43MulticastSet` writes a
+complete unique multicast MAC list (zero clears it); `Cyw43MulticastGet` copies
+a validated list into caller-owned storage without exposing the borrowed RX
+buffer. The 29-entry limit fits the existing 192-byte firmware argument buffer.
+Invalid counts, unicast/broadcast MACs, duplicates, malformed/truncated replies,
+insufficient output capacity and output overlap with driver scratch refuse.
+Get refusals leave caller output unchanged. The owner must preserve memberships
+belonging to other protocols when replacing the complete hardware list.
+
+`Cyw43NeighborOffload` controls only `ndoe`; it leaves IPv4 ARP offload untouched.
+A host IPv6 service can disable it before host-owned neighbor discovery. Calls
+accept 1..100 ms deadlines and propagate busy, pending, timeout and firmware
+errors. They do not change allmulti or promiscuous mode. Firmware acceptance
+alone is not proof of multicast reception, and settings must be renewed after
+a radio generation change.
+
+The physical Pi CPU qualification passed all 45 cases through the real
+CYW43 iovar serialization procedures, with controlled firmware/transport replies.
+Exact command bytes, little-endian list counts, copied output and unchanged
+output on refusal were checked independently. Anvil 441 returned normally,
+cores/fonts/Vulkan healthy. These controls are not yet composed into the monitor
+or exercised against the live radio; resident ownership and generation-aware
+integration remain before IPv6 web traffic is available.

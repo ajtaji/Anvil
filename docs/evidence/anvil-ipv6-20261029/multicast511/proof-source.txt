@@ -1,0 +1,498 @@
+XIncludeFile "RaspberryPi4/Lib/mmu.pi4"
+
+#CYW43_RXBUF=2048
+#CYW43_ARGBUF=192
+#CYW43_C_GET_VAR=262
+#CYW43_C_SET_VAR=263
+#CYW43_IO_TOOBIG=-2
+Global Dim cyw43_rx.l[512]
+Global Dim cyw43_arg.l[48]
+Global cyw43_replyOff.i,cyw43_replyLen.i
+Global Dim output.a[174]
+Global Dim captured.a[192]
+Global capturedBytes.i,capturedKind.i,capturedMs.i,fakeRc.i
+Procedure.i Capture(cmd.i,p.i,n.i,ms.i)
+ Define i.i
+ capturedBytes=n : capturedKind=cmd : capturedMs=ms
+ If n>192 : ProcedureReturn -999 : EndIf
+ For i=0 To n-1 : captured[i]=PeekA(p+i) : Next
+ ProcedureReturn fakeRc
+EndProcedure
+Procedure.i Cyw43IoctlSet(cmd.i,p.i,n.i,ms.i)
+ ProcedureReturn Capture(cmd,p,n,ms)
+EndProcedure
+Procedure.i Cyw43IoctlGet(cmd.i,p.i,n.i,ms.i)
+ ProcedureReturn Capture(cmd,p,n,ms)
+EndProcedure
+Procedure cyw43_PutLE32(p.i, v.i)
+  PokeB(p,     v & $FF)
+  PokeB(p + 1, (v >> 8) & $FF)
+  PokeB(p + 2, (v >> 16) & $FF)
+  PokeB(p + 3, (v >> 24) & $FF)
+EndProcedure
+Procedure.i cyw43_PutName(dst.i, src.i, namelen.i)
+  Define i.i
+  For i = 0 To namelen - 1
+    PokeB(dst + i, PeekA(src + i))
+  Next
+  PokeB(dst + namelen, 0)
+  ProcedureReturn namelen + 1
+EndProcedure
+Procedure.i Cyw43ReplyPtr()
+  ProcedureReturn @cyw43_rx[0] + cyw43_replyOff
+EndProcedure
+Procedure.i Cyw43ReplyLen()
+  ProcedureReturn cyw43_replyLen
+EndProcedure
+Procedure.i Cyw43SetIovarU32(src.i, namelen.i, v.i, timeoutMs.i)
+  Define n.i
+  n = cyw43_PutName(@cyw43_arg[0], src, namelen)
+  cyw43_PutLE32(@cyw43_arg[0] + n, v)
+  ProcedureReturn Cyw43IoctlSet(#CYW43_C_SET_VAR, @cyw43_arg[0], n + 4, timeoutMs)
+EndProcedure
+Procedure.i Cyw43SetIovarData(src.i, namelen.i, *data, datalen.i, timeoutMs.i)
+  Define n.i
+  Define i.i
+  If datalen < 0
+    ProcedureReturn #CYW43_IO_TOOBIG
+  EndIf
+  n = cyw43_PutName(@cyw43_arg[0], src, namelen)
+  If (n + datalen) > #CYW43_ARGBUF
+    ProcedureReturn #CYW43_IO_TOOBIG
+  EndIf
+  For i = 0 To datalen - 1
+    PokeB(@cyw43_arg[0] + n + i, PeekA(*data + i))
+  Next
+  ProcedureReturn Cyw43IoctlSet(#CYW43_C_SET_VAR, @cyw43_arg[0], n + datalen, timeoutMs)
+EndProcedure
+Procedure.i Cyw43GetIovarData(src.i, namelen.i, buflen.i, timeoutMs.i)
+  Define n.i
+  Define i.i
+  If buflen > #CYW43_ARGBUF
+    ProcedureReturn #CYW43_IO_TOOBIG
+  EndIf
+  n = cyw43_PutName(@cyw43_arg[0], src, namelen)
+  If n > buflen
+    ProcedureReturn #CYW43_IO_TOOBIG
+  EndIf
+  For i = n To buflen - 1
+    PokeB(@cyw43_arg[0] + i, 0)
+  Next
+  ProcedureReturn Cyw43IoctlGet(#CYW43_C_GET_VAR, @cyw43_arg[0], buflen, timeoutMs)
+EndProcedure
+XIncludeFile "Anvil/Net/cyw43_multicast.pbi"
+
+Procedure Save(index.i,rc.i)
+ Define p.i,i.i
+ p=$E1C00100+index*512
+ PokeI(p,rc) : PokeI(p+8,capturedKind) : PokeI(p+16,capturedBytes) : PokeI(p+24,capturedMs)
+ For i=0 To 191 : PokeA(p+32+i,captured[i]) : Next
+ For i=0 To 173 : PokeA(p+224+i,output[i]) : Next
+EndProcedure
+Procedure.i Main()
+ Define i.i,rc.i
+ For i=0 To 131071 : PokeA($E1C00000+i,0) : Next
+ PokeI($E1C00000,$4D434334)
+ MmuClearNc() : rc=MmuBuildTables($4F80000) : If rc<>0 : ProcedureReturn 2 : EndIf
+ MmuEnableCached()
+ For i=0 To 173 : output[i]=$A5 : Next
+ For i=0 To 191 : captured[i]=0 : Next
+ capturedBytes=0 : capturedKind=0 : capturedMs=0 : fakeRc=0
+rc=Cyw43MulticastSet(?V0,0,100)
+ Save(0,rc)
+ For i=0 To 173 : output[i]=$A5 : Next
+ For i=0 To 191 : captured[i]=0 : Next
+ capturedBytes=0 : capturedKind=0 : capturedMs=0 : fakeRc=0
+rc=Cyw43MulticastSet(?V1,1,100)
+ Save(1,rc)
+ For i=0 To 173 : output[i]=$A5 : Next
+ For i=0 To 191 : captured[i]=0 : Next
+ capturedBytes=0 : capturedKind=0 : capturedMs=0 : fakeRc=0
+rc=Cyw43MulticastSet(?V2,2,100)
+ Save(2,rc)
+ For i=0 To 173 : output[i]=$A5 : Next
+ For i=0 To 191 : captured[i]=0 : Next
+ capturedBytes=0 : capturedKind=0 : capturedMs=0 : fakeRc=0
+rc=Cyw43MulticastSet(?V3,29,100)
+ Save(3,rc)
+ For i=0 To 173 : output[i]=$A5 : Next
+ For i=0 To 191 : captured[i]=0 : Next
+ capturedBytes=0 : capturedKind=0 : capturedMs=0 : fakeRc=0
+rc=Cyw43MulticastSet(0,0,100)
+ Save(4,rc)
+ For i=0 To 173 : output[i]=$A5 : Next
+ For i=0 To 191 : captured[i]=0 : Next
+ capturedBytes=0 : capturedKind=0 : capturedMs=0 : fakeRc=0
+rc=Cyw43MulticastSet(?V4,30,100)
+ Save(5,rc)
+ For i=0 To 173 : output[i]=$A5 : Next
+ For i=0 To 191 : captured[i]=0 : Next
+ capturedBytes=0 : capturedKind=0 : capturedMs=0 : fakeRc=0
+rc=Cyw43MulticastSet(?V5,-1,100)
+ Save(6,rc)
+ For i=0 To 173 : output[i]=$A5 : Next
+ For i=0 To 191 : captured[i]=0 : Next
+ capturedBytes=0 : capturedKind=0 : capturedMs=0 : fakeRc=0
+rc=Cyw43MulticastSet(0,1,100)
+ Save(7,rc)
+ For i=0 To 173 : output[i]=$A5 : Next
+ For i=0 To 191 : captured[i]=0 : Next
+ capturedBytes=0 : capturedKind=0 : capturedMs=0 : fakeRc=0
+rc=Cyw43MulticastSet(?V6,1,100)
+ Save(8,rc)
+ For i=0 To 173 : output[i]=$A5 : Next
+ For i=0 To 191 : captured[i]=0 : Next
+ capturedBytes=0 : capturedKind=0 : capturedMs=0 : fakeRc=0
+rc=Cyw43MulticastSet(?V7,1,100)
+ Save(9,rc)
+ For i=0 To 173 : output[i]=$A5 : Next
+ For i=0 To 191 : captured[i]=0 : Next
+ capturedBytes=0 : capturedKind=0 : capturedMs=0 : fakeRc=0
+rc=Cyw43MulticastSet(?V8,2,100)
+ Save(10,rc)
+ For i=0 To 173 : output[i]=$A5 : Next
+ For i=0 To 191 : captured[i]=0 : Next
+ capturedBytes=0 : capturedKind=0 : capturedMs=0 : fakeRc=0
+rc=Cyw43MulticastSet(?V9,1,0)
+ Save(11,rc)
+ For i=0 To 173 : output[i]=$A5 : Next
+ For i=0 To 191 : captured[i]=0 : Next
+ capturedBytes=0 : capturedKind=0 : capturedMs=0 : fakeRc=0
+rc=Cyw43MulticastSet(?V10,1,101)
+ Save(12,rc)
+ For i=0 To 173 : output[i]=$A5 : Next
+ For i=0 To 191 : captured[i]=0 : Next
+ capturedBytes=0 : capturedKind=0 : capturedMs=0 : fakeRc=0
+fakeRc=-1
+ rc=Cyw43MulticastSet(?V11,1,25)
+ Save(13,rc)
+ For i=0 To 173 : output[i]=$A5 : Next
+ For i=0 To 191 : captured[i]=0 : Next
+ capturedBytes=0 : capturedKind=0 : capturedMs=0 : fakeRc=0
+fakeRc=-3
+ rc=Cyw43MulticastSet(?V12,1,25)
+ Save(14,rc)
+ For i=0 To 173 : output[i]=$A5 : Next
+ For i=0 To 191 : captured[i]=0 : Next
+ capturedBytes=0 : capturedKind=0 : capturedMs=0 : fakeRc=0
+fakeRc=-6
+ rc=Cyw43MulticastSet(?V13,1,25)
+ Save(15,rc)
+ For i=0 To 173 : output[i]=$A5 : Next
+ For i=0 To 191 : captured[i]=0 : Next
+ capturedBytes=0 : capturedKind=0 : capturedMs=0 : fakeRc=0
+fakeRc=-7
+ rc=Cyw43MulticastSet(?V14,1,25)
+ Save(16,rc)
+ For i=0 To 173 : output[i]=$A5 : Next
+ For i=0 To 191 : captured[i]=0 : Next
+ capturedBytes=0 : capturedKind=0 : capturedMs=0 : fakeRc=0
+fakeRc=-8
+ rc=Cyw43MulticastSet(?V15,1,25)
+ Save(17,rc)
+ For i=0 To 173 : output[i]=$A5 : Next
+ For i=0 To 191 : captured[i]=0 : Next
+ capturedBytes=0 : capturedKind=0 : capturedMs=0 : fakeRc=0
+For i=0 To 2047 : PokeA(@cyw43_rx[0]+i,0) : Next
+For i=0 To 3 : PokeA(@cyw43_rx[0]+3+i,PeekA(?V16+i)) : Next
+cyw43_replyOff=3 : cyw43_replyLen=4 : fakeRc=0
+ rc=Cyw43MulticastGet(@output[0],29,50)
+ Save(18,rc)
+ For i=0 To 173 : output[i]=$A5 : Next
+ For i=0 To 191 : captured[i]=0 : Next
+ capturedBytes=0 : capturedKind=0 : capturedMs=0 : fakeRc=0
+For i=0 To 2047 : PokeA(@cyw43_rx[0]+i,0) : Next
+For i=0 To 9 : PokeA(@cyw43_rx[0]+3+i,PeekA(?V17+i)) : Next
+cyw43_replyOff=3 : cyw43_replyLen=10 : fakeRc=0
+ rc=Cyw43MulticastGet(@output[0],29,50)
+ Save(19,rc)
+ For i=0 To 173 : output[i]=$A5 : Next
+ For i=0 To 191 : captured[i]=0 : Next
+ capturedBytes=0 : capturedKind=0 : capturedMs=0 : fakeRc=0
+For i=0 To 2047 : PokeA(@cyw43_rx[0]+i,0) : Next
+For i=0 To 177 : PokeA(@cyw43_rx[0]+3+i,PeekA(?V18+i)) : Next
+cyw43_replyOff=3 : cyw43_replyLen=178 : fakeRc=0
+ rc=Cyw43MulticastGet(@output[0],29,50)
+ Save(20,rc)
+ For i=0 To 173 : output[i]=$A5 : Next
+ For i=0 To 191 : captured[i]=0 : Next
+ capturedBytes=0 : capturedKind=0 : capturedMs=0 : fakeRc=0
+For i=0 To 2047 : PokeA(@cyw43_rx[0]+i,0) : Next
+For i=0 To 2 : PokeA(@cyw43_rx[0]+0+i,PeekA(?V19+i)) : Next
+cyw43_replyOff=0 : cyw43_replyLen=3 : fakeRc=0
+ rc=Cyw43MulticastGet(@output[0],29,50)
+ Save(21,rc)
+ For i=0 To 173 : output[i]=$A5 : Next
+ For i=0 To 191 : captured[i]=0 : Next
+ capturedBytes=0 : capturedKind=0 : capturedMs=0 : fakeRc=0
+For i=0 To 2047 : PokeA(@cyw43_rx[0]+i,0) : Next
+For i=0 To 9 : PokeA(@cyw43_rx[0]+0+i,PeekA(?V20+i)) : Next
+cyw43_replyOff=0 : cyw43_replyLen=10 : fakeRc=0
+ rc=Cyw43MulticastGet(@output[0],29,50)
+ Save(22,rc)
+ For i=0 To 173 : output[i]=$A5 : Next
+ For i=0 To 191 : captured[i]=0 : Next
+ capturedBytes=0 : capturedKind=0 : capturedMs=0 : fakeRc=0
+For i=0 To 2047 : PokeA(@cyw43_rx[0]+i,0) : Next
+For i=0 To 183 : PokeA(@cyw43_rx[0]+0+i,PeekA(?V21+i)) : Next
+cyw43_replyOff=0 : cyw43_replyLen=184 : fakeRc=0
+ rc=Cyw43MulticastGet(@output[0],29,50)
+ Save(23,rc)
+ For i=0 To 173 : output[i]=$A5 : Next
+ For i=0 To 191 : captured[i]=0 : Next
+ capturedBytes=0 : capturedKind=0 : capturedMs=0 : fakeRc=0
+For i=0 To 2047 : PokeA(@cyw43_rx[0]+i,0) : Next
+For i=0 To 15 : PokeA(@cyw43_rx[0]+0+i,PeekA(?V22+i)) : Next
+cyw43_replyOff=0 : cyw43_replyLen=16 : fakeRc=0
+ rc=Cyw43MulticastGet(@output[0],1,50)
+ Save(24,rc)
+ For i=0 To 173 : output[i]=$A5 : Next
+ For i=0 To 191 : captured[i]=0 : Next
+ capturedBytes=0 : capturedKind=0 : capturedMs=0 : fakeRc=0
+For i=0 To 2047 : PokeA(@cyw43_rx[0]+i,0) : Next
+For i=0 To 9 : PokeA(@cyw43_rx[0]+0+i,PeekA(?V23+i)) : Next
+cyw43_replyOff=0 : cyw43_replyLen=10 : fakeRc=0
+ rc=Cyw43MulticastGet(@output[0],29,50)
+ Save(25,rc)
+ For i=0 To 173 : output[i]=$A5 : Next
+ For i=0 To 191 : captured[i]=0 : Next
+ capturedBytes=0 : capturedKind=0 : capturedMs=0 : fakeRc=0
+For i=0 To 2047 : PokeA(@cyw43_rx[0]+i,0) : Next
+For i=0 To 15 : PokeA(@cyw43_rx[0]+0+i,PeekA(?V24+i)) : Next
+cyw43_replyOff=0 : cyw43_replyLen=16 : fakeRc=0
+ rc=Cyw43MulticastGet(@output[0],29,50)
+ Save(26,rc)
+ For i=0 To 173 : output[i]=$A5 : Next
+ For i=0 To 191 : captured[i]=0 : Next
+ capturedBytes=0 : capturedKind=0 : capturedMs=0 : fakeRc=0
+For i=0 To 2047 : PokeA(@cyw43_rx[0]+i,0) : Next
+For i=0 To 3 : PokeA(@cyw43_rx[0]+0+i,PeekA(?V25+i)) : Next
+cyw43_replyOff=0 : cyw43_replyLen=4 : fakeRc=0
+ rc=Cyw43MulticastGet(@output[0],29,50)
+ Save(27,rc)
+ For i=0 To 173 : output[i]=$A5 : Next
+ For i=0 To 191 : captured[i]=0 : Next
+ capturedBytes=0 : capturedKind=0 : capturedMs=0 : fakeRc=0
+For i=0 To 2047 : PokeA(@cyw43_rx[0]+i,0) : Next
+cyw43_replyOff=-1 : cyw43_replyLen=4 : fakeRc=0
+ rc=Cyw43MulticastGet(@output[0],29,50)
+ Save(28,rc)
+ For i=0 To 173 : output[i]=$A5 : Next
+ For i=0 To 191 : captured[i]=0 : Next
+ capturedBytes=0 : capturedKind=0 : capturedMs=0 : fakeRc=0
+For i=0 To 2047 : PokeA(@cyw43_rx[0]+i,0) : Next
+cyw43_replyOff=2046 : cyw43_replyLen=4 : fakeRc=0
+ rc=Cyw43MulticastGet(@output[0],29,50)
+ Save(29,rc)
+ For i=0 To 173 : output[i]=$A5 : Next
+ For i=0 To 191 : captured[i]=0 : Next
+ capturedBytes=0 : capturedKind=0 : capturedMs=0 : fakeRc=0
+For i=0 To 2047 : PokeA(@cyw43_rx[0]+i,0) : Next
+For i=0 To 3 : PokeA(@cyw43_rx[0]+0+i,PeekA(?V26+i)) : Next
+cyw43_replyOff=0 : cyw43_replyLen=-1 : fakeRc=0
+ rc=Cyw43MulticastGet(@output[0],29,50)
+ Save(30,rc)
+ For i=0 To 173 : output[i]=$A5 : Next
+ For i=0 To 191 : captured[i]=0 : Next
+ capturedBytes=0 : capturedKind=0 : capturedMs=0 : fakeRc=0
+For i=0 To 2047 : PokeA(@cyw43_rx[0]+i,0) : Next
+For i=0 To 3 : PokeA(@cyw43_rx[0]+0+i,PeekA(?V27+i)) : Next
+cyw43_replyOff=0 : cyw43_replyLen=4 : fakeRc=0
+ rc=Cyw43MulticastGet(0,29,50)
+ Save(31,rc)
+ For i=0 To 173 : output[i]=$A5 : Next
+ For i=0 To 191 : captured[i]=0 : Next
+ capturedBytes=0 : capturedKind=0 : capturedMs=0 : fakeRc=0
+For i=0 To 2047 : PokeA(@cyw43_rx[0]+i,0) : Next
+For i=0 To 3 : PokeA(@cyw43_rx[0]+0+i,PeekA(?V28+i)) : Next
+cyw43_replyOff=0 : cyw43_replyLen=4 : fakeRc=0
+ rc=Cyw43MulticastGet(@cyw43_rx[0],29,50)
+ Save(32,rc)
+ For i=0 To 173 : output[i]=$A5 : Next
+ For i=0 To 191 : captured[i]=0 : Next
+ capturedBytes=0 : capturedKind=0 : capturedMs=0 : fakeRc=0
+For i=0 To 2047 : PokeA(@cyw43_rx[0]+i,0) : Next
+For i=0 To 3 : PokeA(@cyw43_rx[0]+0+i,PeekA(?V29+i)) : Next
+cyw43_replyOff=0 : cyw43_replyLen=4 : fakeRc=0
+ rc=Cyw43MulticastGet(@cyw43_arg[0],29,50)
+ Save(33,rc)
+ For i=0 To 173 : output[i]=$A5 : Next
+ For i=0 To 191 : captured[i]=0 : Next
+ capturedBytes=0 : capturedKind=0 : capturedMs=0 : fakeRc=0
+For i=0 To 2047 : PokeA(@cyw43_rx[0]+i,0) : Next
+For i=0 To 3 : PokeA(@cyw43_rx[0]+0+i,PeekA(?V30+i)) : Next
+cyw43_replyOff=0 : cyw43_replyLen=4 : fakeRc=0
+ rc=Cyw43MulticastGet(@output[0],30,50)
+ Save(34,rc)
+ For i=0 To 173 : output[i]=$A5 : Next
+ For i=0 To 191 : captured[i]=0 : Next
+ capturedBytes=0 : capturedKind=0 : capturedMs=0 : fakeRc=0
+For i=0 To 2047 : PokeA(@cyw43_rx[0]+i,0) : Next
+For i=0 To 3 : PokeA(@cyw43_rx[0]+0+i,PeekA(?V31+i)) : Next
+cyw43_replyOff=0 : cyw43_replyLen=4 : fakeRc=0
+ rc=Cyw43MulticastGet(@output[0],0,50)
+ Save(35,rc)
+ For i=0 To 173 : output[i]=$A5 : Next
+ For i=0 To 191 : captured[i]=0 : Next
+ capturedBytes=0 : capturedKind=0 : capturedMs=0 : fakeRc=0
+For i=0 To 2047 : PokeA(@cyw43_rx[0]+i,0) : Next
+For i=0 To 3 : PokeA(@cyw43_rx[0]+0+i,PeekA(?V32+i)) : Next
+cyw43_replyOff=0 : cyw43_replyLen=4 : fakeRc=0
+ rc=Cyw43MulticastGet(@output[0],29,101)
+ Save(36,rc)
+ For i=0 To 173 : output[i]=$A5 : Next
+ For i=0 To 191 : captured[i]=0 : Next
+ capturedBytes=0 : capturedKind=0 : capturedMs=0 : fakeRc=0
+For i=0 To 2047 : PokeA(@cyw43_rx[0]+i,0) : Next
+For i=0 To 3 : PokeA(@cyw43_rx[0]+0+i,PeekA(?V33+i)) : Next
+cyw43_replyOff=0 : cyw43_replyLen=4 : fakeRc=-1
+ rc=Cyw43MulticastGet(@output[0],29,50)
+ Save(37,rc)
+ For i=0 To 173 : output[i]=$A5 : Next
+ For i=0 To 191 : captured[i]=0 : Next
+ capturedBytes=0 : capturedKind=0 : capturedMs=0 : fakeRc=0
+For i=0 To 2047 : PokeA(@cyw43_rx[0]+i,0) : Next
+For i=0 To 3 : PokeA(@cyw43_rx[0]+0+i,PeekA(?V34+i)) : Next
+cyw43_replyOff=0 : cyw43_replyLen=4 : fakeRc=-3
+ rc=Cyw43MulticastGet(@output[0],29,50)
+ Save(38,rc)
+ For i=0 To 173 : output[i]=$A5 : Next
+ For i=0 To 191 : captured[i]=0 : Next
+ capturedBytes=0 : capturedKind=0 : capturedMs=0 : fakeRc=0
+For i=0 To 2047 : PokeA(@cyw43_rx[0]+i,0) : Next
+For i=0 To 3 : PokeA(@cyw43_rx[0]+0+i,PeekA(?V35+i)) : Next
+cyw43_replyOff=0 : cyw43_replyLen=4 : fakeRc=-6
+ rc=Cyw43MulticastGet(@output[0],29,50)
+ Save(39,rc)
+ For i=0 To 173 : output[i]=$A5 : Next
+ For i=0 To 191 : captured[i]=0 : Next
+ capturedBytes=0 : capturedKind=0 : capturedMs=0 : fakeRc=0
+rc=Cyw43NeighborOffload(0,100)
+ Save(40,rc)
+ For i=0 To 173 : output[i]=$A5 : Next
+ For i=0 To 191 : captured[i]=0 : Next
+ capturedBytes=0 : capturedKind=0 : capturedMs=0 : fakeRc=0
+rc=Cyw43NeighborOffload(1,100)
+ Save(41,rc)
+ For i=0 To 173 : output[i]=$A5 : Next
+ For i=0 To 191 : captured[i]=0 : Next
+ capturedBytes=0 : capturedKind=0 : capturedMs=0 : fakeRc=0
+rc=Cyw43NeighborOffload(2,100)
+ Save(42,rc)
+ For i=0 To 173 : output[i]=$A5 : Next
+ For i=0 To 191 : captured[i]=0 : Next
+ capturedBytes=0 : capturedKind=0 : capturedMs=0 : fakeRc=0
+rc=Cyw43NeighborOffload(0,0)
+ Save(43,rc)
+ For i=0 To 173 : output[i]=$A5 : Next
+ For i=0 To 191 : captured[i]=0 : Next
+ capturedBytes=0 : capturedKind=0 : capturedMs=0 : fakeRc=0
+fakeRc=-3
+ rc=Cyw43NeighborOffload(0,100)
+ Save(44,rc)
+ PokeI($E1C00008,45)
+ MmuDisableCachedFlushed()
+ ProcedureReturn 0
+EndProcedure
+DataSection
+V0:
+ Data.a 0
+V1:
+ Data.a 51,51,0,0,0,1
+V2:
+ Data.a 51,51,0,0,0,1,51,51,0,0,0,2
+V3:
+ Data.a 51,51,0,0,0,1,51,51,0,0,0,2,51,51,0,0,0,3,51,51,0,0,0,4
+ Data.a 51,51,0,0,0,5,51,51,0,0,0,6,51,51,0,0,0,7,51,51,0,0,0,8
+ Data.a 51,51,0,0,0,9,51,51,0,0,0,10,51,51,0,0,0,11,51,51,0,0,0,12
+ Data.a 51,51,0,0,0,13,51,51,0,0,0,14,51,51,0,0,0,15,51,51,0,0,0,16
+ Data.a 51,51,0,0,0,17,51,51,0,0,0,18,51,51,0,0,0,19,51,51,0,0,0,20
+ Data.a 51,51,0,0,0,21,51,51,0,0,0,22,51,51,0,0,0,23,51,51,0,0,0,24
+ Data.a 51,51,0,0,0,25,51,51,0,0,0,26,51,51,0,0,0,27,51,51,0,0,0,28
+ Data.a 51,51,0,0,0,29
+V4:
+ Data.a 51,51,0,0,0,1,51,51,0,0,0,2,51,51,0,0,0,3,51,51,0,0,0,4
+ Data.a 51,51,0,0,0,5,51,51,0,0,0,6,51,51,0,0,0,7,51,51,0,0,0,8
+ Data.a 51,51,0,0,0,9,51,51,0,0,0,10,51,51,0,0,0,11,51,51,0,0,0,12
+ Data.a 51,51,0,0,0,13,51,51,0,0,0,14,51,51,0,0,0,15,51,51,0,0,0,16
+ Data.a 51,51,0,0,0,17,51,51,0,0,0,18,51,51,0,0,0,19,51,51,0,0,0,20
+ Data.a 51,51,0,0,0,21,51,51,0,0,0,22,51,51,0,0,0,23,51,51,0,0,0,24
+ Data.a 51,51,0,0,0,25,51,51,0,0,0,26,51,51,0,0,0,27,51,51,0,0,0,28
+ Data.a 51,51,0,0,0,29,51,51,0,0,0,30
+V5:
+ Data.a 0
+V6:
+ Data.a 2,1,2,3,4,5
+V7:
+ Data.a 255,255,255,255,255,255
+V8:
+ Data.a 51,51,0,0,0,1,51,51,0,0,0,1
+V9:
+ Data.a 51,51,0,0,0,1
+V10:
+ Data.a 51,51,0,0,0,1
+V11:
+ Data.a 51,51,0,0,0,1
+V12:
+ Data.a 51,51,0,0,0,1
+V13:
+ Data.a 51,51,0,0,0,1
+V14:
+ Data.a 51,51,0,0,0,1
+V15:
+ Data.a 51,51,0,0,0,1
+V16:
+ Data.a 0,0,0,0
+V17:
+ Data.a 1,0,0,0,51,51,0,0,0,1
+V18:
+ Data.a 29,0,0,0,51,51,0,0,0,1,51,51,0,0,0,2,51,51,0,0,0,3,51,51
+ Data.a 0,0,0,4,51,51,0,0,0,5,51,51,0,0,0,6,51,51,0,0,0,7,51,51
+ Data.a 0,0,0,8,51,51,0,0,0,9,51,51,0,0,0,10,51,51,0,0,0,11,51,51
+ Data.a 0,0,0,12,51,51,0,0,0,13,51,51,0,0,0,14,51,51,0,0,0,15,51,51
+ Data.a 0,0,0,16,51,51,0,0,0,17,51,51,0,0,0,18,51,51,0,0,0,19,51,51
+ Data.a 0,0,0,20,51,51,0,0,0,21,51,51,0,0,0,22,51,51,0,0,0,23,51,51
+ Data.a 0,0,0,24,51,51,0,0,0,25,51,51,0,0,0,26,51,51,0,0,0,27,51,51
+ Data.a 0,0,0,28,51,51,0,0,0,29
+V19:
+ Data.a 1,0,0
+V20:
+ Data.a 2,0,0,0,51,51,0,0,0,1
+V21:
+ Data.a 30,0,0,0,51,51,0,0,0,1,51,51,0,0,0,2,51,51,0,0,0,3,51,51
+ Data.a 0,0,0,4,51,51,0,0,0,5,51,51,0,0,0,6,51,51,0,0,0,7,51,51
+ Data.a 0,0,0,8,51,51,0,0,0,9,51,51,0,0,0,10,51,51,0,0,0,11,51,51
+ Data.a 0,0,0,12,51,51,0,0,0,13,51,51,0,0,0,14,51,51,0,0,0,15,51,51
+ Data.a 0,0,0,16,51,51,0,0,0,17,51,51,0,0,0,18,51,51,0,0,0,19,51,51
+ Data.a 0,0,0,20,51,51,0,0,0,21,51,51,0,0,0,22,51,51,0,0,0,23,51,51
+ Data.a 0,0,0,24,51,51,0,0,0,25,51,51,0,0,0,26,51,51,0,0,0,27,51,51
+ Data.a 0,0,0,28,51,51,0,0,0,29,51,51,0,0,0,30
+V22:
+ Data.a 2,0,0,0,51,51,0,0,0,1,51,51,0,0,0,2
+V23:
+ Data.a 1,0,0,0,2,1,2,3,4,5
+V24:
+ Data.a 2,0,0,0,51,51,0,0,0,1,51,51,0,0,0,1
+V25:
+ Data.a 255,255,255,255
+V26:
+ Data.a 0,0,0,0
+V27:
+ Data.a 0,0,0,0
+V28:
+ Data.a 0,0,0,0
+V29:
+ Data.a 0,0,0,0
+V30:
+ Data.a 0,0,0,0
+V31:
+ Data.a 0,0,0,0
+V32:
+ Data.a 0,0,0,0
+V33:
+ Data.a 0,0,0,0
+V34:
+ Data.a 0,0,0,0
+V35:
+ Data.a 0,0,0,0
+EndDataSection

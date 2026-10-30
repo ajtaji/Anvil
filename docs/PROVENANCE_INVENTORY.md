@@ -1555,3 +1555,6 @@ text is unchanged; no new board execution or boot claim follows.
 | `Anvil/Network/ipv6_mld_policy.pbi` | protocol-facts | ietf-rfc | IETF specification | RFC 9777 sections 8.2.1 and 9.12; independently implemented interface compatibility and querier timing policy. |
 
 | `Anvil/Network/ipv6_mld_group.pbi` | protocol-facts | ietf-rfc | IETF specification | RFC 9777 sections 6.1-6.3 and 8.2, RFC 2710 section 4; independently implemented any-source membership scheduler. |
+
+| `Anvil/Net/cyw43_multicast.pbi` | interface-facts | broadcom-brcmfmac | ISC | firmware iovar shapes only; independently implemented |
+| `Anvil/Net/cyw43_multicast.pbi` | interface-facts | linux-v6.12 | GPL-2.0 (per file) | firmware iovar shapes only; independently implemented |
