@@ -41,7 +41,7 @@ EndProcedure
 
 ; request is finalized; response was initialized with HEAD semantics as needed.
 ; All contexts/buffers and the URL host remain owned by the caller until Close.
-Procedure.i WebClientStart(*s.WebClient,*url.WebUrl,*request.WebRequest,*response.WebResponse,tx.i,txCapacity.i,rx.i,rxCapacity.i,now.i,timeout.i)
+Procedure.i wcInit(*s.WebClient,*url.WebUrl,*request.WebRequest,*response.WebResponse,tx.i,txCapacity.i,rx.i,rxCapacity.i,now.i,timeout.i)
   Define i.i,rc.i
   If *s=0 : ProcedureReturn #WEB_CLIENT_ARGUMENT : EndIf
   ; Start is for a fresh or explicitly closed context, not a live connection.
@@ -56,8 +56,33 @@ Procedure.i WebClientStart(*s.WebClient,*url.WebUrl,*request.WebRequest,*respons
   *s\request=*request : *s\response=*response
   *s\tx=tx : *s\txCapacity=txCapacity : *s\rx=rx : *s\rxCapacity=rxCapacity
   *s\started=now : *s\timeout=timeout : *s\state=1
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i WebClientStart(*s.WebClient,*url.WebUrl,*request.WebRequest,*response.WebResponse,tx.i,txCapacity.i,rx.i,rxCapacity.i,now.i,timeout.i)
+  Define rc.i
+  rc=wcInit(*s,*url,*request,*response,tx,txCapacity,rx,rxCapacity,now,timeout)
+  If rc<>0 : ProcedureReturn rc : EndIf
   rc=WebTransportOpen(@*s\connection)
   If rc<0 : ProcedureReturn wcFail(*s,rc) : EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; Adopt an already-open HTTP/1 transport without opening it again. The caller
+; must have selected HTTP/1 (or no ALPN), never h2. Destination must be fresh or
+; closed. On success ownership moves; failure leaves the source connection intact.
+Procedure.i WebClientAdopt(*s.WebClient,*connection.WebConnection,*request.WebRequest,*response.WebResponse,tx.i,txCapacity.i,rx.i,rxCapacity.i,now.i,timeout.i)
+  Define url.WebUrl,rc.i,i.i
+  If *s=0 Or *connection=0 : ProcedureReturn #WEB_CLIENT_ARGUMENT : EndIf
+  If *connection=@*s\connection Or *connection\handle<=0 : ProcedureReturn #WEB_CLIENT_ARGUMENT : EndIf
+  rc=WebTransportState(*connection)
+  If rc<>1 : ProcedureReturn #WEB_CLIENT_STATE : EndIf
+  url\secure=*connection\secure : url\host=*connection\host : url\port=*connection\port
+  rc=wcInit(*s,@url,*request,*response,tx,txCapacity,rx,rxCapacity,now,timeout)
+  If rc<>0 : ProcedureReturn rc : EndIf
+  For i=0 To SizeOf(WebConnection)-1
+    PokeA(@*s\connection+i,PeekA(*connection+i)) : PokeA(*connection+i,0)
+  Next
   ProcedureReturn 0
 EndProcedure
 

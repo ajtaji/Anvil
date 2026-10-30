@@ -1,4 +1,4 @@
-"""Compile a verified HTTP/2 GET probe using shared transport, frames and HPACK.
+"""Compile a verified HTTP/2 POST probe using shared transport, frames and HPACK.
 
 Exercises shared WebRequest headers, streamed DATA uploads and response events.
 """
@@ -6,7 +6,7 @@ from pathlib import Path
 import argparse,hashlib,json,os,re,subprocess
 from pmf_compiler import resolve_compiler
 
-def build(compiler,out):
+def build(compiler,out,negotiate=False):
  root=Path(__file__).resolve().parents[1];out.mkdir(parents=True,exist_ok=False)
  rows=['https://httpbin.org/post']
  names=['RaspberryPi4/Lib/mmu.pi4','Anvil/Network/web_url.pbi','Anvil/Network/web_transport.pbi','Anvil/Network/h2_frame.pbi','Anvil/Network/hpack_decode.pbi','Anvil/Network/hpack_tables.pbi','Anvil/Network/h2_client.pbi','Anvil/Network/h2_request.pbi','Anvil/Network/web_request.pbi']
@@ -101,6 +101,7 @@ Procedure.i Main()
  ProcedureReturn 0
 EndProcedure
 '''
+ if negotiate:s=s.replace('H2ClientStart(@c,','H2ClientStartNegotiated(@c,')
  source=out/'proof.pi4';source.write_text(s,encoding='utf8')
  q=subprocess.run([str(resolve_compiler(compiler)),'--compile',str(source),'-t','pi4','--load-addr','0x1000000','--stack-addr','0x4f00000','--entry-returns','--wants-services','-o',str(out/'proof.img')],env=dict(os.environ,PMF_ROOT=str(root)),capture_output=True,text=True,encoding='utf8',timeout=180,creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
  log=q.stdout+q.stderr;(out/'compile.txt').write_text(log,encoding='utf8');print(log[-2200:]);assert q.returncode==0
@@ -109,4 +110,5 @@ EndProcedure
  (out/'identity.json').write_text(json.dumps(dict(bytes=len(payload),sha256=hashlib.sha256(payload).hexdigest(),checked_ranges=ranges,source_hashes={n:hashlib.sha256((root/n).read_bytes()).hexdigest() for n in names},cases=rows),indent=2),encoding='utf8')
 if __name__=='__main__':
     ap=argparse.ArgumentParser(description=__doc__);ap.add_argument('--compiler',required=True);ap.add_argument('--out',type=Path,required=True)
-    a=ap.parse_args();build(a.compiler,a.out.resolve())
+    ap.add_argument('--negotiate',action='store_true')
+    a=ap.parse_args();build(a.compiler,a.out.resolve(),a.negotiate)

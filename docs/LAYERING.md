@@ -536,3 +536,14 @@ network regression fixture. All 4096 report bytes match, including guards;
 21 damaged reports are rejected. Radio calls in this CPU proof are counted
 doubles, not a Wi-Fi interruption experiment. Architecture findings fall from
 44 to 42; publication remains blocked by the remaining findings.
+
+## Addresses of storage versus procedures
+
+The downward-call and private-namespace checks use the same scoped reference
+extraction. A bare address of an explicitly declared local, parameter or global
+is storage, even when a procedure on another board has the same spelling.
+Declarations are resolved per procedure, with global storage visible throughout
+the file. Calls in declaration initializers remain checked, and a local name
+does not exempt a procedure address in another scope. Explicit calls remain
+visible. The self-test covers these cases alongside the existing planted
+violations. No name-specific exemption or increased ratchet limit is needed.

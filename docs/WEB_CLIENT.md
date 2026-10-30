@@ -2849,3 +2849,63 @@ was required. Evidence: `docs/evidence/anvil-ipv6-20261030/http2-upload483`.
 Remaining work includes WebClient ALPN dispatch, per-stream deadlines, graceful
 local connection shutdown and stream-local error isolation, as well as the
 broader remaining TLS, off-link IPv6/RDNSS qualification and HTTP/3 work.
+
+
+### Negotiated transport and HTTP/1 ownership transfer
+
+`H2ClientStartNegotiated` takes the same arguments and ownership contract as
+H2ClientStart but offers `h2` followed by `http/1.1`. An h2 selection follows
+the existing engine. Selection of http/1.1, or no ALPN selection, enters state
+4 without sending any HTTP/2 preface or request bytes. Unknown selections and
+ALPN service errors fail closed. The original H2ClientStart still offers only
+h2 and refuses fallback. The connection deadline also applies while awaiting
+handoff in state 4. ALPN support is required; this entry does not silently
+reopen through a legacy service table that lacks it.
+
+`H2ClientTakeHttp1(context, destinationConnection)` moves the verified connection
+from state 4 into a fresh/closed, disjoint WebConnection. A nonzero destination
+handle, alias of the source, or any other source state is refused without a
+transfer. On success the source handle and ownership are cleared. Closing the
+old H2Client cannot close the moved connection.
+
+`WebClientAdopt(client, connection, request, response, tx, txCapacity, rx,
+rxCapacity, now, timeout)` initializes an HTTP/1 exchange around an already-open
+transport and moves ownership into WebClient. It performs no second open or TLS
+handshake. Argument/state failures leave the source connection owned by the
+caller; close it or correct the arguments and retry. As with Start, the client
+must be fresh or closed and all contexts/buffers must be disjoint and live.
+The caller must establish HTTP/1 selection before adopting; do not adopt an h2
+connection. Adopt receives the exchange deadline parameters explicitly; retain
+the original start time when a single deadline must cover negotiation too.
+
+Physical qualification on Anvil 483 passed ten negotiation/ownership cases plus
+the 46-case HTTP/2 regression. The new suite checks exact offers and wire bytes,
+explicit HTTP/1 and absent-ALPN fallback, strict-h2 refusals, unknown selection,
+timeout, cancellation, ALPN errors, alias/busy-destination refusal, invalid then
+successful adoption, repeated close/take, and the unchanged legacy start path.
+Each exchange opens once and closes once, using short reads/writes and injected
+pending results. The first host report checker used two wrong numeric expected
+errors; topic 1536 records its correction. The original rejected check and its
+raw report are retained beside the successful recheck of the same report.
+
+Actual verified HTTPS negotiation selected h2 at httpbin.org and passed the
+70000-byte POST echo test. Two TLS 1.3 servers without an ALPN selection then
+passed handoff into WebClient: www.openbsd.org returned HTTP 200 and 3622 bytes;
+www.sqlite.org returned HTTP 200 and 9008 bytes. Both bodies matched independently
+fetched reference hashes exactly, and instrumentation confirmed one TLS open and
+one close per exchange. Their observed elapsed times were 1089190 and 595979 us;
+maximum Step calls 4282/2442 us and service calls 4319/2583 us. These are observations,
+not scheduling guarantees. Existing HTTP/1 gzip/deflate and preparation-cancel
+qualification also passed. Shared Pi 3 compilation passed, without a hardware
+claim. Captures 157-162 returned zero and the Pi remained healthy on monitor 483.
+
+The earlier GNU/FSF live attempts returned transport timeouts and are retained
+as failures. Later desktop GNU connections also timed out; the desktop FSF
+connection used TLS 1.2, which this TLS 1.3 implementation does not support. Neither
+failed attempt is counted as fallback qualification or certificate validation.
+Evidence: `docs/evidence/anvil-ipv6-20261030/http-negotiation483`.
+
+These APIs supply negotiation and a tested ownership handoff. They do not yet
+provide a unified WebClient entry that maps HTTP/2 response events and bodies
+into WebResponse. That integration, HTTP/2 lifecycle work, remaining TLS work,
+off-link IPv6/RDNSS qualification and HTTP/3 remain open.

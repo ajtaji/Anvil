@@ -452,20 +452,81 @@ class Tree(object):
 # ----------------------------------------------------------------------
 #  RULE 1 - no downward call.
 # ----------------------------------------------------------------------
+
+def declaration_names(text):
+    """Names at the start of comma-separated declarations, not initializer calls."""
+    depth = 0
+    first = 0
+    parts = []
+    for at, char in enumerate(text):
+        if char in "([":
+            depth += 1
+        elif char in ")]":
+            depth = max(0, depth - 1)
+        elif char == "," and depth == 0:
+            parts.append(text[first:at])
+            first = at + 1
+    parts.append(text[first:])
+    names = set()
+    for part in parts:
+        match = re.match(r"\s*\*?(" + IDENT + r")\b", part)
+        if match:
+            names.add(match.group(1).lower())
+    return names
+
+
+def referenced_names(lines):
+    """Resolve bare addresses of declared storage before treating them as code.
+
+    Explicit calls stay visible, including calls in declaration initializers.
+    Local declarations and parameters apply only to their procedure; a same-name
+    procedure address in another scope must still be checked. Strings/comments
+    have already been removed by Tree, preserving statement boundaries.
+    """
+    globals_ = set()
+    locals_ = {0: set()}
+    scopes = []
+    scope = 0
+    serial = 0
+    declaration = re.compile(
+        r"^\s*(Global|Define|Protected|Static|Shared|Dim|ReDim)"
+        r"(?:\." + IDENT + r")?\b\s+(?:Dim\s+)?(.*)$", re.IGNORECASE)
+    for line in lines:
+        definition = DEF_RE.match(line)
+        if definition:
+            serial += 1
+            scope = serial
+            parameters = line[definition.end():line.rfind(")")]
+            locals_[scope] = declaration_names(parameters)
+        scopes.append(scope)
+        for statement in line.split(":"):
+            match = declaration.match(statement)
+            if match:
+                target = globals_ if match.group(1).lower() == "global" or scope == 0 else locals_[scope]
+                target.update(declaration_names(match.group(2)))
+            if re.match(r"^\s*EndProcedure\b", statement, re.IGNORECASE):
+                scope = 0
+    for lineno, (line, scope) in enumerate(zip(lines, scopes), 1):
+        if DEF_RE.match(line):
+            continue
+        seen = [match.group(2) for match in CALL_RE.finditer(line)]
+        storage = globals_ | locals_[scope]
+        for match in ADDR_RE.finditer(line):
+            # @Name() is explicit code syntax. Preserve the existing checks;
+            # only a bare @Name resolved to declared storage is excluded.
+            explicit = line[match.end():].lstrip().startswith("(")
+            if explicit or match.group(1).lower() not in storage:
+                seen.append(match.group(1))
+        yield lineno, seen
+
+
 def rule_downward_call(tree):
     findings = {}
     details = []
     for path in tree.files:
         if layer_of(path) != "shared":
             continue
-        for lineno, line in enumerate(tree.code[path], 1):
-            if DEF_RE.match(line):
-                continue
-            seen = []
-            for m in CALL_RE.finditer(line):
-                seen.append(m.group(2))
-            for m in ADDR_RE.finditer(line):
-                seen.append(m.group(1))
+        for lineno, seen in referenced_names(tree.code[path]):
             for raw in seen:
                 key = raw.lower()
                 owners = tree.defs.get(key)
@@ -579,11 +640,7 @@ def rule_private_namespace(tree):
     findings = {}
     details = []
     for path in tree.files:
-        for lineno, line in enumerate(tree.code[path], 1):
-            if DEF_RE.match(line):
-                continue
-            seen = [m.group(2) for m in CALL_RE.finditer(line)]
-            seen += [m.group(1) for m in ADDR_RE.finditer(line)]
+        for lineno, seen in referenced_names(tree.code[path]):
             for raw in seen:
                 key = raw.lower()
                 prefix = member.get(key)
@@ -982,6 +1039,26 @@ def self_test():
     sha_pairs = "Data.l $428A2F98, $D728AE22, $71374491, $23EF65CD, $6A09E667, $F3BCC908, $BB67AE85, $84CAA73B\n"
     sha_tree = dict(SELF_TEST_TREE)
     sha_tree.update({
+        "RaspberryPi4/Lib/address_names.pi4": (
+            "Procedure.i Url()\nEndProcedure\n"
+            "Procedure.i DataBuffer()\nEndProcedure\n"
+        ),
+        "Anvil/Core/address_storage.pbi": (
+            "Global Dim DataBuffer.a[16]\n"
+            "Procedure.i Storage(Url.i, *zz_Helper.Any)\n"
+            " Define value.i=BoardOnlyThing(1,2), second.i\n"
+            " Use(@Url, @zz_Helper, @DataBuffer[0])\n"
+            "EndProcedure\n"
+        ),
+        "Anvil/Core/address_scope.pbi": (
+            "Procedure.i Locals()\n"
+            " Define URL.WebUrl, zz_Helper.i : Use(@url, @zz_Helper)\n"
+            " Url()\n"
+            "EndProcedure\n"
+            "Procedure.i Outside()\n"
+            " Use(@Url, @zz_Helper)\n"
+            "EndProcedure\n"
+        ),
         "Anvil/Hal/aarch64_counter.pbi": "ProcedureNaked.i A64CounterRead()\nASM\nmrs x0, cntpct_el0\nret\nENDASM\nEndProcedure\n",
         "RaspberryPi4/Lib/timer.pi4": "Procedure.i DuplicatedTicks()\nASM\nmrs x0, cntpct_el0\nENDASM\nEndProcedure\n",
         "RockPi4C/Lib/duplicate_counter.pbi": "Procedure.i DuplicatedFrequency()\nASM\nmrs x0, cntfrq_el0\nENDASM\nEndProcedure\n",
@@ -1010,6 +1087,13 @@ def self_test():
              "rule 1 red on the planted downward call")
         want("Anvil/Core/legal.pbi" not in dcall,
              "rule 1 quiet on the declared console seam and the Hw* family")
+        want(dcall.get("Anvil/Core/address_storage.pbi") == {"BoardOnlyThing": 1},
+             "storage addresses are not procedure references; initializer calls still count")
+        want(dcall.get("Anvil/Core/address_scope.pbi", {}).get("Url") == 2,
+             "local addresses are scoped; explicit calls and outside procedure addresses remain")
+        want("Anvil/Core/address_storage.pbi" not in priv
+             and priv.get("Anvil/Core/address_scope.pbi", {}).get("zz_Helper") == 1,
+             "private namespace uses the same scoped address resolution")
         want(dincl.get("Anvil/Core/includes_down.pbi", {}).get(
              "RaspberryPi4/Lib/board_lib.pi4") == 1,
              "rule 2a red on the planted downward include")

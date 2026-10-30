@@ -48,6 +48,7 @@ Structure H2Buffers
  streamCount.i
 EndStructure
 Structure H2Client
+ allowHttp1.i
  connection.WebConnection
  buffers.H2Buffers
  frame.H2FrameHeader
@@ -180,8 +181,8 @@ Procedure.i h2cFinish(*c.H2Client,*s.H2Stream)
  *c\event=#H2_END : *c\eventStream=*s\id : *c\finishStream=0
  ProcedureReturn *c\event
 EndProcedure
-Procedure.i H2ClientStart(*c.H2Client,*url.WebUrl,*buffers.H2Buffers,now.i,timeout.i)
- Define i.i,rc.i
+Procedure.i h2cStartMode(*c.H2Client,*url.WebUrl,*buffers.H2Buffers,now.i,timeout.i,allowHttp1.i)
+ Define i.i,rc.i,bytes.i,protocol.i
  If *c=0 : ProcedureReturn #H2_ARGUMENT : EndIf
  For i=0 To SizeOf(H2Client)-1 : PokeA(*c+i,0) : Next
  If *url=0 Or *buffers=0 : ProcedureReturn h2cFail(*c,#H2_ARGUMENT) : EndIf
@@ -195,8 +196,37 @@ Procedure.i H2ClientStart(*c.H2Client,*url.WebUrl,*buffers.H2Buffers,now.i,timeo
  rc=HpackInit(@*c\decoder,*buffers\dynamic,4096) : If rc<>0 : ProcedureReturn h2cFail(*c,rc) : EndIf
  H2FrameInit(@*c\frame,16384)
  PokeA(*buffers\tx,2) : PokeA(*buffers\tx+1,104) : PokeA(*buffers\tx+2,50)
- *c\state=1 : rc=WebTransportOpenAlpn(@*c\connection,*buffers\tx,3)
+ bytes=3 : *c\allowHttp1=allowHttp1
+ If allowHttp1<>0
+  PokeA(*buffers\tx+3,8) : protocol="http/1.1"
+  For i=0 To 7 : PokeA(*buffers\tx+4+i,PeekA(protocol+i)) : Next
+  bytes=12
+ EndIf
+ *c\state=1 : rc=WebTransportOpenAlpn(@*c\connection,*buffers\tx,bytes)
  If rc<>0 : ProcedureReturn h2cFail(*c,rc) : EndIf
+ ProcedureReturn 0
+EndProcedure
+; Existing explicit HTTP/2 callers still require an h2 selection.
+Procedure.i H2ClientStart(*c.H2Client,*url.WebUrl,*buffers.H2Buffers,now.i,timeout.i)
+ ProcedureReturn h2cStartMode(*c,*url,*buffers,now,timeout,0)
+EndProcedure
+; Offers h2 followed by http/1.1. State 4 means a verified HTTP/1 connection
+; is ready for TakeHttp1; no HTTP/2 preface or request has been transmitted.
+Procedure.i H2ClientStartNegotiated(*c.H2Client,*url.WebUrl,*buffers.H2Buffers,now.i,timeout.i)
+ ProcedureReturn h2cStartMode(*c,*url,*buffers,now,timeout,1)
+EndProcedure
+; Move ownership into a fresh/closed, disjoint WebConnection. Failure preserves
+; ownership. Close on this context after a successful take cannot close the moved handle.
+Procedure.i H2ClientTakeHttp1(*c.H2Client,*destination.WebConnection)
+ Define i.i
+ If *c=0 Or *destination=0 : ProcedureReturn #H2_ARGUMENT : EndIf
+ If *destination=@*c\connection : ProcedureReturn #H2_ARGUMENT : EndIf
+ If *destination\handle<>0 : ProcedureReturn #H2_STATE : EndIf
+ If *c\state<>4 : ProcedureReturn #H2_STATE : EndIf
+ For i=0 To SizeOf(WebConnection)-1
+  PokeA(*destination+i,PeekA(@*c\connection+i)) : PokeA(@*c\connection+i,0)
+ Next
+ *c\state=0
  ProcedureReturn 0
 EndProcedure
 Procedure.i H2ClientCancel(*c.H2Client)
@@ -559,6 +589,7 @@ Procedure.i H2ClientStep(*c.H2Client,now.i)
  If *c\state=-1 : ProcedureReturn *c\error : EndIf
  If *c\state=0 : ProcedureReturn #H2_STATE : EndIf
  If ((now-*c\started) & $FFFFFFFF)>=*c\timeout : ProcedureReturn h2cFail(*c,#H2_TIMEOUT) : EndIf
+ If *c\state=4 : ProcedureReturn 0 : EndIf
  If *c\event<>0 : ProcedureReturn *c\event : EndIf
  If *c\finishStream<>0 And *c\txLength=0 And *c\requestHeaderBytes=0 : ProcedureReturn h2cFinish(*c,*c\finishStream) : EndIf
  If *c\goaway<>0
@@ -577,6 +608,10 @@ Procedure.i H2ClientStep(*c.H2Client,now.i)
   If st=0 : ProcedureReturn 0 : EndIf
   If st<>1 : ProcedureReturn h2cFail(*c,#H2_CLOSED) : EndIf
   rc=WebTransportAlpn(@*c\connection,*c\buffers\tx,16)
+  If rc<0 : ProcedureReturn h2cFail(*c,rc) : EndIf
+  If *c\allowHttp1<>0 And (rc=0 Or (rc=8 And h2cEqual(*c\buffers\tx,8,"http/1.1")))
+   *c\state=4 : ProcedureReturn 0
+  EndIf
   If rc<>2 Or PeekA(*c\buffers\tx)<>104 Or PeekA(*c\buffers\tx+1)<>50 : ProcedureReturn h2cFail(*c,#H2_PROTOCOL) : EndIf
   H2ClientPreface(*c\buffers\tx,16384) : H2FrameWrite(*c\buffers\tx+24,16360,12,4,0,0)
   NetWriteBE16(*c\buffers\tx+33,2) : NetWriteBE32(*c\buffers\tx+35,0)
