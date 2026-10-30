@@ -2251,3 +2251,52 @@ Evidence: docs/evidence/anvil-ipv6-20261030/tls-setup476.
 
 The 1 ms slice remains a soft scheduling policy. Remaining atomic device/TLS work,
 IPv6 off-link/PMTU/DNS transport, HTTP/2-3 and managed cookies remain open.
+
+
+### IPv6 DNS transport (installed 477)
+
+The shared payload resolver now accepts an explicit IPv6 resolver through
+`settings set net.dns6 <IPv6-address>`. Read it with `printenv net.dns6`, or
+remove the override with `settings remove net.dns6`. These commands change the
+in-memory settings; persistence still requires the existing `settings save`.
+Use an unbracketed numeric address, without a zone suffix. Route/source selection
+uses the shared IPv6 service. No interface with an IPv4 address is required.
+
+For uncached payload A and AAAA queries, this setting takes precedence over the
+IPv4 resolver policy. Invalid settings or an unavailable IPv6 route are reported,
+not silently replaced by a DHCP resolver. With the setting absent, the existing
+IPv4 UDP/TCP fallback is unchanged. Console DNS and NTP retain their IPv4 policy.
+Existing cached records retain their TTL and query-type ownership.
+
+IPv6 resolver requests use TCP directly, a permitted first-choice transport in
+[RFC 7766 section 5](https://www.rfc-editor.org/rfc/rfc7766.html#section-5).
+They share the bounded TCP DNS owner: partial writes/reads, two-byte framing,
+question/ID/type validation, cancellation, and the original 4.5-second deadline.
+No UDP listener is acquired. The resolver consumes one of the existing four
+payload TCP handles while a query is pending and releases it on completion,
+failure or cancellation. Resource contention does not extend the deadline.
+
+Physical Pi validation:
+
+- 64 transport cases cover IPv4/IPv6 TCP with A/AAAA answers, malformed/truncated
+  replies, partial progress, busy handles, disconnects, timeout and cancellation.
+- Eight startup cases cover IPv6 without IPv4 usability, bad configuration,
+  missing routes, invalid names, busy/open failures and cleanup; 24 policy cases
+  cover the unchanged IPv4 selection plus IPv6 parsing and untouched outputs.
+- Actual public A/AAAA answers for one.one.one.one arrived over LAN IPv6 TCP DNS
+  in 311/85 ms, followed by six cache hits at the millisecond timer resolution.
+  The temporary LAN resolver forwarded unchanged requests upstream over IPv4.
+- A controlled hostname, anvil-ipv6.test, resolved through IPv6 DNS and returned
+  the exact 20,000-byte HTTP body over IPv6 in 591 ms, with HTTP status 200.
+- Certificate-verified HTTPS, compression and cancellation regression passed.
+  Core/font/Vulkan/watchdog checks passed, and temporary settings/listeners were
+  removed. The first DNS harness attempt used an unsupported settings verb and
+  stopped before changing settings or booting a payload; its transcript is kept.
+
+Pi 4 build 477 is installed and physically tested; Pi 3 build 91 is compile-only.
+Evidence: docs/evidence/anvil-ipv6-20261030/dns-ipv6-477.
+
+This proves LAN IPv6 DNS and hostname-based web traffic, not public off-link IPv6.
+IPv6 UDP DNS, automatic resolver discovery, scoped resolver selection, off-link
+and PMTU work, remaining atomic TLS/device work, HTTP/2-3 and managed cookies
+remain open. The networking implementation is not complete.

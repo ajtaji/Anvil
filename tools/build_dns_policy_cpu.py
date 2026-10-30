@@ -5,7 +5,7 @@ from pmf_compiler import resolve_compiler
 
 def build(compiler,out):
  root=Path(__file__).resolve().parents[1];out.mkdir(parents=True,exist_ok=False)
- names=['Anvil/Core/dns_policy.pbi','Anvil/Core/netfmt.pbi']
+ names=['Anvil/Core/dns_policy.pbi','Anvil/Core/netfmt.pbi','Anvil/Network/ipv6_address.pbi','Anvil/Network/byte_order.pbi']
  fmt=(root/names[1]).read_text();parse=re.search(r'^Procedure.i ParseDotted\(.*?^EndProcedure',fmt,re.M|re.S).group(0)
  s=parse+'\nXIncludeFile "Anvil/Core/dns_policy.pbi"\n'+r'''
 Global fixtureSetting.i,fixtureRoute.i,fixtureLease.i
@@ -27,6 +27,13 @@ Procedure PolicyFixture(index.i,setting.i,route.i,lease.i,kind.i)
  p=$E1C00100+index*32
  PokeI(p,NetDnsResolverFor(kind)) : PokeI(p+8,fixtureLease) : PokeI(p+16,fixtureRoute)
 EndProcedure
+Procedure Policy6(index.i,setting.i)
+ Define p.i,i.i,rc.i
+ p=$E1C01000+index*32
+ fixtureSetting=setting
+ For i=0 To 15 : PokeA(p+8+i,$A5) : Next
+ rc=NetDnsResolver6(p+8) : PokeI(p,rc)
+EndProcedure
 Procedure.i Main()
  Define i.i
  For i=0 To 131071 : PokeA($E1C00000+i,$A5) : Next
@@ -43,6 +50,18 @@ Procedure.i Main()
  PolicyFixture(9,0,1,0,1)
  PolicyFixture(10,"1.1.1.1",0,$08080808,0)
  PolicyFixture(11,0,2,$08080404,2)
+ Policy6(0,0)
+ Policy6(1,"2001:4860:4860::8888")
+ Policy6(2,"fd12:3456:789a::53")
+ Policy6(3,"fe80::1")
+ Policy6(4,"::")
+ Policy6(5,"ff02::1")
+ Policy6(6,"1.1.1.1")
+ Policy6(7,"bad")
+ Policy6(8,"fe80::1%2")
+ Policy6(9,"[2001:db8::1]")
+ Policy6(10,"123456789012345678901234567890123456789012345678")
+ Policy6(11,"")
  ProcedureReturn 0
 EndProcedure
 '''

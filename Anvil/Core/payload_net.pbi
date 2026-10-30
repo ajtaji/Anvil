@@ -199,6 +199,8 @@ Global Dim paynet_dnsTcpTx.a[#DNS_OUT_MAX+2]
 Global Dim paynet_dnsTcpRx.a[65537]
 Global paynet_dnsState.i
 Global paynet_dnsKind.i
+Global paynet_dnsFamily.i = 4
+Global Dim paynet_dnsServer6.a[16]
 Global paynet_dnsServer.i
 Global paynet_dnsLocalIp.i
 Global paynet_dnsPort.i
@@ -521,7 +523,11 @@ Procedure paynet_DnsTcpStep(now.i)
     EndIf
     NetWriteBE16(@paynet_dnsTcpTx[0],n)
     For i=0 To n-1 : paynet_dnsTcpTx[i+2]=PeekA(DnsQueryBuf()+i) : Next
-    rc=PayNetTcpOpen(paynet_dnsServer,#DNS_PORT)
+    If paynet_dnsFamily=6
+      rc=PayNetTcpOpen6(@paynet_dnsServer6[0],#DNS_PORT)
+    Else
+      rc=PayNetTcpOpen(paynet_dnsServer,#DNS_PORT)
+    EndIf
     If rc=#SVC_EBUSY : ProcedureReturn : EndIf
     If rc<0
       paynet_DnsFail(rc,"TCP to the DNS resolver could not be opened")
@@ -547,6 +553,7 @@ Procedure paynet_DnsTcpStep(now.i)
       ProcedureReturn
     EndIf
     paynet_dnsTcpTxOff=paynet_dnsTcpTxOff+n
+    If n>0 And paynet_dnsTcpTxOff=paynet_dnsTcpTxLen : paynet_dnsQueries=paynet_dnsQueries+1 : EndIf
   EndIf
   capacity=paynet_dnsTcpRxWant-paynet_dnsTcpRxLen
   If capacity>2048 : capacity=2048 : EndIf
@@ -649,6 +656,8 @@ Procedure.i paynet_DnsResolveType(*name,qtype.i,destination.i)
   Define kind.i
   Define dns.i
   Define code.i
+  Define resolver6.IPv6AddressStorage,source6.IPv6AddressStorage
+  Define family.i,i.i
 
   now = millis()
   If qtype<>#DNS_QTYPE_A And qtype<>#DNS_QTYPE_AAAA
@@ -714,27 +723,41 @@ Procedure.i paynet_DnsResolveType(*name,qtype.i,destination.i)
   EndIf
 
   ; ---- a new question ----
-  If NetIfUsableCount() = 0
-    gSvcDetail = "no interface holds an address; ask the net-up service, and call the network service slot until it answers"
-    ProcedureReturn #SVC_ESTATE
+  ; Query type and resolver transport are independent. The explicit IPv6
+  ; resolver takes precedence, including on links with no IPv4 address.
+  ; A bad explicit setting is refused, never silently replaced by DHCP.
+  family=4 : code=NetDnsResolver6(@resolver6)
+  If code<0
+    gSvcDetail="net.dns6 is not a valid unicast IPv6 resolver address"
+    ProcedureReturn #SVC_EARG
   EndIf
-  ; Every usable interface in order - the wired row first when it has one -
-  ; taking the first that has a resolver and a route to it, so a cable
-  ; with no gateway cannot starve a radio that has both.
-  paynet_dnsKind = #HW_LINK_NONE
-  kind = NetIfNext(0)
-  While kind <> #HW_LINK_NONE
-    dns = paynet_DnsFor(kind)
-    If dns <> 0 And NetNextHop(kind, dns) <> 0
-      paynet_dnsKind = kind
-      paynet_dnsServer = dns
-      Break
+  paynet_dnsKind=#HW_LINK_NONE
+  If code=16
+    family=6
+    kind=NetTcp6Select(@resolver6,@source6)
+    If kind<1
+      gSvcDetail="no assigned IPv6 source and route can reach net.dns6"
+      ProcedureReturn #SVC_ESTATE
     EndIf
-    kind = NetIfNext(kind)
-  Wend
-  If paynet_dnsKind = #HW_LINK_NONE
-    gSvcDetail = "no DNS resolver is known on any interface that holds an address: the lease did not name one and net.dns is not set"
-    ProcedureReturn #SVC_ESTATE
+    paynet_dnsKind=kind
+  Else
+    If NetIfUsableCount()=0
+      gSvcDetail="no interface holds an IPv4 address and net.dns6 is not set"
+      ProcedureReturn #SVC_ESTATE
+    EndIf
+    kind=NetIfNext(0)
+    While kind<>#HW_LINK_NONE
+      dns=paynet_DnsFor(kind)
+      If dns<>0 And NetNextHop(kind,dns)<>0
+        paynet_dnsKind=kind : paynet_dnsServer=dns
+        Break
+      EndIf
+      kind=NetIfNext(kind)
+    Wend
+    If paynet_dnsKind=#HW_LINK_NONE
+      gSvcDetail="no DNS resolver has a route: neither the lease nor net.dns names a usable resolver"
+      ProcedureReturn #SVC_ESTATE
+    EndIf
   EndIf
   ; Refuse a malformed name now, at the call that made it, not a second later.
   If DnsBuildQueryType(*name, 1,qtype) <= 0
@@ -742,14 +765,18 @@ Procedure.i paynet_DnsResolveType(*name,qtype.i,destination.i)
     gSvcDetail = "that is not a host name DNS can carry: a part between two dots is empty or longer than 63 characters"
     ProcedureReturn #SVC_EARG
   EndIf
-  paynet_dnsPort = #PAYNET_DNS_PORT_BASE + paynet_dnsKind
-  If NetUdpListen(paynet_dnsKind, paynet_dnsPort, 1) = 0
-    paynet_dnsPort = 0
-    paynet_dnsKind = #HW_LINK_NONE
-    gSvcDetail = "no UDP listener slot is free on that interface for the DNS reply"
-    ProcedureReturn #SVC_EBUSY
+  paynet_dnsPort=0 : paynet_dnsFamily=family
+  If family=6
+    For i=0 To 15 : paynet_dnsServer6[i]=PeekA(@resolver6+i) : Next
+  Else
+    paynet_dnsPort=#PAYNET_DNS_PORT_BASE+paynet_dnsKind
+    If NetUdpListen(paynet_dnsKind,paynet_dnsPort,1)=0
+      paynet_dnsPort=0 : paynet_dnsKind=#HW_LINK_NONE
+      gSvcDetail="no UDP listener slot is free for the DNS reply"
+      ProcedureReturn #SVC_EBUSY
+    EndIf
+    NetServiceSetUdpHook(@PayNetDnsInput)
   EndIf
-  NetServiceSetUdpHook(@PayNetDnsInput)
   paynet_CopyName(@paynet_dnsName[0], *name)
   paynet_dnsQid = (now ! (paynet_dnsQueries << 7) ! (paynet_dnsServer & $FFFF)) & $FFFF
   If paynet_dnsQid = 0
@@ -761,6 +788,7 @@ Procedure.i paynet_DnsResolveType(*name,qtype.i,destination.i)
   paynet_dnsDue = now
   paynet_dnsLocalIp = 0
   paynet_dnsState = #PAYNET_DNS_SEND
+  If family=6 : paynet_dnsState=#PAYNET_DNS_TCP : EndIf
   paynet_DnsStep(now)
   If paynet_dnsState = #PAYNET_DNS_FAIL
     code = paynet_dnsErr

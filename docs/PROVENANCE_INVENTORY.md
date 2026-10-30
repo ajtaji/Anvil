@@ -1392,6 +1392,7 @@ The Pi 5 adapted boot stub remains pending its source and notice review.
 
 | File | Class | Source | License | Evidence / scope |
 | --- | --- | --- | --- | --- |
+| `Anvil/Core/dns_policy.pbi` | protocol-facts | ietf-rfc | IETF specification | independent resolver policy; RFC 7766 section 5 permits TCP as the first transport |
 | `Anvil/Core/payload_net.pbi` | protocol-facts | ietf-rfc | IETF Trust legal provisions; protocol specifications | RFC 9293 close timing, RFC 1035 name limit and RFC 4343 case rules; retain existing citations/notices |
 | `Anvil/Core/tls_client.pbi` | protocol-facts | ietf-rfc | IETF Trust legal provisions; protocol specifications | RFC 8446 maximum record size; retain existing citations/notices |
 | `Anvil/Core/tls_roots.pbi` | protocol-facts | ietf-rfc | IETF Trust legal provisions; protocol specifications | RFC 4648 Base64 wire encoding; retain existing citations/notices |
