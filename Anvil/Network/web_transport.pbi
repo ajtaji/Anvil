@@ -2,21 +2,19 @@
 ; WEB_KERNEL_BINDING=1 calls the kernel owners; 0 calls ABI 1.6 slots.
 ; Only the call boundary differs. DNS retry, handle state and close ownership
 ; are shared. No register access, waits, or disabled TLS verification.
+CompilerIf #WEB_KERNEL_BINDING=1
+ XIncludeFile "Anvil/Core/tcp_dial.pbi"
+CompilerElse
+ #TCP_DIAL_KERNEL=0
+ XIncludeFile "Anvil/Network/tcp_dial.pbi"
+CompilerEndIf
 Structure WebConnection
-  secure.i
-  handle.i
-  address.i
-  host.i
-  port.i
-  dialAt.i
-  dial4.i
-  dial6.i
-  dns4.i
-  dns6.i
-  error4.i
-  error6.i
-  allow6.i
-  address6.IPv6AddressStorage
+ secure.i
+ handle.i
+ address.i
+ host.i
+ port.i
+ dial.TcpDial
 EndStructure
 
 CompilerIf #WEB_KERNEL_BINDING=0
@@ -56,63 +54,11 @@ EndProcedure
 
 CompilerEndIf
 
-Procedure.i webDialTime()
- CompilerIf #WEB_KERNEL_BINDING=1
-  ProcedureReturn millis()
- CompilerElse
-  ProcedureReturn webpTime()/1000
- CompilerEndIf
-EndProcedure
-
-Procedure.i webDialState(handle.i)
- CompilerIf #WEB_KERNEL_BINDING=1
-  ProcedureReturn PayNetTcpState(handle)
- CompilerElse
-  ProcedureReturn webpState(handle)
- CompilerEndIf
-EndProcedure
-
-Procedure webDialClose(handle.i)
- If handle<=0 : ProcedureReturn : EndIf
- CompilerIf #WEB_KERNEL_BINDING=1
-  PayNetTcpClose(handle)
- CompilerElse
-  webpClose(handle)
- CompilerEndIf
-EndProcedure
-
-Procedure webDialWin(*c.WebConnection,handle.i)
- If *c\dial4<>handle : webDialClose(*c\dial4) : EndIf
- If *c\dial6<>handle : webDialClose(*c\dial6) : EndIf
- *c\handle=handle : *c\dial4=0 : *c\dial6=0
-EndProcedure
-
-; Numeric IPv4 authorities must never be reinterpreted as DNS names for AAAA.
-Procedure.i webDialLiteral4(host.i)
- Define i.i,parts.i,digits.i,value.i,ch.i
- If host=0 : ProcedureReturn 0 : EndIf
- For i=0 To 15
-  ch=PeekA(host+i)
-  If ch=0 Or ch=46
-   If digits=0 Or value>255 : ProcedureReturn 0 : EndIf
-   parts=parts+1
-   If ch=0 : ProcedureReturn Bool(parts=4) : EndIf
-   If parts>=4 : ProcedureReturn 0 : EndIf
-   value=0 : digits=0
-  Else
-   If ch<48 Or ch>57 Or digits>=3 : ProcedureReturn 0 : EndIf
-   value=value*10+ch-48 : digits=digits+1
-  EndIf
- Next
- ProcedureReturn 0
-EndProcedure
-
 Procedure.i WebTransportOpen(*c.WebConnection)
   Define literal.IPv6AddressStorage
   Define n.i,rc.i
   *c\handle=0 : *c\address=0
-  *c\dial4=0 : *c\dial6=0 : *c\dns4=0 : *c\dns6=0
-  *c\error4=0 : *c\error6=0 : *c\allow6=0
+  For n=0 To SizeOf(TcpDial)-1 : PokeA(@*c\dial+n,0) : Next
   If PeekA(*c\host)=91
     n=0 : While n<48 And PeekA(*c\host+n)<>0 : n=n+1 : Wend
     rc=WebUrlHostIPv6(*c\host,n,@literal)
@@ -133,13 +79,6 @@ Procedure.i WebTransportOpen(*c.WebConnection)
   CompilerIf #WEB_KERNEL_BINDING=0
     If webpBound=0 : ProcedureReturn -109 : EndIf
   CompilerEndIf
-  *c\dialAt=webDialTime()
-  CompilerIf #WEB_KERNEL_BINDING=1
-    *c\allow6=1
-  CompilerElse
-    If webpDns6<>0 And webpOpen6<>0 : *c\allow6=1 : EndIf
-  CompilerEndIf
-  If webDialLiteral4(*c\host) : *c\allow6=0 : EndIf
   If *c\secure
   CompilerIf #WEB_KERNEL_BINDING=1
     *c\handle=TlsClientOpen(*c\host,*c\port)
@@ -147,6 +86,16 @@ Procedure.i WebTransportOpen(*c.WebConnection)
     *c\handle=webpTlsOpen(*c\host,*c\port)
   CompilerEndIf
     If *c\handle<0 : ProcedureReturn *c\handle : EndIf
+  EndIf
+  If *c\secure=0
+  CompilerIf #WEB_KERNEL_BINDING=1
+    ProcedureReturn NetDialStart(@*c\dial,*c\host,*c\port)
+  CompilerElse
+    tcpdTime=webpTime : tcpdDns4=webpDns : tcpdDns6=webpDns6
+    tcpdOpen4=webpOpen : tcpdOpen6=webpOpen6
+    tcpdState=webpState : tcpdClose=webpClose
+    ProcedureReturn TcpDialStart(@*c\dial,*c\host,*c\port)
+  CompilerEndIf
   EndIf
   ProcedureReturn 0
 EndProcedure
@@ -165,94 +114,19 @@ Procedure.i WebTransportState(*c.WebConnection)
     ProcedureReturn 0
   EndIf
   If *c\handle>0
-    rc=webDialState(*c\handle)
+  CompilerIf #WEB_KERNEL_BINDING=1
+    rc=PayNetTcpState(*c\handle)
+  CompilerElse
+    rc=webpState(*c\handle)
+  CompilerEndIf
     If rc<0 : ProcedureReturn rc : EndIf
     If rc=2 : ProcedureReturn 1 : EndIf
     If rc=3 : ProcedureReturn 2 : EndIf
     ProcedureReturn 0
   EndIf
-  ; Poll both attempts on every call, even while the other DNS type is busy.
-  If *c\dial4>0
-    rc=webDialState(*c\dial4)
-    If rc=2 Or rc=3
-      webDialWin(*c,*c\dial4) : ProcedureReturn rc-1
-    EndIf
-    If rc<0
-      webDialClose(*c\dial4) : *c\dial4=0 : *c\dns4=3 : *c\error4=rc
-    EndIf
-  EndIf
-  If *c\dial6>0
-    rc=webDialState(*c\dial6)
-    If rc=2 Or rc=3
-      webDialWin(*c,*c\dial6) : ProcedureReturn rc-1
-    EndIf
-    If rc<0
-      webDialClose(*c\dial6) : *c\dial6=0 : *c\dns6=3 : *c\error6=rc
-    EndIf
-  EndIf
-  If *c\dns4<2
-    CompilerIf #WEB_KERNEL_BINDING=1
-      rc=PayNetDnsResolve(*c\host)
-    CompilerElse
-      rc=webpDns(*c\host)
-    CompilerEndIf
-    If rc=-110 Or rc=-103
-      *c\dns4=1
-    ElseIf rc>0
-      *c\address=rc : *c\dns4=2
-    Else
-      *c\error4=rc : *c\dns4=3
-    EndIf
-  EndIf
-  If *c\dns4=2 And *c\dial4=0
-    CompilerIf #WEB_KERNEL_BINDING=1
-      rc=PayNetTcpOpen(*c\address,*c\port)
-    CompilerElse
-      rc=webpOpen(*c\address,*c\port)
-    CompilerEndIf
-    If rc>0
-      *c\dial4=rc
-    ElseIf rc<>-103
-      *c\error4=rc : *c\dns4=3
-    EndIf
-  EndIf
-  ; IPv4 starts immediately. IPv6 is eligible after 250 ms or an IPv4
-  ; failure. The resolver serializes uncached queries, but both connection
-  ; attempts progress without waiting for the other family to time out.
-  If *c\allow6 And (*c\dns4=3 Or ((webDialTime()-*c\dialAt) & $FFFFFFFF)>=250)
-    If *c\dns6<2
-      CompilerIf #WEB_KERNEL_BINDING=1
-        rc=PayNetDnsResolve6(*c\host,@*c\address6)
-      CompilerElse
-        rc=webpDns6(*c\host,@*c\address6)
-      CompilerEndIf
-      If rc=-110 Or rc=-103
-        *c\dns6=1
-      ElseIf rc=16
-        *c\dns6=2
-      Else
-        *c\error6=rc : *c\dns6=3
-      EndIf
-    EndIf
-    If *c\dns6=2 And *c\dial6=0
-      CompilerIf #WEB_KERNEL_BINDING=1
-        rc=PayNetTcpOpen6(@*c\address6,*c\port)
-      CompilerElse
-        rc=webpOpen6(@*c\address6,*c\port)
-      CompilerEndIf
-      If rc>0
-        *c\dial6=rc
-      ElseIf rc<>-103
-        *c\error6=rc : *c\dns6=3
-      EndIf
-    EndIf
-  EndIf
-  If *c\dns4=3 And (*c\allow6=0 Or *c\dns6=3)
-    If *c\error6<0 : ProcedureReturn *c\error6 : EndIf
-    If *c\error4<0 : ProcedureReturn *c\error4 : EndIf
-    ProcedureReturn -105
-  EndIf
-  ProcedureReturn 0
+  rc=TcpDialPoll(@*c\dial)
+  If rc>0 : *c\handle=TcpDialTake(@*c\dial) : EndIf
+  ProcedureReturn rc
 EndProcedure
 
 Procedure.i WebTransportSend(*c.WebConnection,source.i,bytes.i)
@@ -286,8 +160,7 @@ Procedure.i WebTransportRecv(*c.WebConnection,destination.i,capacity.i)
 EndProcedure
 
 Procedure WebTransportClose(*c.WebConnection)
-  webDialClose(*c\dial4) : webDialClose(*c\dial6)
-  *c\dial4=0 : *c\dial6=0 : *c\dns4=3 : *c\dns6=3
+  TcpDialClose(@*c\dial)
   If *c\handle>0
     If *c\secure
   CompilerIf #WEB_KERNEL_BINDING=1

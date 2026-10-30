@@ -43,6 +43,7 @@
 ; ======================================================================
 
 EnableExplicit
+XIncludeFile "Anvil/Core/tcp_dial.pbi"
 
 #SVC_TLS_RESOLVING   = 1
 #SVC_TLS_CONNECTING  = 2
@@ -70,6 +71,7 @@ EnableExplicit
 
 XIncludeFile "Anvil/Crypto/tls13_context.pbi"
 #TLSC_CONNECTIONS=4
+Global Dim tlsc_dial.TcpDial[#TLSC_CONNECTIONS]
 Global tlsc_state.i
 Global tlsc_fail.i                 ; the latched #SVC_* code
 Global tlsc_why.i                  ; and its fragment
@@ -160,6 +162,7 @@ Procedure tlsc_Refuse(code.i, *why)
     tlsc_peerAlert = Tls13PeerAlert
   EndIf
   tlsc_state = #TLSC_FAILED
+  TcpDialClose(@tlsc_dial[tlsc_slot])
   If tlsc_tcp > 0
     PayNetTcpClose(tlsc_tcp)
     tlsc_tcp = 0
@@ -299,25 +302,19 @@ Procedure tlsc_AdvanceWork()
   Else
     DrbgAutoReseed()
   EndIf
+    r=NetDialStart(@tlsc_dial[tlsc_slot],@tlsc_name[tlsc_slot*#TLSC_NAME_MAX],tlsc_port)
+    If r<0 : tlsc_Refuse(r,"the connection selector could not start") : ProcedureReturn : EndIf
     tlsc_state=#TLSC_RESOLVING
   EndIf
 
   If tlsc_state = #TLSC_RESOLVING
-    r = PayNetDnsResolve(@tlsc_name[tlsc_slot*#TLSC_NAME_MAX+0])
-    If r = #SVC_EAGAIN Or r = #SVC_EBUSY
-      ProcedureReturn
-    EndIf
-    If r < 0
-      tlsc_Refuse(r, "the server's name did not resolve")
-      ProcedureReturn
-    EndIf
-    tlsc_ip = r
-    r = PayNetTcpOpen(tlsc_ip, tlsc_port)
-    If r < 0
-      tlsc_Refuse(r, "TCP to the server could not be opened")
-      ProcedureReturn
-    EndIf
-    tlsc_tcp = r
+    r=TcpDialPoll(@tlsc_dial[tlsc_slot])
+    If r=0 : ProcedureReturn : EndIf
+    If r<0 : tlsc_Refuse(r,"the server could not be reached over either address family") : ProcedureReturn : EndIf
+    If r<>1 : tlsc_Refuse(#SVC_EIO,"the server closed TCP before TLS began") : ProcedureReturn : EndIf
+    tlsc_ip=0
+    If tlsc_dial[tlsc_slot]\family=4 : tlsc_ip=tlsc_dial[tlsc_slot]\address : EndIf
+    tlsc_tcp=TcpDialTake(@tlsc_dial[tlsc_slot])
     tlsc_state = #TLSC_TCP
   EndIf
 
@@ -604,6 +601,7 @@ Procedure.i TlsClientClose(h.i)
       tlsc_Flush()
     EndIf
   EndIf
+  TcpDialClose(@tlsc_dial[tlsc_slot])
   If tlsc_tcp > 0
     PayNetTcpClose(tlsc_tcp)
   EndIf

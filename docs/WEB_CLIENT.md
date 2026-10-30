@@ -1799,6 +1799,40 @@ The first installed candidate456 exposed missing IPv6 neighbor progress in
 the command pump and timed out before connecting. Build457 advances shared
 lease/protocol services without re-entering the console dispatcher.
 
-This closes native plain-HTTP integration coverage. TLS still needs dual-family
+This closes native plain-HTTP integration coverage. At build457, TLS still needed dual-family
 connection support; public off-link IPv6, IPv6 DNS transport, full multi-address
 racing, remaining service stalls and HTTP/2-3 remain open.
+
+
+### Shared dual-family TLS dialing
+
+Anvil458 uses the same bounded IPv4/IPv6 connection selector for plain HTTP
+and TLS. IPv4 starts immediately; IPv6 becomes eligible after 250 ms or an
+IPv4 failure. Both TCP attempts are polled while DNS work progresses, and the
+losing attempt is closed when one connects. Cancellation, timeout, failure and
+payload return close pending attempts. Each TLS slot keeps its own dial state.
+The existing hostname is retained for SNI and certificate verification. No trust
+or TLS verification check was bypassed. The kernel uses direct service calls;
+payloads bind the same algorithm to the existing ABI. Pi3build73 compiles the
+shared implementation; physical validation was on Pi4.
+
+Physical RAM checks passed 18 connection-selection cases, eight HTTP lifecycle
+cases, isolation of four TLS slots, and seven TLS dialing/cleanup cases.
+Installed build458 passed full running-image SHA, cores, fonts and Vulkan checks
+after a 90-second boot interval. The verified rollback is build457.
+
+For live IPv6 TLS, a temporary DNS server returned no A address and a LAN ULA
+AAAA address for httpbingo.org. The Pi connected over IPv6 to a transparent TCP
+relay, which forwarded encrypted bytes to the public server over IPv4. Anvil
+itself completed TLS 1.3, verified the server certificate against its existing
+root store, and received HTTP200 with the expected 100-byte body. The relay did
+not terminate TLS. This proves IPv6 TLS on the LAN, not public off-link IPv6.
+An ordinary public HTTPS request also passed after removing the relay, along
+with all six native plain-HTTP regression cases. Temporary DNS overrides were
+removed without saving settings; local servers and the relay were closed.
+Evidence: `docs/evidence/anvil-ipv6-20261030/tls458`.
+
+Still open: public off-link IPv6, DNS transport over IPv6, multiple addresses
+per DNS answer and full address racing, remaining service stalls, HTTP/2-3,
+and a complete managed-cookie policy. IPv6 literal certificate identities are
+not added by this hostname-dialing change.

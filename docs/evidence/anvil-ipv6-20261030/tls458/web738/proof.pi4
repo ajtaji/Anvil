@@ -1,0 +1,1312 @@
+; SPDX-License-Identifier: MIT
+; Network-order integers through byte loads/stores, including unaligned fields.
+; The caller supplies two or four valid bytes. No packet, driver or global state.
+Procedure.i NetReadBE16(*p)
+  ProcedureReturn ((PeekA(*p) << 8) | PeekA(*p + 1)) & $FFFF
+EndProcedure
+
+Procedure.i NetReadBE32(*p)
+  Protected v.i
+  v = PeekA(*p)
+  v = (v << 8) | PeekA(*p + 1)
+  v = (v << 8) | PeekA(*p + 2)
+  v = (v << 8) | PeekA(*p + 3)
+  ProcedureReturn v & $FFFFFFFF
+EndProcedure
+
+Procedure NetWriteBE16(*p, v.i)
+  PokeB(*p + 0, (v >> 8) & $FF)
+  PokeB(*p + 1, v & $FF)
+EndProcedure
+
+Procedure NetWriteBE32(*p, v.i)
+  PokeB(*p + 0, (v >> 24) & $FF)
+  PokeB(*p + 1, (v >> 16) & $FF)
+  PokeB(*p + 2, (v >> 8) & $FF)
+  PokeB(*p + 3, v & $FF)
+EndProcedure
+; Shared IPv6 address representation: exactly 16 network-order bytes.
+; RFC 4291 section 2.2 input; RFC 5952 section 4 hexadecimal output.
+; No allocation, global scratch, resolver, interface or device dependency.
+; Scope identifiers, URI brackets and prefix suffixes belong to their callers.
+Structure IPv6AddressStorage
+ high.q
+ low.q
+EndStructure
+
+Procedure.i ipv6a_Hex(c.i)
+ If c>=48 And c<=57 : ProcedureReturn c-48 : EndIf
+ If c>=65 And c<=70 : ProcedureReturn c-55 : EndIf
+ If c>=97 And c<=102 : ProcedureReturn c-87 : EndIf
+ ProcedureReturn -1
+EndProcedure
+
+; 0 success, -1 invalid input. Output is untouched on refusal.
+; The explicit input span and 16-byte output must not overlap.
+Procedure.i IPv6AddressParse(text.i,bytes.i,out.i)
+ Define tmp.IPv6AddressStorage
+ Define i.i,n.i,gap.i,compressed.i,start.i,digits.i,value.i,c.i,k.i,dot.i,part.i
+ If text=0 Or out=0 : ProcedureReturn -1 : EndIf
+ If bytes<2 Or bytes>45 : ProcedureReturn -1 : EndIf
+ If out<text+bytes And text<out+16 : ProcedureReturn -1 : EndIf
+ tmp\high=0 : tmp\low=0 : i=0 : n=0 : compressed=-1
+ If PeekA(text)=58
+  If PeekA(text+1)<>58 : ProcedureReturn -1 : EndIf
+  compressed=0 : i=2
+ EndIf
+ While i<bytes
+  If n>=16 : ProcedureReturn -1 : EndIf
+  start=i : dot=0
+  While i<bytes
+   c=PeekA(text+i)
+   If c=58 : Break : EndIf
+   If c=46 : dot=1 : EndIf
+   i=i+1
+  Wend
+  If dot<>0
+   If n>12 Or i<>bytes : ProcedureReturn -1 : EndIf
+   i=start
+   For part=0 To 3
+    start=i : value=0 : digits=0
+    While i<bytes
+     c=PeekA(text+i)
+     If c=46 : Break : EndIf
+     If c<48 Or c>57 Or digits>=3 : ProcedureReturn -1 : EndIf
+     value=value*10+c-48 : digits=digits+1 : i=i+1
+    Wend
+    If digits=0 Or value>255 : ProcedureReturn -1 : EndIf
+    If digits>1
+     If PeekA(text+start)=48 : ProcedureReturn -1 : EndIf
+    EndIf
+    PokeA(@tmp+n,value) : n=n+1
+    If part<3
+     If i>=bytes : ProcedureReturn -1 : EndIf
+     i=i+1
+    Else
+     If i<>bytes : ProcedureReturn -1 : EndIf
+    EndIf
+   Next
+   Break
+  EndIf
+  digits=i-start
+  If digits<1 Or digits>4 : ProcedureReturn -1 : EndIf
+  value=0
+  For k=start To i-1
+   c=ipv6a_Hex(PeekA(text+k))
+   If c<0 : ProcedureReturn -1 : EndIf
+   value=(value<<4)|c
+  Next
+  NetWriteBE16(@tmp+n,value) : n=n+2
+  If i<bytes
+   i=i+1
+   If i=bytes : ProcedureReturn -1 : EndIf
+   If PeekA(text+i)=58
+    If compressed>=0 : ProcedureReturn -1 : EndIf
+    compressed=n : i=i+1
+   EndIf
+  EndIf
+ Wend
+ If compressed>=0
+  gap=16-n
+  If gap<2 : ProcedureReturn -1 : EndIf
+  k=n-1
+  While k>=compressed
+   PokeA(@tmp+k+gap,PeekA(@tmp+k)) : k=k-1
+  Wend
+  For k=compressed To compressed+gap-1 : PokeA(@tmp+k,0) : Next
+ Else
+  If n<>16 : ProcedureReturn -1 : EndIf
+ EndIf
+ For k=0 To 15 : PokeA(out+k,PeekA(@tmp+k)) : Next
+ ProcedureReturn 0
+EndProcedure
+
+; Lowercase hex with longest/first zero run compressed; no single-zero
+; compression. IPv4-embedded addresses also use hexadecimal here.
+; Returns bytes excluding NUL; null output/capacity0 measures. Short output
+; returns -2 without writing. A successful write includes the trailing NUL.
+Procedure.i IPv6AddressFormat(address.i,out.i,capacity.i)
+ Define i.i,j.i,best.i,run.i,longest.i,value.i,digit.i,shift.i,started.i,count.i,pass.i,c.i
+ If address=0 Or capacity<0 : ProcedureReturn -1 : EndIf
+ If out=0 And capacity<>0 : ProcedureReturn -1 : EndIf
+ If out<>0
+  If out<address+16 And address<out+capacity : ProcedureReturn -1 : EndIf
+ EndIf
+ best=-1 : longest=1 : i=0
+ While i<8
+  If NetReadBE16(address+i*2)=0
+   j=i+1
+   While j<8
+    If NetReadBE16(address+j*2)<>0 : Break : EndIf
+    j=j+1
+   Wend
+   run=j-i
+   If run>longest : best=i : longest=run : EndIf
+   i=j
+  Else
+   i=i+1
+  EndIf
+ Wend
+ For pass=0 To 1
+  count=0 : i=0
+  While i<8
+   If i=best
+    If pass=1 : PokeA(out+count,58) : PokeA(out+count+1,58) : EndIf
+    count=count+2 : i=i+longest
+   Else
+    If i>0 And i<>best+longest
+     If pass=1 : PokeA(out+count,58) : EndIf
+     count=count+1
+    EndIf
+    value=NetReadBE16(address+i*2) : started=0 : shift=12
+    While shift>=0
+     digit=(value>>shift)&15
+     If digit<>0 Or started<>0 Or shift=0
+      c=digit+48 : If digit>9 : c=digit+87 : EndIf
+      If pass=1 : PokeA(out+count,c) : EndIf
+      count=count+1 : started=1
+     EndIf
+     shift=shift-4
+    Wend
+    i=i+1
+   EndIf
+  Wend
+  If pass=0
+   If out=0 : ProcedureReturn count : EndIf
+   If capacity<=count : ProcedureReturn -2 : EndIf
+  EndIf
+ Next
+ PokeA(out+count,0)
+ ProcedureReturn count
+EndProcedure
+
+; Prefix length 0..128, result 1 match, 0 different, -1 invalid.
+Procedure.i IPv6AddressPrefix(a.i,b.i,bits.i)
+ Define i.i,whole.i,rest.i,mask.i,aa.i,bb.i
+ If a=0 Or b=0 : ProcedureReturn -1 : EndIf
+ If bits<0 Or bits>128 : ProcedureReturn -1 : EndIf
+ whole=bits/8 : rest=bits%8
+ For i=0 To whole-1
+  If PeekA(a+i)<>PeekA(b+i) : ProcedureReturn 0 : EndIf
+ Next
+ If rest<>0
+  mask=($FF<<(8-rest))&$FF
+  aa=PeekA(a+whole)&mask : bb=PeekA(b+whole)&mask
+  If aa<>bb : ProcedureReturn 0 : EndIf
+ EndIf
+ ProcedureReturn 1
+EndProcedure
+Structure TcpDial
+  handle.i
+  address.i
+  host.i
+  port.i
+  dialAt.i
+  dial4.i
+  dial6.i
+  dns4.i
+  dns6.i
+  error4.i
+  error6.i
+  allow6.i
+  address6.IPv6AddressStorage
+  family.i
+EndStructure
+Structure WebConnection
+ secure.i
+ handle.i
+ address.i
+ host.i
+ port.i
+ dial.TcpDial
+EndStructure
+; Bounded HTTP(S) URL decomposition for the shared web client.
+; RFC 3986 sections 3.1-3.5; RFC 9110 sections 4.2 and 7.1.
+; Input is an explicit byte span, not an implicitly readable C string.
+; Keeps escaped path/query bytes, excludes fragments, and emits origin-form.
+; No DNS, allocation or transport calls. Caller owns output and serialization.
+; Bracketed IPv6 literals retain brackets for Host/authority serialization.
+; Zone identifiers and international host conversion remain unsupported.
+#WEB_URL_OK = 0
+#WEB_URL_ARGUMENT = -500
+#WEB_URL_SCHEME = -501
+#WEB_URL_AUTHORITY = -502
+#WEB_URL_PORT = -503
+#WEB_URL_SYNTAX = -504
+#WEB_URL_CAPACITY = -505
+#WEB_URL_HOST_UNSUPPORTED = -506
+#WEB_URL_LIMIT = 4096
+#WEB_URL_HOST = 256
+#WEB_URL_TARGET = 3072
+Structure WebUrl
+  secure.i
+  port.i
+  explicitPort.i
+  hostLength.i
+  targetLength.i
+  host.i
+  target.i
+  hostCapacity.i
+  targetCapacity.i
+EndStructure
+
+Procedure.i WebUrlHostIPv6(host.i,bytes.i,address.i)
+ If host=0 Or address=0 Or bytes<4 Or bytes>47 : ProcedureReturn #WEB_URL_HOST_UNSUPPORTED : EndIf
+ If PeekA(host)<>91 Or PeekA(host+bytes-1)<>93 : ProcedureReturn #WEB_URL_HOST_UNSUPPORTED : EndIf
+ If IPv6AddressParse(host+1,bytes-2,address)<>0 : ProcedureReturn #WEB_URL_HOST_UNSUPPORTED : EndIf
+ ProcedureReturn 0
+EndProcedure
+
+Procedure.i webUrlLower(c.i)
+  If c>=65 And c<=90 : ProcedureReturn c+32 : EndIf
+  ProcedureReturn c
+EndProcedure
+
+Procedure.i webUrlHex(c.i)
+  c=webUrlLower(c)
+  ProcedureReturn Bool((c>=48 And c<=57) Or (c>=97 And c<=102))
+EndProcedure
+
+; defaultSecure selects the scheme for a bare host, preserving monitor syntax.
+; Explicit schemes are checked completely and case-insensitively.
+; Caller supplies separate writable host/target buffers and capacities.
+; Output is usable only after a zero return; lengths are cleared on entry.
+Procedure.i WebUrlParse(*input,bytes.i,defaultSecure.i,*out.WebUrl)
+  Define i.i,c.i,start.i,finish.i,colon.i,port.i,digits.i,target.i,label.i
+  Define literal.IPv6AddressStorage
+  If *out=0 : ProcedureReturn #WEB_URL_ARGUMENT : EndIf
+  *out\hostLength=0 : *out\targetLength=0 : *out\explicitPort=0
+  If *out\host=0 Or *out\target=0 Or *out\hostCapacity<2 Or *out\targetCapacity<2
+    ProcedureReturn #WEB_URL_ARGUMENT
+  EndIf
+  PokeA(*out\host,0) : PokeA(*out\target,0)
+  If *input=0 Or bytes<1 Or bytes>#WEB_URL_LIMIT Or (defaultSecure<>0 And defaultSecure<>1)
+    ProcedureReturn #WEB_URL_ARGUMENT
+  EndIf
+  ; No raw whitespace, controls, backslash or non-ASCII bytes in a URI.
+  ; Percent escapes remain escaped; decoding them here changes URI structure.
+  For i=0 To bytes-1
+    c=PeekA(*input+i) & 255
+    If c<=32 Or c>=127 Or c=92 Or c=34 Or c=60 Or c=62 Or c=96 Or c=123 Or c=125 Or c=124 Or c=94
+      ProcedureReturn #WEB_URL_SYNTAX
+    EndIf
+    If c=37
+      If i+2>=bytes : ProcedureReturn #WEB_URL_SYNTAX : EndIf
+      If webUrlHex(PeekA(*input+i+1) & 255)=0 Or webUrlHex(PeekA(*input+i+2) & 255)=0
+        ProcedureReturn #WEB_URL_SYNTAX
+      EndIf
+    EndIf
+  Next
+  *out\secure=defaultSecure : start=0
+  For i=0 To bytes-3
+    If PeekA(*input+i)=58 And PeekA(*input+i+1)=47 And PeekA(*input+i+2)=47
+      If i<>4 And i<>5 : ProcedureReturn #WEB_URL_SCHEME : EndIf
+      If webUrlLower(PeekA(*input))<>104 Or webUrlLower(PeekA(*input+1))<>116 Or webUrlLower(PeekA(*input+2))<>116 Or webUrlLower(PeekA(*input+3))<>112
+        ProcedureReturn #WEB_URL_SCHEME
+      EndIf
+      If i=5
+        If webUrlLower(PeekA(*input+4))<>115 : ProcedureReturn #WEB_URL_SCHEME : EndIf
+        *out\secure=1
+      Else
+        *out\secure=0
+      EndIf
+      start=i+3 : Break
+    EndIf
+    If PeekA(*input+i)=47 Or PeekA(*input+i)=63 Or PeekA(*input+i)=35 : Break : EndIf
+  Next
+  *out\port=80 : If *out\secure<>0 : *out\port=443 : EndIf
+  finish=start
+  While finish<bytes
+    c=PeekA(*input+finish)
+    If c=47 Or c=63 Or c=35 : Break : EndIf
+    finish=finish+1
+  Wend
+  If finish=start : ProcedureReturn #WEB_URL_AUTHORITY : EndIf
+  colon=finish : label=0
+  If PeekA(*input+start)=91
+    colon=start+1
+    While colon<finish And PeekA(*input+colon)<>93 : colon=colon+1 : Wend
+    If colon>=finish : ProcedureReturn #WEB_URL_HOST_UNSUPPORTED : EndIf
+    colon=colon+1
+    If WebUrlHostIPv6(*input+start,colon-start,@literal)<>0 : ProcedureReturn #WEB_URL_HOST_UNSUPPORTED : EndIf
+    If colon<finish And PeekA(*input+colon)<>58 : ProcedureReturn #WEB_URL_AUTHORITY : EndIf
+  Else
+  For i=start To finish-1
+    c=PeekA(*input+i)
+    If c=58 : colon=i : Break : EndIf
+    If c=46
+      If label=0 Or PeekA(*input+i-1)=45 : ProcedureReturn #WEB_URL_AUTHORITY : EndIf
+      label=0
+    Else
+      If (c<48 Or c>57) And (webUrlLower(c)<97 Or webUrlLower(c)>122) And c<>45
+        ProcedureReturn #WEB_URL_AUTHORITY
+      EndIf
+      If c=45 And label=0 : ProcedureReturn #WEB_URL_AUTHORITY : EndIf
+      label=label+1
+      If label>63 : ProcedureReturn #WEB_URL_AUTHORITY : EndIf
+    EndIf
+  Next
+  EndIf
+  If colon=start Or colon-start>=#WEB_URL_HOST : ProcedureReturn #WEB_URL_AUTHORITY : EndIf
+  If PeekA(*input+colon-1)=45 : ProcedureReturn #WEB_URL_AUTHORITY : EndIf
+  If colon<finish
+    port=0 : digits=0
+    For i=colon+1 To finish-1
+      c=PeekA(*input+i)
+      If c<48 Or c>57 : ProcedureReturn #WEB_URL_PORT : EndIf
+      port=port*10+c-48 : digits=digits+1
+      If port>65535 Or digits>5 : ProcedureReturn #WEB_URL_PORT : EndIf
+    Next
+    If digits=0 Or port=0 : ProcedureReturn #WEB_URL_PORT : EndIf
+    *out\port=port : *out\explicitPort=1
+  EndIf
+  If colon-start>=*out\hostCapacity : ProcedureReturn #WEB_URL_CAPACITY : EndIf
+  For i=start To colon-1 : PokeA(*out\host+i-start,webUrlLower(PeekA(*input+i))) : Next
+  *out\hostLength=colon-start : PokeA(*out\host+colon-start,0)
+  target=0
+  If finish=bytes
+    PokeA(*out\target,47) : target=1
+  ElseIf PeekA(*input+finish)<>47
+    PokeA(*out\target,47) : target=1
+  EndIf
+  For i=finish To bytes-1
+    c=PeekA(*input+i)
+    If c=35 : Break : EndIf
+    If target>=#WEB_URL_TARGET-1 Or target>=*out\targetCapacity-1 : ProcedureReturn #WEB_URL_CAPACITY : EndIf
+    PokeA(*out\target+target,c) : target=target+1
+  Next
+  PokeA(*out\target+target,0) : *out\targetLength=target
+  ProcedureReturn #WEB_URL_OK
+EndProcedure
+; Bounded HTTP/1.1 request serialization, shared by TCP and TLS callers.
+; RFC 9110 sections 7-9; RFC 9112 sections 3, 6 and 7. No transport calls.
+; The caller retains input until consumed; short output capacity never loses it.
+#WEB_REQUEST_ARGUMENT=-540
+#WEB_REQUEST_SYNTAX=-541
+#WEB_REQUEST_LIMIT=-542
+#WEB_REQUEST_STATE=-543
+#WEB_REQUEST_LENGTH=-544
+Structure WebRequest
+  headers.i
+  capacity.i
+  length.i
+  offset.i
+  remaining.i
+  chunked.i
+  state.i
+  error.i
+  consumed.i
+  written.i
+  frameValue.i
+  frameDivisor.i
+  frameRemaining.i
+  framePhase.i
+  ending.i
+EndStructure
+
+Procedure.i wqFail(*s.WebRequest,error.i)
+  *s\error=error : *s\state=-1 : ProcedureReturn error
+EndProcedure
+
+Procedure.i wqToken(c.i)
+  If (c>=48 And c<=57) Or (c>=65 And c<=90) Or (c>=97 And c<=122) : ProcedureReturn 1 : EndIf
+  If c=33 Or c=35 Or c=36 Or c=37 Or c=38 Or c=39 Or c=42 Or c=43 Or c=45 Or c=46 Or c=94 Or c=95 Or c=96 Or c=124 Or c=126 : ProcedureReturn 1 : EndIf
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i wqEqual(p.i,n.i,text.i)
+  Define i.i
+  For i=0 To n-1
+    If PeekA(text+i)=0 Or webUrlLower(PeekA(p+i) & 255)<>PeekA(text+i) : ProcedureReturn 0 : EndIf
+  Next
+  ProcedureReturn Bool(PeekA(text+n)=0)
+EndProcedure
+
+Procedure wqByte(*s.WebRequest,c.i)
+  If *s\error<0 : ProcedureReturn : EndIf
+  If *s\length>=*s\capacity : wqFail(*s,#WEB_REQUEST_LIMIT) : ProcedureReturn : EndIf
+  PokeA(*s\headers+*s\length,c) : *s\length=*s\length+1
+EndProcedure
+
+Procedure wqText(*s.WebRequest,text.i)
+  Define i.i
+  While PeekA(text+i)<>0 And *s\error=0
+    wqByte(*s,PeekA(text+i)) : i=i+1
+  Wend
+EndProcedure
+
+Procedure wqDecimal(*s.WebRequest,value.i)
+  Define divisor.i,digit.i
+  divisor=1
+  While value/divisor>=10 : divisor=divisor*10 : Wend
+  While divisor>0
+    digit=(value/divisor) % 10 : wqByte(*s,48+digit) : divisor=divisor/10
+  Wend
+EndProcedure
+
+; A bodyLength of -1 selects chunked upload; otherwise exactly that many bytes
+; must be consumed. URL storage must remain valid through this call only.
+; States: 0 adding fields, 1 streaming, 2 finished, -1 refused.
+Procedure.i WebRequestInit(*s.WebRequest,*url.WebUrl,method.i,methodLength.i,bodyLength.i,keepAlive.i,headers.i,capacity.i)
+  Define i.i,c.i
+  Define literal.IPv6AddressStorage
+  If *s=0 : ProcedureReturn #WEB_REQUEST_ARGUMENT : EndIf
+  For i=0 To SizeOf(WebRequest)-1 : PokeA(*s+i,0) : Next
+  If *url=0 Or method=0 Or methodLength<1 Or methodLength>32 Or bodyLength< -1 Or headers=0 Or capacity<128 Or capacity>32768
+    ProcedureReturn wqFail(*s,#WEB_REQUEST_ARGUMENT)
+  EndIf
+  If *url\host=0 Or *url\target=0 Or *url\hostLength<1 Or *url\hostLength>=#WEB_URL_HOST Or *url\targetLength<1 Or *url\targetLength>=#WEB_URL_TARGET Or *url\port<1 Or *url\port>65535
+    ProcedureReturn wqFail(*s,#WEB_REQUEST_ARGUMENT)
+  EndIf
+  For i=0 To methodLength-1
+    If wqToken(PeekA(method+i) & 255)=0 : ProcedureReturn wqFail(*s,#WEB_REQUEST_SYNTAX) : EndIf
+  Next
+  ; CONNECT needs authority-form and tunnel ownership, not origin-form.
+  If wqEqual(method,methodLength,"connect") : ProcedureReturn wqFail(*s,#WEB_REQUEST_SYNTAX) : EndIf
+  If PeekA(*url\host)=91
+    If WebUrlHostIPv6(*url\host,*url\hostLength,@literal)<>0 : ProcedureReturn wqFail(*s,#WEB_REQUEST_SYNTAX) : EndIf
+  Else
+    For i=0 To *url\hostLength-1
+      c=PeekA(*url\host+i) & 255
+      If c<=32 Or c>=127 Or c=58 Or c=47 Or c=91 Or c=93 : ProcedureReturn wqFail(*s,#WEB_REQUEST_SYNTAX) : EndIf
+    Next
+  EndIf
+  If PeekA(*url\target)<>47 : ProcedureReturn wqFail(*s,#WEB_REQUEST_SYNTAX) : EndIf
+  For i=0 To *url\targetLength-1
+    c=PeekA(*url\target+i) & 255
+    If c<=32 Or c>=127 Or c=35 : ProcedureReturn wqFail(*s,#WEB_REQUEST_SYNTAX) : EndIf
+  Next
+  *s\headers=headers : *s\capacity=capacity : *s\remaining=bodyLength : *s\chunked=Bool(bodyLength= -1)
+  For i=0 To methodLength-1 : wqByte(*s,PeekA(method+i)) : Next
+  wqByte(*s,32)
+  For i=0 To *url\targetLength-1 : wqByte(*s,PeekA(*url\target+i)) : Next
+  wqText(*s," HTTP/1.1") : wqByte(*s,13) : wqByte(*s,10)
+  wqText(*s,"Host: ")
+  For i=0 To *url\hostLength-1 : wqByte(*s,PeekA(*url\host+i)) : Next
+  If *url\explicitPort : wqByte(*s,58) : wqDecimal(*s,*url\port) : EndIf
+  wqByte(*s,13) : wqByte(*s,10)
+  If *s\chunked
+    wqText(*s,"Transfer-Encoding: chunked")
+    wqByte(*s,13) : wqByte(*s,10)
+  ElseIf bodyLength<>0 Or (wqEqual(method,methodLength,"get")=0 And wqEqual(method,methodLength,"head")=0)
+    wqText(*s,"Content-Length: ") : wqDecimal(*s,bodyLength)
+    wqByte(*s,13) : wqByte(*s,10)
+  EndIf
+  If keepAlive=0
+    wqText(*s,"Connection: close") : wqByte(*s,13) : wqByte(*s,10)
+  EndIf
+  ProcedureReturn *s\error
+EndProcedure
+
+; Header name/value are explicit byte spans. Framing and connection control
+; belong to the serializer and cannot be injected or duplicated by the caller.
+Procedure.i WebRequestHeader(*s.WebRequest,name.i,nameLength.i,value.i,valueLength.i)
+  Define i.i,c.i
+  If *s=0 : ProcedureReturn #WEB_REQUEST_ARGUMENT : EndIf
+  If *s\error<0 : ProcedureReturn *s\error : EndIf
+  If *s\state<>0 : ProcedureReturn wqFail(*s,#WEB_REQUEST_STATE) : EndIf
+  If name=0 Or nameLength<1 Or nameLength>256 Or valueLength<0 Or valueLength>8192 Or (valueLength>0 And value=0)
+    ProcedureReturn wqFail(*s,#WEB_REQUEST_ARGUMENT)
+  EndIf
+  For i=0 To nameLength-1
+    If wqToken(PeekA(name+i) & 255)=0 : ProcedureReturn wqFail(*s,#WEB_REQUEST_SYNTAX) : EndIf
+  Next
+  If wqEqual(name,nameLength,"host") Or wqEqual(name,nameLength,"content-length") Or wqEqual(name,nameLength,"transfer-encoding") Or wqEqual(name,nameLength,"connection") Or wqEqual(name,nameLength,"expect") Or wqEqual(name,nameLength,"upgrade")
+    ProcedureReturn wqFail(*s,#WEB_REQUEST_SYNTAX)
+  EndIf
+  For i=0 To valueLength-1
+    c=PeekA(value+i) & 255
+    If (c<32 And c<>9) Or c=127 : ProcedureReturn wqFail(*s,#WEB_REQUEST_SYNTAX) : EndIf
+  Next
+  If nameLength+valueLength+4>*s\capacity-*s\length : ProcedureReturn wqFail(*s,#WEB_REQUEST_LIMIT) : EndIf
+  For i=0 To nameLength-1 : wqByte(*s,PeekA(name+i)) : Next
+  wqText(*s,": ")
+  For i=0 To valueLength-1 : wqByte(*s,PeekA(value+i)) : Next
+  wqByte(*s,13) : wqByte(*s,10)
+  ProcedureReturn *s\error
+EndProcedure
+
+Procedure.i WebRequestFinishHeaders(*s.WebRequest)
+  If *s=0 : ProcedureReturn #WEB_REQUEST_ARGUMENT : EndIf
+  If *s\error<0 : ProcedureReturn *s\error : EndIf
+  If *s\state<>0 : ProcedureReturn wqFail(*s,#WEB_REQUEST_STATE) : EndIf
+  wqByte(*s,13) : wqByte(*s,10)
+  If *s\error=0 : *s\state=1 : EndIf
+  ProcedureReturn *s\error
+EndProcedure
+
+; Returns output byte count. Advance body by consumed, send written bytes,
+; then call again. endBody asserts that the supplied span is the final span;
+; repeat that assertion while draining output. capacity zero is backpressure.
+Procedure.i WebRequestOutput(*s.WebRequest,body.i,bytes.i,endBody.i,destination.i,capacity.i)
+  Define c.i,n.i,digit.i
+  If *s=0 : ProcedureReturn #WEB_REQUEST_ARGUMENT : EndIf
+  *s\consumed=0 : *s\written=0
+  If *s\error<0 : ProcedureReturn *s\error : EndIf
+  If bytes<0 Or capacity<0 Or (bytes>0 And body=0) Or (capacity>0 And destination=0) : ProcedureReturn wqFail(*s,#WEB_REQUEST_ARGUMENT) : EndIf
+  If *s\state=2
+    If bytes>0 : ProcedureReturn wqFail(*s,#WEB_REQUEST_LENGTH) : EndIf
+    ProcedureReturn 0
+  EndIf
+  If *s\state<>1 : ProcedureReturn wqFail(*s,#WEB_REQUEST_STATE) : EndIf
+  If *s\chunked=0 And bytes>*s\remaining : ProcedureReturn wqFail(*s,#WEB_REQUEST_LENGTH) : EndIf
+  While *s\written<capacity And *s\state=1
+    c=-1
+    If *s\offset<*s\length
+      c=PeekA(*s\headers+*s\offset) : *s\offset=*s\offset+1
+    ElseIf *s\chunked=0
+      If *s\remaining=0 : *s\state=2 : Break : EndIf
+      If *s\consumed=bytes
+        If endBody : ProcedureReturn wqFail(*s,#WEB_REQUEST_LENGTH) : EndIf
+        Break
+      EndIf
+      c=PeekA(body+*s\consumed) : *s\consumed=*s\consumed+1 : *s\remaining=*s\remaining-1
+    Else
+      Select *s\framePhase
+        Case 0
+          n=bytes-*s\consumed
+          If n=0 And endBody=0 : Break : EndIf
+          If n>16384 : n=16384 : EndIf
+          *s\ending=Bool(n=0) : *s\frameValue=n : *s\frameRemaining=n : *s\frameDivisor=1
+          While n / *s\frameDivisor>=16 : *s\frameDivisor=*s\frameDivisor*16 : Wend
+          *s\framePhase=1
+        Case 1
+          digit=(*s\frameValue / *s\frameDivisor) % 16
+          c=48+digit : If digit>9 : c=87+digit : EndIf
+          *s\frameDivisor=*s\frameDivisor/16
+          If *s\frameDivisor=0 : *s\framePhase=2 : EndIf
+        Case 2
+          c=13 : *s\framePhase=3
+        Case 3
+          c=10 : *s\framePhase=4
+        Case 4
+          If *s\frameRemaining=0
+            *s\framePhase=5
+          Else
+            If *s\consumed=bytes
+              If endBody : ProcedureReturn wqFail(*s,#WEB_REQUEST_LENGTH) : EndIf
+              Break
+            EndIf
+            c=PeekA(body+*s\consumed) : *s\consumed=*s\consumed+1 : *s\frameRemaining=*s\frameRemaining-1
+          EndIf
+        Case 5
+          c=13 : *s\framePhase=6
+        Case 6
+          c=10 : *s\framePhase=0
+          If *s\ending : *s\state=2 : EndIf
+      EndSelect
+    EndIf
+    If c>=0
+      PokeA(destination+*s\written,c) : *s\written=*s\written+1
+    EndIf
+  Wend
+  ; A full output buffer can end exactly at the known-length boundary.
+  If *s\chunked=0 And *s\offset=*s\length And *s\remaining=0 : *s\state=2 : EndIf
+  ProcedureReturn *s\written
+EndProcedure
+; Incremental HTTP/1 response framing, independent of TCP/TLS and board code.
+; RFC 9112 sections 4-8; RFC 9110 sections 5, 6 and 8. No copied implementation.
+; Caller owns context and disjoint line/header/output buffers. Feed consumes
+; only reported bytes and stops exactly at message end or output backpressure.
+; Strict CRLF, bounded metadata, no ignored/truncated framing fields. Decoded
+; transfer bytes are returned; Content-Encoding remains an application concern.
+#WEB_RESPONSE_STATUS=0
+#WEB_RESPONSE_HEADERS=1
+#WEB_RESPONSE_LENGTH=2
+#WEB_RESPONSE_CLOSE=3
+#WEB_RESPONSE_CHUNK_SIZE=4
+#WEB_RESPONSE_CHUNK_DATA=5
+#WEB_RESPONSE_CHUNK_CR=6
+#WEB_RESPONSE_CHUNK_LF=7
+#WEB_RESPONSE_TRAILERS=8
+#WEB_RESPONSE_DONE=9
+#WEB_RESPONSE_ARGUMENT=-520
+#WEB_RESPONSE_SYNTAX=-521
+#WEB_RESPONSE_FRAMING=-522
+#WEB_RESPONSE_LIMIT=-523
+#WEB_RESPONSE_INCOMPLETE=-524
+#WEB_RESPONSE_CODING=-525
+#WEB_RESPONSE_UPGRADE=-526
+#WEB_RESPONSE_NOTFOUND=-527
+#WEB_RESPONSE_MAX_METADATA=32768
+Structure WebResponse
+  state.i
+  error.i
+  status.i
+  versionMinor.i
+  headOnly.i
+  allowUpgrade.i
+  line.i
+  lineCapacity.i
+  lineLength.i
+  sawCR.i
+  headers.i
+  headerCapacity.i
+  headerLength.i
+  metadataBytes.i
+  interimCount.i
+  haveLength.i
+  contentLength.i
+  chunked.i
+  connectionClose.i
+  connectionKeepAlive.i
+  remaining.i
+  bodyBytes.i
+  written.i
+  consumed.i
+  reusable.i
+EndStructure
+
+Procedure.i wrLower(c.i)
+  If c>=65 And c<=90 : ProcedureReturn c+32 : EndIf
+  ProcedureReturn c
+EndProcedure
+
+Procedure.i wrToken(c.i)
+  If (c>=48 And c<=57) Or (c>=65 And c<=90) Or (c>=97 And c<=122) : ProcedureReturn 1 : EndIf
+  If c=33 Or c=35 Or c=36 Or c=37 Or c=38 Or c=39 Or c=42 Or c=43 Or c=45 Or c=46 Or c=94 Or c=95 Or c=96 Or c=124 Or c=126
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i wrEqual(p.i,n.i,text.i)
+  Define i.i
+  For i=0 To n-1
+    If PeekA(text+i)=0 : ProcedureReturn 0 : EndIf
+    If wrLower(PeekA(p+i) & 255)<>PeekA(text+i) : ProcedureReturn 0 : EndIf
+  Next
+  ProcedureReturn Bool(PeekA(text+n)=0)
+EndProcedure
+
+; Read one final-response field (zero-based occurrence); duplicate fields stay
+; distinct. A null destination with capacity zero queries its byte length.
+; Trailers are retained after the header terminator but never override headers.
+Procedure.i WebResponseHeader(*s.WebResponse,name.i,occurrence.i,destination.i,capacity.i)
+  Define at.i,finish.i,colon.i,start.i,last.i,i.i,count.i,first.i,c.i
+  If *s=0 Or name=0 Or occurrence<0 Or capacity<0 Or (capacity>0 And destination=0)
+    ProcedureReturn #WEB_RESPONSE_ARGUMENT
+  EndIf
+  If capacity>0 : PokeA(destination,0) : EndIf
+  first=1
+  While at+1<*s\headerLength
+    finish=at
+    While finish+1<*s\headerLength
+      If PeekA(*s\headers+finish)=13 And PeekA(*s\headers+finish+1)=10 : Break : EndIf
+      finish=finish+1
+    Wend
+    If finish=at : Break : EndIf
+    If first=0
+      colon=at
+      While colon<finish
+        If PeekA(*s\headers+colon)=58 : Break : EndIf
+        colon=colon+1
+      Wend
+      If colon<finish
+        If wrEqual(*s\headers+at,colon-at,name)
+          If count=occurrence
+            start=colon+1 : last=finish
+            While start<last
+              c=PeekA(*s\headers+start) : If c<>32 And c<>9 : Break : EndIf
+              start=start+1
+            Wend
+            While last>start
+              c=PeekA(*s\headers+last-1) : If c<>32 And c<>9 : Break : EndIf
+              last=last-1
+            Wend
+            If destination=0 And capacity=0 : ProcedureReturn last-start : EndIf
+            If last-start>=capacity : ProcedureReturn #WEB_RESPONSE_LIMIT : EndIf
+            For i=start To last-1 : PokeA(destination+i-start,PeekA(*s\headers+i)) : Next
+            PokeA(destination+last-start,0) : ProcedureReturn last-start
+          EndIf
+          count=count+1
+        EndIf
+      EndIf
+    EndIf
+    first=0 : at=finish+2
+  Wend
+  ProcedureReturn #WEB_RESPONSE_NOTFOUND
+EndProcedure
+
+Procedure.i WebResponseHeaderCount(*s.WebResponse)
+  Define i.i,count.i,first.i,start.i
+  If *s=0 : ProcedureReturn 0 : EndIf
+  first=1
+  For i=0 To *s\headerLength-2
+    If PeekA(*s\headers+i)=13 And PeekA(*s\headers+i+1)=10
+      If i=start : Break : EndIf
+      If first=0 : count=count+1 : EndIf
+      first=0 : start=i+2
+    EndIf
+  Next
+  ProcedureReturn count
+EndProcedure
+
+Procedure.i wrFail(*s.WebResponse,error.i)
+  *s\state=-1 : *s\error=error : *s\reusable=0
+  ProcedureReturn error
+EndProcedure
+
+Procedure.i WebResponseInit(*s.WebResponse,line.i,lineCapacity.i,headers.i,headerCapacity.i,headOnly.i)
+  Define i.i
+  If *s=0 : ProcedureReturn #WEB_RESPONSE_ARGUMENT : EndIf
+  For i=0 To SizeOf(WebResponse)-SizeOf(.i) Step SizeOf(.i) : PokeI(*s+i,0) : Next
+  If line=0 Or lineCapacity<128 Or lineCapacity>8192 Or headers=0 Or headerCapacity<128 Or headerCapacity>#WEB_RESPONSE_MAX_METADATA Or (headOnly<>0 And headOnly<>1)
+    ProcedureReturn wrFail(*s,#WEB_RESPONSE_ARGUMENT)
+  EndIf
+  *s\line=line : *s\lineCapacity=lineCapacity
+  *s\headers=headers : *s\headerCapacity=headerCapacity : *s\headOnly=headOnly
+  ProcedureReturn 0
+EndProcedure
+
+; Opt-in only. The protocol owner must validate all upgrade handshake fields.
+Procedure.i WebResponseAllowUpgrade(*s.WebResponse)
+  If *s=0 : ProcedureReturn #WEB_RESPONSE_ARGUMENT : EndIf
+  If *s\state<>#WEB_RESPONSE_STATUS Or *s\error<>0 Or *s\metadataBytes<>0 Or *s\headOnly<>0
+    ProcedureReturn #WEB_RESPONSE_ARGUMENT
+  EndIf
+  *s\allowUpgrade=1 : ProcedureReturn 0
+EndProcedure
+
+Procedure.i wrStoreLine(*s.WebResponse)
+  Define i.i,p.i
+  If *s\headerLength+*s\lineLength+2>*s\headerCapacity : ProcedureReturn #WEB_RESPONSE_LIMIT : EndIf
+  p=*s\headers+*s\headerLength
+  For i=0 To *s\lineLength-1 : PokeA(p+i,PeekA(*s\line+i)) : Next
+  PokeA(p+*s\lineLength,13) : PokeA(p+*s\lineLength+1,10)
+  *s\headerLength=*s\headerLength+*s\lineLength+2
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i wrLength(*s.WebResponse,p.i,n.i)
+  Define i.i,c.i,value.i,digits.i,items.i,first.i
+  i=0 : items=0
+  Repeat
+    While i<n
+      c=PeekA(p+i)
+      If c<>32 And c<>9 : Break : EndIf
+      i=i+1
+    Wend
+    value=0 : digits=0
+    While i<n
+      c=PeekA(p+i)
+      If c<48 Or c>57 : Break : EndIf
+      If value>($7FFFFFFFFFFFFFFF-(c-48))/10 : ProcedureReturn #WEB_RESPONSE_FRAMING : EndIf
+      value=value*10+c-48 : digits=digits+1 : i=i+1
+    Wend
+    If digits=0 : ProcedureReturn #WEB_RESPONSE_FRAMING : EndIf
+    If items=0 : first=value : ElseIf value<>first : ProcedureReturn #WEB_RESPONSE_FRAMING : EndIf
+    items=items+1
+    While i<n
+      c=PeekA(p+i)
+      If c<>32 And c<>9 : Break : EndIf
+      i=i+1
+    Wend
+    If i=n : Break : EndIf
+    If PeekA(p+i)<>44 : ProcedureReturn #WEB_RESPONSE_FRAMING : EndIf
+    i=i+1
+    If i=n : ProcedureReturn #WEB_RESPONSE_FRAMING : EndIf
+  ForEver
+  If *s\haveLength<>0 And *s\contentLength<>first : ProcedureReturn #WEB_RESPONSE_FRAMING : EndIf
+  *s\contentLength=first : *s\haveLength=1
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i wrConnection(*s.WebResponse,p.i,n.i)
+  Define i.i,start.i,c.i
+  While i<n
+    c=PeekA(p+i)
+    If c=32 Or c=9 Or c=44
+      i=i+1
+    Else
+      start=i
+      While i<n
+        If wrToken(PeekA(p+i) & 255)=0 : Break : EndIf
+        i=i+1
+      Wend
+      If i=start : ProcedureReturn #WEB_RESPONSE_SYNTAX : EndIf
+      If wrEqual(p+start,i-start,"close") : *s\connectionClose=1 : EndIf
+      If wrEqual(p+start,i-start,"keep-alive") : *s\connectionKeepAlive=1 : EndIf
+      While i<n
+        c=PeekA(p+i)
+        If c<>32 And c<>9 : Break : EndIf
+        i=i+1
+      Wend
+      If i<n
+        If PeekA(p+i)<>44 : ProcedureReturn #WEB_RESPONSE_SYNTAX : EndIf
+      EndIf
+    EndIf
+  Wend
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i wrHeader(*s.WebResponse,trailer.i)
+  Define p.i,n.i,i.i,colon.i,start.i,finish.i,c.i
+  p=*s\line : n=*s\lineLength : colon=-1
+  For i=0 To n-1
+    c=PeekA(p+i) & 255
+    If c=58 : colon=i : Break : EndIf
+    If wrToken(c)=0 : ProcedureReturn #WEB_RESPONSE_SYNTAX : EndIf
+  Next
+  If colon<1 : ProcedureReturn #WEB_RESPONSE_SYNTAX : EndIf
+  start=colon+1 : finish=n
+  For i=start To n-1
+    c=PeekA(p+i) & 255
+    If (c<32 And c<>9) Or c=127 : ProcedureReturn #WEB_RESPONSE_SYNTAX : EndIf
+  Next
+  While start<finish
+    c=PeekA(p+start) : If c<>32 And c<>9 : Break : EndIf
+    start=start+1
+  Wend
+  While finish>start
+    c=PeekA(p+finish-1) : If c<>32 And c<>9 : Break : EndIf
+    finish=finish-1
+  Wend
+  If trailer<>0
+    If wrEqual(p,colon,"content-length") Or wrEqual(p,colon,"transfer-encoding") Or wrEqual(p,colon,"connection") Or wrEqual(p,colon,"host") Or wrEqual(p,colon,"content-encoding") Or wrEqual(p,colon,"trailer")
+      ProcedureReturn #WEB_RESPONSE_FRAMING
+    EndIf
+    ProcedureReturn 0
+  EndIf
+  If wrEqual(p,colon,"content-length") : ProcedureReturn wrLength(*s,p+start,finish-start) : EndIf
+  If wrEqual(p,colon,"transfer-encoding")
+    If *s\chunked<>0 Or wrEqual(p+start,finish-start,"chunked")=0 : ProcedureReturn #WEB_RESPONSE_CODING : EndIf
+    *s\chunked=1
+  EndIf
+  If wrEqual(p,colon,"connection") : ProcedureReturn wrConnection(*s,p+start,finish-start) : EndIf
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i wrChunk(*s.WebResponse)
+  Define p.i,n.i,i.i,c.i,d.i,value.i,digits.i,start.i,closed.i
+  p=*s\line : n=*s\lineLength
+  While i<n
+    c=wrLower(PeekA(p+i) & 255) : d=-1
+    If c>=48 And c<=57 : d=c-48 : ElseIf c>=97 And c<=102 : d=c-87 : EndIf
+    If d<0 : Break : EndIf
+    If value>($7FFFFFFFFFFFFFFF-d)/16 : ProcedureReturn #WEB_RESPONSE_FRAMING : EndIf
+    value=value*16+d : digits=digits+1 : i=i+1
+  Wend
+  If digits=0 : ProcedureReturn #WEB_RESPONSE_SYNTAX : EndIf
+  While i<n
+    c=PeekA(p+i)
+    If c=32 Or c=9 : i=i+1 : Continue : EndIf
+    If c<>59 : ProcedureReturn #WEB_RESPONSE_SYNTAX : EndIf
+    i=i+1
+    While i<n
+      c=PeekA(p+i) : If c<>32 And c<>9 : Break : EndIf
+      i=i+1
+    Wend
+    start=i
+    While i<n
+      If wrToken(PeekA(p+i) & 255)=0 : Break : EndIf
+      i=i+1
+    Wend
+    If i=start : ProcedureReturn #WEB_RESPONSE_SYNTAX : EndIf
+    While i<n
+      c=PeekA(p+i) : If c<>32 And c<>9 : Break : EndIf
+      i=i+1
+    Wend
+    If i<n
+      If PeekA(p+i)=61
+        i=i+1
+        While i<n
+          c=PeekA(p+i) : If c<>32 And c<>9 : Break : EndIf
+          i=i+1
+        Wend
+        If i=n : ProcedureReturn #WEB_RESPONSE_SYNTAX : EndIf
+        If PeekA(p+i)=34
+          i=i+1 : closed=0
+          While i<n
+            c=PeekA(p+i) & 255 : i=i+1
+            If c=34 : closed=1 : Break : EndIf
+            If c=92
+              If i=n : ProcedureReturn #WEB_RESPONSE_SYNTAX : EndIf
+              c=PeekA(p+i) & 255 : i=i+1
+            EndIf
+            If (c<32 And c<>9) Or c=127 : ProcedureReturn #WEB_RESPONSE_SYNTAX : EndIf
+          Wend
+          If closed=0 : ProcedureReturn #WEB_RESPONSE_SYNTAX : EndIf
+        Else
+          start=i
+          While i<n
+            If wrToken(PeekA(p+i) & 255)=0 : Break : EndIf
+            i=i+1
+          Wend
+          If i=start : ProcedureReturn #WEB_RESPONSE_SYNTAX : EndIf
+        EndIf
+      EndIf
+    EndIf
+  Wend
+  *s\remaining=value
+  If value=0 : *s\state=#WEB_RESPONSE_TRAILERS : Else : *s\state=#WEB_RESPONSE_CHUNK_DATA : EndIf
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i wrLine(*s.WebResponse)
+  Define p.i,n.i,i.i,c.i,result.i
+  p=*s\line : n=*s\lineLength
+  If *s\state=#WEB_RESPONSE_CHUNK_SIZE : ProcedureReturn wrChunk(*s) : EndIf
+  result=wrStoreLine(*s) : If result<0 : ProcedureReturn result : EndIf
+  If *s\state=#WEB_RESPONSE_STATUS
+    If n<12 : ProcedureReturn #WEB_RESPONSE_SYNTAX : EndIf
+    If PeekA(p)<>72 Or PeekA(p+1)<>84 Or PeekA(p+2)<>84 Or PeekA(p+3)<>80 Or PeekA(p+4)<>47 Or PeekA(p+5)<>49 Or PeekA(p+6)<>46 Or (PeekA(p+7)<>48 And PeekA(p+7)<>49) Or PeekA(p+8)<>32
+      ProcedureReturn #WEB_RESPONSE_SYNTAX
+    EndIf
+    For i=9 To 11
+      c=PeekA(p+i) : If c<48 Or c>57 : ProcedureReturn #WEB_RESPONSE_SYNTAX : EndIf
+      *s\status=*s\status*10+c-48
+    Next
+    If *s\status<100 Or *s\status>599 : ProcedureReturn #WEB_RESPONSE_SYNTAX : EndIf
+    If n>12
+      If PeekA(p+12)<>32 : ProcedureReturn #WEB_RESPONSE_SYNTAX : EndIf
+    EndIf
+    For i=13 To n-1
+      c=PeekA(p+i) & 255 : If (c<32 And c<>9) Or c=127 : ProcedureReturn #WEB_RESPONSE_SYNTAX : EndIf
+    Next
+    *s\versionMinor=PeekA(p+7)-48 : *s\state=#WEB_RESPONSE_HEADERS
+    ProcedureReturn 0
+  EndIf
+  If n>0 : ProcedureReturn wrHeader(*s,Bool(*s\state=#WEB_RESPONSE_TRAILERS)) : EndIf
+  If *s\state=#WEB_RESPONSE_TRAILERS : *s\state=#WEB_RESPONSE_DONE : ProcedureReturn 0 : EndIf
+  If *s\status=101
+    If *s\allowUpgrade=0 : ProcedureReturn #WEB_RESPONSE_UPGRADE : EndIf
+    If *s\versionMinor<>1 Or *s\chunked<>0 Or *s\haveLength<>0 Or *s\connectionClose<>0 : ProcedureReturn #WEB_RESPONSE_FRAMING : EndIf
+    *s\state=#WEB_RESPONSE_DONE : *s\reusable=0 : ProcedureReturn 0
+  EndIf
+  If *s\chunked<>0 And *s\haveLength<>0 : ProcedureReturn #WEB_RESPONSE_FRAMING : EndIf
+  If *s\status<200
+    If *s\chunked<>0 Or *s\haveLength<>0 : ProcedureReturn #WEB_RESPONSE_FRAMING : EndIf
+    *s\interimCount=*s\interimCount+1
+    If *s\interimCount>8 : ProcedureReturn #WEB_RESPONSE_LIMIT : EndIf
+    *s\state=#WEB_RESPONSE_STATUS : *s\status=0 : *s\headerLength=0
+    *s\connectionClose=0 : *s\connectionKeepAlive=0
+    ProcedureReturn 0
+  EndIf
+  *s\reusable=Bool(*s\connectionClose=0 And (*s\versionMinor=1 Or *s\connectionKeepAlive<>0))
+  If *s\status=204
+    If *s\chunked<>0 Or *s\haveLength<>0 : ProcedureReturn #WEB_RESPONSE_FRAMING : EndIf
+    *s\state=#WEB_RESPONSE_DONE
+  ElseIf *s\headOnly<>0 Or *s\status=304
+    *s\state=#WEB_RESPONSE_DONE
+  ElseIf *s\chunked<>0
+    *s\state=#WEB_RESPONSE_CHUNK_SIZE
+  ElseIf *s\haveLength<>0
+    *s\remaining=*s\contentLength : *s\state=#WEB_RESPONSE_LENGTH
+    If *s\remaining=0 : *s\state=#WEB_RESPONSE_DONE : EndIf
+  Else
+    *s\state=#WEB_RESPONSE_CLOSE : *s\reusable=0
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i WebResponseFeed(*s.WebResponse,source.i,bytes.i,destination.i,capacity.i)
+  Define i.i,c.i,result.i
+  If *s=0 : ProcedureReturn #WEB_RESPONSE_ARGUMENT : EndIf
+  *s\written=0 : *s\consumed=0
+  If *s\error<0 : ProcedureReturn *s\error : EndIf
+  If bytes<0 Or capacity<0 Or (bytes>0 And source=0) Or (capacity>0 And destination=0)
+    ProcedureReturn wrFail(*s,#WEB_RESPONSE_ARGUMENT)
+  EndIf
+  While i<bytes And *s\state<>#WEB_RESPONSE_DONE
+    If *s\state=#WEB_RESPONSE_LENGTH Or *s\state=#WEB_RESPONSE_CLOSE Or *s\state=#WEB_RESPONSE_CHUNK_DATA
+      If *s\written=capacity : Break : EndIf
+      If *s\bodyBytes=$7FFFFFFFFFFFFFFF : ProcedureReturn wrFail(*s,#WEB_RESPONSE_LIMIT) : EndIf
+      PokeA(destination+*s\written,PeekA(source+i))
+      *s\written=*s\written+1 : *s\bodyBytes=*s\bodyBytes+1 : i=i+1 : *s\consumed=i
+      If *s\state<>#WEB_RESPONSE_CLOSE
+        *s\remaining=*s\remaining-1
+        If *s\remaining=0
+          If *s\state=#WEB_RESPONSE_LENGTH : *s\state=#WEB_RESPONSE_DONE : Else : *s\state=#WEB_RESPONSE_CHUNK_CR : EndIf
+        EndIf
+      EndIf
+    Else
+      c=PeekA(source+i) & 255 : i=i+1 : *s\consumed=i
+      If *s\state=#WEB_RESPONSE_CHUNK_CR
+        If c<>13 : ProcedureReturn wrFail(*s,#WEB_RESPONSE_SYNTAX) : EndIf
+        *s\state=#WEB_RESPONSE_CHUNK_LF
+      ElseIf *s\state=#WEB_RESPONSE_CHUNK_LF
+        If c<>10 : ProcedureReturn wrFail(*s,#WEB_RESPONSE_SYNTAX) : EndIf
+        *s\state=#WEB_RESPONSE_CHUNK_SIZE
+      Else
+        If *s\state<>#WEB_RESPONSE_CHUNK_SIZE
+          *s\metadataBytes=*s\metadataBytes+1
+          If *s\metadataBytes>#WEB_RESPONSE_MAX_METADATA : ProcedureReturn wrFail(*s,#WEB_RESPONSE_LIMIT) : EndIf
+        EndIf
+        If *s\sawCR<>0
+          If c<>10 : ProcedureReturn wrFail(*s,#WEB_RESPONSE_SYNTAX) : EndIf
+          result=wrLine(*s) : *s\lineLength=0 : *s\sawCR=0
+          If result<0 : ProcedureReturn wrFail(*s,result) : EndIf
+        ElseIf c=13
+          *s\sawCR=1
+        Else
+          If c=10 Or c=0 : ProcedureReturn wrFail(*s,#WEB_RESPONSE_SYNTAX) : EndIf
+          If *s\lineLength=*s\lineCapacity : ProcedureReturn wrFail(*s,#WEB_RESPONSE_LIMIT) : EndIf
+          PokeA(*s\line+*s\lineLength,c) : *s\lineLength=*s\lineLength+1
+        EndIf
+      EndIf
+    EndIf
+  Wend
+  ProcedureReturn i
+EndProcedure
+
+Procedure.i WebResponseEof(*s.WebResponse)
+  If *s=0 : ProcedureReturn #WEB_RESPONSE_ARGUMENT : EndIf
+  If *s\error<0 : ProcedureReturn *s\error : EndIf
+  If *s\state=#WEB_RESPONSE_CLOSE : *s\state=#WEB_RESPONSE_DONE : EndIf
+  If *s\state<>#WEB_RESPONSE_DONE : ProcedureReturn wrFail(*s,#WEB_RESPONSE_INCOMPLETE) : EndIf
+  ProcedureReturn 0
+EndProcedure
+; Cooperative HTTP/1 exchange engine. No waits, sockets or board dependencies.
+; Select the kernel or payload binding before including this file.
+; Transport state: 0 pending, 1 open, 2 peer closed, negative failure.
+; Pump the underlying network outside Step. Each Step does at most one send,
+; one receive and bounded parsing; output backpressure preserves unread bytes.
+#WEB_CLIENT_ARGUMENT=-550
+#WEB_CLIENT_STATE=-551
+#WEB_CLIENT_TIMEOUT=-552
+#WEB_CLIENT_CANCELLED=-553
+#WEB_CLIENT_TRANSPORT=-554
+Structure WebClient
+  connection.WebConnection
+  request.i
+  response.i
+  tx.i
+  txCapacity.i
+  txLength.i
+  txOffset.i
+  rx.i
+  rxCapacity.i
+  rxLength.i
+  rxOffset.i
+  started.i
+  timeout.i
+  state.i
+  error.i
+  consumed.i
+  written.i
+  sent.i
+  received.i
+EndStructure
+
+Procedure.i wcFail(*s.WebClient,error.i)
+  If *s\state=1 Or *s\state=2 Or *s\state=3 : WebTransportClose(@*s\connection) : EndIf
+  *s\state=-1 : *s\error=error
+  ProcedureReturn error
+EndProcedure
+
+; request is finalized; response was initialized with HEAD semantics as needed.
+; All contexts/buffers and the URL host remain owned by the caller until Close.
+Procedure.i WebClientStart(*s.WebClient,*url.WebUrl,*request.WebRequest,*response.WebResponse,tx.i,txCapacity.i,rx.i,rxCapacity.i,now.i,timeout.i)
+  Define i.i,rc.i
+  If *s=0 : ProcedureReturn #WEB_CLIENT_ARGUMENT : EndIf
+  ; Start is for a fresh or explicitly closed context, not a live connection.
+  For i=0 To SizeOf(WebClient)-1 : PokeA(*s+i,0) : Next
+  If *url=0 Or *request=0 Or *response=0 Or tx=0 Or rx=0 Or txCapacity<128 Or txCapacity>16384 Or rxCapacity<128 Or rxCapacity>16384 Or timeout<1 Or timeout>$7FFFFFFF
+    *s\state=-1 : *s\error=#WEB_CLIENT_ARGUMENT : ProcedureReturn *s\error
+  EndIf
+  If *request\state<>1 Or *response\state<>#WEB_RESPONSE_STATUS Or *response\error<>0
+    *s\state=-1 : *s\error=#WEB_CLIENT_STATE : ProcedureReturn *s\error
+  EndIf
+  *s\connection\secure=*url\secure : *s\connection\host=*url\host : *s\connection\port=*url\port
+  *s\request=*request : *s\response=*response
+  *s\tx=tx : *s\txCapacity=txCapacity : *s\rx=rx : *s\rxCapacity=rxCapacity
+  *s\started=now : *s\timeout=timeout : *s\state=1
+  rc=WebTransportOpen(@*s\connection)
+  If rc<0 : ProcedureReturn wcFail(*s,rc) : EndIf
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i WebClientCancel(*s.WebClient)
+  If *s=0 : ProcedureReturn #WEB_CLIENT_ARGUMENT : EndIf
+  ProcedureReturn wcFail(*s,#WEB_CLIENT_CANCELLED)
+EndProcedure
+
+Procedure WebClientClose(*s.WebClient)
+  If *s=0 : ProcedureReturn : EndIf
+  If *s\state<>0 And *s\state<>-1 : WebTransportClose(@*s\connection) : EndIf
+  *s\state=0
+EndProcedure
+
+; A zero result means call again; 1 means a complete response; negative means
+; failure and closed transport. Opted-in upgrade returns 2 and retains unread
+; rx bytes/connection for protocol validation. Always consume output before reuse.
+; Early final responses stop uploading and prohibit connection reuse.
+Procedure.i WebClientStep(*s.WebClient,body.i,bytes.i,endBody.i,output.i,capacity.i,now.i)
+  Define *request.WebRequest,*response.WebResponse,rc.i,st.i
+  If *s=0 : ProcedureReturn #WEB_CLIENT_ARGUMENT : EndIf
+  *s\consumed=0 : *s\written=0
+  If *s\state=-1 : ProcedureReturn *s\error : EndIf
+  If *s\state=2 : ProcedureReturn 1 : EndIf
+  If *s\state=3 : ProcedureReturn 2 : EndIf
+  If *s\state<>1 : ProcedureReturn #WEB_CLIENT_STATE : EndIf
+  If bytes<0 Or capacity<0 Or (bytes>0 And body=0) Or (capacity>0 And output=0) : ProcedureReturn wcFail(*s,#WEB_CLIENT_ARGUMENT) : EndIf
+  If ((now-*s\started) & $FFFFFFFF)>=*s\timeout : ProcedureReturn wcFail(*s,#WEB_CLIENT_TIMEOUT) : EndIf
+  *request=*s\request : *response=*s\response
+  st=WebTransportState(@*s\connection)
+  If st<0 : ProcedureReturn wcFail(*s,st) : EndIf
+  If st=0 : ProcedureReturn 0 : EndIf
+  If st<>1 And st<>2 : ProcedureReturn wcFail(*s,#WEB_CLIENT_TRANSPORT) : EndIf
+  ; Read first, so a server rejection can stop a large upload promptly.
+  If *s\rxOffset=*s\rxLength
+    *s\rxOffset=0 : *s\rxLength=0
+    rc=WebTransportRecv(@*s\connection,*s\rx,*s\rxCapacity)
+    If rc<0 : ProcedureReturn wcFail(*s,rc) : EndIf
+    If rc>*s\rxCapacity : ProcedureReturn wcFail(*s,#WEB_CLIENT_TRANSPORT) : EndIf
+    *s\rxLength=rc : *s\received=*s\received+rc
+    If rc=0 And st=2
+      rc=WebResponseEof(*response)
+      If rc<0 : ProcedureReturn wcFail(*s,rc) : EndIf
+    EndIf
+  EndIf
+  If *s\rxOffset<*s\rxLength
+    rc=WebResponseFeed(*response,*s\rx+*s\rxOffset,*s\rxLength-*s\rxOffset,output,capacity)
+    *s\rxOffset=*s\rxOffset+*response\consumed : *s\written=*response\written
+    If rc<0 : ProcedureReturn wcFail(*s,rc) : EndIf
+  EndIf
+  If *response\state=#WEB_RESPONSE_DONE
+    If *response\status=101 And *response\allowUpgrade
+      ; Upgraded bytes may follow headers in the same read. Keep them and
+      ; the connection for the protocol owner; never reuse as ordinary HTTP.
+      If *request\state<>2 Or *s\txOffset<>*s\txLength Or st<>1 : ProcedureReturn wcFail(*s,#WEB_CLIENT_STATE) : EndIf
+      *s\state=3 : ProcedureReturn 2
+    EndIf
+    If *request\state<>2 Or *s\txOffset<>*s\txLength Or st=2 Or *s\rxOffset<>*s\rxLength : *response\reusable=0 : EndIf
+    *s\state=2
+    If *response\reusable=0 : WebTransportClose(@*s\connection) : EndIf
+    ProcedureReturn 1
+  EndIf
+  If st=2 : ProcedureReturn 0 : EndIf
+  If *response\status>=200 : ProcedureReturn 0 : EndIf
+  If *s\txOffset=*s\txLength And *request\state<>2
+    rc=WebRequestOutput(*request,body,bytes,endBody,*s\tx,*s\txCapacity)
+    *s\consumed=*request\consumed
+    If rc<0 : ProcedureReturn wcFail(*s,rc) : EndIf
+    *s\txOffset=0 : *s\txLength=rc
+  EndIf
+  If *s\txOffset<*s\txLength
+    rc=WebTransportSend(@*s\connection,*s\tx+*s\txOffset,*s\txLength-*s\txOffset)
+    If rc<0 : ProcedureReturn wcFail(*s,rc) : EndIf
+    If rc>*s\txLength-*s\txOffset : ProcedureReturn wcFail(*s,#WEB_CLIENT_TRANSPORT) : EndIf
+    *s\txOffset=*s\txOffset+rc : *s\sent=*s\sent+rc
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; Sequential reuse on the SAME origin and connection. The new request must be
+; built from the original URL authority; do not mutate its host while connected.
+; Call before replacing the old response context, whose reuse decision is read.
+Procedure.i WebClientNext(*s.WebClient,*request.WebRequest,*response.WebResponse,now.i,timeout.i)
+  Define *previous.WebResponse,st.i
+  If *s=0 Or *request=0 Or *response=0 : ProcedureReturn #WEB_CLIENT_ARGUMENT : EndIf
+  If *s\state<>2 : ProcedureReturn #WEB_CLIENT_STATE : EndIf
+  *previous=*s\response
+  If *previous\reusable=0 Or *s\rxOffset<>*s\rxLength Or *s\txOffset<>*s\txLength : ProcedureReturn #WEB_CLIENT_STATE : EndIf
+  If *request\state<>1 Or *response\state<>#WEB_RESPONSE_STATUS Or timeout<1 Or timeout>$7FFFFFFF : ProcedureReturn #WEB_CLIENT_ARGUMENT : EndIf
+  st=WebTransportState(@*s\connection)
+  If st<>1 : ProcedureReturn #WEB_CLIENT_STATE : EndIf
+  *s\request=*request : *s\response=*response : *s\started=now : *s\timeout=timeout
+  *s\txOffset=0 : *s\txLength=0 : *s\rxOffset=0 : *s\rxLength=0
+  *s\consumed=0 : *s\written=0 : *s\sent=0 : *s\received=0 : *s\error=0 : *s\state=1
+  ProcedureReturn 0
+EndProcedure
+Global u.WebUrl,q.WebRequest,a.WebResponse,client.WebClient,q2.WebRequest,a2.WebResponse
+Global Dim host.a[256]
+Global Dim target.a[3072]
+Global Dim qh.a[1024]
+Global Dim ah.a[1024]
+Global Dim line.a[512]
+Global Dim qh2.a[1024]
+Global Dim ah2.a[1024]
+Global Dim line2.a[512]
+Global Dim tx.a[128]
+Global Dim rx.a[128]
+Global Dim output.a[64]
+Global mode.i,wire.i,wireBytes.i,position.i,closes.i,sends.i,round.i,step.i
+Procedure.i WebTransportOpen(*c.WebConnection) : *c\handle=1 : ProcedureReturn 0 : EndProcedure
+Procedure.i WebTransportState(*c.WebConnection)
+ If mode=5 And sends>6 : ProcedureReturn -77 : EndIf
+ If mode=2 : ProcedureReturn 0 : EndIf
+ If mode=6 And position=wireBytes : ProcedureReturn 2 : EndIf
+ ProcedureReturn 1
+EndProcedure
+Procedure.i WebTransportSend(*c.WebConnection,p.i,n.i)
+ If n>3 : n=3 : EndIf
+ sends=sends+n : ProcedureReturn n
+EndProcedure
+Procedure.i WebTransportRecv(*c.WebConnection,p.i,n.i)
+ Define i.i,take.i,*request.WebRequest
+ *request=client\request
+ If mode<>1 And (*request\state<>2 Or client\txOffset<>client\txLength) : ProcedureReturn 0 : EndIf
+ take=wireBytes-position : If take>5 : take=5 : EndIf : If take>n : take=n : EndIf
+ For i=0 To take-1 : PokeA(p+i,PeekA(wire+position+i)) : Next
+ position=position+take : ProcedureReturn take
+EndProcedure
+Procedure WebTransportClose(*c.WebConnection)
+ If *c\handle>0 : closes=closes+1 : *c\handle=0 : EndIf
+EndProcedure
+Procedure Record(index.i,kind.i)
+ Define rc.i,off.i,out.i,p.i,i.i,cap.i,nextRc.i,*response.WebResponse
+ mode=kind : position=0 : closes=0 : sends=0 : round=0 : step=0
+ wire=?normal : wireBytes=41
+ If mode=1 : wire=?early : wireBytes=44 : EndIf
+ If mode=6 : wire=?short : wireBytes=40 : EndIf
+ u\host=@host[0] : u\hostCapacity=256 : u\target=@target[0] : u\targetCapacity=3072
+ rc=WebUrlParse("http://example.com/",19,0,@u)
+ If rc=0
+  If mode=4 : rc=WebRequestInit(@q,@u,"POST",4,-1,1,@qh[0],1024) : Else : rc=WebRequestInit(@q,@u,"POST",4,3,1,@qh[0],1024) : EndIf
+ EndIf
+ If rc=0 : rc=WebRequestFinishHeaders(@q) : EndIf
+ If rc=0 : rc=WebResponseInit(@a,@line[0],512,@ah[0],1024,0) : EndIf
+ If rc=0 : rc=WebClientStart(@client,@u,@q,@a,@tx[0],128,@rx[0],128,0,1000) : EndIf
+ For i=0 To 63 : output[i]=0 : Next
+ While rc=0
+  step=step+1 : cap=1 : If (step & 1)=0 : cap=0 : EndIf
+  If mode=2 : step=1001 : EndIf
+  If mode=3 And step=3 : rc=WebClientCancel(@client) : Break : EndIf
+  rc=WebClientStep(@client,?body+off,3-off,1,@output[out],cap,step)
+  off=off+client\consumed : out=out+client\written
+  If step>2000 : rc=-999 : Break : EndIf
+ Wend
+ nextRc=-999
+ If mode=7 And rc=1
+  nextRc=WebRequestInit(@q2,@u,"POST",4,3,1,@qh2[0],1024)
+  If nextRc=0 : nextRc=WebRequestFinishHeaders(@q2) : EndIf
+  If nextRc=0 : nextRc=WebResponseInit(@a2,@line2[0],512,@ah2[0],1024,0) : EndIf
+  If nextRc=0 : nextRc=WebClientNext(@client,@q2,@a2,step,1000) : EndIf
+  If nextRc=0
+   position=0 : off=0 : round=1 : rc=0
+   While rc=0
+    step=step+1
+    rc=WebClientStep(@client,?body+off,3-off,1,@output[out],1,step)
+    off=off+client\consumed : out=out+client\written
+    If step>2000 : rc=-999 : Break : EndIf
+   Wend
+  EndIf
+ EndIf
+ *response=client\response
+ p=$E1C00100+index*256
+ For i=0 To 255 : PokeA(p+i,0) : Next
+ PokeI(p,rc) : PokeI(p+8,client\state) : PokeI(p+16,*response\status) : PokeI(p+24,out)
+ PokeI(p+32,closes) : PokeI(p+40,*response\reusable) : PokeI(p+48,nextRc) : PokeI(p+56,sends)
+ For i=0 To 63 : PokeA(p+80+i,output[i]) : Next
+ WebClientClose(@client) : PokeI(p+64,closes)
+EndProcedure
+Procedure.i Main(services.i)
+ Define i.i
+ For i=0 To 16383 : PokeA($E1C00000+i,$A5) : Next
+ PokeI($E1C00000,$57455831)
+ For i=0 To 7 : Record(i,i) : Next
+ PokeI($E1C00008,8)
+ ProcedureReturn 0
+EndProcedure
+DataSection
+normal:
+ Data.a 72,84,84,80,47,49,46,49,32,50,48,48,32,79,75,13,10,67,111,110,116,101,110,116,45,76,101,110,103,116,104,58,32,51,13,10,13,10,97,98,99
+early:
+ Data.a 72,84,84,80,47,49,46,49,32,52,49,51,32,76,97,114,103,101,13,10,67,111,110,116,101,110,116,45,76,101,110,103,116,104,58,32,51,13,10,13,10,110,111,33
+short:
+ Data.a 72,84,84,80,47,49,46,49,32,50,48,48,32,79,75,13,10,67,111,110,116,101,110,116,45,76,101,110,103,116,104,58,32,51,13,10,13,10,97,98
+body:
+ Data.a 97,98,99
+EndDataSection

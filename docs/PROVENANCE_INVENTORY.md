@@ -1583,3 +1583,6 @@ text is unchanged; no new board execution or boot claim follows.
 | `docs/evidence/anvil-ipv6-20261030/resolver453/cache665/proof.pi4` | protocol-facts | ietf-rfc | IETF specification | Generated typed DNS owner/cache qualification source |
 | `docs/evidence/anvil-ipv6-20261030/resolver453/pending669/proof.pi4` | protocol-facts | ietf-rfc | IETF specification | Generated typed DNS owner/cache qualification source |
 | `docs/evidence/anvil-ipv6-20261030/web455/webreg686/proof.pi4` | protocol-facts | ietf-rfc | IETF specification | Generated HTTP lifecycle regression source |
+| `docs/evidence/anvil-ipv6-20261030/tls458/pool737/proof.pi4` | protocol-facts | ietf-rfc | IETF specification | Shared TLS/HTTP physical lifecycle proof |
+| `docs/evidence/anvil-ipv6-20261030/tls458/tlsdial742/proof.pi4` | protocol-facts | ietf-rfc | IETF specification | Shared TLS/HTTP physical lifecycle proof |
+| `docs/evidence/anvil-ipv6-20261030/tls458/web738/proof.pi4` | protocol-facts | ietf-rfc | IETF specification | Shared TLS/HTTP physical lifecycle proof |

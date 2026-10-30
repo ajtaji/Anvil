@@ -7,12 +7,13 @@ ap=argparse.ArgumentParser(description="Compile TLS pool lifecycle qualification
 ap.add_argument('--compiler',required=True);ap.add_argument('--out',type=Path,required=True);args=ap.parse_args()
 r=Path(__file__).resolve().parents[1];d=args.out.resolve();d.mkdir(parents=True,exist_ok=False)
 names=['Anvil/Core/tls_client.pbi','Anvil/Hal/abi.pbi','Anvil/Crypto/tls13_hs.pbi','Anvil/Crypto/tls13_record.pbi','Anvil/Crypto/x509.pbi','Anvil/Crypto/tls13_context.pbi']
+names+=['Anvil/Core/tcp_dial.pbi','Anvil/Network/tcp_dial.pbi','Anvil/Network/ipv6_address.pbi']
 owner=(r/names[0]).read_text(encoding='utf8')
 # Compile the actual TLS service owner. Display-only diagnostics are outside
 # this probe; crypto/TCP seams are deterministic doubles, not TLS wire tests.
 owner=owner[:owner.index('; `tls status`')]
 needed=set(re.findall(r'#[A-Z][A-Z_0-9]*',owner));defined=set(re.findall(r'(?m)^#([A-Z][A-Z_0-9]*)\s*=',owner))
-needed.update(['#TLS13_ST_CONNECTED','#TLS13_ST_WAIT_SH','#SVC_TCP_OPEN'])
+needed.update(['#SVC_EAGAIN','#TLS13_ST_CONNECTED','#TLS13_ST_WAIT_SH','#SVC_TCP_OPEN'])
 constants=[]
 for name in names[1:3]:
  for line in (r/name).read_text(encoding='utf8').splitlines():
@@ -180,6 +181,12 @@ Procedure.i Tls13BuildAlert(p.i,n.i,level.i,description.i)
 EndProcedure
 Procedure.i PayNetDnsResolve(p.i)
  ProcedureReturn #SVC_EAGAIN
+EndProcedure
+Procedure.i PayNetDnsResolve6(p.i,out.i)
+ ProcedureReturn #SVC_EAGAIN
+EndProcedure
+Procedure.i PayNetTcpOpen6(ip.i,port.i)
+ ProcedureReturn 2
 EndProcedure
 Procedure.i PayNetTcpOpen(ip.i,port.i)
  ProcedureReturn 1

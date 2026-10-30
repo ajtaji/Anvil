@@ -5,7 +5,7 @@ from pmf_compiler import resolve_compiler
 
 def build(compiler,out):
  root=Path(__file__).resolve().parents[1];out.mkdir(parents=True,exist_ok=False)
- names=['Anvil/Network/web_transport.pbi','Anvil/Network/web_url.pbi','Anvil/Network/ipv6_address.pbi']
+ names=['Anvil/Network/tcp_dial.pbi','Anvil/Network/web_transport.pbi','Anvil/Network/web_url.pbi','Anvil/Network/ipv6_address.pbi']
  s='#WEB_KERNEL_BINDING=0\nXIncludeFile "Anvil/Network/web_url.pbi"\nXIncludeFile "Anvil/Network/web_transport.pbi"\n'+r'''
 Global con.WebConnection
 Global Dim fixtureTable.i[256]
@@ -112,8 +112,8 @@ Procedure DialFixtureRun(index.i)
  p=$E1C00100+index*128
  PokeI(p,rc) : PokeI(p+8,chosen) : PokeI(p+16,opens4) : PokeI(p+24,opens6)
  PokeI(p+32,calls4) : PokeI(p+40,calls6) : PokeI(p+48,closed4) : PokeI(p+56,closed6)
- PokeI(p+64,closedTls) : PokeI(p+72,con\handle) : PokeI(p+80,con\dial4) : PokeI(p+88,con\dial6)
- PokeI(p+96,fixtureAge) : PokeI(p+104,con\allow6)
+ PokeI(p+64,closedTls) : PokeI(p+72,con\handle) : PokeI(p+80,con\dial\dial4) : PokeI(p+88,con\dial\dial6)
+ PokeI(p+96,fixtureAge) : PokeI(p+104,con\dial\allow6)
 EndProcedure
 Procedure.i Main()
  Define i.i

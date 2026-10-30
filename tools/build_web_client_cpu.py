@@ -8,9 +8,11 @@ ap.add_argument('--compiler',required=True);ap.add_argument('--out',type=Path,re
 r=Path(__file__).resolve().parents[1];d=args.out.resolve();d.mkdir(parents=True,exist_ok=False)
 names=['Anvil/Network/byte_order.pbi','Anvil/Network/ipv6_address.pbi','Anvil/Network/web_url.pbi','Anvil/Network/web_request.pbi','Anvil/Network/web_response.pbi','Anvil/Network/web_client.pbi']
 contract=(r/'Anvil/Network/web_transport.pbi').read_text(encoding='utf8')
+dial_contract=(r/'Anvil/Network/tcp_dial.pbi').read_text(encoding='utf8')
+dial_structs='\n'.join(re.findall(r'Structure .*?EndStructure',dial_contract,re.S))
 connection=re.search(r'Structure WebConnection.*?EndStructure',contract,re.S).group(0)
 chunks=['\n'.join(x for x in (r/n).read_text(encoding='utf8').splitlines() if not x.startswith('XIncludeFile')) for n in names]
-s='\n'.join(chunks[:2])+'\n'+connection+'\n'+'\n'.join(chunks[2:])+'''
+s='\n'.join(chunks[:2])+'\n'+dial_structs+'\n'+connection+'\n'+'\n'.join(chunks[2:])+'''
 Global u.WebUrl,q.WebRequest,a.WebResponse,client.WebClient,q2.WebRequest,a2.WebResponse
 Global Dim host.a[256]
 Global Dim target.a[3072]
@@ -112,4 +114,4 @@ q=subprocess.run([c,'--compile',str(p),'-t','pi4','--load-addr','0x1000000','--s
 log=q.stdout+q.stderr;(d/'compile.txt').write_text(log,encoding='utf8');print(log[-2000:]);assert q.returncode==0
 code=re.search(r'occupying \$([0-9A-Fa-f]+)\.\.\$([0-9A-Fa-f]+)',log);bss=re.search(r'bss \$([0-9A-Fa-f]+)\.\.\$([0-9A-Fa-f]+)',log)
 ranges={'code':['0x'+x for x in code.groups()],'bss':['0x'+x for x in bss.groups()],'stack':['0x4e00000','0x4efffff'],'report':['0xe1c00000','0xe1c03fff']}
-p=d/'proof.img.pmf';(d/'identity.json').write_text(json.dumps(dict(bytes=p.stat().st_size,sha256=hashlib.sha256(p.read_bytes()).hexdigest(),checked_ranges=ranges,source_hashes={n:hashlib.sha256((r/n).read_bytes()).hexdigest() for n in names+['Anvil/Network/web_transport.pbi']},cases=list(range(8))),indent=2),encoding='utf8')
+p=d/'proof.img.pmf';(d/'identity.json').write_text(json.dumps(dict(bytes=p.stat().st_size,sha256=hashlib.sha256(p.read_bytes()).hexdigest(),checked_ranges=ranges,source_hashes={n:hashlib.sha256((r/n).read_bytes()).hexdigest() for n in names+['Anvil/Network/web_transport.pbi','Anvil/Network/tcp_dial.pbi']},cases=list(range(8))),indent=2),encoding='utf8')
