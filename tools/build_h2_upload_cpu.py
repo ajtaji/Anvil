@@ -3,9 +3,9 @@ from pathlib import Path
 import argparse,hashlib,json,os,re,subprocess
 from pmf_compiler import resolve_compiler
 
-def build(compiler,out):
+def build(compiler,out,cases=None,transform=None):
  root=Path(__file__).resolve().parents[1];out.mkdir(parents=True,exist_ok=False)
- rows=json.loads((root/'tools/h2_upload_cases.json').read_text())
+ rows=json.loads((root/'tools/h2_upload_cases.json').read_text()) if cases is None else cases
  names=['RaspberryPi4/Lib/mmu.pi4','Anvil/Network/web_url.pbi','Anvil/Network/web_transport.pbi','Anvil/Network/h2_frame.pbi','Anvil/Network/hpack_decode.pbi','Anvil/Network/hpack_tables.pbi','Anvil/Network/h2_client.pbi','Anvil/Network/h2_request.pbi','Anvil/Network/web_request.pbi']
  s='#WEB_KERNEL_BINDING=0\n'+'\n'.join('XIncludeFile "'+n+'"' for n in names)+r'''
 
@@ -18,6 +18,8 @@ Global request.WebRequest
 Global Dim tx.a[16384]
 Global Dim rx.a[16384]
 Global Dim block.a[65536]
+Global Dim controls.a[1024]
+Global Dim requestBlock.a[65536]
 Global Dim dynamic.a[4096]
 Global Dim field.a[8192]
 Global Dim streams.a[2048]
@@ -95,7 +97,7 @@ Procedure.i RunOne(index.i)
  For i=0 To 999 : large[i]=76 : Next
  If mode=2 : For i=0 To 16 : body[i]=i : Next : EndIf
  url\secure=1 : url\host="example.org" : url\hostLength=11 : url\port=443 : url\target="/upload" : url\targetLength=7
- buffers\tx=@tx[0] : buffers\rx=@rx[0] : buffers\block=@block[0] : buffers\dynamic=@dynamic[0] : buffers\field=@field[0] : buffers\streams=@streams[0] : buffers\streamCount=4
+ buffers\tx=@tx[0] : buffers\rx=@rx[0] : buffers\requestBlock=@requestBlock[0] : buffers\controls=@controls[0] : buffers\block=@block[0] : buffers\dynamic=@dynamic[0] : buffers\field=@field[0] : buffers\streams=@streams[0] : buffers\streamCount=4
  method="POST" : methodBytes=4 : length=goal
  If mode=2 Or mode=3 : length=-1 : EndIf
  If mode=4 : method="HEAD" : EndIf
@@ -125,8 +127,8 @@ Procedure.i RunOne(index.i)
    If rc=#H2_RESET Or rc=#H2_GOAWAY : rc=-9302 : Break : EndIf
    rc=H2ClientConsume(@c) : If rc<>0 : Break : EndIf
   EndIf
-  If ended<>0 And c\txLength=0 : rc=0 : Break : EndIf
-  If submitted=0 And c\state=3 And c\txLength=0
+  If ended<>0 And c\txLength=0 And c\controlLength=0 : rc=0 : Break : EndIf
+  If submitted=0 And c\state=3 And c\txLength=0 And c\controlLength=0
    rc=H2ClientRequest(@c,@request)
    If rc<0 : Break : EndIf
    If rc<>1 : rc=-9303 : Break : EndIf
@@ -179,6 +181,7 @@ Procedure.i Main()
  ProcedureReturn 0
 EndProcedure
 '''
+ if transform is not None:s=transform(s)
  s+='\nDataSection\nCases:\n Data.i '+str(len(rows))+'\n'
  for row in rows:
   wire=bytes.fromhex(row['wire'])

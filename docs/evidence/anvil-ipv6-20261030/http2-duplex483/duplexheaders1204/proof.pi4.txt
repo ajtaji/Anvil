@@ -1,0 +1,209 @@
+#WEB_KERNEL_BINDING=0
+XIncludeFile "RaspberryPi4/Lib/mmu.pi4"
+XIncludeFile "Anvil/Network/web_url.pbi"
+XIncludeFile "Anvil/Network/web_transport.pbi"
+XIncludeFile "Anvil/Network/h2_frame.pbi"
+XIncludeFile "Anvil/Network/hpack_decode.pbi"
+XIncludeFile "Anvil/Network/hpack_tables.pbi"
+XIncludeFile "Anvil/Network/h2_client.pbi"
+XIncludeFile "Anvil/Network/h2_request.pbi"
+XIncludeFile "Anvil/Network/web_request.pbi"
+
+Global services.i
+Global *pet,*clock
+Global c.H2Client
+Global buffers.H2Buffers
+Global url.WebUrl
+Global request.WebRequest
+Global Dim tx.a[16384]
+Global Dim rx.a[16384]
+Global Dim block.a[65536]
+Global Dim controls.a[1024]
+Global Dim requestBlock.a[65536]
+Global Dim dynamic.a[4096]
+Global Dim field.a[8192]
+Global Dim streams.a[2048]
+Global Dim headers.a[32768]
+Global Dim body.a[70001]
+Global Dim large.a[1000]
+Global Dim incoming.a[8192]
+Global Dim outgoing.a[131072]
+Global Dim gateAt.i[64]
+Global Dim gateBytes.i[64]
+Global firstSent.i,overlap.i,secondStarted.i,secondFinished.i
+Global inBytes.i,inAt.i,outBytes.i,sendCalls.i,recvCalls.i,closeCalls.i,mode.i,goal.i,gateCount.i
+Procedure.i FakeOpen(host.i,port.i,offer.i,bytes.i)
+ ProcedureReturn 1
+EndProcedure
+Procedure.i FakeState(handle.i)
+ ProcedureReturn 4
+EndProcedure
+Procedure.i FakeAlpn(handle.i,destination.i,capacity.i)
+ PokeA(destination,104) : PokeA(destination+1,50) : ProcedureReturn 2
+EndProcedure
+Procedure.i FakeClose(handle.i)
+ closeCalls=closeCalls+1 : ProcedureReturn 0
+EndProcedure
+Procedure.i FakeSend(handle.i,source.i,bytes.i)
+ Define i.i,n.i
+ sendCalls=sendCalls+1 : If (sendCalls % 4)=0 : ProcedureReturn 0 : EndIf
+ n=bytes : If n>97 : n=97 : EndIf
+ If outBytes+n>131072 : ProcedureReturn -9301 : EndIf
+ For i=0 To n-1 : outgoing[outBytes+i]=PeekA(source+i) : Next
+ outBytes=outBytes+n : ProcedureReturn n
+EndProcedure
+Procedure.i FakeRecv(handle.i,destination.i,bytes.i)
+ Define i.i,n.i,at.i,length.i,uploaded.i,ready.i,ended.i,required.i,kind.i,flags.i
+ recvCalls=recvCalls+1 : If (recvCalls % 3)=0 : ProcedureReturn 0 : EndIf
+ at=24 : uploaded=0 : ready=0 : ended=0
+ While at+9<=outBytes
+  length=(outgoing[at]<<16)|(outgoing[at+1]<<8)|outgoing[at+2]
+  If mode=9 And NetReadBE32(@outgoing[at+5])=3
+   If outBytes>=at+22 : secondStarted=1 : EndIf
+   If at+9+length<=outBytes And (outgoing[at+4] & 4)<>0 : secondFinished=1 : EndIf
+  EndIf
+  If at+9+length>outBytes : Break : EndIf
+  kind=outgoing[at+3] : flags=outgoing[at+4]
+  If (kind=1 Or kind=9) And (flags & 4)<>0 : ready=1 : EndIf
+  If (kind=1 Or kind=0) And (flags & 1)<>0 : ended=1 : EndIf
+  If kind=0 : uploaded=uploaded+length : EndIf
+  at=at+9+length
+ Wend
+ If mode=9
+  If inAt>=18 And secondStarted=0 : ProcedureReturn 0 : EndIf
+  If inAt>=gateAt[0] And secondFinished=0 : ProcedureReturn 0 : EndIf
+ EndIf
+ required=-1
+ For i=0 To gateCount-1
+  If inAt>=gateAt[i] : required=gateBytes[i] : EndIf
+ Next
+ If required<>-1
+  If ready=0 : ProcedureReturn 0 : EndIf
+  If required=-2
+   If ended=0 : ProcedureReturn 0 : EndIf
+  Else
+   If uploaded<required : ProcedureReturn 0 : EndIf
+  EndIf
+ EndIf
+ n=inBytes-inAt : If n>bytes : n=bytes : EndIf : If n>5 : n=5 : EndIf
+ For i=0 To n-1 : PokeA(destination+i,incoming[inAt+i]) : Next
+ inAt=inAt+n : ProcedureReturn n
+EndProcedure
+Procedure CaptureTable()
+ ASM
+ adrp x1, global_services
+ add x1, x1, #:lo12:global_services
+ str x0, [x1]
+ EndASM
+EndProcedure
+
+
+
+Procedure.i RunOne(index.i)
+ Define rc.i,tick.i,submitted.i,ended.i,position.i,i.i,p.i,n.i,method.i,methodBytes.i,length.i,bodyBytes.i,status.i,busy.i
+ firstSent=0 : overlap=0 : secondStarted=0 : secondFinished=0 : inAt=0 : outBytes=0 : sendCalls=0 : recvCalls=0 : closeCalls=0
+ For i=0 To 70000 : body[i]=97 : Next
+ For i=0 To 999 : large[i]=76 : Next
+ If mode=2 : For i=0 To 16 : body[i]=i : Next : EndIf
+ url\secure=1 : url\host="example.org" : url\hostLength=11 : url\port=443 : url\target="/upload" : url\targetLength=7
+ buffers\tx=@tx[0] : buffers\rx=@rx[0] : buffers\requestBlock=@requestBlock[0] : buffers\controls=@controls[0] : buffers\block=@block[0] : buffers\dynamic=@dynamic[0] : buffers\field=@field[0] : buffers\streams=@streams[0] : buffers\streamCount=4
+ method="POST" : methodBytes=4 : length=goal
+ If mode=2 Or mode=3 : length=-1 : EndIf
+ If mode=4 : method="HEAD" : EndIf
+ If mode=5 Or mode=9 : method="GET" : methodBytes=3 : EndIf
+ If mode=7 : url\host="foreign.org" : EndIf
+ rc=WebRequestInit(@request,@url,method,methodBytes,length,0,@headers[0],32768) : If rc<>0 : ProcedureReturn rc : EndIf
+ rc=WebRequestHeader(@request,"X-Test",6,"  value  ",9) : If rc<>0 : ProcedureReturn rc : EndIf
+ rc=WebRequestHeader(@request,"Cookie",6,"a=b; c=d",8) : If rc<>0 : ProcedureReturn rc : EndIf
+ If mode=5 Or mode=9
+  For i=0 To 30
+   rc=WebRequestHeader(@request,"X-Large",7,@large[0],1000) : If rc<>0 : ProcedureReturn rc : EndIf
+  Next
+ EndIf
+ If mode=8 : rc=WebRequestHeader(@request,"TE",2,"gzip",4) : If rc<>0 : ProcedureReturn rc : EndIf : EndIf
+ rc=WebRequestFinishHeaders(@request) : If rc<>0 : ProcedureReturn rc : EndIf
+ url\host="example.org"
+ rc=H2ClientStart(@c,@url,@buffers,0,200000) : If rc<>0 : ProcedureReturn rc : EndIf
+ For tick=1 To 100000
+  pet() : rc=H2ClientStep(@c,tick)
+  If rc<0 : Break : EndIf
+  If rc>0
+   If mode=9 And rc=#H2_FIELD And c\eventStream=1 And c\requestHeaderBytes<>0 : overlap=1 : EndIf
+   If rc=#H2_FIELD And h2cEqual(c\name,c\nameLength,":status")
+    status=(PeekA(c\value)-48)*100+(PeekA(c\value+1)-48)*10+PeekA(c\value+2)-48
+   EndIf
+   If rc=#H2_DATA : bodyBytes=bodyBytes+c\dataBytes : EndIf
+   If rc=#H2_END : ended=ended+1 : EndIf
+   If rc=#H2_RESET Or rc=#H2_GOAWAY : rc=-9302 : Break : EndIf
+   rc=H2ClientConsume(@c) : If rc<>0 : Break : EndIf
+  EndIf
+  If ((mode=9 And ended=2) Or (mode<>9 And ended<>0)) And c\txLength=0 And c\controlLength=0 : rc=0 : Break : EndIf
+  If submitted=0 And c\state=3 And c\txLength=0 And c\controlLength=0
+   If mode=9 And firstSent=0
+    rc=H2ClientGet(@c,"/first",6)
+    If rc<>1 : rc=-9401 : Break : EndIf
+    firstSent=1
+   Else
+    rc=H2ClientRequest(@c,@request)
+    If rc<0 : Break : EndIf
+    If (mode=9 And rc<>3) Or (mode<>9 And rc<>1) : rc=-9303 : Break : EndIf
+    submitted=1
+   EndIf
+  EndIf
+  If submitted<>0 And request\state<>2 And ended=0
+   rc=H2ClientData(@c,1,@body[0]+position,goal-position,1)
+   If rc=#H2_BUSY
+    busy=busy+1
+   Else
+    If rc<0 : Break : EndIf
+    position=position+rc
+   EndIf
+  EndIf
+ Next
+ If tick>100000 : rc=-9304 : EndIf
+ p=$E1C00100+index*120000
+ PokeI(p,rc) : PokeI(p+8,position) : PokeI(p+16,bodyBytes) : PokeI(p+24,status)
+ PokeI(p+32,outBytes) : PokeI(p+40,request\state) : PokeI(p+48,request\offset) : PokeI(p+56,busy)
+ PokeI(p+88,overlap) : PokeI(p+96,ended) : PokeI(p+72,c\nextStream) : PokeI(p+80,c\activeStreams)
+ If outBytes>100000 : ProcedureReturn -9305 : EndIf
+ For i=0 To outBytes-1 : PokeA(p+256+i,outgoing[i]) : Next
+ H2ClientClose(@c) : PokeI(p+64,closeCalls)
+ ProcedureReturn 0
+EndProcedure
+Procedure RunCases()
+ Define index.i,i.i,n.i,v.i
+ webpTlsOpenAlpn=@FakeOpen : webpTlsState=@FakeState : webpTlsAlpn=@FakeAlpn : webpTlsClose=@FakeClose : webpTlsSend=@FakeSend : webpTlsRecv=@FakeRecv
+ Restore Cases : Read.i n : PokeI($E1C00008,n)
+ For index=0 To n-1
+  Read.i mode : Read.i goal : Read.i inBytes : Read.i gateCount
+  For i=0 To gateCount-1 : Read.i v : gateAt[i]=v : Read.i v : gateBytes[i]=v : Next
+  For i=0 To inBytes-1 : Read.i v : incoming[i]=v : Next
+  RunOne(index)
+ Next
+EndProcedure
+Procedure.i Main()
+ CaptureTable()
+ Define i.i,rc.i
+ rc=WebPayloadBind(services) : If rc<>0 : ProcedureReturn 71 : EndIf
+ pet=PeekI(services+16+6*8) : clock=PeekI(services+16+11*8)
+ MmuClearNc() : MmuAddNc($08A00000,$09200000) : MmuAddNc($08100000,$08180000)
+ rc=MmuBuildTables($4F80000) : If rc<>0 : ProcedureReturn 72 : EndIf
+ MmuEnableCached()
+ For i=0 To 1048575 : PokeA($E1C00000+i,0) : Next
+ PokeI($E1C00000,$48325550)
+ RunCases()
+ H2ClientClose(@c)
+ MmuDisableCachedFlushed()
+ ProcedureReturn 0
+EndProcedure
+
+DataSection
+Cases:
+ Data.i 1
+ Data.i 9,0,91,1
+ Data.i 79,-1
+ Data.i 0,0,0,4,0,0,0,0,0,0,0,0,4,1,0,0,0,0,0,0,35,1,5,0
+ Data.i 0,0,1,136,92,129,7,64,133,242,180,166,177,9,151,176,168,172,245,32,170,120,156,212
+ Data.i 21,75,107,160,227,144,213,76,164,229,28,133,177,31,0,0,8,6,0,0,0,0,0,49
+ Data.i 50,51,52,53,54,55,56,0,0,3,1,5,0,0,0,3,136,191,190
+EndDataSection

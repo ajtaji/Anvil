@@ -1,0 +1,27 @@
+import struct
+from hpack import Decoder
+def check(data,cases):
+ q=lambda at:struct.unpack_from('<q',data,at)[0]
+ p=256
+ assert q(0)==0x48324155 and q(8)==1
+ assert q(p)==0,(q(p),q(p+24),q(p+168))
+ assert q(p+8)==16375 and q(p+16)==2 and q(p+24)==413
+ assert data[p+25000:p+25002]==b'no'
+ assert q(p+200)==1 and q(p+168)==len(bytes.fromhex(cases[0]['wire']))
+ assert q(p+72)==1 and q(p+192)==1 and q(p+40)==2 and q(p+48)==9
+ assert q(p+144)==70000-16375
+ wire=data[q(p+96):q(p+96)+q(p+32)];at=24;payload=b'';headers=[];resets=[];credits=[];decoder=Decoder()
+ assert wire[:24]==b'PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n'
+ while at<len(wire):
+  assert at+9<=len(wire)
+  n=int.from_bytes(wire[at:at+3],'big');kind=wire[at+3];flags=wire[at+4];sid=int.from_bytes(wire[at+5:at+9],'big');body=wire[at+9:at+9+n]
+  assert len(body)==n
+  if kind==0:assert flags==0 and sid==1;payload+=body
+  if kind==1:headers=decoder.decode(body)
+  if kind==3:resets.append((sid,int.from_bytes(body,'big')))
+  if kind==8:credits.append((sid,int.from_bytes(body,'big')))
+  at+=9+n
+ assert payload==b'a'*16375 and resets==[(1,0)] and credits==[(0,2)]
+ h=dict(headers);assert h[':method']=='POST' and h[':path']=='/upload' and h['content-length']=='70000'
+ assert q(p+152)==len(wire) and q(p+160)==q(p+168)
+ return dict(stalled_upload_completed=True,http_status=413,accepted_upload=q(p+8),exact_upload_bytes=len(payload),received_wire=q(p+168),complete_frames=True)

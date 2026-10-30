@@ -31,6 +31,7 @@ Global response.WebResponse
 Global Dim tx.a[16384]
 Global Dim rx.a[16384]
 Global Dim block.a[65536]
+Global Dim controls.a[1024]
 Global Dim dynamic.a[4096]
 Global Dim field.a[8192]
 Global Dim streams.a[2048]
@@ -100,7 +101,7 @@ Procedure.i Probe(p.i)
  For i=0 To SizeOf(WebConnection)-1 : PokeA(@moved+i,0) : Next
  For i=0 To SizeOf(WebClient)-1 : PokeA(@wc+i,0) : Next
  url\secure=1 : url\host="example.org" : url\hostLength=11 : url\port=443 : url\target="/test" : url\targetLength=5
- buffers\tx=@tx[0] : buffers\rx=@rx[0] : buffers\block=@block[0] : buffers\dynamic=@dynamic[0] : buffers\field=@field[0] : buffers\streams=@streams[0] : buffers\streamCount=4
+ buffers\tx=@tx[0] : buffers\rx=@rx[0] : buffers\controls=@controls[0] : buffers\block=@block[0] : buffers\dynamic=@dynamic[0] : buffers\field=@field[0] : buffers\streams=@streams[0] : buffers\streamCount=4
  rc=WebRequestInit(@request,@url,"GET",3,0,1,@headers[0],2048) : If rc<>0 : ProcedureReturn rc : EndIf
  rc=WebRequestFinishHeaders(@request) : If rc<>0 : ProcedureReturn rc : EndIf
  rc=WebResponseInit(@response,@line[0],512,@responseHeaders[0],2048,0) : If rc<>0 : ProcedureReturn rc : EndIf

@@ -1,0 +1,132 @@
+from pathlib import Path
+r=Path('C:/Users/ajtaj/Desktop/Anvil');p=r/'Anvil/Network/h2_client.pbi';s=p.read_text()
+def rep(a,b):
+ global s
+ assert a in s,a[:100]
+ s=s.replace(a,b)
+rep(' streamCount.i\nEndStructure',' streamCount.i\n controls.i\n requestBlock.i\nEndStructure')
+rep(' txOffset.i\n',' txOffset.i\n controlLength.i\n txControls.i\n txCreditOffset.i\n writeTurn.i\n')
+anchor='Procedure.i h2cFinish('
+at=s.index(anchor)
+s=s[:at]+''' ; Reserve a complete control frame without touching an in-flight TX frame.
+; The bounded 1024-byte queue fails explicitly on resource exhaustion.
+Procedure.i h2cControl(*c.H2Client,bytes.i,kind.i,flags.i,id.i)
+ Define p.i
+ If *c\\controlLength+bytes+9>1024 : ProcedureReturn h2cFail(*c,#H2_LIMIT) : EndIf
+ p=*c\\buffers\\controls+*c\\controlLength
+ H2FrameWrite(p,1024-*c\\controlLength,bytes,kind,flags,id)
+ *c\\controlLength=*c\\controlLength+bytes+9
+ ProcedureReturn p+9
+EndProcedure
+'''+s[at:]
+rep(' Define *request.WebRequest\n If *s\\state',' Define *request.WebRequest,p.i\n If *s\\state')
+rep('  H2FrameWrite(*c\\buffers\\tx,16384,4,3,0,*s\\id)\n  NetWriteBE32(*c\\buffers\\tx+9,0) : *c\\txLength=13 : *c\\txOffset=0','  p=h2cControl(*c,4,3,0,*s\\id) : If p<0 : ProcedureReturn p : EndIf\n  NetWriteBE32(p,0)')
+rep('If *buffers\\tx=0 Or *buffers\\rx=0','If *buffers\\controls=0 Or *buffers\\tx=0 Or *buffers\\rx=0')
+# New submission never jumps ahead of queued controls.
+rep('If *c\\event<>0 Or *c\\txLength<>0 Or *c\\requestHeaderBytes<>0','If *c\\event<>0 Or *c\\controlLength<>0 Or *c\\txLength<>0 Or *c\\requestHeaderBytes<>0')
+rep('PeekA(*c\\buffers\\block+*c\\requestHeaderOffset+i)','PeekA(*c\\buffers\\requestBlock+*c\\requestHeaderOffset+i)')
+rep(' If *c=0 Or *request=0 : ProcedureReturn #H2_ARGUMENT : EndIf',' If *c=0 Or *request=0 : ProcedureReturn #H2_ARGUMENT : EndIf\n If *c\\buffers\\requestBlock=0 : ProcedureReturn #H2_ARGUMENT : EndIf')
+rep('*c\\connection\\port,*c\\buffers\\block,65536,*c\\peerHeaderLimit','*c\\connection\\port,*c\\buffers\\requestBlock,65536,*c\\peerHeaderLimit')
+# CancelStream does not need to change its existing BUSY contract.
+rep('Procedure.i H2ClientCancelStream(*c.H2Client,id.i)\n Define *s.H2Stream','Procedure.i H2ClientCancelStream(*c.H2Client,id.i)\n Define *s.H2Stream,p.i')
+rep(' H2FrameWrite(*c\\buffers\\tx,16384,4,3,0,id)\n NetWriteBE32(*c\\buffers\\tx+9,8) : *c\\txLength=13 : *c\\txOffset=0',' p=h2cControl(*c,4,3,0,id) : If p<0 : ProcedureReturn p : EndIf\n NetWriteBE32(p,8)')
+a=s.index('Procedure.i H2ClientConsume(');z=s.index('Procedure.i h2cDecode(',a)
+s=s[:a]+'''Procedure.i H2ClientConsume(*c.H2Client)
+ Define *s.H2Stream,p.i,needed.i
+ If *c=0 : ProcedureReturn #H2_ARGUMENT : EndIf
+ If *c\\state=-1 : ProcedureReturn *c\\error : EndIf
+ If *c\\event=#H2_DATA And *c\\credit>0
+  *s=h2cStream(*c,*c\\eventStream) : If *s=0 : ProcedureReturn h2cFail(*c,#H2_STATE) : EndIf
+  needed=13 : If *c\\finishStream=0 : needed=26 : EndIf
+  If *c\\controlLength+needed>1024 : ProcedureReturn h2cFail(*c,#H2_LIMIT) : EndIf
+  p=h2cControl(*c,4,8,0,0) : NetWriteBE32(p,*c\\credit)
+  If needed=26
+   p=h2cControl(*c,4,8,0,*s\\id) : NetWriteBE32(p,*c\\credit)
+  EndIf
+ EndIf
+ *c\\event=0 : *c\\credit=0 : ProcedureReturn 0
+EndProcedure
+'''+s[z:]
+rep('rc.i,j.i,*other.H2Stream,closed.i','rc.i,j.i,*other.H2Stream,closed.i,control.i')
+rep('    H2FrameWrite(*c\\buffers\\tx,16384,0,4,1,0) : *c\\txLength=9 : *c\\txOffset=0','    control=h2cControl(*c,0,4,1,0) : If control<0 : ProcedureReturn control : EndIf')
+rep('     H2FrameWrite(*c\\buffers\\tx,16384,4,8,0,0)\n     NetWriteBE32(*c\\buffers\\tx+9,*h\\length) : *c\\txLength=13 : *c\\txOffset=0','     control=h2cControl(*c,4,8,0,0) : If control<0 : ProcedureReturn control : EndIf\n     NetWriteBE32(control,*h\\length) : *c\\window=*c\\window-*h\\length')
+rep('    H2FrameWrite(*c\\buffers\\tx,16384,8,6,1,0)\n    For i=0 To 7 : PokeA(*c\\buffers\\tx+9+i,PeekA(p+i)) : Next\n    *c\\txLength=17 : *c\\txOffset=0','    control=h2cControl(*c,8,6,1,0) : If control<0 : ProcedureReturn control : EndIf\n    For i=0 To 7 : PokeA(control+i,PeekA(p+i)) : Next')
+a=s.index('; Each step performs at most one send');s=s[:a]+''' ; Progress only complete wire frames; never splice controls into a partial
+; frame or a HEADERS/CONTINUATION sequence. Advertise credit only once the
+; complete WINDOW_UPDATE has actually been sent, including fragmented writes.
+Procedure.i h2cSend(*c.H2Client)
+ Define rc.i,i.i,p.i,n.i,id.i,*stream.H2Stream
+ If *c\\txLength=0
+  If *c\\requestHeaderBytes<>0
+   h2cRequestHeaderFrame(*c) : ProcedureReturn 0
+  EndIf
+  If *c\\controlLength=0 : ProcedureReturn 0 : EndIf
+  For i=0 To *c\\controlLength-1 : PokeA(*c\\buffers\\tx+i,PeekA(*c\\buffers\\controls+i)) : Next
+  *c\\txLength=*c\\controlLength : *c\\controlLength=0 : *c\\txOffset=0
+  *c\\txControls=1 : *c\\txCreditOffset=0
+ EndIf
+ rc=WebTransportSend(@*c\\connection,*c\\buffers\\tx+*c\\txOffset,*c\\txLength-*c\\txOffset)
+ If rc<0 And rc<>#H2_BUSY : ProcedureReturn h2cFail(*c,rc) : EndIf
+ If rc<=0 : ProcedureReturn 0 : EndIf
+ If rc>*c\\txLength-*c\\txOffset : ProcedureReturn h2cFail(*c,#H2_PROTOCOL) : EndIf
+ *c\\sent=*c\\sent+rc : *c\\txOffset=*c\\txOffset+rc
+ If *c\\txControls<>0
+  While *c\\txCreditOffset+9<=*c\\txOffset
+   p=*c\\buffers\\tx+*c\\txCreditOffset
+   n=(PeekA(p)<<16)|(PeekA(p+1)<<8)|PeekA(p+2)
+   If *c\\txCreditOffset+9+n>*c\\txOffset : Break : EndIf
+   If PeekA(p+3)=8
+    id=NetReadBE32(p+5) : n=NetReadBE32(p+9)
+    If id=0
+     *c\\window=*c\\window+n
+    Else
+     *stream=h2cStream(*c,id)
+     If *stream<>0 : *stream\\window=*stream\\window+n : EndIf
+    EndIf
+    n=4
+   EndIf
+   *c\\txCreditOffset=*c\\txCreditOffset+9+n
+  Wend
+ EndIf
+ If *c\\txOffset=*c\\txLength
+  *c\\txOffset=0 : *c\\txLength=0 : *c\\txControls=0 : *c\\txCreditOffset=0
+ EndIf
+ ProcedureReturn 0
+EndProcedure
+; Each step performs at most one send OR receive OR bounded HPACK step.
+; Retained events block parsing, but permit outgoing work to progress.
+'''+s[a+len('; Each step performs at most one send OR receive OR bounded HPACK step.\n; An event blocks parsing until Consume. Pump underlying Service separately.\n'):]
+# Move the state1 negotiation prelude before event/write scheduling.
+a=s.index(' If *c\\event<>0 : ProcedureReturn *c\\event : EndIf',s.index('Procedure.i H2ClientStep'))
+z=s.index(' st=WebTransportState',a)
+pre=s[a:z];s=s[:a]+s[z:]
+a=s.index(' If *c\\txLength<>0\n  rc=WebTransportSend',s.index('Procedure.i H2ClientStep'))
+z=s.index(' If *c\\frame\\used<9',a)
+pre=pre.replace(' If *c\\event<>0 : ProcedureReturn *c\\event : EndIf\n','')
+pre=pre.replace(' And *c\\txLength=0 And *c\\requestHeaderBytes=0','')
+s=s[:a]+''' If *c\\event<>0
+  rc=h2cSend(*c) : If rc<0 : ProcedureReturn rc : EndIf
+  ProcedureReturn *c\\event
+ EndIf
+ If (*c\\txLength<>0 Or *c\\controlLength<>0 Or *c\\requestHeaderBytes<>0) And *c\\writeTurn<>0
+  *c\\writeTurn=0 : ProcedureReturn h2cSend(*c)
+ EndIf
+ *c\\writeTurn=1
+'''+pre+s[z:]
+s=s.replace('; field workspace8192, and streamCount*SizeOf(H2Stream) bytes. Keep disjoint.','; field workspace8192, controls1024, and streamCount*SizeOf(H2Stream) bytes.\n; Request uploads additionally require requestBlock65536. Keep all disjoint.')
+s=s.replace('; Parsing resumes only after the queued WINDOW_UPDATE is fully sent.','; Restore receive credit only after the queued WINDOW_UPDATE is sent.')
+p.write_text(s)
+p=r/'Anvil/Network/web_client.pbi';s=p.read_text();s=s.replace('If *h=0 Or *buffers=0 : ProcedureReturn #WEB_CLIENT_ARGUMENT : EndIf','If *h=0 Or *buffers=0 : ProcedureReturn #WEB_CLIENT_ARGUMENT : EndIf\n  If *buffers\\requestBlock=0 : ProcedureReturn #WEB_CLIENT_ARGUMENT : EndIf')
+s=s.replace('*h\\txLength<>0 Or *h\\requestHeaderBytes<>0','*h\\txLength<>0 Or *h\\controlLength<>0 Or *h\\requestHeaderBytes<>0')
+s=s.replace('Or *h\\txLength<>0 : ProcedureReturn #WEB_CLIENT_STATE','Or *h\\txLength<>0 Or *h\\controlLength<>0 : ProcedureReturn #WEB_CLIENT_STATE');p.write_text(s)
+# Recorded builder inventory. No directory scan.
+for name in ['build_h2_post_probe.py','build_web_negotiation_cpu.py','build_web_auto_cpu.py','build_web_fallback_probe.py','build_web_auto_probe.py','build_h2_upload_cpu.py','build_h2_client_probe.py','build_h2_client_cpu.py']:
+ p=r/'tools'/name;s=p.read_text()
+ assert 'Global Dim block.a[65536]' in s
+ s=s.replace('Global Dim block.a[65536]','Global Dim block.a[65536]\nGlobal Dim controls.a[1024]')
+ s=s.replace('buffers\\block=@block[0]', 'buffers\\controls=@controls[0] : buffers\\block=@block[0]')
+ if name in ['build_h2_post_probe.py','build_web_auto_cpu.py','build_web_auto_probe.py','build_h2_upload_cpu.py']:
+  s=s.replace('Global Dim controls.a[1024]','Global Dim controls.a[1024]\nGlobal Dim requestBlock.a[65536]')
+  s=s.replace('buffers\\controls=@controls[0]', 'buffers\\requestBlock=@requestBlock[0] : buffers\\controls=@controls[0]')
+ p.write_text(s)
+print('Shared scheduler, buffer ownership and recorded callers updated; not yet qualified.')

@@ -1,0 +1,35 @@
+from pathlib import Path
+import sys,json
+w=Path(__file__).parent;r=Path('C:/Users/ajtaj/Desktop/Anvil');b=w/'anvil-ipv6-20261030'
+sys.path[:0]=[str(w/'hpack-oracle1091'),str(r/'tools')]
+from hpack import Encoder
+def frame(kind,flags,sid,payload=b''):
+ return len(payload).to_bytes(3,'big')+bytes([kind,flags])+sid.to_bytes(4,'big')+payload
+wire=frame(4,0,0)+frame(4,1,0)+frame(1,4,1,Encoder().encode([(':status','413'),('content-length','2')]))+frame(0,1,1,b'no')
+rows=[dict(name='blocked upload with available early rejection',mode=24,goal=70000,unknown=False,wire=wire.hex(),gates=[[18,0]])]
+(b/'duplex1196-cases.json').write_text(json.dumps(rows,indent=2))
+s=(r/'tools/build_web_auto_cpu.py').read_text()
+s=s.replace("rows=json.loads((root/'tools/web_auto_cases.json').read_text())",'rows='+repr(rows))
+s=s.replace('Global inBytes.i,inAt.i','Global stalled.i\nGlobal inBytes.i,inAt.i')
+s=s.replace('Define i.i,n.i\n sendCalls=', '''Define i.i,n.i,at.i,length.i
+ If mode=24 And inAt<inBytes
+  at=24
+  While at+9<=outBytes
+   length=(outgoing[at]<<16)|(outgoing[at+1]<<8)|outgoing[at+2]
+   If outgoing[at+3]=0 And outBytes>=at+22 And outBytes<at+9+length
+    stalled=1 : ProcedureReturn 0
+   EndIf
+   If at+9+length>outBytes : Break : EndIf
+   at=at+9+length
+  Wend
+ EndIf
+ sendCalls=''')
+s=s.replace('recvCalls=recvCalls+1 :', 'If mode=24 And inAt>=18 And stalled=0 : ProcedureReturn 0 : EndIf\n recvCalls=recvCalls+1 :')
+s=s.replace('inAt=0 : outBytes=0 :','stalled=0 : inAt=0 : outBytes=0 :')
+s=s.replace('Or mode=23 : method=', 'Or mode=23 Or mode=24 : method=')
+s=s.replace('If mode=13 : timeout=250', 'If mode=24 : timeout=500 : EndIf\n If mode=13 : timeout=250')
+s=s.replace('PokeI(p+176,client\\sent)', 'PokeI(p+200,stalled) : PokeI(p+176,client\\sent)')
+assert 'stalled=1' in s and 'PokeI(p+200,stalled)' in s
+ns={'__file__':str(r/'tools/build_web_auto_cpu.py'),'__name__':'duplex_fixture'}
+exec(compile(s,ns['__file__'],'exec'),ns)
+ns['build']('C:/Users/ajtaj/Desktop/Github/PureBasicCode/OpenGl Work/ArduinoBasic/PureMetalForge.exe',b/'duplex1196')

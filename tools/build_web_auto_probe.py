@@ -33,6 +33,8 @@ Global response.WebResponse,response2.WebResponse
 Global Dim tx.a[16384]
 Global Dim rx.a[16384]
 Global Dim block.a[65536]
+Global Dim controls.a[1024]
+Global Dim requestBlock.a[65536]
 Global Dim dynamic.a[4096]
 Global Dim field.a[8192]
 Global Dim streams.a[2048]
@@ -59,7 +61,7 @@ EndProcedure
 Procedure.i Probe(index.i)
  Define rc.i,i.i,started.i,now.i,before.i,cost.i,maxStep.i,maxService.i,position.i,received.i,goal.i,method.i,methodBytes.i,p.i,destination.i,*q.WebRequest,*a.WebResponse
  p=$E1C00100+index*128 : destination=$E1C01000+index*200000
- buffers\tx=@tx[0] : buffers\rx=@rx[0] : buffers\block=@block[0] : buffers\dynamic=@dynamic[0] : buffers\field=@field[0] : buffers\streams=@streams[0] : buffers\streamCount=4
+ buffers\tx=@tx[0] : buffers\rx=@rx[0] : buffers\requestBlock=@requestBlock[0] : buffers\controls=@controls[0] : buffers\block=@block[0] : buffers\dynamic=@dynamic[0] : buffers\field=@field[0] : buffers\streams=@streams[0] : buffers\streamCount=4
  url\secure=1 : url\port=443 : url\host="httpbin.org" : url\hostLength=11 : url\target="/post" : url\targetLength=5
  If index=1 : url\target="/uuid" : url\targetLength=5 : EndIf
  If index=2 : url\host="www.openbsd.org" : url\hostLength=15 : url\target="/" : url\targetLength=1 : EndIf

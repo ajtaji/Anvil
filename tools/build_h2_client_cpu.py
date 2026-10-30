@@ -17,6 +17,7 @@ Global url.WebUrl
 Global Dim tx.a[16384]
 Global Dim rx.a[16384]
 Global Dim block.a[65536]
+Global Dim controls.a[1024]
 Global Dim dynamic.a[4096]
 Global Dim field.a[8192]
 Global Dim streams.a[1024]
@@ -75,18 +76,18 @@ Procedure.i RunOne(index.i)
  Define rc.i,tick.i,sent.i,ended.i,bodyBytes.i,bodySum.i,i.i,p.i,at.i,st.i,busy.i,cancelled.i,shouldCancel.i,eventKind.i
  inAt=0 : outBytes=0 : sendCalls=0 : recvCalls=0 : closeCalls=0 : forceClosed=0
  url\secure=1 : url\host="example.org" : url\hostLength=11 : url\port=443
- buffers\tx=@tx[0] : buffers\rx=@rx[0] : buffers\block=@block[0] : buffers\dynamic=@dynamic[0] : buffers\field=@field[0] : buffers\streams=@streams[0] : buffers\streamCount=4
+ buffers\tx=@tx[0] : buffers\rx=@rx[0] : buffers\controls=@controls[0] : buffers\block=@block[0] : buffers\dynamic=@dynamic[0] : buffers\field=@field[0] : buffers\streams=@streams[0] : buffers\streamCount=4
  rc=H2ClientStart(@c,@url,@buffers,0,200000)
  If rc<>0 : ProcedureReturn rc : EndIf
  For tick=1 To 100000
   pet()
-  If sent=wanted And c\txLength=0
+  If sent=wanted And c\txLength=0 And c\controlLength=0
    If mode=1 : rc=H2ClientCancel(@c) : Break : EndIf
    If mode=2 : rc=H2ClientStep(@c,200001) : Break : EndIf
    If mode=3 : forceClosed=1 : EndIf
   EndIf
   shouldCancel=0
-  If cancelled=0 And sent>=2 And c\txLength=0 And c\event=0
+  If cancelled=0 And sent>=2 And c\txLength=0 And c\controlLength=0 And c\event=0
    If mode=4 : shouldCancel=1 : EndIf
    If (mode=5 Or mode=7) And c\continuation=1 : shouldCancel=1 : EndIf
    If mode=6 And c\decoding<>0 And c\decoder\fields>0 : shouldCancel=1 : EndIf
@@ -121,8 +122,8 @@ Procedure.i RunOne(index.i)
     rc=H2ClientRelease(@c,at) : If rc<>0 : Break : EndIf
    EndIf
   EndIf
-  If ended=wanted And c\txLength=0 : rc=0 : Break : EndIf
-  If c\state=3 And c\txLength=0 And c\event=0 And sent<wanted And (mode<>7 Or sent<2 Or cancelled<>0)
+  If ended=wanted And c\txLength=0 And c\controlLength=0 : rc=0 : Break : EndIf
+  If c\state=3 And c\txLength=0 And c\controlLength=0 And c\event=0 And sent<wanted And (mode<>7 Or sent<2 Or cancelled<>0)
    rc=H2ClientGet(@c,"/test?x=1",9)
    If rc>0
     sent=sent+1

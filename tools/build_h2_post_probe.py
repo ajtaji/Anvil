@@ -21,6 +21,8 @@ Global url.WebUrl
 Global Dim tx.a[16384]
 Global Dim rx.a[16384]
 Global Dim block.a[65536]
+Global Dim controls.a[1024]
+Global Dim requestBlock.a[65536]
 Global Dim dynamic.a[4096]
 Global Dim field.a[8192]
 Global Dim streams.a[1024]
@@ -39,7 +41,7 @@ Global Dim upload.a[70000]
 Procedure.i Probe()
  Define rc.i,now.i,started.i,before.i,cost.i,maxStep.i,maxService.i,submitted.i,ended.i,i.i,position.i,received.i,status.i
  url\secure=1 : url\host="httpbin.org" : url\hostLength=11 : url\port=443 : url\target="/post" : url\targetLength=5
- buffers\tx=@tx[0] : buffers\rx=@rx[0] : buffers\block=@block[0] : buffers\dynamic=@dynamic[0] : buffers\field=@field[0] : buffers\streams=@streams[0] : buffers\streamCount=4
+ buffers\tx=@tx[0] : buffers\rx=@rx[0] : buffers\requestBlock=@requestBlock[0] : buffers\controls=@controls[0] : buffers\block=@block[0] : buffers\dynamic=@dynamic[0] : buffers\field=@field[0] : buffers\streams=@streams[0] : buffers\streamCount=4
  For i=0 To 69999 : upload[i]=97 : Next
  rc=WebRequestInit(@request,@url,"POST",4,70000,1,@headers[0],32768) : If rc<>0 : ProcedureReturn rc : EndIf
  rc=WebRequestHeader(@request,"Content-Type",12,"text/plain",10) : If rc<>0 : ProcedureReturn rc : EndIf
@@ -67,8 +69,8 @@ Procedure.i Probe()
    If rc=#H2_RESET Or rc=#H2_GOAWAY : ProcedureReturn -9403 : EndIf
    rc=H2ClientConsume(@c) : If rc<>0 : ProcedureReturn rc : EndIf
   EndIf
-  If ended<>0 And c\txLength=0 : Break : EndIf
-  If submitted=0 And c\state=3 And c\txLength=0
+  If ended<>0 And c\txLength=0 And c\controlLength=0 : Break : EndIf
+  If submitted=0 And c\state=3 And c\txLength=0 And c\controlLength=0
    rc=H2ClientRequest(@c,@request) : If rc<>1 : ProcedureReturn rc : EndIf
    submitted=1
   EndIf

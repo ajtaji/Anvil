@@ -2674,8 +2674,10 @@ TLS work, so this is not a hard real-time latency guarantee.
 
 Create an `H2Client`, a parsed HTTPS `WebUrl`, and `H2Buffers` with disjoint,
 persistent storage: 16384-byte tx and rx buffers, a 65536-byte compressed-header
-buffer, 4096-byte dynamic table, 8192-byte field workspace, and 1..16 `H2Stream`
-records. Keep the origin host alive throughout the connection. Start only a
+buffer, 4096-byte dynamic table, 8192-byte field workspace, 1024-byte `controls`
+queue, and 1..16 `H2Stream` records. H2ClientRequest and WebClientStartAuto also
+require a separate 65536-byte `requestBlock`; GET-only H2Client callers may leave
+that pointer zero. Keep the origin host alive throughout the connection. Start only a
 fresh or explicitly closed context; starting again does not close an old handle.
 `H2ClientStart(context, url, buffers, now, timeout)` establishes ownership.
 `now` and `timeout` use the caller's same monotonic units; elapsed time is modulo
@@ -2697,8 +2699,9 @@ stream ID. Informational headers and trailers are exposed too; inspect the
 block status/trailer state when distinguishing them. DATA exposes only content
 bytes, excluding padding. Consumption queues connection/stream WINDOW_UPDATE
 credit for the complete DATA payload, including padding. Parsing is backpressured
-while an event is outstanding. This currently stalls all streams, so callers
-should consume promptly. After consuming END or RESET, `H2ClientRelease` frees
+while an event is outstanding. This stalls incoming parsing for all streams,
+but Step can advance outgoing writes without changing the retained event or its
+spans. Callers should consume promptly. After consuming END or RESET, `H2ClientRelease` frees
 that caller-owned stream slot for another monotonically increasing stream ID.
 
 The engine validates SETTINGS values, ACK state, continuation ordering, frame
@@ -2976,14 +2979,12 @@ only Pi 4 was physically tested. Captures 163-166 returned zero with cores, font
 and Vulkan healthy, watchdog off and temporary DNS overrides removed. Monitor 483
 was unchanged. Evidence: `docs/evidence/anvil-ipv6-20261030/webclient-auto483`.
 
-This is not a complete HTTP/2 implementation. The engine still prioritizes pending
-transmission, which can delay incoming response/control processing during a stalled
-upload. Duplex progress, per-stream deadlines, graceful local GOAWAY and stream-local
+This is not a complete HTTP/2 implementation. Per-stream deadlines, graceful local GOAWAY and stream-local
 error isolation remain work, alongside remaining TLS compatibility/blocking work,
 off-link IPv6/RDNSS qualification and HTTP/3.
 
 
-The TX-priority limitation is now physically reproduced in forum topic 1538.
+The former TX-priority limitation was physically reproduced in forum topic 1538.
 A POST stalled after 88 bytes of its first DATA payload while the peer had its
 SETTINGS acknowledgment and final 413 response ready. The current engine timed
 out (-552), having read only the initial nine-byte SETTINGS frame; 37 incoming
@@ -2992,4 +2993,50 @@ Capture 167 returned zero and the Pi remained healthy. This is failed networking
 behavior, not a passing exchange. The original checker expected 18 received bytes;
 its corrected check confirms the defect from the same immutable report without
 another board run. Evidence: `docs/evidence/anvil-ipv6-20261030/http2-duplex-repro483`.
-The finding remains open; no timeout increase or protocol fix has been applied.
+That evidence records the unfixed behavior. The scheduler correction is described below.
+
+### Duplex progress and bounded control output
+
+H2ClientStep now alternates pending writes with receive/HPACK work, performing
+at most one send, one receive, or one bounded HPACK step per call. A write returning
+zero or BUSY no longer prevents reading a waiting response. Retained events remain
+stable while outgoing work progresses. Cancellation and deadlines still apply.
+
+Incoming control replies use a separate caller-owned 1024-byte `controls` queue.
+SETTINGS/PING acknowledgments, receive-credit updates and early-response resets
+cannot overwrite a partially sent frame. Queued controls drain at frame boundaries,
+after any ongoing HEADERS/CONTINUATION sequence. Receive credit becomes available
+only after the complete WINDOW_UPDATE reaches the transport, including when a write
+ends partway through a frame. Exhausting the control queue fails explicitly with
+H2_LIMIT; it does not drop replies or allocate unbounded storage.
+
+The separate `requestBlock` prevents inbound HPACK blocks from overwriting unsent
+outgoing header fragments. H2Buffers and H2Client layouts changed: recompile callers
+and initialize the new pointers with persistent, disjoint storage. Start requires
+controls; Request requires requestBlock; GET-only clients do not require requestBlock.
+Direct callers draining output after END must wait for txLength, controlLength and
+requestHeaderBytes to become zero. WebClient performs that drain before completion.
+
+Physical qualification on Anvil 483 passed the original stalled-upload case with
+its unchanged 500-tick fixture deadline: status 413 and the exact two-byte response
+were delivered, the committed 16375-byte DATA payload remained intact, and the
+final reset/credit frames were correct. Seven further cases cover zero/BUSY writes,
+PING and SETTINGS during a stalled upload, retained DATA with outgoing progress,
+bounded queue exhaustion, timeout, cancellation and unknown-length uploads.
+A separate two-stream test decoded the first response while a 31 KB header block
+for the second request was still being sent. Independent HPACK decoding verified
+all 31 large fields, contiguous CONTINUATION frames and deferred PING acknowledgment.
+
+All 46 engine cases, eight upload cases and 24 automatic-client cases passed on
+the final source. An intermediate candidate failed the closed-transport drain case;
+that failed report is retained alongside the corrected run. The final scheduler
+drains queued final output before treating known EOF as an exchange failure.
+
+Actual verified HTTPS again uploaded 70000 bytes and checked the complete echo,
+then reused the same connection for /uuid. Observed elapsed times were 2017929 and
+103676 microseconds; maximum Step calls 2606 and 91 microseconds. HTTP/1 fallback
+downloads from OpenBSD and SQLite matched independent reference body hashes.
+These are measurements, not worst-case guarantees. Shared Pi 3 compilation passed;
+physical qualification was on Pi 4. Monitor 483 remained installed, with healthy
+cores, fonts and Vulkan, watchdog off and temporary DNS overrides removed.
+Evidence: `docs/evidence/anvil-ipv6-20261030/http2-duplex483`.

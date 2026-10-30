@@ -1,0 +1,1 @@
+Topic1538 duplex correction. Captures168-176. h2cpu1200 is an intermediate FAILED closed-transport drain regression; retained, not counted as passing. h2cpu1201 and the later proofs use the corrected final source. duplex1196 proves the original stall at the unchanged500-tick deadline. All final protocol cases and real HTTPS checks passed. Only Pi4 physical; Pi3 compile-only.

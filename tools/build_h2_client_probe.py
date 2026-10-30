@@ -20,6 +20,7 @@ Global url.WebUrl
 Global Dim tx.a[16384]
 Global Dim rx.a[16384]
 Global Dim block.a[65536]
+Global Dim controls.a[1024]
 Global Dim dynamic.a[4096]
 Global Dim field.a[8192]
 Global Dim streams.a[1024]
@@ -34,7 +35,7 @@ EndProcedure
 Procedure.i Probe()
  Define rc.i,now.i,started.i,before.i,cost.i,maxStep.i,maxService.i,sent.i,ended.i,i.i,id.i,slot.i,p.i,n.i,peak.i
  url\secure=1 : url\host="httpbin.org" : url\hostLength=11 : url\port=443
- buffers\tx=@tx[0] : buffers\rx=@rx[0] : buffers\block=@block[0] : buffers\dynamic=@dynamic[0] : buffers\field=@field[0] : buffers\streams=@streams[0] : buffers\streamCount=4
+ buffers\tx=@tx[0] : buffers\rx=@rx[0] : buffers\controls=@controls[0] : buffers\block=@block[0] : buffers\dynamic=@dynamic[0] : buffers\field=@field[0] : buffers\streams=@streams[0] : buffers\streamCount=4
  started=clock()
  rc=H2ClientStart(@c,@url,@buffers,started,45000000) : If rc<>0 : ProcedureReturn rc : EndIf
  While ended<2 And clock()-started<45000000
@@ -64,7 +65,7 @@ Procedure.i Probe()
    If rc=#H2_RESET Or rc=#H2_GOAWAY : ProcedureReturn -9104 : EndIf
    rc=H2ClientConsume(@c) : If rc<>0 : ProcedureReturn rc : EndIf
   EndIf
-  If c\state=3 And c\txLength=0 And c\event=0 And sent<2
+  If c\state=3 And c\txLength=0 And c\controlLength=0 And c\event=0 And sent<2
    If sent=0 : rc=H2ClientGet(@c,"/uuid",5) : Else : rc=H2ClientGet(@c,"/bytes/70000",12) : EndIf
    If c\activeStreams>peak : peak=c\activeStreams : EndIf
    If rc>0 : sent=sent+1 : Else : If rc<>#H2_BUSY : ProcedureReturn rc : EndIf : EndIf

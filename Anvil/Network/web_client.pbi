@@ -112,6 +112,7 @@ Procedure.i WebClientStartAuto(*s.WebClient,*url.WebUrl,*request.WebRequest,*res
   CompilerEndIf
   If legacy<>0 : ProcedureReturn WebClientStart(*s,*url,*request,*response,tx,txCapacity,rx,rxCapacity,now,timeout) : EndIf
   If *h=0 Or *buffers=0 : ProcedureReturn #WEB_CLIENT_ARGUMENT : EndIf
+  If *buffers\requestBlock=0 : ProcedureReturn #WEB_CLIENT_ARGUMENT : EndIf
   rc=wcInit(*s,*url,*request,*response,tx,txCapacity,rx,rxCapacity,now,timeout)
   If rc<>0 : ProcedureReturn rc : EndIf
   *s\protocol=0 : *s\h2=*h
@@ -191,7 +192,7 @@ Procedure.i wcH2Field(*s.WebClient,*h.H2Client)
 EndProcedure
 Procedure.i wcH2Complete(*s.WebClient,*h.H2Client)
  Define *r.WebResponse
- If *s\h2Ending=0 Or *h\txLength<>0 Or *h\requestHeaderBytes<>0 : ProcedureReturn 0 : EndIf
+ If *s\h2Ending=0 Or *h\txLength<>0 Or *h\controlLength<>0 Or *h\requestHeaderBytes<>0 : ProcedureReturn 0 : EndIf
  *r=*s\response : *r\state=#WEB_RESPONSE_DONE : *r\remaining=0
  *r\reusable=Bool(*h\goaway=0 And *h\state=3)
  *s\state=2
@@ -279,7 +280,7 @@ EndProcedure
 Procedure.i wcH2Next(*s.WebClient,*request.WebRequest,*response.WebResponse,now.i,timeout.i)
  Define *previous.WebResponse,*h.H2Client,st.i
  *h=*s\h2 : *previous=*s\response
- If *s\state<>2 Or *previous\reusable=0 Or *h\goaway<>0 Or *h\state<>3 Or *h\event<>0 Or *h\activeStreams<>0 Or *h\txLength<>0 : ProcedureReturn #WEB_CLIENT_STATE : EndIf
+ If *s\state<>2 Or *previous\reusable=0 Or *h\goaway<>0 Or *h\state<>3 Or *h\event<>0 Or *h\activeStreams<>0 Or *h\txLength<>0 Or *h\controlLength<>0 : ProcedureReturn #WEB_CLIENT_STATE : EndIf
  If *request\state<>1 Or *response\state<>#WEB_RESPONSE_STATUS Or *response\error<>0 Or *response\allowUpgrade<>0 Or timeout<1 Or timeout>$7FFFFFFF : ProcedureReturn #WEB_CLIENT_ARGUMENT : EndIf
  st=WebTransportState(@*h\connection) : If st<>1 : ProcedureReturn #WEB_CLIENT_STATE : EndIf
  *s\request=*request : *s\response=*response : *s\started=now : *s\timeout=timeout : *s\state=1

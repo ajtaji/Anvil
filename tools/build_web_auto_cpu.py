@@ -3,9 +3,9 @@ from pathlib import Path
 import argparse,hashlib,json,os,re,subprocess
 from pmf_compiler import resolve_compiler
 
-def build(compiler,out):
+def build(compiler,out,cases=None,transform=None):
  root=Path(__file__).resolve().parents[1];out.mkdir(parents=True,exist_ok=False)
- rows=json.loads((root/'tools/web_auto_cases.json').read_text())
+ rows=json.loads((root/'tools/web_auto_cases.json').read_text()) if cases is None else cases
  names=['RaspberryPi4/Lib/mmu.pi4', 'Anvil/Network/web_url.pbi', 'Anvil/Network/web_transport.pbi', 'Anvil/Network/h2_frame.pbi', 'Anvil/Network/hpack_decode.pbi', 'Anvil/Network/hpack_tables.pbi', 'Anvil/Network/h2_client.pbi', 'Anvil/Network/h2_request.pbi', 'Anvil/Network/web_request.pbi', 'Anvil/Network/web_response.pbi', 'Anvil/Network/web_client.pbi', 'Anvil/Network/tcp_dial.pbi', 'Anvil/Network/ipv6_address.pbi']
  s=r'''#WEB_KERNEL_BINDING=0
 XIncludeFile "RaspberryPi4/Lib/mmu.pi4"
@@ -32,6 +32,8 @@ Global response.WebResponse,response2.WebResponse
 Global Dim tx.a[16384]
 Global Dim rx.a[16384]
 Global Dim block.a[65536]
+Global Dim controls.a[1024]
+Global Dim requestBlock.a[65536]
 Global Dim dynamic.a[4096]
 Global Dim field.a[8192]
 Global Dim streams.a[2048]
@@ -141,7 +143,7 @@ Procedure RunOne(index.i)
  If mode=2 : For i=0 To 16 : body[i]=i : Next : EndIf
  url\secure=1 : url\host="example.org" : url\hostLength=11 : url\port=443 : url\target="/upload" : url\targetLength=7
  If mode=19 : url\secure=0 : url\port=80 : EndIf
- buffers\tx=@tx[0] : buffers\rx=@rx[0] : buffers\block=@block[0] : buffers\dynamic=@dynamic[0] : buffers\field=@field[0] : buffers\streams=@streams[0] : buffers\streamCount=4
+ buffers\tx=@tx[0] : buffers\rx=@rx[0] : buffers\requestBlock=@requestBlock[0] : buffers\controls=@controls[0] : buffers\block=@block[0] : buffers\dynamic=@dynamic[0] : buffers\field=@field[0] : buffers\streams=@streams[0] : buffers\streamCount=4
  webpTlsOpenAlpn=@FakeOpen : webpTlsOpen=@FakeLegacyOpen : webpTlsState=@FakeState : webpTlsAlpn=@FakeAlpn : webpTlsClose=@FakeClose : webpTlsSend=@FakeSend : webpTlsRecv=@FakeRecv
  webpDns=@FakeDns : webpTime=@FakeTime : webpOpen=@FakeLegacyOpen : webpState=@FakeTcpState : webpClose=@FakeClose : webpSend=@FakeSend : webpRecv=@FakeRecv : webpDns6=0 : webpOpen6=0
  If mode=17 : webpTlsOpenAlpn=0 : webpTlsAlpn=0 : EndIf
@@ -241,6 +243,7 @@ Procedure.i Main()
  ProcedureReturn 0
 EndProcedure
 '''
+ if transform is not None:s=transform(s)
  s+='\nDataSection\nCases:\n Data.i '+str(len(rows))+'\n'
  for row in rows:
   wire=bytes.fromhex(row['wire'])
