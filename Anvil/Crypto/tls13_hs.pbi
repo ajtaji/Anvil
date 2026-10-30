@@ -319,6 +319,8 @@
 #TLS13_REFUSE_TRAILING_DATA              = 23
 #TLS13_REFUSE_EMPTY_HANDSHAKE_RECORD     = 24
 #TLS13_REFUSE_MESSAGE_HASH_SYNTHETIC     = 25
+#TLS13_REFUSE_COOPERATIVE_STOP           = 26
+#TLS13_REFUSE_TRANSCRIPT_INPUT           = 27
 ; --- ServerHello ---
 #TLS13_REFUSE_SH_LEGACY_VERSION          = 30
 #TLS13_REFUSE_HELLO_RETRY_REQUEST        = 31
@@ -639,6 +641,35 @@ Procedure Tls13TranscriptAbsorb(addr.i, len.i)
   Sha256Restore(@TlsTrSnap[0])
   Sha256Update(addr, len)
   Sha256Snapshot(@TlsTrSnap[0])
+EndProcedure
+
+; Optional scheduler seam. A paused chunk owns no live SHA context: each
+; chunk restores and snapshots the connection's transcript before yielding.
+Global *Tls13PauseHook
+Procedure.i Tls13TranscriptAppend(addr.i,bytes.i)
+  Define off.i,n.i
+  If Tls13State=#TLS13_ST_FAILED : ProcedureReturn 0 : EndIf
+  If bytes<0 Or (bytes>0 And addr=0)
+    ProcedureReturn TlsFail(#TLS13_REFUSE_TRANSCRIPT_INPUT,#TLS_ALERT_INTERNAL_ERROR)
+  EndIf
+  If Tls13PauseHook=0
+    Tls13TranscriptAbsorb(addr,bytes) : ProcedureReturn 1
+  EndIf
+  off=0
+  While off<bytes
+    If Tls13PauseHook<>0
+      If Tls13PauseHook()=0 : ProcedureReturn TlsFail(#TLS13_REFUSE_COOPERATIVE_STOP,#TLS_ALERT_INTERNAL_ERROR) : EndIf
+    EndIf
+    n=bytes-off : If n>512 : n=512 : EndIf
+    Sha256Restore(@TlsTrSnap[0])
+    Sha256Update(addr+off,n)
+    Sha256Snapshot(@TlsTrSnap[0])
+    off=off+n
+  Wend
+  If Tls13PauseHook<>0
+    If Tls13PauseHook()=0 : ProcedureReturn TlsFail(#TLS13_REFUSE_COOPERATIVE_STOP,#TLS_ALERT_INTERNAL_ERROR) : EndIf
+  EndIf
+  ProcedureReturn 1
 EndProcedure
 
 ; Writes the hash of the handshake messages so far (32 bytes) to dst; the
@@ -1177,7 +1208,7 @@ Procedure.i Tls13BuildClientHello(dst.i, dstmax.i)
   ; 0x0301 for middlebox compatibility
   Tls13RecBuildPlainHeader(dst, #TLS_CT_HANDSHAKE, 4 + msgLen, $01)
 
-  Tls13TranscriptAbsorb(dst + 5, 4 + msgLen)
+  If Tls13TranscriptAppend(dst + 5, 4 + msgLen)=0 : ProcedureReturn 0 : EndIf
   Tls13State = #TLS13_ST_WAIT_SH
   ProcedureReturn 5 + 4 + msgLen
 EndProcedure
@@ -1667,7 +1698,7 @@ Procedure.i TlsHandleServerFinished(msg.i, mlen.i)
 
   ; now the Finished joins the transcript, and CH..server-Finished is the
   ; context for both application traffic secrets AND for our own Finished
-  Tls13TranscriptAbsorb(msg, mlen)
+  If Tls13TranscriptAppend(msg, mlen)=0 : ProcedureReturn 0 : EndIf
   Tls13TranscriptHash(@TlsThSf[0])
   TlsScheduleApplication(@TlsThSf[0])
 
@@ -1717,7 +1748,7 @@ Procedure.i Tls13BuildClientFinished(dst.i, dstmax.i)
 
   ; keep the transcript honest even though nothing in scope consumes it
   ; past this point (the resumption master secret is out of scope)
-  Tls13TranscriptAbsorb(@TlsScratch[0], 36)
+  If Tls13TranscriptAppend(@TlsScratch[0], 36)=0 : ProcedureReturn 0 : EndIf
 
   ; and now the write side moves to application keys (derived and checked
   ; above, before anything was sent)
@@ -1873,7 +1904,7 @@ Procedure.i TlsHandleMessage(msg.i, mlen.i)
     If t <> #TLS_HS_SERVER_HELLO
       ProcedureReturn TlsFail(#TLS13_REFUSE_UNEXPECTED_MESSAGE, #TLS_ALERT_UNEXPECTED_MESSAGE)
     EndIf
-    Tls13TranscriptAbsorb(msg, mlen)
+    If Tls13TranscriptAppend(msg, mlen)=0 : ProcedureReturn 0 : EndIf
     ProcedureReturn TlsHandleServerHello(msg, mlen)
   EndIf
 
@@ -1881,7 +1912,7 @@ Procedure.i TlsHandleMessage(msg.i, mlen.i)
     If t <> #TLS_HS_ENCRYPTED_EXTENSIONS
       ProcedureReturn TlsFail(#TLS13_REFUSE_UNEXPECTED_MESSAGE, #TLS_ALERT_UNEXPECTED_MESSAGE)
     EndIf
-    Tls13TranscriptAbsorb(msg, mlen)
+    If Tls13TranscriptAppend(msg, mlen)=0 : ProcedureReturn 0 : EndIf
     ProcedureReturn TlsHandleEncryptedExtensions(msg, mlen)
   EndIf
 
@@ -1889,7 +1920,7 @@ Procedure.i TlsHandleMessage(msg.i, mlen.i)
     If t <> #TLS_HS_CERTIFICATE
       ProcedureReturn TlsFail(#TLS13_REFUSE_UNEXPECTED_MESSAGE, #TLS_ALERT_UNEXPECTED_MESSAGE)
     EndIf
-    Tls13TranscriptAbsorb(msg, mlen)
+    If Tls13TranscriptAppend(msg, mlen)=0 : ProcedureReturn 0 : EndIf
     ProcedureReturn TlsHandleCertificate(msg, mlen)
   EndIf
 
@@ -1901,7 +1932,7 @@ Procedure.i TlsHandleMessage(msg.i, mlen.i)
     If r = 0
       ProcedureReturn 0
     EndIf
-    Tls13TranscriptAbsorb(msg, mlen)
+    If Tls13TranscriptAppend(msg, mlen)=0 : ProcedureReturn 0 : EndIf
     ProcedureReturn 1
   EndIf
 

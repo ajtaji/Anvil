@@ -13,7 +13,7 @@ Global tlsw_gapFrom.i
 Global tlsw_gapTo.i
 Global tlsw_lastCheck.i
 ; Interval endpoints: -1 worker entry, 0 roots, 1 X509, 2 P256, 3 wide EC,
-; 4 RSA, 5 X25519, 6 decrypt, 7 encrypt, 8 worker return.
+; 4 RSA, 5 X25519, 6 decrypt, 7 encrypt, 8 worker return, 9 transcript hashing.
 Procedure tlsw_CheckGap(kind.i)
  Define now.i,gap.i
  now=HwMicros() : gap=now-tlsw_gapStart : tlsw_gapStart=now
@@ -60,7 +60,7 @@ Procedure tlsw_ShowProfile()
 EndProcedure
 
 Procedure tlsw_ClearHooks()
- X509PauseHook=0 : TlsRootsPauseHook=0 : TlsRecDecryptHook=0 : TlsRecEncryptHook=0
+ X509PauseHook=0 : TlsRootsPauseHook=0 : TlsRecDecryptHook=0 : TlsRecEncryptHook=0 : Tls13PauseHook=0
  EcdsaVerifyHook=0 : RsaPublicHook=0 : X25519ComputeHook=0
 EndProcedure
 
@@ -71,6 +71,9 @@ Procedure.i tlsw_YieldKind(kind.i)
 EndProcedure
 Procedure.i tlsw_RootYield()
  ProcedureReturn tlsw_YieldKind(0)
+EndProcedure
+Procedure.i tlsw_TranscriptYield()
+ ProcedureReturn tlsw_YieldKind(9)
 EndProcedure
 Procedure.i tlsw_X509Yield()
  ProcedureReturn tlsw_YieldKind(1)
@@ -154,7 +157,7 @@ EndProcedure
 
 
 Procedure tlsw_SetHooks()
- X509PauseHook=@tlsw_X509Yield : TlsRootsPauseHook=@tlsw_RootYield : TlsRecDecryptHook=@tlsw_GcmDecrypt : TlsRecEncryptHook=@tlsw_GcmEncrypt
+ X509PauseHook=@tlsw_X509Yield : TlsRootsPauseHook=@tlsw_RootYield : TlsRecDecryptHook=@tlsw_GcmDecrypt : TlsRecEncryptHook=@tlsw_GcmEncrypt : Tls13PauseHook=@tlsw_TranscriptYield
  EcdsaVerifyHook=@tlsw_Ecdsa : RsaPublicHook=@tlsw_Rsa : X25519ComputeHook=@tlsw_X25519
 EndProcedure
 

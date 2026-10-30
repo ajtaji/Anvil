@@ -1,0 +1,135 @@
+XIncludeFile "Anvil/Core/sha256.pbi"
+XIncludeFile "RaspberryPi4/Lib/mmu.pi4"
+#TLS13_OK                                = 0
+#TLS13_ST_FAILED        = 10   ; terminal; Tls13Err names why
+#TLS13_REFUSE_COOPERATIVE_STOP           = 26
+#TLS13_REFUSE_TRANSCRIPT_INPUT           = 27
+#TLS_ALERT_INTERNAL_ERROR=80
+Global Tls13State.i,Tls13Err.i,Tls13Alert.i
+Global Dim TlsTrSnap.a[104]
+Global *Tls13PauseHook
+Procedure.i TlsFail(err.i, alert.i)
+  If Tls13Err = #TLS13_OK
+    Tls13Err = err
+    Tls13Alert = alert
+  EndIf
+  Tls13State = #TLS13_ST_FAILED
+  ProcedureReturn 0
+EndProcedure
+Procedure Tls13TranscriptReset()
+  Sha256Begin()
+  Sha256Snapshot(@TlsTrSnap[0])
+EndProcedure
+Procedure Tls13TranscriptAbsorb(addr.i, len.i)
+  Sha256Restore(@TlsTrSnap[0])
+  Sha256Update(addr, len)
+  Sha256Snapshot(@TlsTrSnap[0])
+EndProcedure
+Procedure.i Tls13TranscriptAppend(addr.i,bytes.i)
+  Define off.i,n.i
+  If Tls13State=#TLS13_ST_FAILED : ProcedureReturn 0 : EndIf
+  If bytes<0 Or (bytes>0 And addr=0)
+    ProcedureReturn TlsFail(#TLS13_REFUSE_TRANSCRIPT_INPUT,#TLS_ALERT_INTERNAL_ERROR)
+  EndIf
+  If Tls13PauseHook=0
+    Tls13TranscriptAbsorb(addr,bytes) : ProcedureReturn 1
+  EndIf
+  off=0
+  While off<bytes
+    If Tls13PauseHook<>0
+      If Tls13PauseHook()=0 : ProcedureReturn TlsFail(#TLS13_REFUSE_COOPERATIVE_STOP,#TLS_ALERT_INTERNAL_ERROR) : EndIf
+    EndIf
+    n=bytes-off : If n>512 : n=512 : EndIf
+    Sha256Restore(@TlsTrSnap[0])
+    Sha256Update(addr+off,n)
+    Sha256Snapshot(@TlsTrSnap[0])
+    off=off+n
+  Wend
+  If Tls13PauseHook<>0
+    If Tls13PauseHook()=0 : ProcedureReturn TlsFail(#TLS13_REFUSE_COOPERATIVE_STOP,#TLS_ALERT_INTERNAL_ERROR) : EndIf
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+Procedure Tls13TranscriptHash(dst.i)
+  Sha256Restore(@TlsTrSnap[0])
+  Sha256End(dst)
+EndProcedure
+
+Global table.i
+Global *pet,*timer
+Global Dim input.a[16384]
+Global Dim digest.a[32]
+Global Dim foreign.a[32]
+Global calls.i,stopAt.i,lastTick.i,maxGap.i
+Procedure CaptureTable()
+ ASM
+ adrp x1, global_table
+ add x1, x1, #:lo12:global_table
+ str x0, [x1]
+ EndASM
+EndProcedure
+Procedure.i Interfere()
+ Define gap.i
+ gap=timer()-lastTick : If gap>maxGap : maxGap=gap : EndIf
+ calls=calls+1 : pet()
+ ; A different service may use the single SHA context while this one yields.
+ Sha256Of(@input[8000],31,@foreign[0])
+ lastTick=timer()
+ If stopAt>0 And calls=stopAt : ProcedureReturn 0 : EndIf
+ ProcedureReturn 1
+EndProcedure
+Procedure Run(index.i,n.i,stop.i,mode.i)
+ Define p.i,rc.i,retry.i,i.i,addr.i,begin.i,elapsed.i,syncCost.i
+ p=$E1C00100+index*128
+ Tls13State=0 : Tls13Err=0 : Tls13Alert=0 : Tls13PauseHook=0
+ Tls13TranscriptReset() : Tls13TranscriptAbsorb(@input[0],37)
+ begin=timer()
+ If n>=0 And mode<>2 : Tls13TranscriptAbsorb(@input[0],n) : EndIf
+ syncCost=timer()-begin
+ Tls13TranscriptReset() : Tls13TranscriptAbsorb(@input[0],37)
+ calls=0 : stopAt=stop : maxGap=0 : addr=@input[0]
+ If mode<>0 : Tls13PauseHook=@Interfere : EndIf
+ If mode=2 : addr=0 : EndIf
+ begin=timer() : lastTick=begin
+ rc=Tls13TranscriptAppend(addr,n) : elapsed=timer()-begin
+ retry=-1
+ If rc=0 : retry=Tls13TranscriptAppend(@input[0],1) : EndIf
+ Tls13TranscriptHash(@digest[0])
+ PokeI(p,rc) : PokeI(p+8,Tls13Err) : PokeI(p+16,Tls13State) : PokeI(p+24,calls)
+ PokeI(p+32,maxGap) : PokeI(p+40,syncCost) : PokeI(p+48,elapsed) : PokeI(p+56,retry)
+ For i=0 To 31 : PokeA(p+64+i,digest[i]) : Next
+EndProcedure
+Procedure.i Main()
+ Define i.i,rc.i
+ CaptureTable()
+ pet=PeekI(table+16+6*8) : timer=PeekI(table+16+11*8)
+ For i=0 To 16383 : PokeA($E1C00000+i,0) : input[i]=(i*29+7) & 255 : Next
+ PokeI($E1C00000,$54524131)
+ MmuClearNc() : MmuAddNc($08A00000,$09200000) : MmuAddNc($08100000,$08180000)
+ rc=MmuBuildTables($4F80000) : If rc<>0 : ProcedureReturn 2 : EndIf
+ MmuEnableCached()
+ Run(0,0,0,1)
+ Run(1,1,0,1)
+ Run(2,63,0,1)
+ Run(3,64,0,1)
+ Run(4,65,0,1)
+ Run(5,511,0,1)
+ Run(6,512,0,1)
+ Run(7,513,0,1)
+ Run(8,1023,0,1)
+ Run(9,1024,0,1)
+ Run(10,1025,0,1)
+ Run(11,4096,0,1)
+ Run(12,16384,0,1)
+ Run(13,1537,1,1)
+ Run(14,1537,2,1)
+ Run(15,1537,3,1)
+ Run(16,1537,4,1)
+ Run(17,1537,5,1)
+ Run(18,1025,0,0)
+ Run(19,-1,0,1)
+ Run(20,1,0,2)
+ Run(21,0,0,2)
+ PokeI($E1C00008,22)
+ MmuDisableCachedFlushed() : ProcedureReturn 0
+EndProcedure

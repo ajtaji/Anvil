@@ -2181,3 +2181,41 @@ Interval endpoint labels in diagnostics: -1 worker entry, 0 roots, 1 X509,
 A long interval identifies where to investigate; it does not by itself identify
 which internal operation consumed the time. Remaining TLS atomic gaps,
 IPv6 off-link/PMTU/DNS transport, HTTP/2-3 and managed cookies remain open.
+
+
+### Cooperative TLS transcript hashing (installed 475)
+
+The unchecked interval between decryption and X.509 validation included hashing
+an entire handshake message. The new Tls13TranscriptAppend hashes at most 512
+bytes per chunk when a cooperative hook is installed, saving the connection's
+SHA snapshot before each yield. Another service may use the global SHA context
+while it is suspended. All seven handshake call sites check Append's result;
+a stopped callback causes terminal refusal 26 and invalid input refusal 27.
+The existing synchronous Tls13TranscriptAbsorb API remains available, and Append
+uses it directly when no cooperative hook is installed. Certificate verification,
+Finished validation and cryptographic primitives are unchanged.
+
+Physical capture 101 passed 22 independent hashlib comparisons covering SHA-block
+and chunk boundaries, empty input, synchronous compatibility, unrelated SHA work
+between chunks, cancellation at all five boundaries of a 1537-byte input,
+terminal retries, negative length and null input. A 4096-byte unsliced append
+measured 2285 us versus at most 287 us between chunk callbacks; 16384 bytes measured
+9138 us unsliced versus 287 us per interval. This fixture intentionally performs
+unrelated hashing inside each callback, so its total elapsed time is not a TLS
+throughput comparison.
+
+On actual verified HTTPS with preparation cancellation, the observed whole-service
+maximum changed from 2846 us on 474 to 1993 us on 475.
+The longest unchecked interval changed from 2393 us
+to 1579 us. Final endpoints:
+[-1, 5]; endpoint 9 denotes transcript hashing.
+These are observed maxima, not hard worst-case bounds.
+
+A separate test passed four overlapping certificate-verified HTTPS connections,
+including an event stream and three complete replies, exercising connection-state
+switching through the new yields. Board core/font/Vulkan/watchdog checks pass.
+Pi 3 build 89 compiles the shared changes; only Pi 4 build 475 is physically validated.
+Evidence: docs/evidence/anvil-ipv6-20261030/tls-transcript475.
+
+Remaining atomic TLS and device work, IPv6 off-link/PMTU/DNS transport,
+HTTP/2-3 and managed cookies remain open.
