@@ -1099,3 +1099,29 @@ independent packet construction. These tests do not establish live membership:
 listener timers, version compatibility state, retransmission, device filters,
 receive dispatch and endpoint binding still need integration. Anvil 441 remains
 installed; no new monitor or reset was needed for this codec qualification.
+
+
+## MLD interface compatibility policy
+
+`ipv6_mld_policy.pbi` tracks the interface generation, protocol version, older
+querier deadline, robustness and query intervals. A valid v1 general query
+enters or refreshes v1 compatibility; a group-specific query does not switch the
+whole interface. V2 queries cannot end an active v1 compatibility interval.
+Expiry returns the interface to v2, including when no packets arrive: the caller
+must call `IPv6MldInterfaceTick` from its service loop.
+
+The caller tracks both generation and revision. A version transition increments
+the revision so all pending query responses and retransmission timers can be
+canceled before another report is emitted. A new generation resets interface
+state and requires the same cancellation. The policy owns no group timers and
+retains no packet pointer. Invalid packets, stale calls and backwards time leave
+its state unchanged. Wire query intervals are converted from seconds to
+milliseconds, with defaults for zero robustness and interval fields.
+
+MLD source validation now requires the canonical `fe80::/64` prefix rather than
+accepting the entire reserved `fe80::/10` range. The expanded physical Pi CPU
+fixture passed 65 codec and policy cases, including exact expiry, refresh,
+interleaved v1/v2 queries, malformed input and unchanged-state refusals.
+Per-group scheduling, report retransmission, device filters and live IPv6 binding
+remain outstanding; no live multicast or web-connectivity claim follows from
+these CPU tests. The bench remains on Anvil 441.

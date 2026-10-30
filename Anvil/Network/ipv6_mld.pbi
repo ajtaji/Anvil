@@ -18,8 +18,12 @@ Procedure.i ipv6mld_Span(p.i,n.i)
  ProcedureReturn 1
 EndProcedure
 Procedure.i ipv6mld_LinkLocal(p.i)
- If PeekA(p)=254 And (PeekA(p+1)&192)=128 : ProcedureReturn 1 : EndIf
- ProcedureReturn 0
+ Define i.i
+ If PeekA(p)<>254 Or PeekA(p+1)<>128 : ProcedureReturn 0 : EndIf
+ For i=2 To 7
+  If PeekA(p+i)<>0 : ProcedureReturn 0 : EndIf
+ Next
+ ProcedureReturn 1
 EndProcedure
 Procedure.i ipv6mld_Group(p.i)
  Define scope.i,i.i,allnodes.i

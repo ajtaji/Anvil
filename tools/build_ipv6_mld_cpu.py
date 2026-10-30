@@ -5,7 +5,7 @@ from pmf_compiler import resolve_compiler
 
 def build(compiler,out):
  root=Path(__file__).resolve().parents[1];out.mkdir(parents=True,exist_ok=False)
- names=['Anvil/Network/ipv6_mld.pbi','Anvil/Network/ipv6_neighbor.pbi','Anvil/Network/ipv6_packet.pbi','Anvil/Network/ipv6_address.pbi','Anvil/Network/byte_order.pbi','Anvil/Network/internet_checksum.pbi','RaspberryPi4/Lib/mmu.pi4']
+ names=['Anvil/Network/ipv6_mld_policy.pbi','Anvil/Network/ipv6_mld.pbi','Anvil/Network/ipv6_neighbor.pbi','Anvil/Network/ipv6_packet.pbi','Anvil/Network/ipv6_address.pbi','Anvil/Network/byte_order.pbi','Anvil/Network/internet_checksum.pbi','RaspberryPi4/Lib/mmu.pi4']
  addr=lambda s:ipaddress.IPv6Address(s).packed
  ll=addr('fe80::1234');zero=bytes(16);group=addr('ff02::1:ff00:1234');allnodes=addr('ff02::1')
  def csum(b):
@@ -48,6 +48,8 @@ def build(compiler,out):
  parse('code ignored',packet(query(code=17)),[2,10000,2,125,0])
  parse('unspecified router',packet(query(),src=zero))
  parse('global router',packet(query(),src=addr('2001:db8::1')))
+ parse('noncanonical link local',packet(query(),src=addr('fe80:1::1')))
+ parse('reserved link local prefix',packet(query(),src=addr('fe90::1')))
  parse('hop limit',packet(query(),hop=2))
  parse('missing router alert',packet(query(),hbh=b'\x3a\0\x01\x04\0\0\0\0'))
  parse('wrong router alert',packet(query(),hbh=b'\x3a\0\x05\x02\0\1\x01\0'))
@@ -61,8 +63,34 @@ def build(compiler,out):
  parse('unspecified source entry',packet(query(g=group,sources=(zero,))))
  parse('unicast query group',packet(query(g=ll)))
  parse('short IPv6',b'\x60'*20)
- s='XIncludeFile "RaspberryPi4/Lib/mmu.pi4"\nXIncludeFile "Anvil/Network/ipv6_neighbor.pbi"\nXIncludeFile "Anvil/Network/ipv6_mld.pbi"\n'
- s+='Global Dim output.a[128]\nGlobal queryView.IPv6MldQueryView\nProcedure Save(index.i,rc.i)\n Define p.i,i.i\n p=$E1C00100+index*256\n PokeI(p,rc) : PokeI(p+8,queryView\\version) : PokeI(p+16,queryView\\maxDelay)\n PokeI(p+24,queryView\\robustness) : PokeI(p+32,queryView\\interval) : PokeI(p+40,queryView\\sourceCount)\n For i=0 To 127 : PokeA(p+64+i,output[i]) : Next\nEndProcedure\n'
+ def policy(name,code,rc,expected):
+  add(name,code,rc);cases[-1]['policy']=expected
+ policy('policy defaults','rc=IPv6MldInterfaceInit(@policyState,1,0)',0,[1,1,2,0,2,125000,10000,0])
+ policy('policy stale init','rc=IPv6MldInterfaceInit(@policyState,1,1)',-771,[1,1,2,0,2,125000,10000,0])
+ def observe(name,b,now,rc,expected,gen=1):
+  policy(name,f'rc=IPv6MldInterfaceQuery(@policyState,{gen},{now},{vector(b)},{len(b)})',rc,expected)
+ observe('specific v1 does not switch',packet(query(1,g=group)),10,2,[1,1,2,0,2,125000,10000,10])
+ observe('learn v2 timing',packet(query(delay=65535,qrv=7,qqic=255)),20,2,[1,1,2,0,7,31744000,8387584,20])
+ observe('enter v1',packet(query(1)),30,1,[1,2,1,222218030,7,31744000,10000,30])
+ observe('v2 cannot exit compatibility',packet(query()),40,1,[1,2,1,222218030,2,125000,10000,40])
+ observe('refresh v1 deadline',packet(query(1)),50,1,[1,2,1,260050,2,125000,10000,50])
+ observe('specific query leaves response interval',packet(query(g=group,delay=100)),60,1,[1,2,1,260050,2,125000,10000,60])
+ observe('invalid does not refresh timer',packet(query(1),src=zero),70,-760,[1,2,1,260050,2,125000,10000,60])
+ observe('stale query',packet(query()),70,-771,[1,2,1,260050,2,125000,10000,60],gen=2)
+ policy('before expiry','rc=IPv6MldInterfaceTick(@policyState,1,260049)',1,[1,2,1,260050,2,125000,10000,260049])
+ policy('exact expiry','rc=IPv6MldInterfaceTick(@policyState,1,260050)',2,[1,3,2,0,2,125000,10000,260050])
+ policy('tick does not repeat revision','rc=IPv6MldInterfaceTick(@policyState,1,260051)',2,[1,3,2,0,2,125000,10000,260051])
+ policy('backwards time','rc=IPv6MldInterfaceTick(@policyState,1,260050)',-770,[1,3,2,0,2,125000,10000,260051])
+ observe('backwards query',packet(query(1)),100,-770,[1,3,2,0,2,125000,10000,260051])
+ observe('zero wire params use defaults',packet(query(qrv=0,qqic=0)),260052,2,[1,3,2,0,2,125000,10000,260052])
+ observe('enter v1 again',packet(query(1)),260053,1,[1,4,1,520053,2,125000,10000,260053])
+ policy('new interface generation','rc=IPv6MldInterfaceInit(@policyState,2,0)',0,[2,1,2,0,2,125000,10000,0])
+ policy('old generation tick','rc=IPv6MldInterfaceTick(@policyState,1,1)',-771,[2,1,2,0,2,125000,10000,0])
+ policy('null context','rc=IPv6MldInterfaceTick(0,2,1)',-770,[2,1,2,0,2,125000,10000,0])
+ policy('overlap context packet','rc=IPv6MldInterfaceQuery(@policyState,2,1,@policyState,64)',-770,[2,1,2,0,2,125000,10000,0])
+
+ s='XIncludeFile "RaspberryPi4/Lib/mmu.pi4"\nXIncludeFile "Anvil/Network/ipv6_neighbor.pbi"\nXIncludeFile "Anvil/Network/ipv6_mld.pbi"\nXIncludeFile "Anvil/Network/ipv6_mld_policy.pbi"\n'
+ s+='Global Dim output.a[128]\nGlobal queryView.IPv6MldQueryView\nGlobal policyState.IPv6MldInterface\nProcedure Save(index.i,rc.i)\n Define p.i,i.i\n p=$E1C00100+index*256\n PokeI(p,rc) : PokeI(p+8,queryView\\version) : PokeI(p+16,queryView\\maxDelay)\n PokeI(p+24,queryView\\robustness) : PokeI(p+32,queryView\\interval) : PokeI(p+40,queryView\\sourceCount)\n For i=0 To 127 : PokeA(p+64+i,output[i]) : Next\n For i=0 To 7 : PokeI(p+192+i*8,PeekI(@policyState+i*8)) : Next\nEndProcedure\n'
  s+='Procedure.i Main()\n Define i.i,rc.i\n For i=0 To 131071 : PokeA($E1C00000+i,0) : Next\n PokeI($E1C00000,$4D4C4431)\n MmuClearNc() : rc=MmuBuildTables($4F80000) : If rc<>0 : ProcedureReturn 2 : EndIf\n MmuEnableCached()\n'
  for k,code in enumerate(steps):s+='For i=0 To 127 : output[i]=$A5 : Next\n For i=0 To SizeOf(IPv6MldQueryView)-1 : PokeA(@queryView+i,0) : Next\n'+code+f'\n Save({k},rc)\n'
  s+=f' PokeI($E1C00008,{len(cases)})\n MmuDisableCachedFlushed()\n ProcedureReturn 0\nEndProcedure\nDataSection\n'

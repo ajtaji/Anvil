@@ -1551,3 +1551,5 @@ text is unchanged; no new board execution or boot claim follows.
 | `Anvil/Network/ipv6_endpoint.pbi` | protocol-facts | ietf-rfc | IETF specification | RFC 4862 section 5.4 DAD, RFC 4861 section 7.2.4 neighbor replies, RFC 4443 section 4.2 echo; independently implemented endpoint |
 
 | `Anvil/Network/ipv6_mld.pbi` | protocol-facts | ietf-rfc | IETF specification | RFC 9777 sections 5 and 8, RFC 2710 section 3, RFC 3590 section 4; independently implemented MLD wire codec. |
+
+| `Anvil/Network/ipv6_mld_policy.pbi` | protocol-facts | ietf-rfc | IETF specification | RFC 9777 sections 8.2.1 and 9.12; independently implemented interface compatibility and querier timing policy. |
