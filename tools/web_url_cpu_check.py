@@ -1,7 +1,7 @@
 """Compare all URL records and guards with the explicit URI case expectations."""
 import struct
 def check(data,cases):
-    expected=bytearray([0xA5]*16384)
+    expected=bytearray([0xA5]*32768)
     struct.pack_into('<QQ',expected,0,0x55524C31,len(cases))
     for i,c in enumerate(cases):
         at=256+i*448;expected[at:at+448]=bytes(448)

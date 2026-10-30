@@ -14,6 +14,7 @@ CompilerIf #WEB_KERNEL_BINDING=0
 Global *webpDns,*webpOpen,*webpState,*webpSend,*webpRecv,*webpClose
 Global *webpTlsOpen,*webpTlsState,*webpTlsSend,*webpTlsRecv,*webpTlsClose
 Global *webpService
+Global *webpOpen6
 Global webpBound.i
 
 Procedure.i webpWord(table.i,offset.i)
@@ -22,6 +23,7 @@ EndProcedure
 
 Procedure.i WebPayloadBind(table.i)
   webpBound=0
+  *webpOpen6=0
   If table=0 : ProcedureReturn -109 : EndIf
   If webpWord(table,0)<>$53564E41 Or webpWord(table,4)<>1 Or webpWord(table,8)<6 Or webpWord(table,12)<88 : ProcedureReturn -109 : EndIf
   *webpDns=PeekI(table+16+75*8)
@@ -31,6 +33,7 @@ Procedure.i WebPayloadBind(table.i)
   *webpTlsRecv=PeekI(table+16+82*8) : *webpTlsClose=PeekI(table+16+83*8)
   *webpState=PeekI(table+16+86*8) : *webpService=PeekI(table+16+85*8)
   *webpTlsState=PeekI(table+16+87*8)
+  If webpWord(table,8)>=11 And webpWord(table,12)>=89 : *webpOpen6=PeekI(table+16+88*8) : EndIf
   If *webpDns=0 Or *webpOpen=0 Or *webpSend=0 Or *webpRecv=0 Or *webpClose=0 Or *webpTlsOpen=0 Or *webpTlsSend=0 Or *webpTlsRecv=0 Or *webpTlsClose=0 Or *webpState=0 Or *webpService=0 Or *webpTlsState=0 : ProcedureReturn -109 : EndIf
   webpBound=1 : ProcedureReturn 0
 EndProcedure
@@ -43,7 +46,26 @@ EndProcedure
 CompilerEndIf
 
 Procedure.i WebTransportOpen(*c.WebConnection)
+  Define literal.IPv6AddressStorage
+  Define n.i,rc.i
   *c\handle=0 : *c\address=0
+  If PeekA(*c\host)=91
+    n=0 : While n<48 And PeekA(*c\host+n)<>0 : n=n+1 : Wend
+    rc=WebUrlHostIPv6(*c\host,n,@literal)
+    If rc<>0 : ProcedureReturn rc : EndIf
+    ; Literal certificate verification still requires separate TLS support.
+    If *c\secure<>0 : ProcedureReturn #WEB_URL_HOST_UNSUPPORTED : EndIf
+    CompilerIf #WEB_KERNEL_BINDING=1
+      *c\handle=PayNetTcpOpen6(@literal,*c\port)
+      If *c\handle<0 : ProcedureReturn *c\handle : EndIf
+      ProcedureReturn 0
+    CompilerElse
+      If webpBound=0 Or webpOpen6=0 : ProcedureReturn #WEB_URL_HOST_UNSUPPORTED : EndIf
+      *c\handle=webpOpen6(@literal,*c\port)
+      If *c\handle<0 : ProcedureReturn *c\handle : EndIf
+      ProcedureReturn 0
+    CompilerEndIf
+  EndIf
   CompilerIf #WEB_KERNEL_BINDING=0
     If webpBound=0 : ProcedureReturn -109 : EndIf
   CompilerEndIf

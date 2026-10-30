@@ -6,7 +6,7 @@ from pmf_compiler import resolve_compiler
 ap=argparse.ArgumentParser(description="Compile streaming HTTP upload qualification for a physical Pi 4")
 ap.add_argument('--compiler',required=True);ap.add_argument('--out',type=Path,required=True);args=ap.parse_args()
 r=Path(__file__).resolve().parents[1];d=args.out.resolve();d.mkdir(parents=True,exist_ok=False)
-names=['Anvil/Network/web_url.pbi','Anvil/Network/web_request.pbi','Anvil/Network/web_redirect.pbi']
+names=['Anvil/Network/byte_order.pbi','Anvil/Network/ipv6_address.pbi','Anvil/Network/web_url.pbi','Anvil/Network/web_request.pbi','Anvil/Network/web_redirect.pbi']
 s='\n'.join(x for n in names for x in (r/n).read_text(encoding='utf8').splitlines() if not x.startswith('XIncludeFile'))+r'''
 Global base.WebUrl,dest.WebUrl,old.WebRequest,new.WebRequest,opt.WebRedirectOptions
 Global Dim bh.a[256]

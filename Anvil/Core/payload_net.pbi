@@ -1,4 +1,5 @@
 XIncludeFile "Anvil/Services/wifi_maintenance.pbi"
+XIncludeFile "Anvil/Network/ipv6_address.pbi"
 ; ======================================================================
 ;  payload_net.pbi - THE NETWORK A PAYLOAD REACHES. The engine behind the
 ;  service table's net group (base 72, Anvil/Hal/abi.pbi).
@@ -224,6 +225,9 @@ Global Dim paynet_tcpUsed.i[#PAYNET_TCP_HANDLES]
 Global Dim paynet_tcpSock.i[#PAYNET_TCP_HANDLES]   ; -1 while ARP is pending
 Global Dim paynet_tcpGen.i[#PAYNET_TCP_HANDLES]
 Global Dim paynet_tcpKind.i[#PAYNET_TCP_HANDLES]
+Global Dim paynet_tcpFamily.i[#PAYNET_TCP_HANDLES]
+Global Dim paynet_tcpSource6.a[#PAYNET_TCP_HANDLES*16]
+Global Dim paynet_tcpDest6.a[#PAYNET_TCP_HANDLES*16]
 Global Dim paynet_tcpIp.i[#PAYNET_TCP_HANDLES]
 Global Dim paynet_tcpPort.i[#PAYNET_TCP_HANDLES]
 Global Dim paynet_tcpT0.i[#PAYNET_TCP_HANDLES]
@@ -762,6 +766,7 @@ Procedure paynet_TcpLatch(i.i, code.i, *why)
 EndProcedure
 
 Procedure paynet_TcpFree(i.i)
+  paynet_tcpFamily[i]=4
   paynet_tcpUsed[i] = 0
   paynet_tcpSock[i] = -1
   paynet_tcpGen[i] = 0
@@ -795,7 +800,9 @@ Procedure paynet_TcpAdvance(i.i, now.i)
   EndIf
   keep = TcpCurrent()
   If paynet_tcpSock[i] < 0
-    If NetIfUsable(paynet_tcpKind[i]) = 0
+    rc=NetIfUsable(paynet_tcpKind[i])
+    If paynet_tcpFamily[i]=6 : rc=NetTcp6SourceValid(paynet_tcpKind[i],@paynet_tcpSource6[i*16]) : EndIf
+    If rc = 0
       paynet_TcpLatch(i, #SVC_ESTATE, "the interface toward that address lost its address before the connection was made")
       ProcedureReturn
     EndIf
@@ -814,7 +821,11 @@ Procedure paynet_TcpAdvance(i.i, now.i)
       ProcedureReturn
     EndIf
     TcpUse(s)
-    rc = TcpConnect(paynet_tcpKind[i], paynet_tcpIp[i], paynet_tcpPort[i])
+    If paynet_tcpFamily[i]=6
+      rc=TcpConnect6(paynet_tcpKind[i],@paynet_tcpSource6[i*16],@paynet_tcpDest6[i*16],paynet_tcpPort[i])
+    Else
+      rc = TcpConnect(paynet_tcpKind[i], paynet_tcpIp[i], paynet_tcpPort[i])
+    EndIf
     If rc = #NET_TCP_OK
       paynet_tcpSock[i] = s
       paynet_tcpGen[i] = TcpGeneration()
@@ -910,6 +921,35 @@ Procedure.i PayNetTcpOpen(ip.i, port.i)
   EndIf
   gSvcDetail = 0
   ProcedureReturn h + 1
+EndProcedure
+
+; Kernel IPv6 open shares the existing handle/timeout/cleanup owner.
+; Address bytes are copied before return; callers need not retain storage.
+Procedure.i PayNetTcpOpen6(destination.i,port.i)
+ Define source.IPv6AddressStorage
+ Define k.i,h.i,i.i,now.i,code.i
+ If destination=0 Or port<1 Or port>65535 : ProcedureReturn #SVC_EARG : EndIf
+ k=NetTcp6Select(destination,@source)
+ If k<1
+  gSvcDetail="no assigned IPv6 source and route can reach that destination"
+  ProcedureReturn #SVC_ESTATE
+ EndIf
+ h=-1
+ For i=#PAYNET_TCP_HANDLES-1 To 0 Step -1
+  If paynet_tcpUsed[i]=0 : h=i : EndIf
+ Next
+ If h<0 : ProcedureReturn #SVC_EBUSY : EndIf
+ now=millis() : paynet_TcpFree(h)
+ paynet_tcpUsed[h]=1 : paynet_tcpFamily[h]=6 : paynet_tcpKind[h]=k
+ For i=0 To 15
+  paynet_tcpSource6[h*16+i]=PeekA(@source+i) : paynet_tcpDest6[h*16+i]=PeekA(destination+i)
+ Next
+ paynet_tcpPort[h]=port : paynet_tcpT0[h]=now : paynet_tcpNext[h]=now
+ paynet_TcpAdvance(h,now)
+ If paynet_tcpFail[h]<>0
+  code=paynet_tcpFail[h] : gSvcDetail=paynet_tcpWhy[h] : paynet_TcpFree(h) : ProcedureReturn code
+ EndIf
+ gSvcDetail=0 : ProcedureReturn h+1
 EndProcedure
 
 ; Slot 86. Where the connection is - see the header for the three states.

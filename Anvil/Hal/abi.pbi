@@ -2141,6 +2141,15 @@ Procedure.i SvcTcpOpen(ip.i, port.i)
   ProcedureReturn PayNetTcpOpen(ip, port)
 EndProcedure
 
+; Slot88, ABI1.11: destination is 16 network-order bytes, copied on open.
+; Uses the existing TCP handle state/send/receive/close services.
+Procedure.i SvcTcpOpen6(destination.i,port.i)
+  If SvcRequireCap(#CAP_NET,"net","this board has no network interface Anvil can reach")=0
+    ProcedureReturn #SVC_ENOCAP
+  EndIf
+  ProcedureReturn PayNetTcpOpen6(destination,port)
+EndProcedure
+
 Procedure.i SvcTcpSend(h.i, *b, n.i)
   If SvcRequireCap(#CAP_NET, "net", "this board has no network interface Anvil can reach") = 0
     ProcedureReturn #SVC_ENOCAP
@@ -2912,6 +2921,7 @@ Procedure BuildServiceTable()
   gSvcTab[#SVC_HDR_WORDS + #SVC_BASE_NET + 10] = @SvcTlsRecv
   gSvcTab[#SVC_HDR_WORDS + #SVC_BASE_NET + 11] = @SvcTlsClose
   gSvcTab[#SVC_HDR_WORDS + #SVC_BASE_NET + 15] = @SvcTlsState
+  gSvcTab[#SVC_HDR_WORDS + #SVC_BASE_NET + 16] = @SvcTcpOpen6
   CompilerEndIf
 
   ; --- usb, base 96 ---------------------------------------------------

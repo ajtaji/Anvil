@@ -1005,7 +1005,7 @@ Global net_tcpRxMac.i           ; -> the six source-MAC bytes in the
                                 ; addressed, and the stranger is by
                                 ; definition not in the ARP cache.
 Global net_tcpRxFamily.i=4,net_tcpRxFrom6.i,net_tcpRxTo6.i
-Global *net_tcp6SourceHook,*net_tcp6ResolveHook
+Global *net_tcp6SourceHook,*net_tcp6ResolveHook,*net_tcp6SelectHook
 Global net_tcpRxCount.i         ; segments handed up
 
 ; The last ICMP echo REPLY we received.
@@ -2936,6 +2936,14 @@ EndProcedure
 ; for a currently assigned address; resolve returns 1/MAC, 0/pending or error.
 Procedure NetSetTcp6Hooks(source.i,resolve.i)
  *net_tcp6SourceHook=source : *net_tcp6ResolveHook=resolve
+EndProcedure
+Procedure NetSetTcp6SelectHook(selectSource.i)
+ *net_tcp6SelectHook=selectSource
+EndProcedure
+Procedure.i NetTcp6Select(destination.i,source.i)
+ If destination=0 Or source=0 Or net_tcp6SelectHook=0 : ProcedureReturn -881 : EndIf
+ If source<destination+16 And destination<source+16 : ProcedureReturn -881 : EndIf
+ ProcedureReturn net_tcp6SelectHook(destination,source)
 EndProcedure
 Procedure.i NetTcp6SourceValid(kind.i,source.i)
  If source=0 Or kind<1 Or kind>=#NET_IF_KINDS : ProcedureReturn 0 : EndIf

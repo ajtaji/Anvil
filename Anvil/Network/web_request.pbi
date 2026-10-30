@@ -70,6 +70,7 @@ EndProcedure
 ; States: 0 adding fields, 1 streaming, 2 finished, -1 refused.
 Procedure.i WebRequestInit(*s.WebRequest,*url.WebUrl,method.i,methodLength.i,bodyLength.i,keepAlive.i,headers.i,capacity.i)
   Define i.i,c.i
+  Define literal.IPv6AddressStorage
   If *s=0 : ProcedureReturn #WEB_REQUEST_ARGUMENT : EndIf
   For i=0 To SizeOf(WebRequest)-1 : PokeA(*s+i,0) : Next
   If *url=0 Or method=0 Or methodLength<1 Or methodLength>32 Or bodyLength< -1 Or headers=0 Or capacity<128 Or capacity>32768
@@ -83,10 +84,14 @@ Procedure.i WebRequestInit(*s.WebRequest,*url.WebUrl,method.i,methodLength.i,bod
   Next
   ; CONNECT needs authority-form and tunnel ownership, not origin-form.
   If wqEqual(method,methodLength,"connect") : ProcedureReturn wqFail(*s,#WEB_REQUEST_SYNTAX) : EndIf
-  For i=0 To *url\hostLength-1
-    c=PeekA(*url\host+i) & 255
-    If c<=32 Or c>=127 Or c=58 Or c=47 : ProcedureReturn wqFail(*s,#WEB_REQUEST_SYNTAX) : EndIf
-  Next
+  If PeekA(*url\host)=91
+    If WebUrlHostIPv6(*url\host,*url\hostLength,@literal)<>0 : ProcedureReturn wqFail(*s,#WEB_REQUEST_SYNTAX) : EndIf
+  Else
+    For i=0 To *url\hostLength-1
+      c=PeekA(*url\host+i) & 255
+      If c<=32 Or c>=127 Or c=58 Or c=47 Or c=91 Or c=93 : ProcedureReturn wqFail(*s,#WEB_REQUEST_SYNTAX) : EndIf
+    Next
+  EndIf
   If PeekA(*url\target)<>47 : ProcedureReturn wqFail(*s,#WEB_REQUEST_SYNTAX) : EndIf
   For i=0 To *url\targetLength-1
     c=PeekA(*url\target+i) & 255

@@ -2,6 +2,7 @@
 ; random_service.pbi and netconsole.pbi first. All work runs on core 0 between
 ; receive dispatches. Device hooks supply generation and bounded filter setup.
 ; The service owns every host context, source list and outstanding link receipt.
+XIncludeFile "Anvil/Network/ipv6_source.pbi"
 Global *ipv6svcGeneration,*ipv6svcPrepare
 Global ipv6svcBusy.i,ipv6svcCursor.i=1,ipv6svcClock.i,ipv6svcRaw.i,ipv6svcClockSet.i
 Global Dim ipv6svcHost.IPv6Host[#NET_IF_KINDS]
@@ -246,6 +247,70 @@ Procedure.i IPv6ServiceResolve(kind.i,source.i,destination.i,mac.i)
  If rc=0 : ProcedureReturn 0 : EndIf
  For i=0 To 5 : PokeA(mac+i,PeekA(@ipv6svcNeighbor[slot]\policy\mac+i)) : Next
  ProcedureReturn 1
+EndProcedure
+
+; Route first, then RFC6724 comparison of this interface's assigned
+; public addresses. Longest on-link route wins; selected link breaks equal
+; route ties. Scoped literals without a zone follow that selected interface.
+Procedure.i IPv6ServiceSelect(destination.i,source.i)
+ Define chosen.IPv6AddressStorage,candidate.IPv6AddressStorage
+ Define kind.i,now.i,route.i,bestRoute.i,bestKind.i,bestDeprecated.i
+ Define i.i,j.i,slot.i,state.i,deprecated.i,failed.i,index.i,rc.i
+ Define *router.IPv6DefaultRouter
+ If destination=0 Or source=0 : ProcedureReturn -881 : EndIf
+ If PeekA(destination)=255 Or IPv6AddressUnspecified(destination)<>0 : ProcedureReturn -881 : EndIf
+ If IPv6SourceLabel(destination)=0 Or IPv6SourceLabel(destination)=3 Or IPv6SourceLabel(destination)=4 : ProcedureReturn -881 : EndIf
+ now=ipv6svc_Now() : bestKind=0 : bestRoute=-1
+ For kind=1 To #NET_IF_KINDS-1
+  If HwLinkReady(kind)<>0 And ipv6svcState[kind]=2 And ipv6svcHost[kind]\phase=#IPV6_HOST_READY
+   route=IPv6PrefixListMatch(@ipv6svcOnLink[kind],ipv6svcEpoch[kind],now,destination)
+   If IPv6SourceScope(destination)=2 : route=129 : EndIf
+   If route=0
+    failed=0
+    For j=0 To 3
+     *router=@ipv6svcRouterRows[kind*128+j*32]
+     slot=ipv6svc_NeighborFind(kind,@*router\address)
+     If slot>=0
+      If ipv6svcNeighbor[slot]\policy\state=#IPV6_NC_FAILED : failed=failed|(1<<j) : EndIf
+     EndIf
+    Next
+    index=IPv6DefaultRoutersSelect(@ipv6svcRouters[kind],ipv6svcEpoch[kind],now,failed)
+    If index<=0 : route=-1 : EndIf
+   EndIf
+   If route>=0
+    For i=0 To 15 : PokeA(@candidate+i,ipv6svcAddresses[kind*16+i]) : Next
+    deprecated=0
+    For j=0 To #IPV6_SERVICE_ADDRESSES-1
+     slot=kind*#IPV6_SERVICE_ADDRESSES+j
+     If ipv6svcOwnerUsed[slot]<>0
+      state=IPv6AddressOwnerStatus(@ipv6svcOwner[slot],ipv6svcOwner[slot]\generation,now)
+      If state=2 Or state=3
+       rc=IPv6SourceBetter(destination,@ipv6svcOwner[slot]\lifetime\address,Bool(state=3),64,@candidate,deprecated,64)
+       If rc=1
+        For i=0 To 15 : PokeA(@candidate+i,PeekA(@ipv6svcOwner[slot]\lifetime\address+i)) : Next
+        deprecated=Bool(state=3)
+       EndIf
+      EndIf
+     EndIf
+    Next
+    If IPv6SourceScope(@candidate)>=IPv6SourceScope(destination)
+     rc=0
+     If bestKind=0 Or route>bestRoute
+      rc=1
+     ElseIf route=bestRoute
+      If kind=LinkKind() And bestKind<>LinkKind() : rc=1 : EndIf
+     EndIf
+     If rc=1
+      For i=0 To 15 : PokeA(@chosen+i,PeekA(@candidate+i)) : Next
+      bestKind=kind : bestRoute=route
+     EndIf
+    EndIf
+   EndIf
+  EndIf
+ Next
+ If bestKind=0 : ProcedureReturn -883 : EndIf
+ For i=0 To 15 : PokeA(source+i,PeekA(@chosen+i)) : Next
+ ProcedureReturn bestKind
 EndProcedure
 
 Procedure.i IPv6ServiceEchoStart(source.i,destination.i)
@@ -690,6 +755,7 @@ Procedure.i IPv6ServiceBind(generation.i,prepare.i)
  ipv6svcGeneration=generation : ipv6svcPrepare=prepare
  NetSetIPv6InputHook(@IPv6ServiceInput)
  NetSetTcp6Hooks(@IPv6ServiceSourceValid,@IPv6ServiceResolve)
+ NetSetTcp6SelectHook(@IPv6ServiceSelect)
  NetSetProtocolTickHook(@IPv6ServiceTick)
  ProcedureReturn 0
 EndProcedure

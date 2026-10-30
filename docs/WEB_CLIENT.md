@@ -1621,3 +1621,55 @@ This proves live local-link IPv6 HTTP server traffic. Outbound IPv6 HTTP/DNS,
 automatic source selection, path-MTU handling, off-link validation, remaining
 TLS blocking and HTTP/2-3 are not yet complete. The legacy IPv4-named pending
 error constant is retained for API compatibility, including IPv6 ND waits.
+
+
+## Outbound IPv6 HTTP and ABI 1.11
+
+Anvil 452 adds `SvcTcpOpen6(destination16,port)` in previously reserved net
+slot 88. The 200-entry ABI table and all existing slots remain unchanged.
+It returns an ordinary TCP handle, used with existing send, receive, state
+and close operations. The destination is copied; the resident owner selects
+and retains the source/interface, resolves neighbors cooperatively, and uses
+the same bounded pending-open and socket-generation cleanup as IPv4.
+
+Route selection considers the longest on-link prefix, default routers and
+the selected link for equal routes. Within that outgoing interface, assigned
+public source addresses are compared using RFC 6724 rules: exact destination,
+appropriate scope, preferred lifetime, matching default policy label, then
+common prefix capped at the configured prefix length. Tentative/expired addresses
+are excluded. Anvil currently assigns neither mobile nor temporary addresses,
+and does not retain router-to-prefix associations. This is source selection
+for the currently owned address types, not a claim of complete dual-stack
+destination ordering or configurable policy tables. Loopback, mapped and
+IPv4-compatible destinations are refused by this physical-link selector.
+
+The shared URL parser accepts bracketed IPv6 literals and retains their
+brackets in HTTP Host fields. The request serializer validates the literal;
+malformed brackets, ports and zone identifiers are refused. Plain HTTP can
+open IPv6 literals through both kernel and payload web adapters. Payloads
+read slot 88 only on ABI 1.11 or newer; older kernels continue supporting the
+existing IPv4 APIs. HTTPS literals remain explicitly refused until certificate
+IP-address verification and the TLS connection adapter are integrated.
+
+Physical Pi validation passed 47 URL cases, 20 source-selection/request-wire
+cases and the eight existing HTTP lifecycle scenarios. Redirect and upload
+builders compile with the shared address dependency. The complete resident
+composition also builds for Pi 3 as build 68, with its IPv6 entropy prerequisite
+unchanged.
+
+Using the actual resident ABI on physical Pi 4 build 452, a returning payload
+fetched `http://[fd3f:f605:b7f1:cfd6:f0d4:2621:4d4:d168]:18080/ipv6-proof`
+from the PC over Wi-Fi. Anvil automatically chose its assigned ULA source.
+The PC verified the exact 101-byte request, including bracketed Host authority.
+The Pi received HTTP 200 and all 20,000 body bytes with the expected SHA-256;
+the complete response was 20,101 bytes and took 281 ms from client start to
+completion. Report guards were unchanged. The temporary PC server was removed,
+and the Pi returned with healthy cores, fonts, Vulkan and disabled watchdog.
+The running 452 image was hash-verified after a 90-second boot interval; a
+verified 451 rollback image is retained. Evidence and final image are under
+`docs/evidence/anvil-ipv6-20261030/client452`.
+
+Live local-link HTTP now works in both directions over IPv6. AAAA DNS and
+dual-stack selection, IPv6 TLS/literal certificate verification, scoped URI
+zones, off-link validation, path-MTU handling, remaining TLS blocking and
+HTTP/2-3 are still incomplete.

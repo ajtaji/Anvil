@@ -3,8 +3,9 @@
 ; Input is an explicit byte span, not an implicitly readable C string.
 ; Keeps escaped path/query bytes, excludes fragments, and emits origin-form.
 ; No DNS, allocation or transport calls. Caller owns output and serialization.
-; IPv6 literals and international host conversion require transport/resolver
-; support; currently refused explicitly, never mistaken for a host/port pair.
+; Bracketed IPv6 literals retain brackets for Host/authority serialization.
+; Zone identifiers and international host conversion remain unsupported.
+XIncludeFile "Anvil/Network/ipv6_address.pbi"
 #WEB_URL_OK = 0
 #WEB_URL_ARGUMENT = -500
 #WEB_URL_SCHEME = -501
@@ -28,6 +29,13 @@ Structure WebUrl
   targetCapacity.i
 EndStructure
 
+Procedure.i WebUrlHostIPv6(host.i,bytes.i,address.i)
+ If host=0 Or address=0 Or bytes<4 Or bytes>47 : ProcedureReturn #WEB_URL_HOST_UNSUPPORTED : EndIf
+ If PeekA(host)<>91 Or PeekA(host+bytes-1)<>93 : ProcedureReturn #WEB_URL_HOST_UNSUPPORTED : EndIf
+ If IPv6AddressParse(host+1,bytes-2,address)<>0 : ProcedureReturn #WEB_URL_HOST_UNSUPPORTED : EndIf
+ ProcedureReturn 0
+EndProcedure
+
 Procedure.i webUrlLower(c.i)
   If c>=65 And c<=90 : ProcedureReturn c+32 : EndIf
   ProcedureReturn c
@@ -44,6 +52,7 @@ EndProcedure
 ; Output is usable only after a zero return; lengths are cleared on entry.
 Procedure.i WebUrlParse(*input,bytes.i,defaultSecure.i,*out.WebUrl)
   Define i.i,c.i,start.i,finish.i,colon.i,port.i,digits.i,target.i,label.i
+  Define literal.IPv6AddressStorage
   If *out=0 : ProcedureReturn #WEB_URL_ARGUMENT : EndIf
   *out\hostLength=0 : *out\targetLength=0 : *out\explicitPort=0
   If *out\host=0 Or *out\target=0 Or *out\hostCapacity<2 Or *out\targetCapacity<2
@@ -92,8 +101,15 @@ Procedure.i WebUrlParse(*input,bytes.i,defaultSecure.i,*out.WebUrl)
     finish=finish+1
   Wend
   If finish=start : ProcedureReturn #WEB_URL_AUTHORITY : EndIf
-  If PeekA(*input+start)=91 : ProcedureReturn #WEB_URL_HOST_UNSUPPORTED : EndIf
   colon=finish : label=0
+  If PeekA(*input+start)=91
+    colon=start+1
+    While colon<finish And PeekA(*input+colon)<>93 : colon=colon+1 : Wend
+    If colon>=finish : ProcedureReturn #WEB_URL_HOST_UNSUPPORTED : EndIf
+    colon=colon+1
+    If WebUrlHostIPv6(*input+start,colon-start,@literal)<>0 : ProcedureReturn #WEB_URL_HOST_UNSUPPORTED : EndIf
+    If colon<finish And PeekA(*input+colon)<>58 : ProcedureReturn #WEB_URL_AUTHORITY : EndIf
+  Else
   For i=start To finish-1
     c=PeekA(*input+i)
     If c=58 : colon=i : Break : EndIf
@@ -109,6 +125,7 @@ Procedure.i WebUrlParse(*input,bytes.i,defaultSecure.i,*out.WebUrl)
       If label>63 : ProcedureReturn #WEB_URL_AUTHORITY : EndIf
     EndIf
   Next
+  EndIf
   If colon=start Or colon-start>=#WEB_URL_HOST : ProcedureReturn #WEB_URL_AUTHORITY : EndIf
   If PeekA(*input+colon-1)=45 : ProcedureReturn #WEB_URL_AUTHORITY : EndIf
   If colon<finish

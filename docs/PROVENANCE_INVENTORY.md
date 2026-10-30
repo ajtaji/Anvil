@@ -1575,3 +1575,7 @@ text is unchanged; no new board execution or boot claim follows.
 | `Anvil/Network/ipv6_neighbor_owner.pbi` | protocol-facts | ietf-rfc | IETF specification | neighbor resolution and queued NUD owner; cite RFC 4861 |
 
 | `Anvil/Network/ipv6_tcp.pbi` | protocol-facts | ietf-rfc | IETF specification | TCP IPv6 wire boundary; RFC 8200 and RFC 9293 |
+
+| `Anvil/Network/ipv6_source.pbi` | protocol-facts | ietf-rfc | IETF specification | source comparison for assigned public addresses; RFC 6724 |
+| `docs/evidence/anvil-ipv6-20261030/client452/client-regression639/proof.pi4` | protocol-facts | ietf-rfc | IETF specification | Generated HTTP/IPv6 protocol test source |
+| `docs/evidence/anvil-ipv6-20261030/client452/url634/proof.pi4` | protocol-facts | ietf-rfc | IETF specification | Generated HTTP/IPv6 protocol test source |

@@ -1,0 +1,199 @@
+XIncludeFile "RaspberryPi4/Lib/mmu.pi4"
+XIncludeFile "Anvil/Network/ipv6_source.pbi"
+XIncludeFile "Anvil/Network/web_request.pbi"
+
+Global Dim output.a[1514]
+Global Dim host.a[256]
+Global Dim target.a[3072]
+Global url.WebUrl,request.WebRequest
+Procedure Save(index.i,rc.i)
+ Define p.i,i.i
+ p=$E1C00100+index*2048 : PokeI(p,rc)
+ For i=1 To 9 : PokeI(p+i*8,-1) : Next
+ For i=0 To 1513 : PokeA(p+80+i,output[i]) : Next
+EndProcedure
+Procedure.i Main()
+ Define rc.i,i.i
+ For i=0 To 131071 : PokeA($E1C00000+i,$A5) : Next
+ PokeI($E1C00000,$53454C36)
+ url\host=@host[0] : url\hostCapacity=256 : url\target=@target[0] : url\targetCapacity=3072
+ MmuClearNc() : rc=MmuBuildTables($4F80000) : If rc<>0 : ProcedureReturn 2 : EndIf
+ MmuEnableCached()
+For i=0 To 1513 : output[i]=$A5 : Next
+rc=IPv6SourceBetter(?V0,?V1,1,64,?V2,0,64)
+Save(0,rc)
+For i=0 To 1513 : output[i]=$A5 : Next
+rc=IPv6SourceBetter(?V3,?V4,0,64,?V5,0,64)
+Save(1,rc)
+For i=0 To 1513 : output[i]=$A5 : Next
+rc=IPv6SourceBetter(?V6,?V7,1,64,?V8,0,64)
+Save(2,rc)
+For i=0 To 1513 : output[i]=$A5 : Next
+rc=IPv6SourceBetter(?V9,?V10,0,64,?V11,0,64)
+Save(3,rc)
+For i=0 To 1513 : output[i]=$A5 : Next
+rc=IPv6SourceBetter(?V12,?V13,0,64,?V14,0,64)
+Save(4,rc)
+For i=0 To 1513 : output[i]=$A5 : Next
+rc=IPv6SourceBetter(?V15,?V16,0,64,?V17,1,64)
+Save(5,rc)
+For i=0 To 1513 : output[i]=$A5 : Next
+rc=IPv6SourceBetter(?V18,?V19,1,64,?V20,0,64)
+Save(6,rc)
+For i=0 To 1513 : output[i]=$A5 : Next
+rc=IPv6SourceBetter(?V21,?V22,0,64,?V23,0,64)
+Save(7,rc)
+For i=0 To 1513 : output[i]=$A5 : Next
+rc=IPv6SourceBetter(?V24,?V25,0,64,?V26,0,64)
+Save(8,rc)
+For i=0 To 1513 : output[i]=$A5 : Next
+rc=IPv6SourceBetter(?V27,?V28,0,64,?V29,0,64)
+Save(9,rc)
+For i=0 To 1513 : output[i]=$A5 : Next
+rc=IPv6SourceBetter(?V30,?V31,0,64,?V32,0,64)
+Save(10,rc)
+For i=0 To 1513 : output[i]=$A5 : Next
+rc=IPv6SourceBetter(?V33,?V34,0,64,?V35,0,64)
+Save(11,rc)
+For i=0 To 1513 : output[i]=$A5 : Next
+rc=IPv6SourceBetter(?V36,?V37,0,64,?V38,0,64)
+Save(12,rc)
+For i=0 To 1513 : output[i]=$A5 : Next
+rc=IPv6SourceBetter(?V39,?V40,0,129,?V41,0,64)
+Save(13,rc)
+For i=0 To 1513 : output[i]=$A5 : Next
+rc=IPv6SourceBetter(?V42,?V43,0,64,?V44,0,64)
+Save(14,rc)
+For i=0 To 1513 : output[i]=$A5 : Next
+rc=IPv6SourceBetter(?V45,?V46,0,64,?V47,0,64)
+Save(15,rc)
+For i=0 To 1513 : output[i]=$A5 : Next
+rc=WebUrlParse(?V48,31,0,@url)
+ If rc=0 : rc=WebRequestInit(@request,@url,"GET",3,0,0,@output[0],1514) : EndIf
+ If rc=0 : rc=WebRequestFinishHeaders(@request) : EndIf
+Save(16,rc)
+For i=0 To 1513 : output[i]=$A5 : Next
+rc=WebUrlParse(?V49,26,0,@url)
+ If rc=0 : rc=WebRequestInit(@request,@url,"GET",3,0,0,@output[0],1514) : EndIf
+ If rc=0 : rc=WebRequestFinishHeaders(@request) : EndIf
+Save(17,rc)
+For i=0 To 1513 : output[i]=$A5 : Next
+rc=WebUrlParse(?V50,22,0,@url)
+ If rc=0 : rc=WebRequestInit(@request,@url,"GET",3,0,0,@output[0],1514) : EndIf
+ If rc=0 : rc=WebRequestFinishHeaders(@request) : EndIf
+Save(18,rc)
+For i=0 To 1513 : output[i]=$A5 : Next
+rc=WebUrlParse(?V51,19,0,@url)
+ If rc=0 : rc=WebRequestInit(@request,@url,"GET",3,0,0,@output[0],1514) : EndIf
+ If rc=0 : rc=WebRequestFinishHeaders(@request) : EndIf
+Save(19,rc)
+PokeI($E1C00008,20)
+MmuDisableCachedFlushed()
+ProcedureReturn 0
+EndProcedure
+DataSection
+V0:
+ Data.a 253,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1
+V1:
+ Data.a 253,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1
+V2:
+ Data.a 253,0,0,0,0,0,0,0,0,0,0,0,0,0,0,2
+V3:
+ Data.a 253,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1
+V4:
+ Data.a 253,0,0,0,0,0,0,0,0,0,0,0,0,0,0,2
+V5:
+ Data.a 253,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1
+V6:
+ Data.a 254,128,0,0,0,0,0,0,0,0,0,0,0,0,0,9
+V7:
+ Data.a 254,128,0,0,0,0,0,0,0,0,0,0,0,0,0,1
+V8:
+ Data.a 253,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1
+V9:
+ Data.a 32,1,13,184,0,0,0,0,0,0,0,0,0,0,0,9
+V10:
+ Data.a 32,1,13,184,0,0,0,0,0,0,0,0,0,0,0,1
+V11:
+ Data.a 254,128,0,0,0,0,0,0,0,0,0,0,0,0,0,1
+V12:
+ Data.a 32,1,13,184,0,0,0,0,0,0,0,0,0,0,0,9
+V13:
+ Data.a 254,128,0,0,0,0,0,0,0,0,0,0,0,0,0,1
+V14:
+ Data.a 253,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1
+V15:
+ Data.a 253,0,0,1,0,0,0,0,0,0,0,0,0,0,0,9
+V16:
+ Data.a 253,0,0,2,0,0,0,0,0,0,0,0,0,0,0,1
+V17:
+ Data.a 253,0,0,1,0,0,0,0,0,0,0,0,0,0,0,1
+V18:
+ Data.a 253,0,0,1,0,0,0,0,0,0,0,0,0,0,0,9
+V19:
+ Data.a 253,0,0,1,0,0,0,0,0,0,0,0,0,0,0,1
+V20:
+ Data.a 253,0,0,2,0,0,0,0,0,0,0,0,0,0,0,1
+V21:
+ Data.a 253,0,0,1,0,0,0,0,0,0,0,0,0,0,0,9
+V22:
+ Data.a 253,0,0,2,0,0,0,0,0,0,0,0,0,0,0,1
+V23:
+ Data.a 32,1,13,184,0,0,0,0,0,0,0,0,0,0,0,1
+V24:
+ Data.a 32,1,13,184,0,0,0,0,0,0,0,0,0,0,0,9
+V25:
+ Data.a 32,1,13,185,0,0,0,0,0,0,0,0,0,0,0,1
+V26:
+ Data.a 253,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1
+V27:
+ Data.a 253,0,0,1,0,0,0,0,0,0,0,0,0,0,0,9
+V28:
+ Data.a 253,0,0,1,0,0,0,0,0,0,0,0,0,0,0,1
+V29:
+ Data.a 253,0,0,2,0,0,0,0,0,0,0,0,0,0,0,1
+V30:
+ Data.a 253,0,0,1,0,0,0,0,0,0,0,0,0,0,0,255
+V31:
+ Data.a 253,0,0,1,0,0,0,0,0,0,0,0,0,0,0,254
+V32:
+ Data.a 253,0,0,1,0,0,0,0,0,0,0,0,0,0,0,1
+V33:
+ Data.a 254,128,0,0,0,0,0,0,0,0,0,0,0,0,0,9
+V34:
+ Data.a 254,128,0,0,0,0,0,0,0,0,0,0,0,0,0,1
+V35:
+ Data.a 254,192,0,0,0,0,0,0,0,0,0,0,0,0,0,1
+V36:
+ Data.a 32,1,13,184,0,0,0,0,0,0,0,0,0,0,0,9
+V37:
+ Data.a 254,192,0,0,0,0,0,0,0,0,0,0,0,0,0,1
+V38:
+ Data.a 253,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1
+V39:
+ Data.a 253,0,0,0,0,0,0,0,0,0,0,0,0,0,0,9
+V40:
+ Data.a 253,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1
+V41:
+ Data.a 253,0,0,0,0,0,0,0,0,0,0,0,0,0,0,2
+V42:
+ Data.a 253,0,0,0,0,0,0,0,0,0,0,0,0,0,0,9
+V43:
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+V44:
+ Data.a 253,0,0,0,0,0,0,0,0,0,0,0,0,0,0,2
+V45:
+ Data.a 253,0,0,0,0,0,0,0,0,0,0,0,0,0,0,9
+V46:
+ Data.a 255,2,0,0,0,0,0,0,0,0,0,0,0,0,0,1
+V47:
+ Data.a 253,0,0,0,0,0,0,0,0,0,0,0,0,0,0,2
+V48:
+ Data.a 104,116,116,112,58,47,47,91,70,68,51,70,58,58,49,50,51,52,93,58,56,48,56,48,47,104,101,97,108,116,104
+V49:
+ Data.a 104,116,116,112,58,47,47,91,50,48,48,49,58,100,98,56,58,58,49,93,47,97,63,113,61,120
+V50:
+ Data.a 104,116,116,112,58,47,47,49,57,50,46,48,46,50,46,49,58,56,48,56,48,47
+V51:
+ Data.a 104,116,116,112,58,47,47,69,120,97,109,112,108,101,46,67,79,77,47
+EndDataSection
