@@ -40,6 +40,9 @@ EndProcedure
 Procedure.i FakeAlpn(handle.i,destination.i,capacity.i)
  PokeA(destination,104) : PokeA(destination+1,50) : ProcedureReturn 2
 EndProcedure
+Procedure.i FakeDrain(handle.i)
+ ProcedureReturn 1
+EndProcedure
 Procedure.i FakeClose(handle.i)
  closeCalls=closeCalls+1 : ProcedureReturn 0
 EndProcedure
@@ -156,7 +159,7 @@ Procedure.i RunOne(index.i)
 EndProcedure
 Procedure RunCases()
  Define index.i,i.i,n.i,v.i
- webpTlsOpenAlpn=@FakeOpen : webpTlsState=@FakeState : webpTlsAlpn=@FakeAlpn : webpTlsClose=@FakeClose : webpTlsSend=@FakeSend : webpTlsRecv=@FakeRecv
+ webpTlsOpenAlpn=@FakeOpen : webpTlsState=@FakeState : webpTlsAlpn=@FakeAlpn : webpTlsClose=@FakeClose : webpTlsDrain=@FakeDrain : webpTlsSend=@FakeSend : webpTlsRecv=@FakeRecv
  Restore Cases : Read.i n : PokeI($E1C00008,n)
  For index=0 To n-1
   Read.i mode : Read.i goal : Read.i inBytes : Read.i gateCount

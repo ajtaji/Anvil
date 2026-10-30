@@ -606,6 +606,26 @@ Procedure.i TlsClientSend(h.i, *b, n.i)
   ProcedureReturn take
 EndProcedure
 
+ ; Output drain: 1 when accepted application bytes and protected records have
+; passed to TCP, 0 while pending, negative on failure. This is not a peer ACK.
+; The cooperative driver advances one bounded slice, with no wait loop.
+Procedure.i TlsClientDrain(h.i)
+  Define r.i
+  r=tlsc_Handle(h)
+  If r<0 : ProcedureReturn r : EndIf
+  tlsc_AdvanceCurrent()
+  If tlsc_state=#TLSC_FAILED
+    gSvcDetail=tlsc_why : ProcedureReturn tlsc_fail
+  EndIf
+  If (tlsc_state=#TLSC_OPEN Or tlsc_state=#TLSC_CLOSED) And tlsc_txLen=0 And tlsc_appPending[tlsc_slot]=0
+    ProcedureReturn 1
+  EndIf
+  If tlsc_state=#TLSC_CLOSED
+    gSvcDetail="TLS closed with outgoing bytes pending" : ProcedureReturn #SVC_EIO
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
 ; Plaintext out; bytes delivered, 0 = nothing yet.
 Procedure.i TlsClientRecv(h.i, *b, n.i)
   Define r.i

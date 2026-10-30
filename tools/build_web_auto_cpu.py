@@ -90,6 +90,9 @@ Procedure.i FakeAlpn(handle.i,destination.i,capacity.i)
  For i=0 To n-1 : PokeA(destination+i,PeekA(value+i)) : Next
  ProcedureReturn n
 EndProcedure
+Procedure.i FakeDrain(handle.i)
+ ProcedureReturn 1
+EndProcedure
 Procedure.i FakeClose(handle.i)
  closeCalls=closeCalls+1 : ProcedureReturn 0
 EndProcedure
@@ -144,11 +147,11 @@ Procedure RunOne(index.i)
  url\secure=1 : url\host="example.org" : url\hostLength=11 : url\port=443 : url\target="/upload" : url\targetLength=7
  If mode=19 : url\secure=0 : url\port=80 : EndIf
  buffers\tx=@tx[0] : buffers\rx=@rx[0] : buffers\requestBlock=@requestBlock[0] : buffers\controls=@controls[0] : buffers\block=@block[0] : buffers\dynamic=@dynamic[0] : buffers\field=@field[0] : buffers\streams=@streams[0] : buffers\streamCount=4
- webpTlsOpenAlpn=@FakeOpen : webpTlsOpen=@FakeLegacyOpen : webpTlsState=@FakeState : webpTlsAlpn=@FakeAlpn : webpTlsClose=@FakeClose : webpTlsSend=@FakeSend : webpTlsRecv=@FakeRecv
+ webpTlsOpenAlpn=@FakeOpen : webpTlsOpen=@FakeLegacyOpen : webpTlsState=@FakeState : webpTlsAlpn=@FakeAlpn : webpTlsClose=@FakeClose : webpTlsDrain=@FakeDrain : webpTlsSend=@FakeSend : webpTlsRecv=@FakeRecv
  webpDns=@FakeDns : webpTime=@FakeTime : webpOpen=@FakeLegacyOpen : webpState=@FakeTcpState : webpClose=@FakeClose : webpSend=@FakeSend : webpRecv=@FakeRecv : webpDns6=0 : webpOpen6=0
  If mode=17 : webpTlsOpenAlpn=0 : webpTlsAlpn=0 : EndIf
  method="GET" : methodBytes=3 : length=goal
- If mode=1 Or mode=2 Or mode=4 Or mode=23 : method="POST" : methodBytes=4 : EndIf
+ If mode=1 Or mode=2 Or mode=4 Or mode=23 Or mode=25 : method="POST" : methodBytes=4 : EndIf
  If mode=3 : method="HEAD" : methodBytes=4 : head=1 : EndIf
  If unknown<>0 : length=-1 : EndIf
  rc=WebRequestInit(@request,@url,method,methodBytes,length,1,@headers[0],2048)

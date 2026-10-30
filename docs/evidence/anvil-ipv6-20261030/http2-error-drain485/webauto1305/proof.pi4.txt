@@ -1,0 +1,405 @@
+#WEB_KERNEL_BINDING=0
+XIncludeFile "RaspberryPi4/Lib/mmu.pi4"
+XIncludeFile "Anvil/Network/web_url.pbi"
+XIncludeFile "Anvil/Network/web_transport.pbi"
+XIncludeFile "Anvil/Network/h2_frame.pbi"
+XIncludeFile "Anvil/Network/hpack_decode.pbi"
+XIncludeFile "Anvil/Network/hpack_tables.pbi"
+XIncludeFile "Anvil/Network/h2_client.pbi"
+XIncludeFile "Anvil/Network/h2_request.pbi"
+XIncludeFile "Anvil/Network/web_request.pbi"
+XIncludeFile "Anvil/Network/web_response.pbi"
+XIncludeFile "Anvil/Network/web_client.pbi"
+XIncludeFile "Anvil/Network/tcp_dial.pbi"
+XIncludeFile "Anvil/Network/ipv6_address.pbi"
+Global services.i
+Global *pet
+Global c.H2Client
+Global client.WebClient
+Global buffers.H2Buffers
+Global url.WebUrl
+Global request.WebRequest,request2.WebRequest
+Global response.WebResponse,response2.WebResponse
+Global Dim tx.a[16384]
+Global Dim rx.a[16384]
+Global Dim block.a[65536]
+Global Dim controls.a[1024]
+Global Dim requestBlock.a[65536]
+Global Dim dynamic.a[4096]
+Global Dim field.a[8192]
+Global Dim streams.a[2048]
+Global Dim headers.a[2048]
+Global Dim headers2.a[2048]
+Global Dim line.a[8192]
+Global Dim line2.a[8192]
+Global Dim metadata.a[4096]
+Global Dim metadata2.a[4096]
+Global Dim result.a[512]
+Global Dim lookup.a[32]
+Global Dim body.a[70001]
+Global Dim incoming.a[8192]
+Global Dim outgoing.a[131072]
+Global Dim gateAt.i[64]
+Global Dim gateBytes.i[64]
+Global Dim offer.a[32]
+Global inBytes.i,inAt.i,outBytes.i,sendCalls.i,recvCalls.i,closeCalls.i,openCalls.i,offerBytes.i,mode.i,goal.i,unknown.i,gateCount.i,nowTick.i
+Procedure CaptureTable()
+ ASM
+ adrp x1, global_services
+ add x1, x1, #:lo12:global_services
+ str x0, [x1]
+ EndASM
+EndProcedure
+Procedure.i FakeOpen(host.i,port.i,protocols.i,bytes.i)
+ Define i.i
+ openCalls=openCalls+1 : offerBytes=bytes
+ For i=0 To bytes-1 : offer[i]=PeekA(protocols+i) : Next
+ ProcedureReturn 1
+EndProcedure
+Procedure.i FakeLegacyOpen(host.i,port.i)
+ ProcedureReturn FakeOpen(host,port,0,0)
+EndProcedure
+Procedure.i FakeDns(host.i)
+ ProcedureReturn $04030201
+EndProcedure
+Procedure.i FakeTime()
+ ProcedureReturn nowTick*1000
+EndProcedure
+Procedure.i FakeTcpState(handle.i)
+ ProcedureReturn 2
+EndProcedure
+Procedure.i FakeState(handle.i)
+ If mode=21 Or mode=22 : ProcedureReturn 0 : EndIf
+ ProcedureReturn 4
+EndProcedure
+Procedure.i FakeAlpn(handle.i,destination.i,capacity.i)
+ Define value.i,n.i,i.i
+ If mode=16 : ProcedureReturn 0 : EndIf
+ value="h2" : n=2
+ If mode=15 : value="http/1.1" : n=8 : EndIf
+ If mode=20 : value="spdy" : n=4 : EndIf
+ For i=0 To n-1 : PokeA(destination+i,PeekA(value+i)) : Next
+ ProcedureReturn n
+EndProcedure
+Procedure.i FakeDrain(handle.i)
+ ProcedureReturn 1
+EndProcedure
+Procedure.i FakeClose(handle.i)
+ closeCalls=closeCalls+1 : ProcedureReturn 0
+EndProcedure
+Procedure.i FakeSend(handle.i,source.i,bytes.i)
+ Define i.i,n.i
+ sendCalls=sendCalls+1 : If (sendCalls % 4)=0 : ProcedureReturn 0 : EndIf
+ n=bytes : If n>97 : n=97 : EndIf
+ If outBytes+n>131072 : ProcedureReturn -9601 : EndIf
+ For i=0 To n-1 : outgoing[outBytes+i]=PeekA(source+i) : Next
+ outBytes=outBytes+n : ProcedureReturn n
+EndProcedure
+Procedure.i FakeRecv(handle.i,destination.i,bytes.i)
+ Define i.i,n.i,at.i,length.i,uploaded.i,ready.i,ended.i,required.i,kind.i,flags.i,highest.i,sid.i
+ recvCalls=recvCalls+1 : If (recvCalls % 3)=0 : ProcedureReturn 0 : EndIf
+ If mode>=15 And mode<=19
+  If outBytes<request\length : ProcedureReturn 0 : EndIf
+ Else
+  at=24
+  While at+9<=outBytes
+   length=(outgoing[at]<<16)|(outgoing[at+1]<<8)|outgoing[at+2]
+   If at+9+length>outBytes : Break : EndIf
+   kind=outgoing[at+3] : flags=outgoing[at+4]
+   sid=NetReadBE32(@outgoing[at+5])
+   If (kind=1 Or kind=9) And (flags & 4)<>0 : ready=1 : If sid>highest : highest=sid : EndIf : EndIf
+   If (kind=1 Or kind=0) And (flags & 1)<>0 : ended=1 : EndIf
+   If kind=0 : uploaded=uploaded+length : EndIf
+   at=at+9+length
+  Wend
+  required=-1
+  For i=0 To gateCount-1 : If inAt>=gateAt[i] : required=gateBytes[i] : EndIf : Next
+  If required<>-1
+   If ready=0 : ProcedureReturn 0 : EndIf
+   If required=-2
+    If ended=0 : ProcedureReturn 0 : EndIf
+   ElseIf required=-3
+    If highest<3 : ProcedureReturn 0 : EndIf
+   Else
+    If uploaded<required : ProcedureReturn 0 : EndIf
+   EndIf
+  EndIf
+ EndIf
+ n=inBytes-inAt : If n>bytes : n=bytes : EndIf : If n>5 : n=5 : EndIf
+ For i=0 To n-1 : PokeA(destination+i,incoming[inAt+i]) : Next
+ inAt=inAt+n : ProcedureReturn n
+EndProcedure
+Procedure RunOne(index.i)
+ Define i.i,rc.i,tick.i,base.i,timeout.i,position.i,received.i,capacity.i,method.i,methodBytes.i,length.i,head.i,limit.i,lineLimit.i,again.i,p.i,wireAt.i,*active.WebResponse,check.i
+ inAt=0 : outBytes=0 : sendCalls=0 : recvCalls=0 : closeCalls=0 : openCalls=0 : offerBytes=0 : nowTick=0
+ For i=0 To SizeOf(H2Client)-1 : PokeA(@c+i,0) : Next
+ For i=0 To 70000 : body[i]=97 : Next
+ If mode=2 : For i=0 To 16 : body[i]=i : Next : EndIf
+ url\secure=1 : url\host="example.org" : url\hostLength=11 : url\port=443 : url\target="/upload" : url\targetLength=7
+ If mode=19 : url\secure=0 : url\port=80 : EndIf
+ buffers\tx=@tx[0] : buffers\rx=@rx[0] : buffers\requestBlock=@requestBlock[0] : buffers\controls=@controls[0] : buffers\block=@block[0] : buffers\dynamic=@dynamic[0] : buffers\field=@field[0] : buffers\streams=@streams[0] : buffers\streamCount=4
+ webpTlsOpenAlpn=@FakeOpen : webpTlsOpen=@FakeLegacyOpen : webpTlsState=@FakeState : webpTlsAlpn=@FakeAlpn : webpTlsClose=@FakeClose : webpTlsDrain=@FakeDrain : webpTlsSend=@FakeSend : webpTlsRecv=@FakeRecv
+ webpDns=@FakeDns : webpTime=@FakeTime : webpOpen=@FakeLegacyOpen : webpState=@FakeTcpState : webpClose=@FakeClose : webpSend=@FakeSend : webpRecv=@FakeRecv : webpDns6=0 : webpOpen6=0
+ If mode=17 : webpTlsOpenAlpn=0 : webpTlsAlpn=0 : EndIf
+ method="GET" : methodBytes=3 : length=goal
+ If mode=1 Or mode=2 Or mode=4 Or mode=23 Or mode=25 : method="POST" : methodBytes=4 : EndIf
+ If mode=3 : method="HEAD" : methodBytes=4 : head=1 : EndIf
+ If unknown<>0 : length=-1 : EndIf
+ rc=WebRequestInit(@request,@url,method,methodBytes,length,1,@headers[0],2048)
+ If rc=0 : rc=WebRequestHeader(@request,"X-Test",6,"value",5) : EndIf
+ If rc=0 : rc=WebRequestFinishHeaders(@request) : EndIf
+ limit=4096 : lineLimit=512
+ If mode=5 : limit=128 : EndIf
+ If mode=6 : lineLimit=128 : EndIf
+ If rc=0 : rc=WebResponseInit(@response,@line[0],lineLimit,@metadata[0],limit,head) : EndIf
+ If mode=18 And rc=0 : rc=WebResponseAllowUpgrade(@response) : EndIf
+ *active=@response : timeout=10000
+ If mode=13 : timeout=250 : EndIf
+ If mode=21 : timeout=50 : EndIf
+ If rc=0 : rc=WebClientStartAuto(@client,@url,@request,@response,@tx[0],16384,@rx[0],16384,@c,@buffers,0,timeout) : EndIf
+ If rc=0
+  For tick=1 To 30000
+   pet() : nowTick=base+tick : capacity=1
+   If (tick % 4)=0 Or mode=13 : capacity=0 : EndIf
+   rc=WebClientStep(@client,@body[0]+position,goal-position,1,@result[0]+received,capacity,nowTick)
+   position=position+client\consumed : received=received+client\written
+   If position>goal Or received>511 : rc=-9602 : Break : EndIf
+   If mode=12 And received=1 : rc=WebClientCancel(@client) : EndIf
+   If mode=22 And tick=3 : rc=WebClientCancel(@client) : EndIf
+   If rc<0 : Break : EndIf
+   If rc=1
+    If mode=14 And again=0
+     url\target="/second" : url\targetLength=7
+     rc=WebRequestInit(@request2,@url,"GET",3,0,1,@headers2[0],2048)
+     If rc=0 : rc=WebRequestFinishHeaders(@request2) : EndIf
+     If rc=0 : rc=WebResponseInit(@response2,@line2[0],512,@metadata2[0],4096,0) : EndIf
+     If rc<>0 : Break : EndIf
+     base=50000 : nowTick=base+tick
+     If WebClientNext(@client,@request2,@response2,nowTick,0)<>#WEB_CLIENT_ARGUMENT : rc=-9603 : Break : EndIf
+     rc=WebClientNext(@client,@request2,@response2,nowTick,10000)
+     If rc<>0 : Break : EndIf
+     *active=@response2 : again=1
+    Else
+     rc=0 : Break
+    EndIf
+   EndIf
+  Next
+  If tick>30000 : rc=-9604 : EndIf
+ EndIf
+ If rc=0 And mode=0
+  If WebResponseHeaderCount(*active)<>5 : rc=-9605 : EndIf
+  check=WebResponseHeader(*active,"x-trace",1,@lookup[0],32)
+  If check<>3 Or lookup[0]<>116 Or lookup[1]<>119 Or lookup[2]<>111 : rc=-9606 : EndIf
+  If WebResponseHeader(*active,"x-trailer",0,0,0)<>#WEB_RESPONSE_NOTFOUND : rc=-9607 : EndIf
+  If WebResponseHeader(*active,"x-info",0,0,0)<>#WEB_RESPONSE_NOTFOUND : rc=-9608 : EndIf
+ EndIf
+ p=$E1C00100+index*32768
+ PokeI(p,rc) : PokeI(p+8,position) : PokeI(p+16,received) : PokeI(p+24,*active\status)
+ PokeI(p+32,outBytes) : PokeI(p+40,client\state) : PokeI(p+48,*active\state) : PokeI(p+56,*active\versionMajor)
+ PokeI(p+64,client\protocol) : PokeI(p+72,openCalls) : PokeI(p+80,*active\headerLength)
+ PokeI(p+88,*active\reusable) : PokeI(p+104,*active\interimCount) : PokeI(p+112,client\h2ResetCode)
+ PokeI(p+120,*active\remaining) : PokeI(p+128,offerBytes) : PokeI(p+136,WebResponseHeaderCount(*active))
+ PokeI(p+144,request\remaining) : PokeI(p+152,c\sent) : PokeI(p+160,c\received) : PokeI(p+168,inAt)
+ PokeI(p+176,client\sent) : PokeI(p+184,client\received)
+ For i=0 To offerBytes-1 : PokeA(p+208+i,offer[i]) : Next
+ wireAt=p+512
+ If outBytes>16384 : wireAt=$E1CE0000 : EndIf
+ PokeI(p+96,wireAt-$E1C00000)
+ For i=0 To outBytes-1 : PokeA(wireAt+i,outgoing[i]) : Next
+ For i=0 To *active\headerLength-1 : PokeA(p+20000+i,PeekA(*active\headers+i)) : Next
+ For i=0 To received-1 : PokeA(p+25000+i,result[i]) : Next
+ WebClientClose(@client) : WebClientClose(@client)
+ PokeI(p+192,closeCalls)
+EndProcedure
+Procedure RunCases()
+ Define index.i,i.i,n.i,v.i
+ Restore Cases : Read.i n : PokeI($E1C00008,n)
+ For index=0 To n-1
+  Read.i mode : Read.i goal : Read.i unknown : Read.i inBytes : Read.i gateCount
+  For i=0 To gateCount-1 : Read.i v : gateAt[i]=v : Read.i v : gateBytes[i]=v : Next
+  For i=0 To inBytes-1 : Read.i v : incoming[i]=v : Next
+  RunOne(index)
+ Next
+EndProcedure
+Procedure.i Main()
+ CaptureTable()
+ Define i.i,rc.i
+ rc=WebPayloadBind(services) : If rc<>0 : ProcedureReturn 71 : EndIf
+ pet=PeekI(services+16+6*8)
+ MmuClearNc() : MmuAddNc($08A00000,$09200000) : MmuAddNc($08100000,$08180000)
+ rc=MmuBuildTables($4F80000) : If rc<>0 : ProcedureReturn 72 : EndIf
+ MmuEnableCached()
+ For i=0 To 1048575 : PokeA($E1C00000+i,0) : Next
+ PokeI($E1C00000,$48324155)
+ RunCases()
+ WebClientClose(@client)
+ MmuDisableCachedFlushed()
+ ProcedureReturn 0
+EndProcedure
+
+DataSection
+Cases:
+ Data.i 26
+ Data.i 0,0,0,119,5
+ Data.i 0,-1
+ Data.i 9,-2
+ Data.i 39,-2
+ Data.i 80,-2
+ Data.i 94,-2
+ Data.i 0,0,0,4,0,0,0,0,0,0,0,21,1,4,0,0,0,1,72,3,49,48,51,64
+ Data.i 6,120,45,105,110,102,111,7,105,103,110,111,114,101,100,0,0,32,1,4,0,0,0,1
+ Data.i 136,92,1,53,64,7,120,45,116,114,97,99,101,3,111,110,101,126,3,116,119,111,119,3
+ Data.i 97,61,49,119,3,98,61,50,0,0,5,0,0,0,0,0,1,104,101,108,108,111,0,0
+ Data.i 16,1,5,0,0,0,1,64,9,120,45,116,114,97,105,108,101,114,4,100,111,110,101
+ Data.i 1,70000,0,52,4
+ Data.i 0,-1
+ Data.i 15,65535
+ Data.i 28,-2
+ Data.i 41,-2
+ Data.i 0,0,6,4,0,0,0,0,0,0,4,0,15,66,64,0,0,4,8,0,0,0,0,0
+ Data.i 0,0,64,0,0,0,4,1,4,0,0,0,1,136,92,129,23,0,0,2,0,1,0,0
+ Data.i 0,1,111,107
+ Data.i 2,17,1,78,6
+ Data.i 0,-1
+ Data.i 15,5
+ Data.i 28,10
+ Data.i 41,15
+ Data.i 54,-2
+ Data.i 67,-2
+ Data.i 0,0,6,4,0,0,0,0,0,0,4,0,0,0,5,0,0,4,8,0,0,0,0,1
+ Data.i 0,0,0,5,0,0,4,8,0,0,0,0,1,0,0,0,5,0,0,4,8,0,0,0
+ Data.i 0,1,0,0,0,5,0,0,4,1,4,0,0,0,1,136,92,129,23,0,0,2,0,1
+ Data.i 0,0,0,1,111,107
+ Data.i 3,0,0,29,2
+ Data.i 0,-1
+ Data.i 15,-2
+ Data.i 0,0,6,4,0,0,0,0,0,0,4,0,0,0,5,0,0,5,1,5,0,0,0,1
+ Data.i 136,92,130,104,95
+ Data.i 4,1000,0,32,2
+ Data.i 0,-1
+ Data.i 15,0
+ Data.i 0,0,6,4,0,0,0,0,0,0,4,0,0,0,5,0,0,8,1,5,0,0,0,1
+ Data.i 72,131,104,44,255,92,129,7
+ Data.i 5,0,0,131,2
+ Data.i 0,-1
+ Data.i 9,-2
+ Data.i 0,0,0,4,0,0,0,0,0,0,0,113,1,5,0,0,0,1,136,64,6,120,45,108
+ Data.i 111,110,103,100,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120
+ Data.i 120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120
+ Data.i 120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120
+ Data.i 120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120
+ Data.i 120,120,120,120,120,120,120,120,92,1,50
+ Data.i 6,0,0,229,2
+ Data.i 0,-1
+ Data.i 9,-2
+ Data.i 0,0,0,4,0,0,0,0,0,0,0,211,1,5,0,0,0,1,136,64,6,120,45,108
+ Data.i 111,110,103,127,73,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120
+ Data.i 120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120
+ Data.i 120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120
+ Data.i 120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120
+ Data.i 120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120
+ Data.i 120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120
+ Data.i 120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120
+ Data.i 120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120
+ Data.i 120,120,120,120,120,120,120,120,120,120,120,120,120
+ Data.i 7,0,0,102,10
+ Data.i 0,-1
+ Data.i 9,-2
+ Data.i 22,-2
+ Data.i 32,-2
+ Data.i 42,-2
+ Data.i 52,-2
+ Data.i 62,-2
+ Data.i 72,-2
+ Data.i 82,-2
+ Data.i 92,-2
+ Data.i 0,0,0,4,0,0,0,0,0,0,0,4,1,4,0,0,0,1,72,130,8,25,0,0
+ Data.i 1,1,4,0,0,0,1,190,0,0,1,1,4,0,0,0,1,190,0,0,1,1,4,0
+ Data.i 0,0,1,190,0,0,1,1,4,0,0,0,1,190,0,0,1,1,4,0,0,0,1,190
+ Data.i 0,0,1,1,4,0,0,0,1,190,0,0,1,1,4,0,0,0,1,190,0,0,1,1
+ Data.i 4,0,0,0,1,190
+ Data.i 8,0,0,22,2
+ Data.i 0,-1
+ Data.i 9,-2
+ Data.i 0,0,0,4,0,0,0,0,0,0,0,4,3,0,0,0,0,1,0,0,0,8
+ Data.i 9,0,0,50,4
+ Data.i 0,-1
+ Data.i 9,-2
+ Data.i 26,-2
+ Data.i 39,-2
+ Data.i 0,0,0,4,0,0,0,0,0,0,0,8,7,0,0,0,0,0,0,0,0,1,0,0
+ Data.i 0,0,0,0,4,1,4,0,0,0,1,136,92,129,23,0,0,2,0,1,0,0,0,1
+ Data.i 111,107
+ Data.i 10,0,0,32,2
+ Data.i 0,-1
+ Data.i 15,-1
+ Data.i 0,0,6,4,0,0,0,0,0,0,3,0,0,0,0,0,0,8,7,0,0,0,0,0
+ Data.i 0,0,0,0,0,0,0,0
+ Data.i 11,0,0,33,3
+ Data.i 0,-1
+ Data.i 9,-2
+ Data.i 22,-2
+ Data.i 0,0,0,4,0,0,0,0,0,0,0,4,1,4,0,0,0,1,136,92,1,51,0,0
+ Data.i 2,0,1,0,0,0,1,104,105
+ Data.i 12,0,0,36,3
+ Data.i 0,-1
+ Data.i 9,-2
+ Data.i 22,-2
+ Data.i 0,0,0,4,0,0,0,0,0,0,0,4,1,4,0,0,0,1,136,92,1,53,0,0
+ Data.i 5,0,1,0,0,0,1,104,101,108,108,111
+ Data.i 13,0,0,36,3
+ Data.i 0,-1
+ Data.i 9,-2
+ Data.i 22,-2
+ Data.i 0,0,0,4,0,0,0,0,0,0,0,4,1,4,0,0,0,1,136,92,1,53,0,0
+ Data.i 5,0,1,0,0,0,1,104,101,108,108,111
+ Data.i 14,0,0,74,5
+ Data.i 0,-1
+ Data.i 9,-2
+ Data.i 34,-2
+ Data.i 48,-3
+ Data.i 60,-3
+ Data.i 0,0,0,4,0,0,0,0,0,0,0,16,1,4,0,0,0,1,136,92,129,111,64,134
+ Data.i 242,181,133,181,5,147,131,64,233,47,0,0,5,0,1,0,0,0,1,104,101,108,108,111
+ Data.i 0,0,3,1,4,0,0,0,3,136,191,190,0,0,5,0,1,0,0,0,3,119,111,114
+ Data.i 108,100
+ Data.i 15,0,0,59,0
+ Data.i 72,84,84,80,47,49,46,49,32,50,48,48,32,79,75,13,10,67,111,110,116,101,110,116
+ Data.i 45,76,101,110,103,116,104,58,32,50,13,10,67,111,110,110,101,99,116,105,111,110,58,32
+ Data.i 99,108,111,115,101,13,10,13,10,111,107
+ Data.i 16,0,0,59,0
+ Data.i 72,84,84,80,47,49,46,49,32,50,48,48,32,79,75,13,10,67,111,110,116,101,110,116
+ Data.i 45,76,101,110,103,116,104,58,32,50,13,10,67,111,110,110,101,99,116,105,111,110,58,32
+ Data.i 99,108,111,115,101,13,10,13,10,111,107
+ Data.i 17,0,0,59,0
+ Data.i 72,84,84,80,47,49,46,49,32,50,48,48,32,79,75,13,10,67,111,110,116,101,110,116
+ Data.i 45,76,101,110,103,116,104,58,32,50,13,10,67,111,110,110,101,99,116,105,111,110,58,32
+ Data.i 99,108,111,115,101,13,10,13,10,111,107
+ Data.i 18,0,0,59,0
+ Data.i 72,84,84,80,47,49,46,49,32,50,48,48,32,79,75,13,10,67,111,110,116,101,110,116
+ Data.i 45,76,101,110,103,116,104,58,32,50,13,10,67,111,110,110,101,99,116,105,111,110,58,32
+ Data.i 99,108,111,115,101,13,10,13,10,111,107
+ Data.i 19,0,0,59,0
+ Data.i 72,84,84,80,47,49,46,49,32,50,48,48,32,79,75,13,10,67,111,110,116,101,110,116
+ Data.i 45,76,101,110,103,116,104,58,32,50,13,10,67,111,110,110,101,99,116,105,111,110,58,32
+ Data.i 99,108,111,115,101,13,10,13,10,111,107
+ Data.i 20,0,0,0,0
+ Data.i 21,0,0,0,0
+ Data.i 22,0,0,0,0
+ Data.i 23,0,1,39,3
+ Data.i 0,-1
+ Data.i 15,-2
+ Data.i 28,-2
+ Data.i 0,0,6,4,0,0,0,0,0,0,4,0,0,0,0,0,0,4,1,4,0,0,0,1
+ Data.i 136,92,129,23,0,0,2,0,1,0,0,0,1,111,107
+ Data.i 24,0,0,25,2
+ Data.i 0,-1
+ Data.i 9,0
+ Data.i 0,0,0,4,0,0,0,0,0,0,0,7,6,0,0,0,0,0,49,50,51,52,53,54
+ Data.i 55
+ Data.i 25,10,0,25,2
+ Data.i 0,-1
+ Data.i 15,0
+ Data.i 0,0,6,4,0,0,0,0,0,0,4,0,0,0,0,0,0,1,0,0,0,0,0,5
+ Data.i 120
+EndDataSection

@@ -4,7 +4,7 @@ from hpack import Decoder
 
 def check(data,cases):
  def q(at):return struct.unpack_from('<q',data,at)[0]
- assert q(0)==0x48324155 and q(8)==len(cases)==24
+ assert q(0)==0x48324155 and q(8)==len(cases)
  for index,c in enumerate(cases):
   p=256+index*32768;mode=c['mode'];label=c['name']
   assert q(p)==c['error'],(label,'result',q(p),c['error'])
@@ -34,7 +34,7 @@ def check(data,cases):
    continue
   assert q(p+152)==len(wire) and q(p+160)==q(p+168),(label,'H2 wire counters')
   assert wire.startswith(b'PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n'),label
-  at=24;decoder=Decoder();headers={};block=b'';uploads=b'';ends=set();resets=[];continued=0
+  at=24;decoder=Decoder();headers={};block=b'';uploads=b'';ends=set();resets=[];continued=0;goaway=[]
   while at<len(wire):
    assert at+9<=len(wire),label
    n=int.from_bytes(wire[at:at+3],'big');kind=wire[at+3];flags=wire[at+4];sid=int.from_bytes(wire[at+5:at+9],'big')
@@ -47,7 +47,11 @@ def check(data,cases):
    if kind==0:uploads+=b
    if kind in (0,1) and flags&1:ends.add(sid)
    if kind==3:resets.append((sid,int.from_bytes(b,'big')))
+   if kind==7:
+    assert sid==0 and flags==0 and n==8 and b[:4]==bytes(4) and at==len(wire),label
+    goaway.append(int.from_bytes(b[4:],'big'))
   assert not block and not continued,label
+  if 'goaway' in c:assert goaway==c['goaway'],(label,goaway)
   if mode==10:
    assert not headers and not uploads,label
    continue
@@ -71,4 +75,4 @@ def check(data,cases):
    assert q(p+104)==1 and q(p+136)==5
   if mode==3:assert b'content-length: 42\r\n' in metadata and body==b''
   if mode==14:assert b'x-reused: same\r\n' in metadata and q(p+176)<len(wire)
- return {'cases':24,'automatic_webclient_dispatch':True,'reused_connection':True}
+ return {'cases':len(cases),'automatic_webclient_dispatch':True,'reused_connection':True}

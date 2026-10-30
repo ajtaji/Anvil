@@ -2233,6 +2233,14 @@ Procedure.i SvcTlsState(h.i)
   ProcedureReturn TlsClientState(h)
 EndProcedure
 
+ ; ABI 1.14, reserved network slot 92. Existing signatures do not change.
+Procedure.i SvcTlsDrain(h.i)
+  If SvcRequireCap(#CAP_NET, "net", "this board has no network interface Anvil can reach") = 0
+    ProcedureReturn #SVC_ENOCAP
+  EndIf
+  ProcedureReturn TlsClientDrain(h)
+EndProcedure
+
 ; ABI 1.13, reserved network slots 90/91. No existing slot moves.
 Procedure.i SvcTlsOpenAlpn(host.i,port.i,protocols.i,bytes.i)
   Define i.i,terminated.i
@@ -2959,6 +2967,7 @@ Procedure BuildServiceTable()
   gSvcTab[#SVC_HDR_WORDS + #SVC_BASE_NET + 17] = @SvcDnsResolve6
   gSvcTab[#SVC_HDR_WORDS + #SVC_BASE_NET + 18] = @SvcTlsOpenAlpn
   gSvcTab[#SVC_HDR_WORDS + #SVC_BASE_NET + 19] = @SvcTlsAlpn
+  gSvcTab[#SVC_HDR_WORDS + #SVC_BASE_NET + 20] = @SvcTlsDrain
   CompilerEndIf
 
   ; --- usb, base 96 ---------------------------------------------------

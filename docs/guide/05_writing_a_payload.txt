@@ -735,7 +735,27 @@ zero-terminated. Capacity is bounded to 256 bytes; too-small or invalid
 storage returns EARG without a partial copy. The getter does not perform
 network progress: continue calling the service and state slots.
 
-@TRAP A selected h2 protocol requires HTTP/2 frames. Do not send an HTTP/1 request on that connection. Existing web-client calls continue to advertise no ALPN; negotiation support alone does not implement HTTP/2 or HTTP/3.
+@TRAP A selected h2 protocol requires HTTP/2 frames. Do not send an HTTP/1 request on that connection. Use the asynchronous HTTP/2 engine or WebClientStartAuto for h2. Legacy explicit HTTP/1 calls keep their existing selection. This does not add HTTP/3.
+
+@SECTION TLS output draining
+
+ABI 1.14 fills reserved network slot 92, SvcTlsDrain(handle). Check major 1,
+minor at least 14 and at least 93 entries before reading that pointer. The
+service table still has 200 entries; older indices and signatures do not move.
+
+TLS send accepts a copied buffer into an asynchronous queue. A positive send
+result does not mean that encryption and TCP submission have finished.
+SvcTlsDrain returns 1 only after accepted application bytes and protected
+records have passed to TCP, 0 while pending, or a negative failure code.
+With the cooperative driver, each call advances a bounded progress slice.
+Keep servicing networking and enforce the caller's deadline while it returns 0.
+This is an output-queue check, not an acknowledgement from the remote peer.
+
+Close and cancellation remain immediate and can discard pending bytes.
+For orderly shutdown, drain before closing. H2ClientShutdown does this before
+reporting H2_DRAINED; a monitor without this service cannot report successful
+draining. Connection-error GOAWAY is best effort within the connection's
+existing deadline and retains the original error if transport draining fails.
 
 @SECTION API credentials and forms
 

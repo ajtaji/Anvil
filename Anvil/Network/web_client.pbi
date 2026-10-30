@@ -192,6 +192,8 @@ Procedure.i wcH2Field(*s.WebClient,*h.H2Client)
 EndProcedure
 Procedure.i wcH2Complete(*s.WebClient,*h.H2Client)
  Define *r.WebResponse
+ If *h\state=#H2_STATE_ERROR_DRAIN : ProcedureReturn 0 : EndIf
+ If *h\state=-1 : ProcedureReturn wcFail(*s,*h\error) : EndIf
  If *s\h2Ending=0 Or *h\txLength<>0 Or *h\controlLength<>0 Or *h\requestHeaderBytes<>0 : ProcedureReturn 0 : EndIf
  *r=*s\response : *r\state=#WEB_RESPONSE_DONE : *r\remaining=0
  *r\reusable=Bool(*h\goaway=0 And *h\state=3)
@@ -206,6 +208,7 @@ Procedure.i wcH2Step(*s.WebClient,body.i,bytes.i,endBody.i,output.i,capacity.i,n
  event=H2ClientStep(*h,now)
  *s\sent=*h\sent-*s\h2SentStart : *s\received=*h\received-*s\h2ReceivedStart
  If event<0 : ProcedureReturn wcFail(*s,event) : EndIf
+ If *h\state=#H2_STATE_ERROR_DRAIN : ProcedureReturn 0 : EndIf
  If *h\state=4
   rc=H2ClientTakeHttp1(*h,@*s\connection)
   If rc<>0 : ProcedureReturn wcFail(*s,rc) : EndIf

@@ -8,11 +8,17 @@ def transform(s):
   nonlocal s
   assert a in s,a
   s=s.replace(a,b)
- replace('Global inBytes.i,inAt.i','Global stopping.i\nGlobal inBytes.i,inAt.i')
- replace('inAt=0 : outBytes=0 :','stopping=0 : inAt=0 : outBytes=0 :')
+ replace('Procedure.i FakeDrain(handle.i)\n ProcedureReturn 1',r"""Procedure.i FakeDrain(handle.i)
+ drainCalls=drainCalls+1
+ If mode=30 : ProcedureReturn 0 : EndIf
+ If mode=31 : ProcedureReturn -9298 : EndIf
+ If mode=29 And drainCalls<=5 : ProcedureReturn 0 : EndIf
+ ProcedureReturn 1""")
+ replace('Global inBytes.i,inAt.i','Global stopping.i,drainCalls.i\nGlobal inBytes.i,inAt.i')
+ replace('inAt=0 : outBytes=0 :','drainCalls=0 : webpTlsDrain=@FakeDrain : If mode=32 : webpTlsDrain=0 : EndIf : stopping=0 : inAt=0 : outBytes=0 :')
  replace('eventKind.i\n','eventKind.i,limit.i,byteBefore.i,j.i,ptr.i\n')
  replace('  rc=H2ClientStep(@c,tick)',r'''  If stopping=0 And c\state=3 And ((sent=wanted And mode<>26) Or (mode=26 And c\event=#H2_DATA))
-   limit=20000 : If mode=23 : limit=200 : EndIf
+   limit=20000 : If mode=23 Or mode=30 : limit=200 : EndIf
    If mode=27
     If H2ClientDeadline(@c,1,tick,1)<>0 : rc=-9601 : Break : EndIf
    EndIf
@@ -45,12 +51,12 @@ def transform(s):
  replace('If busy<>#H2_BUSY And c\\goaway=0', 'If busy<>#H2_BUSY And c\\goaway=0 And c\\shutdown=0')
  replace('   If rc=#H2_GOAWAY : Break : EndIf','   If rc=#H2_GOAWAY : rc=H2ClientConsume(@c) : If rc<>0 : Break : EndIf : EndIf')
  replace('  If ended=wanted And c\\txLength=0 And c\\controlLength=0 : rc=0 : Break : EndIf','  ; Completion is H2_DRAINED, not only the last response event.')
- replace(' PokeI(p,rc) :', ' PokeI(p+72,stopping) : PokeI(p+80,c\\state) : PokeI(p+88,c\\shutdownQueued)\n PokeI(p,rc) :')
+ replace(' PokeI(p,rc) :', ' PokeI(p+96,drainCalls) : PokeI(p+72,stopping) : PokeI(p+80,c\\state) : PokeI(p+88,c\\shutdownQueued)\n PokeI(p,rc) :')
  return s
 
 def build(compiler,out,cases=None):
  rows=json.loads((Path(__file__).parent/'h2_shutdown_cases.json').read_text()) if cases is None else cases
- assert 1<=len(rows)<=8
+ assert 1<=len(rows)<=16
  build_client(compiler,out,rows,transform)
 if __name__=='__main__':
  ap=argparse.ArgumentParser(description=__doc__);ap.add_argument('--compiler',required=True);ap.add_argument('--out',type=Path,required=True)

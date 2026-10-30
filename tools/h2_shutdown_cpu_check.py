@@ -12,6 +12,10 @@ def check(data,cases):
   assert q(p+64)==1 and q(p+72)==1,(label,'ownership/start')
   assert q(p+80)==(5 if success else -1) and q(p+88)==int(mode!=24),label
   if success:assert q(p+24)==c['wanted'],label
+  if mode==29:assert q(p+96)==6,(label,'premature TLS close')
+  if mode==30:assert q(p+96)>1
+  if mode==31:assert q(p+96)==1
+  if mode==32:assert q(p+96)==0
   wire=data[p+256:p+256+q(p+32)];at=24;dec=Decoder();requests=[];goaway=[];reset=[];credit=0;pings=0
   assert wire[:24]==b'PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n'
   while at<len(wire):

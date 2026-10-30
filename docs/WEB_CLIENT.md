@@ -3287,5 +3287,87 @@ returned zero with healthy cores/fonts/Vulkan and watchdog off. Installed Anvil
 483 was unchanged. Evidence:
 `docs/evidence/anvil-ipv6-20261030/http2-priority483`.
 
-Automatic connection-error GOAWAY transmission remains unfinished, as do broader
-TLS compatibility/blocking, off-link IPv6/RDNSS web qualification and HTTP/3.
+Connection-error GOAWAY remained unfinished at this checkpoint; the following
+section records its implementation and transport-drain qualification.
+
+
+### Connection-error GOAWAY and verified TLS output draining
+
+Peer connection failures now enter H2_STATE_ERROR_DRAIN (state 6). Step returns
+zero while finishing pending output, then returns the original negative error
+and retains it in the failed state. Continue pumping Step and network service;
+a latched error during state 6 is not permission to reuse the connection.
+New requests are refused, incoming bytes are no longer parsed, and no new
+application events are emitted. Existing partial frames and contiguous outgoing
+HEADERS/CONTINUATION sequences complete before queued GOAWAY. A prior graceful
+NO_ERROR GOAWAY can be followed by the connection-error frame.
+
+Wire errors are PROTOCOL_ERROR (1), FLOW_CONTROL_ERROR (3), FRAME_SIZE_ERROR (6),
+COMPRESSION_ERROR (9), and ENHANCE_YOUR_CALM (11) for local decoding/storage
+limits. Last processed peer stream ID remains zero because server push is
+unsupported. Transport/caller failures and pre-negotiation errors close directly;
+they are not all classified as peer protocol errors. Explicit cancellation and
+Close remain immediate. Error output is best effort, bounded by the original
+connection deadline, any active shutdown deadline, and a 65536-work-step budget.
+Transport failure, unavailable drain support or budget expiry retains the
+original connection error; explicit Cancel reports H2_CANCELLED.
+
+TLS Send accepts copied plaintext into a queue; it does not prove that records
+have reached TCP. Shared TlsClientDrain and ABI 1.14 slot 92 now return 1 only
+when accepted plaintext and protected records have passed to TCP, 0 while pending,
+or a negative error. This is not a peer acknowledgement. The 200-entry table and
+all previous signatures are unchanged. WebTransportDrain binds the optional slot
+only for minor >=14 and count >=93, returns ENOSYS without it, and treats plaintext
+TCP send acceptance as already handed to TCP. Cooperative TLS advances one bounded
+slice per drain call; synchronous fallback targets retain their existing behavior.
+
+Both graceful and connection-error shutdown now pump transport drain after their
+HTTP/2 buffers empty. Graceful shutdown cannot report H2_DRAINED on an older monitor
+without the service. WebClient's H2 adapter waits through error draining instead
+of trying to submit another upload or prematurely reporting response completion.
+This corrects forum finding 1543: the previous graceful path could close TLS while
+accepted GOAWAY bytes were still queued.
+
+Physical Pi 4 qualifications under installed 483 exercised the new shared code:
+
+- Capture 211: eight production TLS queue cases with controlled crypto/TCP seams,
+  including copied input, delayed progress, partial records, a blocked transport,
+  transport failure, closed/pending states and invalidated handles.
+- Capture 212: 19 error-GOAWAY cases covering exact wire codes, queue pressure,
+  write and drain failures, deadlines, cancellation, unsupported drain and no
+  further receives. Repeated pending drain results must precede close.
+- Capture 213: three failures during real request output, preserving a partial
+  DATA frame, a 31-field HEADERS/CONTINUATION block, and queued control frames.
+- Captures 214-216: all 46 engine, 12 graceful-shutdown and 26 WebClient cases.
+  Graceful tests include pending/failing/unsupported drain; WebClient tests include
+  GET and a flow-blocked POST receiving connection errors.
+
+These deterministic transport/crypto seams are not malformed external-server
+traffic or independent cryptographic validation. Initial capture 206 had an oracle
+that wrongly rejected a deadline-truncated GOAWAY header; its corrected check
+validates the exact prefix. Capture 210 exposed an outdated expectation for the
+previously implemented stream-local truncated-body error. The expected WebClient
+stream reset is now checked. Original failed host checks remain in the evidence;
+the final suites passed without weakening successful-output framing requirements.
+
+Full Pi 4 build 485 and Pi 3 build 99 compiled. Build 485 was installed with a
+verified 483 rollback, candidate and boot-file readback, one restart, a 90-second
+quiet boot interval and full running-image SHA verification. The initial separate
+candidate write failed before the boot file was touched. Only two old candidate
+images were removed, each after hash matching its retained backup; the update then
+completed. No unique rollback was removed. The guide PDF was rebuilt and its
+changed section and adjacent pages visually checked.
+
+Live capture 217 on build 485 completed certificate-verified HTTP/2 HTTPS
+requests to httpbin.org /uuid and /bytes/70000: 70053 bytes, two completed
+streams, successful resident TLS drain and graceful transport closure. It took
+1244348 us; observed maxima were Step 2513 us, network service 2949 us
+and drain 33 us. This run found the queue already drained on its first
+check; pending progress is covered by the controlled physical fixtures above.
+These observations are not worst-case timing guarantees. Cores, fonts and Vulkan
+remained healthy, watchdog off. Pi 3 has compile evidence only.
+
+Evidence: `docs/evidence/anvil-ipv6-20261030/http2-error-drain485`.
+Broader TLS compatibility/blocking, public off-link IPv6 and automatically learned
+RDNSS web qualification, and HTTP/3 remain open. This is not a complete networking
+or HTTP/2 conformance claim.

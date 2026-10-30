@@ -22,7 +22,7 @@ Global *webpDns,*webpOpen,*webpState,*webpSend,*webpRecv,*webpClose
 Global *webpTlsOpen,*webpTlsState,*webpTlsSend,*webpTlsRecv,*webpTlsClose
 Global *webpService
 Global *webpOpen6,*webpDns6,*webpTime
-Global *webpTlsOpenAlpn,*webpTlsAlpn
+Global *webpTlsOpenAlpn,*webpTlsAlpn,*webpTlsDrain
 Global webpBound.i
 
 Procedure.i webpWord(table.i,offset.i)
@@ -32,7 +32,7 @@ EndProcedure
 Procedure.i WebPayloadBind(table.i)
   webpBound=0
   *webpOpen6=0 : *webpDns6=0 : *webpTime=0
-  *webpTlsOpenAlpn=0 : *webpTlsAlpn=0
+  *webpTlsOpenAlpn=0 : *webpTlsAlpn=0 : *webpTlsDrain=0
   If table=0 : ProcedureReturn -109 : EndIf
   If webpWord(table,0)<>$53564E41 Or webpWord(table,4)<>1 Or webpWord(table,8)<6 Or webpWord(table,12)<88 : ProcedureReturn -109 : EndIf
   *webpDns=PeekI(table+16+75*8)
@@ -48,6 +48,7 @@ Procedure.i WebPayloadBind(table.i)
   If webpWord(table,8)>=13 And webpWord(table,12)>=92
     *webpTlsOpenAlpn=PeekI(table+16+90*8) : *webpTlsAlpn=PeekI(table+16+91*8)
   EndIf
+  If webpWord(table,8)>=14 And webpWord(table,12)>=93 : *webpTlsDrain=PeekI(table+16+92*8) : EndIf
   If *webpTime=0 Or *webpDns=0 Or *webpOpen=0 Or *webpSend=0 Or *webpRecv=0 Or *webpClose=0 Or *webpTlsOpen=0 Or *webpTlsSend=0 Or *webpTlsRecv=0 Or *webpTlsClose=0 Or *webpState=0 Or *webpService=0 Or *webpTlsState=0 : ProcedureReturn -109 : EndIf
   webpBound=1 : ProcedureReturn 0
 EndProcedure
@@ -195,6 +196,17 @@ Procedure.i WebTransportRecv(*c.WebConnection,destination.i,capacity.i)
   ProcedureReturn PayNetTcpRecv(*c\handle,destination,capacity)
   CompilerElse
   ProcedureReturn webpRecv(*c\handle,destination,capacity)
+  CompilerEndIf
+EndProcedure
+
+ ; Accepted plaintext is not necessarily protected or handed to TCP yet.
+Procedure.i WebTransportDrain(*c.WebConnection)
+  If *c\secure=0 : ProcedureReturn 1 : EndIf
+  CompilerIf #WEB_KERNEL_BINDING=1
+    ProcedureReturn TlsClientDrain(*c\handle)
+  CompilerElse
+    If *webpTlsDrain=0 : ProcedureReturn -109 : EndIf
+    ProcedureReturn webpTlsDrain(*c\handle)
   CompilerEndIf
 EndProcedure
 
