@@ -1,0 +1,256 @@
+XIncludeFile "RaspberryPi4/Lib/mmu.pi4"
+XIncludeFile "Anvil/Network/ipv6_neighbor.pbi"
+XIncludeFile "Anvil/Network/ipv6_reachability.pbi"
+XIncludeFile "Anvil/Network/ipv6_neighbor_owner.pbi"
+
+Global owner.IPv6NeighborOwner
+Global Dim output.a[1514]
+Procedure Save(index.i,rc.i)
+ Define p.i,i.i
+ p=$E1C00100+index*2048
+ PokeI(p,rc) : PokeI(p+8,owner\generation) : PokeI(p+16,owner\serial) : PokeI(p+24,owner\awaiting)
+ PokeI(p+32,owner\policy\state) : PokeI(p+40,owner\policy\router) : PokeI(p+48,owner\policy\deadline)
+ PokeI(p+56,owner\policy\probes) : PokeI(p+64,owner\policy\mac) : PokeI(p+72,owner\lastNow)
+ For i=0 To 1513 : PokeA(p+80+i,output[i]) : Next
+EndProcedure
+Procedure.i Main()
+ Define rc.i,i.i
+ For i=0 To 131071 : PokeA($E1C00000+i,$A5) : Next
+ PokeI($E1C00000,$4E4F574E)
+ MmuClearNc() : rc=MmuBuildTables($4F80000) : If rc<>0 : ProcedureReturn 2 : EndIf
+ MmuEnableCached()
+ For i=0 To 1513 : output[i]=$A5 : Next
+rc=IPv6NeighborOwnerInit(@owner,1,?Target,?Mac,0,1000)
+ Save(0,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+rc=IPv6NeighborOwnerUse(@owner,1,1)
+ Save(1,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+rc=IPv6NeighborOwnerStep(@owner,1,1,?Local,@output[0],1514)
+ Save(2,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+rc=IPv6NeighborOwnerStep(@owner,1,5000,?Local,@output[0],1514)
+ Save(3,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+rc=IPv6NeighborOwnerSent(@owner,1,5001,1,1)
+ Save(4,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+rc=IPv6NeighborOwnerStep(@owner,1,6000,?Local,@output[0],1514)
+ Save(5,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+rc=IPv6NeighborOwnerStep(@owner,1,6001,?Local,@output[0],1514)
+ Save(6,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+rc=IPv6NeighborOwnerSent(@owner,1,6002,2,0)
+ Save(7,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+rc=IPv6NeighborOwnerStep(@owner,1,7002,?Local,@output[0],1514)
+ Save(8,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+rc=IPv6NeighborOwnerSent(@owner,1,7003,3,-1)
+ Save(9,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+rc=IPv6NeighborOwnerStep(@owner,1,8002,?Local,@output[0],1514)
+ Save(10,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+rc=IPv6NeighborOwnerStep(@owner,1,8003,?Local,@output[0],1514)
+ Save(11,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+rc=IPv6NeighborOwnerSent(@owner,1,8004,4,2)
+ Save(12,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+rc=IPv6NeighborOwnerSent(@owner,1,8004,4,1)
+ Save(13,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+rc=IPv6NeighborOwnerStep(@owner,1,9004,?Local,@output[0],1514)
+ Save(14,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+rc=IPv6NeighborOwnerUse(@owner,1,9005)
+ Save(15,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+rc=IPv6NeighborOwnerInit(@owner,2,?Target,?Mac,0,1000)
+ Save(16,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+rc=IPv6NeighborOwnerLearn(@owner,2,100,?PeerMac,1)
+ Save(17,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+rc=IPv6NeighborOwnerUse(@owner,2,100)
+ Save(18,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+rc=IPv6NeighborOwnerStep(@owner,2,5099,?Local,@output[0],1514)
+ Save(19,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+rc=IPv6NeighborOwnerStep(@owner,2,5100,?Local,@output[0],1514)
+ Save(20,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+rc=IPv6NeighborOwnerStep(@owner,2,9000,?Local,@output[0],1514)
+ Save(21,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+rc=IPv6NeighborOwnerInput(@owner,2,9001,?Local,?V0,86,30000)
+ Save(22,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+rc=IPv6NeighborOwnerSent(@owner,2,9002,1,1)
+ Save(23,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+rc=IPv6NeighborOwnerUse(@owner,2,39001)
+ Save(24,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+rc=IPv6NeighborOwnerStep(@owner,2,44001,?Local,@output[0],1514)
+ Save(25,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+rc=IPv6NeighborOwnerConfirm(@owner,2,44002,30000)
+ Save(26,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+rc=IPv6NeighborOwnerSent(@owner,2,44003,2,1)
+ Save(27,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+rc=IPv6NeighborOwnerInput(@owner,2,44004,?Local,?V1,86,30000)
+ Save(28,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+rc=IPv6NeighborOwnerUse(@owner,2,44005)
+ Save(29,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+rc=IPv6NeighborOwnerStep(@owner,2,49005,?Local,@output[0],1514)
+ Save(30,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+rc=IPv6NeighborOwnerInput(@owner,2,49006,?Local,?V2,86,30000)
+ Save(31,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+rc=IPv6NeighborOwnerSent(@owner,2,49007,3,1)
+ Save(32,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+rc=IPv6NeighborOwnerInput(@owner,2,49008,?Local,?V3,86,30000)
+ Save(33,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+rc=IPv6NeighborOwnerInput(@owner,2,49009,?Local,?V4,86,30000)
+ Save(34,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+rc=IPv6NeighborOwnerInput(@owner,2,49010,?Local,?V5,86,30000)
+ Save(35,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+rc=IPv6NeighborOwnerInput(@owner,2,49011,?Local,?V6,86,30000)
+ Save(36,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+rc=IPv6NeighborOwnerInput(@owner,2,49012,?Local,?V7,86,30000)
+ Save(37,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+rc=IPv6NeighborOwnerLearn(@owner,2,49013,?ZeroMac,1)
+ Save(38,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+rc=IPv6NeighborOwnerInit(@owner,3,?Group,?Mac,0,1000)
+ Save(39,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+rc=IPv6NeighborOwnerUse(@owner,1,49013)
+ Save(40,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+rc=IPv6NeighborOwnerUse(@owner,2,49007)
+ Save(41,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+rc=IPv6NeighborOwnerStep(@owner,2,49013,?Local,@owner,1514)
+ Save(42,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+rc=IPv6NeighborOwnerStep(@owner,2,49013,?ZeroAddress,@output[0],1514)
+ Save(43,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+rc=IPv6NeighborOwnerUse(@owner,2,9223372032559808512)
+ Save(44,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+rc=IPv6NeighborOwnerInit(@owner,3,?Target,?Mac,0,1000)
+ Save(45,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+rc=IPv6NeighborOwnerInput(@owner,3,1,?Local,?V8,78,30000)
+ Save(46,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+rc=IPv6NeighborOwnerInput(@owner,3,2,?Local,?V9,86,30000)
+ Save(47,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+rc=IPv6NeighborOwnerInit(@owner,4,?Target,?Mac,0,1000)
+ Save(48,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+rc=IPv6NeighborOwnerStep(@owner,4,0,?Local,@output[0],1514)
+ Save(49,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+rc=IPv6NeighborOwnerInit(@owner,5,?Target,?Mac,0,1000)
+ Save(50,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+rc=IPv6NeighborOwnerSent(@owner,4,1,1,1)
+ Save(51,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+rc=IPv6NeighborSolicit(@output[0],1514,?ZeroAddress,?Target,?Mac)
+ Save(52,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+rc=IPv6NeighborProbe(@output[0],1514,?ZeroAddress,?Target,?Mac)
+ Save(53,rc)
+ For i=0 To 1513 : output[i]=$A5 : Next
+rc=IPv6NeighborProbe(@output[0],64,?Local,?Target,?Mac)
+ Save(54,rc)
+ PokeI($E1C00008,55)
+ MmuDisableCachedFlushed()
+ ProcedureReturn 0
+EndProcedure
+DataSection
+Target:
+ Data.a 254,128,0,0,0,0,0,0,0,0,0,0,0,0,86,120
+Local:
+ Data.a 254,128,0,0,0,0,0,0,0,0,0,0,0,0,18,52
+Group:
+ Data.a 255,2,0,0,0,0,0,0,0,0,0,1,255,0,86,120
+Mac:
+ Data.a 2,1,2,3,4,5
+PeerMac:
+ Data.a 2,9,8,7,6,5
+ZeroMac:
+ Data.a 0,0,0,0,0,0
+ZeroAddress:
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+V0:
+ Data.a 2,1,2,3,4,5,2,9,8,7,6,5,134,221,96,0,0,0,0,32,58,255,254,128
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,86,120,254,128,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,18,52,136,0,202,230,224,0,0,0,254,128,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,86,120,2,1,2,9,8,7,6,5
+V1:
+ Data.a 51,51,0,0,0,1,2,9,8,7,6,5,134,221,96,0,0,0,0,32,58,255,254,128
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,86,120,255,2,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,0,1,136,0,146,137,32,0,0,0,254,128,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,86,120,2,1,2,10,11,12,13,14
+V2:
+ Data.a 2,1,2,3,4,5,2,9,8,7,6,5,134,221,96,0,0,0,0,32,58,255,254,128
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,86,120,254,128,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,18,52,136,0,106,231,64,0,0,0,254,128,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,86,120,2,1,2,9,8,7,6,5
+V3:
+ Data.a 2,1,2,3,4,5,2,9,8,7,6,5,134,221,96,0,0,0,0,32,58,255,254,128
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,86,120,254,128,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,18,52,136,0,64,216,96,0,0,0,254,128,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,86,120,2,1,2,10,11,12,13,14
+V4:
+ Data.a 2,1,2,3,4,5,2,9,8,7,6,5,134,221,96,0,0,0,0,32,58,255,254,128
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,86,120,254,128,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,18,52,136,0,64,216,96,0,0,0,254,128,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,86,120,2,1,2,10,11,12,13,15
+V5:
+ Data.a 2,1,2,3,4,5,2,9,8,7,6,5,134,221,96,0,0,0,0,32,58,255,254,128
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,86,120,254,128,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,18,52,136,0,253,182,96,0,0,0,254,128,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,153,153,2,1,2,10,11,12,13,14
+V6:
+ Data.a 2,9,8,7,6,5,2,9,8,7,6,5,134,221,96,0,0,0,0,32,58,255,254,128
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,86,120,254,128,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,18,52,136,0,64,216,96,0,0,0,254,128,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,86,120,2,1,2,10,11,12,13,14
+V7:
+ Data.a 2,1,2,3,4,5,2,9,8,7,6,5,134,221,96,0,0,0,0,32,58,255,254,128
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,86,120,254,128,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,153,153,136,0,185,114,96,0,0,0,254,128,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,86,120,2,1,2,10,11,12,13,14
+V8:
+ Data.a 2,1,2,3,4,5,2,9,8,7,6,5,134,221,96,0,0,0,0,24,58,255,254,128
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,86,120,254,128,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,18,52,136,0,93,5,96,0,0,0,254,128,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,86,120
+V9:
+ Data.a 51,51,0,0,0,1,2,9,8,7,6,5,134,221,96,0,0,0,0,32,58,255,254,128
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,86,120,255,2,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,0,1,136,0,146,137,32,0,0,0,254,128,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,86,120,2,1,2,10,11,12,13,14
+EndDataSection

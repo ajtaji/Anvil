@@ -1487,3 +1487,34 @@ requires a board entropy provider.
 This proves live address assignment and inbound neighbor/echo traffic. Outbound
 neighbor-cache ownership, IPv6 TCP/DNS and web requests remain unfinished, as do
 remaining TLS blocking work and HTTP/2-3. No IPv6 web result is claimed here.
+
+
+## Queued neighbor resolution and reachability probes
+
+`Anvil/Network/ipv6_neighbor_owner.pbi` composes neighbor discovery packets
+with the shared reachability policy and explicit link-completion receipts.
+Resolution emits a multicast Neighbor Solicitation; later reachability probes
+use unicast IPv6 and Ethernet destinations. Both use the same packet encoder,
+including checksum construction. The original DAD solicitation remains unchanged.
+
+A pending send suppresses additional probes. The retry interval starts when
+completion is reported. Definite queue refusal restores the wire-attempt budget
+and backs off without spinning; ambiguous failure consumes an attempt. Three
+wire attempts without resolution report failure so the caller can fail queued
+data and invalidate dependent routes. The caller owns overall operation deadlines.
+Generation and token checks reject old completions, including after a valid
+advertisement or upper-layer confirmation has already established reachability.
+
+Learned router hardware addresses start stale. Valid advertisements retain the
+solicited/override/router rules, including reporting a router-to-host transition.
+Input validation covers checksums, target identity, assigned IPv6 destination,
+Ethernet destination, and nonzero unicast hardware addresses. The caller still
+owns the bounded cache table, source assignment, data queue and route selection.
+
+All 55 final physical Pi CPU cases passed on installed Anvil 449: exact multicast
+and unicast solicitation bytes, DAD compatibility, queued/failed/refused sends,
+retry exhaustion, advertisements racing completions, hardware-address changes,
+router demotion, and invalid argument/generation/clock/buffer cases. The payload
+returned normally; cores, fonts and Vulkan remained healthy. This shared owner
+is ready for resident cache integration. Outbound IPv6 TCP/DNS and web requests
+remain unfinished; this qualification does not claim live outbound web traffic.

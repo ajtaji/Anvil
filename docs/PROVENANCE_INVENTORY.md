@@ -1571,3 +1571,5 @@ text is unchanged; no new board execution or boot claim follows.
 | `Anvil/Network/ipv6_prefix_list.pbi` | protocol-facts | ietf-rfc | IETF specification | independent on-link prefix list; cite RFC 4861 |
 
 | `Anvil/Network/ipv6_address_owner.pbi` | protocol-facts | ietf-rfc | IETF specification | SLAAC lifetime and DAD owner; cite RFC 4862 |
+
+| `Anvil/Network/ipv6_neighbor_owner.pbi` | protocol-facts | ietf-rfc | IETF specification | neighbor resolution and queued NUD owner; cite RFC 4861 |

@@ -62,9 +62,10 @@ EndProcedure
 ; Build a complete IPv6 Neighbor Solicitation. An unspecified source emits
 ; the DAD form without a link-layer option. Other sources require a six-byte
 ; Ethernet MAC. Input spans must be separate from the output capacity.
-Procedure.i IPv6NeighborSolicit(out.i,capacity.i,source.i,target.i,mac.i)
+Procedure.i ipv6nd_Solicit(out.i,capacity.i,source.i,target.i,mac.i,probe.i)
  Define dst.IPv6AddressStorage
  Define i.i,n.i,rc.i,unspecified.i
+ If probe<0 Or probe>1 : ProcedureReturn #IPV6_ND_INVALID : EndIf
  If out=0 Or source=0 Or target=0 : ProcedureReturn #IPV6_ND_INVALID : EndIf
  If capacity<64 : ProcedureReturn #IPV6_ND_INVALID : EndIf
  If out<source+16 And source<out+capacity : ProcedureReturn #IPV6_ND_INVALID : EndIf
@@ -73,13 +74,18 @@ Procedure.i IPv6NeighborSolicit(out.i,capacity.i,source.i,target.i,mac.i)
  rc=IPv6AddressUnspecified(target)
  If rc<>0 : ProcedureReturn #IPV6_ND_INVALID : EndIf
  unspecified=IPv6AddressUnspecified(source) : n=24
+ If probe=1 And unspecified<>0 : ProcedureReturn #IPV6_ND_INVALID : EndIf
  If unspecified=0
   If mac=0 Or capacity<72 : ProcedureReturn #IPV6_ND_INVALID : EndIf
   If out<mac+6 And mac<out+capacity : ProcedureReturn #IPV6_ND_INVALID : EndIf
   If (PeekA(mac)&1)<>0 : ProcedureReturn #IPV6_ND_INVALID : EndIf
   n=32
  EndIf
- rc=IPv6SolicitedNode(target,@dst)
+ If probe=1
+  For i=0 To 15 : PokeA(@dst+i,PeekA(target+i)) : Next
+ Else
+  rc=IPv6SolicitedNode(target,@dst)
+ EndIf
  rc=IPv6PacketHeader(out,capacity,source,@dst,n,58,255,0,0)
  If rc<>40 : ProcedureReturn rc : EndIf
  For i=0 To n-1 : PokeA(out+40+i,0) : Next
@@ -92,6 +98,14 @@ Procedure.i IPv6NeighborSolicit(out.i,capacity.i,source.i,target.i,mac.i)
  rc=IPv6TransportChecksum(source,@dst,58,out+40,n)
  NetWriteBE16(out+42,rc)
  ProcedureReturn n+40
+EndProcedure
+
+Procedure.i IPv6NeighborSolicit(out.i,capacity.i,source.i,target.i,mac.i)
+ ProcedureReturn ipv6nd_Solicit(out,capacity,source,target,mac,0)
+EndProcedure
+; RFC4861 7.3: unicast NUD probe, with an assigned source and SLLA option.
+Procedure.i IPv6NeighborProbe(out.i,capacity.i,source.i,target.i,mac.i)
+ ProcedureReturn ipv6nd_Solicit(out,capacity,source,target,mac,1)
 EndProcedure
 
 ; Build an Ethernet Neighbor Advertisement for an address owned by this
