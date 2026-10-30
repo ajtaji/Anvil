@@ -55,6 +55,7 @@
 #FS_E_BUSY = 5                  ; a file is open on the mounted volume
 #FS_E_NO_READER = 6             ; no block reader installed
 #FS_E_ALLOCATION_UNSUPPORTED = 8 ; allocation ownership walk requires FAT32
+#FS_E_MOUNT_HANDLE = 9          ; stale or foreign staged mount handle
 #FS_E_TABLE_READ = 7            ; sector 0 would not read
 
 Global fs_kind.i
@@ -66,6 +67,16 @@ Global fs_rest.i                ; the path after its prefix and separators
 Global *fs_reader
 Global *fs_writer
 Global *fs_flusher
+Global fs_mountHandle.i
+Global fs_mountNext.i
+Global fs_mountDriver.i
+Global fs_mountTarget.i
+Global fs_mountPhase.i
+Global fs_mountRunning.i
+
+Procedure.i FsMountPending()
+  ProcedureReturn Bool(fs_mountHandle<>0 Or fs_mountRunning<>0 Or ExFatMountPending()<>0)
+EndProcedure
 
 ; THE BLOCK-RANGE SEAM. Reader(lba, count, *buf) and Writer(lba, count,
 ; *buf) move count 512-byte blocks per call, at any buffer address, and
@@ -75,6 +86,9 @@ Global *fs_flusher
 ; one-block procedure left installed under the old name would have been
 ; called with its buffer where its count belongs.
 Procedure FsSetRangeReader(address.i)
+  ; Rebinding cancels a driver's unpublished mount. Do not leave the facade
+  ; claiming that its previous partition is still mounted afterward.
+  If FsMountPending()<>0 : fs_mountHandle=0 : fs_mountDriver=0 : fs_kind=#FS_NONE : fs_partition=0 : EndIf
   *fs_reader = address
   FatSetRangeReader(address)
   ExFatSetRangeReader(address)
@@ -146,7 +160,7 @@ Procedure fs_Begin()
   fs_errorKind = #FS_NONE
 EndProcedure
 
-Procedure.i FsMount(partition.i)
+Procedure.i fs_Mount(partition.i)
   fs_Begin()
   fs_kind = #FS_NONE
   fs_partition = 0
@@ -170,6 +184,11 @@ Procedure.i FsMount(partition.i)
   ProcedureReturn 0
 EndProcedure
 
+Procedure.i FsMount(partition.i)
+  If FsMountPending()<>0 : ProcedureReturn fs_Fail(#FS_E_BUSY) : EndIf
+  ProcedureReturn fs_Mount(partition)
+EndProcedure
+
 Procedure.i FsIsOpen()
   If fs_kind = #FS_EXFAT
     ProcedureReturn exfat_open
@@ -180,7 +199,7 @@ Procedure.i FsIsOpen()
   ProcedureReturn 0
 EndProcedure
 
-Procedure.i FsUnmount()
+Procedure.i fs_Unmount()
   fs_Begin()
   If fs_kind = #FS_EXFAT
     If ExFatUnmount() = 0
@@ -198,6 +217,11 @@ Procedure.i FsUnmount()
   ProcedureReturn 1
 EndProcedure
 
+Procedure.i FsUnmount()
+  If FsMountPending()<>0 : ProcedureReturn fs_Fail(#FS_E_BUSY) : EndIf
+  ProcedureReturn fs_Unmount()
+EndProcedure
+
 ; Make `partition` the mounted volume. 1, or 0 with the reason recorded.
 ;
 ; A VOLUME THAT WILL NOT UNMOUNT CLEANLY IS STILL LEFT. ExFatUnmount fails
@@ -207,6 +231,7 @@ EndProcedure
 ; sees it and refuses to change anything. Refusing the switch instead
 ; would strand every other partition behind one failed write.
 Procedure.i FsSelectPartition(partition.i)
+  If FsMountPending()<>0 : fs_Fail(#FS_E_BUSY) : ProcedureReturn 0 : EndIf
   If partition < 1 Or partition > #FS_MAX_PARTITION
     ProcedureReturn fs_Fail(#FS_E_PARTITION)
   EndIf
@@ -226,6 +251,92 @@ Procedure.i FsSelectPartition(partition.i)
     fs_partition = 0
   EndIf
   ProcedureReturn FsMount(partition)
+EndProcedure
+
+; Staged facade mount. Begin has no I/O; each Step owns one preparation,
+; exFAT validation, or FAT fallback stage. A device callback is synchronous.
+; The original synchronous entry points remain available when no job owns it.
+Procedure.i FsMountBegin(partition.i)
+  If FsMountPending()<>0 Or FsIsOpen()<>0 Or fs_mountNext=$7FFFFFFF : ProcedureReturn fs_Fail(#FS_E_BUSY) : EndIf
+  If partition<1 Or partition>#FS_MAX_PARTITION : ProcedureReturn fs_Fail(#FS_E_PARTITION) : EndIf
+  If *fs_reader=0 : ProcedureReturn fs_Fail(#FS_E_NO_READER) : EndIf
+  fs_Begin()
+  fs_mountNext=fs_mountNext+1 : fs_mountHandle=fs_mountNext
+  fs_mountTarget=partition : fs_mountDriver=0 : fs_mountPhase=0
+  If fs_kind<>#FS_NONE And fs_partition=partition : fs_mountPhase=3 : EndIf
+  ProcedureReturn fs_mountHandle
+EndProcedure
+
+Procedure.i FsMountCancel(handle.i)
+  If handle<=0 Or handle<>fs_mountHandle : ProcedureReturn fs_Fail(#FS_E_MOUNT_HANDLE) : EndIf
+  If fs_mountDriver<>0 : ExFatMountCancel(fs_mountDriver) : EndIf
+  If fs_mountPhase=1 Or fs_mountPhase=2 Or fs_mountRunning<>0
+    fs_kind=#FS_NONE : fs_partition=0
+  EndIf
+  fs_mountDriver=0 : fs_mountHandle=0 : fs_Begin()
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i FsMountStep(handle.i)
+  Define rc.i,kind.i
+  If fs_mountRunning<>0 : fs_Fail(#FS_E_BUSY) : ProcedureReturn -1 : EndIf
+  If handle<=0 Or handle<>fs_mountHandle : fs_Fail(#FS_E_MOUNT_HANDLE) : ProcedureReturn -1 : EndIf
+  fs_Begin() : fs_mountRunning=1 : rc=0 : kind=#FS_NONE
+  Select fs_mountPhase
+    Case 0
+      If fs_kind<>#FS_NONE
+        If fs_Unmount()=0 : rc=-1 : EndIf
+      EndIf
+      ; Cancellation from a provider callback must stop before starting a
+      ; replacement driver job or the synchronous recovery fallback.
+      If handle=fs_mountHandle
+        If rc<0
+          rc=fs_Mount(fs_mountTarget)
+          If rc<>0 : kind=fs_kind : Else : rc=-1 : EndIf
+        Else
+          fs_kind=#FS_NONE : fs_partition=0
+          fs_mountDriver=ExFatMountBegin(fs_mountTarget)
+          If fs_mountDriver=0
+            fs_errorKind=#FS_EXFAT : rc=-1
+          Else
+            fs_mountPhase=1
+          EndIf
+        EndIf
+      EndIf
+    Case 1
+      rc=ExFatMountStep(fs_mountDriver)
+      If rc=1
+        kind=#FS_EXFAT
+      ElseIf rc<0
+        If ExFatLastError()=#EXFAT_E_NOT_EXFAT Or ExFatLastError()=#EXFAT_E_NO_MBR
+          fs_mountDriver=0 : fs_mountPhase=2 : rc=0
+        Else
+          fs_errorKind=#FS_EXFAT
+        EndIf
+      EndIf
+    Case 2
+      If FatMount(fs_mountTarget)<>0
+        rc=1 : kind=#FS_FAT
+      Else
+        rc=-1 : fs_errorKind=#FS_FAT
+      EndIf
+    Case 3
+      rc=1 : kind=fs_kind
+  EndSelect
+  fs_mountRunning=0
+  If handle<>fs_mountHandle
+    fs_kind=#FS_NONE : fs_partition=0
+    fs_Fail(#FS_E_MOUNT_HANDLE) : ProcedureReturn -1
+  EndIf
+  If rc<>0
+    fs_mountHandle=0 : fs_mountDriver=0
+    If rc>0
+      fs_kind=kind : fs_partition=fs_mountTarget : fs_Begin()
+    Else
+      fs_kind=#FS_NONE : fs_partition=0
+    EndIf
+  EndIf
+  ProcedureReturn rc
 EndProcedure
 
 ; Split a path into its partition and the rest. Sets fs_pathPartition and
@@ -254,6 +365,7 @@ EndProcedure
 
 ; Split and mount. On success fs_rest is the in-volume path.
 Procedure.i fs_Volume(*path)
+  If FsMountPending()<>0 : fs_Fail(#FS_E_BUSY) : ProcedureReturn 0 : EndIf
   fs_Begin()
   If fs_SplitPath(*path) = 0
     ProcedureReturn 0
@@ -261,6 +373,13 @@ Procedure.i fs_Volume(*path)
   ProcedureReturn FsSelectPartition(fs_pathPartition)
 EndProcedure
 
+
+Procedure.i FsMountPathBegin(*path)
+  If FsMountPending()<>0 : ProcedureReturn fs_Fail(#FS_E_BUSY) : EndIf
+  fs_Begin()
+  If fs_SplitPath(*path)=0 : ProcedureReturn 0 : EndIf
+  ProcedureReturn FsMountBegin(fs_pathPartition)
+EndProcedure
 
 Procedure.i FsOpen(*path)
   If fs_Volume(*path) = 0
@@ -283,6 +402,7 @@ Procedure.i FsCreate(*path)
 EndProcedure
 
 Procedure.i FsRead(*dst, count.i)
+  If FsMountPending()<>0 : fs_Fail(#FS_E_BUSY) : ProcedureReturn -1 : EndIf
   fs_Begin()
   If fs_kind = #FS_EXFAT
     ProcedureReturn ExFatRead(*dst, count)
@@ -294,6 +414,7 @@ Procedure.i FsRead(*dst, count.i)
 EndProcedure
 
 Procedure.i FsWrite(*src, count.i)
+  If FsMountPending()<>0 : fs_Fail(#FS_E_BUSY) : ProcedureReturn -1 : EndIf
   fs_Begin()
   If fs_kind = #FS_EXFAT
     ProcedureReturn ExFatWrite(*src, count)
@@ -305,6 +426,7 @@ Procedure.i FsWrite(*src, count.i)
 EndProcedure
 
 Procedure.i FsSeek(position.i)
+  If FsMountPending()<>0 : fs_Fail(#FS_E_BUSY) : ProcedureReturn 0 : EndIf
   fs_Begin()
   If fs_kind = #FS_EXFAT
     ProcedureReturn ExFatSeek(position)
@@ -316,6 +438,7 @@ Procedure.i FsSeek(position.i)
 EndProcedure
 
 Procedure.i FsTruncate(length.i)
+  If FsMountPending()<>0 : fs_Fail(#FS_E_BUSY) : ProcedureReturn 0 : EndIf
   fs_Begin()
   If fs_kind = #FS_EXFAT
     ProcedureReturn ExFatTruncate(length)
@@ -327,6 +450,7 @@ Procedure.i FsTruncate(length.i)
 EndProcedure
 
 Procedure.i FsOverwrite(*src, length.i)
+  If FsMountPending()<>0 : fs_Fail(#FS_E_BUSY) : ProcedureReturn 0 : EndIf
   If FsTruncate(0) = 0
     ProcedureReturn 0
   EndIf
@@ -346,6 +470,7 @@ EndProcedure
 ; installed range writer receives precisely the file's extent. exFAT remains
 ; refused until it has the same fixed extent proof.
 Procedure.i FsOverwriteFixed(*path, *src, length.i)
+  If FsMountPending()<>0 : fs_Fail(#FS_E_BUSY) : ProcedureReturn 0 : EndIf
   Protected first.i
   Protected blocks.i
   Protected bytes.i
@@ -372,6 +497,7 @@ Procedure.i FsOverwriteFixed(*path, *src, length.i)
 EndProcedure
 
 Procedure FsClose()
+  If FsMountPending()<>0 : fs_Fail(#FS_E_BUSY) : ProcedureReturn : EndIf
   If fs_kind = #FS_EXFAT
     ExFatClose()
   ElseIf fs_kind = #FS_FAT
@@ -380,6 +506,7 @@ Procedure FsClose()
 EndProcedure
 
 Procedure.i FsSize()
+  If FsMountPending()<>0 : fs_Fail(#FS_E_BUSY) : ProcedureReturn 0 : EndIf
   If fs_kind = #FS_EXFAT
     ProcedureReturn ExFatSize()
   EndIf
@@ -390,6 +517,7 @@ Procedure.i FsSize()
 EndProcedure
 
 Procedure.i FsTell()
+  If FsMountPending()<>0 : fs_Fail(#FS_E_BUSY) : ProcedureReturn 0 : EndIf
   If fs_kind = #FS_EXFAT
     ProcedureReturn ExFatTell()
   EndIf
@@ -454,11 +582,12 @@ Procedure.i FsErrorText()
   k = FsErrorKind()
   If k = #FS_FACADE
     Select fs_error
+      Case #FS_E_MOUNT_HANDLE : ProcedureReturn "volume error 9: the staged mount handle is stale or belongs to another operation"
       Case #FS_E_PARTITION : ProcedureReturn "volume error 1: a path may name partition 1, 2, 3 or 4 only, as 2:/name; check the digit before the colon"
       Case #FS_E_CROSS_VOLUME : ProcedureReturn "volume error 2: a rename cannot move an entry to another partition; give both paths the same N: prefix, and remember a path with no prefix means partition 1"
       Case #FS_E_FAT_SUBDIR : ProcedureReturn "volume error 3: retired - FAT partitions have folders since 2026-09-17; if this appears, the monitor is older than its documentation"
       Case #FS_E_FAT_UNSUPPORTED : ProcedureReturn "volume error 4: retired - FAT partitions have mkdir and rename since 2026-09-17; if this appears, the monitor is older than its documentation"
-      Case #FS_E_BUSY : ProcedureReturn "volume error 5: a file is still open on the mounted partition, so another partition was not mounted; close it first"
+      Case #FS_E_BUSY : ProcedureReturn "volume error 5: an open file, pending mount or exhausted mount handles prevents this filesystem operation"
       Case #FS_E_NO_READER : ProcedureReturn "volume error 6: no block reader is installed, so no partition can be mounted; bring the storage medium up first"
       Case #FS_E_ALLOCATION_UNSUPPORTED : ProcedureReturn "volume error 8: bounded allocation ownership checks require a FAT32 volume; this format has no verified allocation walker"
       Case #FS_E_TABLE_READ : ProcedureReturn "volume error 7: sector 0, which holds the partition table, would not read; check that the medium is still connected"
@@ -482,6 +611,7 @@ Procedure.i FsDirOpen(*path)
 EndProcedure
 
 Procedure.i FsDirRewind()
+  If FsMountPending()<>0 : fs_Fail(#FS_E_BUSY) : ProcedureReturn 0 : EndIf
   fs_Begin()
   If fs_kind = #FS_EXFAT
     ProcedureReturn ExFatDirRewind()
@@ -493,6 +623,7 @@ Procedure.i FsDirRewind()
 EndProcedure
 
 Procedure.i FsDirNext()
+  If FsMountPending()<>0 : fs_Fail(#FS_E_BUSY) : ProcedureReturn -1 : EndIf
   fs_Begin()
   If fs_kind = #FS_EXFAT
     ProcedureReturn ExFatDirNext()
@@ -504,6 +635,7 @@ Procedure.i FsDirNext()
 EndProcedure
 
 Procedure.i FsDirNameUtf8(*dst, capacity.i)
+  If FsMountPending()<>0 : fs_Fail(#FS_E_BUSY) : ProcedureReturn 0 : EndIf
   If fs_kind = #FS_EXFAT
     ProcedureReturn ExFatDirNameUtf8(*dst, capacity)
   EndIf
@@ -514,6 +646,7 @@ Procedure.i FsDirNameUtf8(*dst, capacity.i)
 EndProcedure
 
 Procedure.i FsDirIsDir()
+  If FsMountPending()<>0 : fs_Fail(#FS_E_BUSY) : ProcedureReturn 0 : EndIf
   If fs_kind = #FS_EXFAT
     ProcedureReturn ExFatDirIsDir()
   EndIf
@@ -521,6 +654,7 @@ Procedure.i FsDirIsDir()
 EndProcedure
 
 Procedure.i FsDirSize()
+  If FsMountPending()<>0 : fs_Fail(#FS_E_BUSY) : ProcedureReturn 0 : EndIf
   If fs_kind = #FS_EXFAT
     ProcedureReturn ExFatDirSize()
   EndIf
@@ -560,6 +694,7 @@ EndProcedure
 Procedure.i FsRename(*oldPath, *newPath)
   Define oldPartition.i
   Define oldRest.i
+  If FsMountPending()<>0 : fs_Fail(#FS_E_BUSY) : ProcedureReturn 0 : EndIf
   fs_Begin()
   If fs_SplitPath(*newPath) = 0
     ProcedureReturn 0
@@ -583,6 +718,7 @@ Procedure.i FsRename(*oldPath, *newPath)
 EndProcedure
 
 Procedure.i FsFlush()
+  If FsMountPending()<>0 : fs_Fail(#FS_E_BUSY) : ProcedureReturn 0 : EndIf
   fs_Begin()
   If fs_kind = #FS_EXFAT
     ProcedureReturn ExFatFlush()
@@ -594,15 +730,18 @@ Procedure.i FsFlush()
 EndProcedure
 
 Procedure.i FsType()
+  If FsMountPending()<>0 : fs_Fail(#FS_E_BUSY) : ProcedureReturn 0 : EndIf
   ProcedureReturn fs_kind
 EndProcedure
 
 ; The partition the mounted volume lives on, 0 when nothing is mounted.
 Procedure.i FsPartition()
+  If FsMountPending()<>0 : fs_Fail(#FS_E_BUSY) : ProcedureReturn 0 : EndIf
   ProcedureReturn fs_partition
 EndProcedure
 
 Procedure.i FsBytesPerCluster()
+  If FsMountPending()<>0 : fs_Fail(#FS_E_BUSY) : ProcedureReturn 0 : EndIf
   If fs_kind = #FS_EXFAT
     ProcedureReturn ExFatBytesPerCluster()
   EndIf
@@ -639,6 +778,7 @@ EndProcedure
 ; the bounded tree walk; exFAT remains deliberately unsupported here until a
 ; format-specific walker has the same corruption checks.
 Procedure.i FsWalkAllocations(*entryVisitor, *rangeVisitor, context.i)
+  If FsMountPending()<>0 : fs_Fail(#FS_E_BUSY) : ProcedureReturn 0 : EndIf
   fs_Begin()
   If fs_kind <> #FS_FAT
     ProcedureReturn fs_Fail(#FS_E_ALLOCATION_UNSUPPORTED)
@@ -647,17 +787,20 @@ Procedure.i FsWalkAllocations(*entryVisitor, *rangeVisitor, context.i)
 EndProcedure
 
 Procedure.i FsWalkRoot(*rangeVisitor, context.i)
+  If FsMountPending()<>0 : fs_Fail(#FS_E_BUSY) : ProcedureReturn 0 : EndIf
   fs_Begin()
   If fs_kind <> #FS_FAT : ProcedureReturn fs_Fail(#FS_E_ALLOCATION_UNSUPPORTED) : EndIf
   ProcedureReturn FatWalkRoot(*rangeVisitor, context)
 EndProcedure
 
 Procedure.i FsDataLba()
+  If FsMountPending()<>0 : fs_Fail(#FS_E_BUSY) : ProcedureReturn 0 : EndIf
   If fs_kind = #FS_FAT : ProcedureReturn FatDataLba() : EndIf
   ProcedureReturn 0
 EndProcedure
 
 Procedure.i FsDataEnd()
+  If FsMountPending()<>0 : fs_Fail(#FS_E_BUSY) : ProcedureReturn 0 : EndIf
   If fs_kind = #FS_FAT : ProcedureReturn FatDataEnd() : EndIf
   ProcedureReturn 0
 EndProcedure
@@ -676,6 +819,7 @@ Global fs_tableMbr.i
 
 Procedure.i FsTableRead()
   Define i.i
+  If FsMountPending()<>0 : fs_Fail(#FS_E_BUSY) : ProcedureReturn 0 : EndIf
   fs_Begin()
   fs_tableMbr = 0
   If *fs_reader = 0

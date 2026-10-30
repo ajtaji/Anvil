@@ -384,6 +384,10 @@ EndProcedure
 ; ----------------------------------------------------------------------
 Global *TlsRootsPauseHook
 Global tlsroot_loading.i
+Global tlsroot_prepareHandle.i
+Global tlsroot_openCancelled.i
+Global tlsroot_openSpanMax.i
+Global tlsroot_prepareMax.i
 ; Timing remains outside the storage call; no file is kept open by diagnostics.
 Global Dim tlsroot_ioMax.i[4]
 Global Dim tlsroot_ioCount.i[4]
@@ -398,11 +402,41 @@ Procedure.i tlsroot_StorageUp()
  started=HwMicros() : rc=HwStorageUp() : tlsroot_IoTime(0,started)
  ProcedureReturn rc
 EndProcedure
-Procedure.i tlsroot_Open(path.i)
- Define started.i,rc.i
- started=HwMicros() : rc=HwFileOpen(path) : tlsroot_IoTime(1,started)
+Procedure.i tlsroot_OpenResult(rc.i,started.i)
+ Define elapsed.i
+ elapsed=HwMicros()-started
+ If elapsed>tlsroot_openSpanMax : tlsroot_openSpanMax=elapsed : EndIf
  ProcedureReturn rc
 EndProcedure
+Procedure.i tlsroot_Open(path.i)
+ Define started.i,rc.i,span.i,elapsed.i,handle.i
+ span=HwMicros() : tlsroot_openCancelled=0
+ If TlsRootsPauseHook<>0
+  started=HwMicros() : handle=HwFilePrepareBegin(path) : tlsroot_IoTime(1,started)
+  If handle=0 : ProcedureReturn tlsroot_OpenResult(0,span) : EndIf
+  If handle>0
+   tlsroot_prepareHandle=handle
+   Repeat
+    started=HwMicros() : rc=HwFilePrepareStep(handle)
+    elapsed=HwMicros()-started : tlsroot_IoTime(1,started)
+    If elapsed>tlsroot_prepareMax : tlsroot_prepareMax=elapsed : EndIf
+    If rc<>0 : Break : EndIf
+    If TlsRootsPauseHook<>0
+     If TlsRootsPauseHook()=0
+      HwFilePrepareCancel(handle) : tlsroot_prepareHandle=0 : tlsroot_openCancelled=1
+      ProcedureReturn tlsroot_OpenResult(0,span)
+     EndIf
+    EndIf
+   ForEver
+   tlsroot_prepareHandle=0
+   If rc<0 : ProcedureReturn tlsroot_OpenResult(0,span) : EndIf
+  EndIf
+ EndIf
+ ; No yield between publishing the prepared volume and this ordinary open.
+ started=HwMicros() : rc=HwFileOpen(path) : tlsroot_IoTime(1,started)
+ ProcedureReturn tlsroot_OpenResult(rc,span)
+EndProcedure
+
 Procedure.i tlsroot_ReadAt(offset.i,dst.i,bytes.i)
  Define started.i,rc.i
  started=HwMicros() : rc=HwFileReadAt(offset,dst,bytes) : tlsroot_IoTime(2,started)
@@ -443,6 +477,7 @@ Procedure.i tlsroot_LoadWork(*path)
   EndIf
   If tlsroot_Open(@tlsroot_path[0]) = 0
     tlsroot_err = #TLSROOT_ERR_NOFILE
+    If tlsroot_openCancelled<>0 : tlsroot_err=#TLSROOT_ERR_READ : EndIf
     ProcedureReturn tlsroot_err
   EndIf
   size = HwFileSize()
@@ -465,7 +500,9 @@ Procedure.i tlsroot_LoadWork(*path)
     ; Never yield with the single shared file handle open. Reopen and check
     ; the size for each bounded read; storage is free between slices.
     If tlsroot_Open(@tlsroot_path[0]) = 0
-      tlsroot_err = #TLSROOT_ERR_NOFILE : ProcedureReturn tlsroot_err
+      tlsroot_err = #TLSROOT_ERR_NOFILE
+      If tlsroot_openCancelled<>0 : tlsroot_err=#TLSROOT_ERR_READ : EndIf
+      ProcedureReturn tlsroot_err
     EndIf
     If HwFileSize() <> size
       tlsroot_Close()
@@ -552,8 +589,12 @@ Procedure.i TlsRootsLoad(*path)
 EndProcedure
 
 ; Only the cooperative owner calls this after cancelling/reaping its worker.
-; Every yield occurs with the file closed; no storage handle needs recovery.
+; Every yield has a closed file, but an unfinished volume preparation owns
+; a token that must be released when the worker is reaped without unwinding.
 Procedure TlsRootsCancelLoad()
+  If tlsroot_prepareHandle>0
+    HwFilePrepareCancel(tlsroot_prepareHandle) : tlsroot_prepareHandle=0
+  EndIf
   If tlsroot_loading<>0
     tlsroot_loading=0 : tlsroot_loaded=0 : tlsroot_err=#TLSROOT_ERR_READ
   EndIf
@@ -595,6 +636,8 @@ EndProcedure
 
 ; `tls roots` - what the store holds, by kind.
 Procedure TlsRootsShow()
+  Print("Root preparation step maximum microseconds: ") : PrintDec(tlsroot_prepareMax) : PrintNl()
+  Print("Root open elapsed maximum microseconds including yields: ") : PrintDec(tlsroot_openSpanMax) : PrintNl()
   Define phase.i
   Print("Root I/O maximum microseconds (storage/open/read/close): ")
   PrintDec(tlsroot_ioMax[0]) : Print(" / ") : PrintDec(tlsroot_ioMax[1]) : Print(" / ")

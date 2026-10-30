@@ -1863,6 +1863,10 @@ EndProcedure
 
 Procedure.i ExFatMount(partition.i)
   Define handle.i,rc.i
+  ; Preserve the explicit synchronous remount contract, including recovery
+  ; after a failed unmount. Pending jobs cannot be displaced by this path.
+  If ExFatMountPending()<>0 Or exfat_mountNext=$7FFFFFFF : ProcedureReturn exfat_Fail(#EXFAT_E_BUSY) : EndIf
+  exfat_MountReset()
   handle=ExFatMountBegin(partition) : If handle=0 : ProcedureReturn 0 : EndIf
   Repeat
     rc=ExFatMountStep(handle)

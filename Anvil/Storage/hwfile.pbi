@@ -229,6 +229,35 @@ EndProcedure
 ;  #FAT_ERR_NOT_MOUNTED, which maps to #HW_FILE_IO and carries fat.pi4's
 ;  own sentence out through HwFileErrorText.
 ; ----------------------------------------------------------------------
+; Prepare a path's volume without opening a shared file handle. The caller
+; owns the returned token until Step completes/fails or Cancel accepts it.
+Procedure.i HwFilePrepareBegin(*name)
+  Define handle.i
+  gHwFileErr=#HW_FILE_OK : gHwFileFsText=0
+  If *name=0 : gHwFileErr=#HW_FILE_BADNAME : ProcedureReturn 0 : EndIf
+  If gHwFileMounted=0 : gHwFileErr=#HW_FILE_NOMEDIUM : ProcedureReturn 0 : EndIf
+  ExFatProfileSetClock(@HwMicros)
+  handle=FsMountPathBegin(*name)
+  If handle=0 : gHwFileErr=hwfile_MapFat() : EndIf
+  ProcedureReturn handle
+EndProcedure
+
+Procedure.i HwFilePrepareStep(handle.i)
+  Define rc.i
+  gHwFileErr=#HW_FILE_OK : gHwFileFsText=0
+  rc=FsMountStep(handle)
+  If rc<0 : gHwFileErr=hwfile_MapFat() : EndIf
+  ProcedureReturn rc
+EndProcedure
+
+Procedure.i HwFilePrepareCancel(handle.i)
+  Define rc.i
+  gHwFileErr=#HW_FILE_OK : gHwFileFsText=0
+  rc=FsMountCancel(handle)
+  If rc=0 : gHwFileErr=hwfile_MapFat() : EndIf
+  ProcedureReturn rc
+EndProcedure
+
 Procedure.i HwFileOpen(*name)
   gHwFileErr = #HW_FILE_OK
   gHwFileFsText = 0

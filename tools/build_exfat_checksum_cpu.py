@@ -347,12 +347,104 @@ Procedure.i ProofMountJobs()
  If rc<>0 Or ExFatMounted()<>1 : ProcedureReturn 65 : EndIf
  ProcedureReturn 0
 EndProcedure
+Procedure ProofPrepareFacade()
+ ProofPrepareBoot() : exfat_MountReset()
+ fs_kind=#FS_NONE : fs_partition=0
+ FsSetRangeReader(@GateReader) : FsSetRangeWriter(0) : FsSetBlockFlusher(0)
+EndProcedure
+Global proofFsCallbackFault.i
+Procedure.i ProofFsReplacingReader(lba.i,count.i,dst.i)
+ FsSetRangeReader(@GateReader)
+ If FsMountBegin(1)<>0 Or FsMountPending()<>1 : proofFsCallbackFault=1 : EndIf
+ ProcedureReturn GateReader(lba,count,dst)
+EndProcedure
+Procedure.i ProofFsCancelFlusher()
+ FsSetRangeReader(@GateReader)
+ ProcedureReturn 0
+EndProcedure
+Procedure.i ProofFsFailedFlusher()
+ ProcedureReturn 0
+EndProcedure
+Procedure.i ProofFacadeJobs()
+ Define h.i,nextHandle.i,i.i,stopAt.i,rc.i,reads.i
+ ProofPrepareFacade()
+ If FsMount(1)=0 : ProcedureReturn 1 : EndIf
+ reads=gateReads : fs_rest=123 : h=FsMountBegin(2)
+ If h<=0 Or gateReads<>reads : ProcedureReturn 2 : EndIf
+ If FsMount(1)<>0 Or FsUnmount()<>0 Or FsSelectPartition(1)<>0 : ProcedureReturn 3 : EndIf
+ If FsOpen(0)<>0 Or FsRename(0,0)<>0 Or fs_rest<>123 : ProcedureReturn 4 : EndIf
+ If FsRead(@gateRead[0],1)<>-1 Or FsWrite(@gateRead[0],1)<>-1 Or FsTableRead()<>0 : ProcedureReturn 5 : EndIf
+ FsClose()
+ If gateReads<>reads Or fs_kind<>#FS_EXFAT Or fs_partition<>1 : ProcedureReturn 6 : EndIf
+ If FsMountStep(h+1)<>-1 Or FsMountCancel(h+1)<>0 Or FsMountPending()<>1 : ProcedureReturn 7 : EndIf
+ If FsMountCancel(h)<>1 Or FsType()<>#FS_EXFAT Or FsPartition()<>1 : ProcedureReturn 8 : EndIf
+ h=FsMountBegin(1) : reads=gateReads
+ If FsMountStep(h)<>1 Or gateReads<>reads Or FsMountPending()<>0 : ProcedureReturn 9 : EndIf
+ For stopAt=0 To 6
+  ProofPrepareFacade() : h=FsMountBegin(1)
+  For i=0 To stopAt-1
+   If FsMountStep(h)<>0 : ProcedureReturn 20+i : EndIf
+  Next
+  If FsMountCancel(h)<>1 Or FsMountPending()<>0 Or ExFatMountPending()<>0 : ProcedureReturn 30+stopAt : EndIf
+  nextHandle=FsMountBegin(1)
+  If nextHandle<=h Or FsMountCancel(h)<>0 Or FsMountPending()<>1 : ProcedureReturn 40+stopAt : EndIf
+  If FsMountCancel(nextHandle)<>1 : ProcedureReturn 50+stopAt : EndIf
+ Next
+ ProofPrepareFacade() : h=FsMountBegin(1)
+ For i=0 To 6
+  rc=FsMountStep(h)
+  If rc<>Bool(i=6) : ProcedureReturn 60+i : EndIf
+ Next
+ If FsType()<>#FS_EXFAT Or FsPartition()<>1 Or FsMountStep(h)<>-1 : ProcedureReturn 10 : EndIf
+ ProofPrepareFacade() : h=FsMountBegin(1)
+ If FsMountStep(h)<>0 : ProcedureReturn 11 : EndIf
+ FsSetRangeReader(@GateReader)
+ If FsMountPending()<>0 Or FsMountStep(h)<>-1 Or FsType()<>#FS_NONE : ProcedureReturn 12 : EndIf
+ ProofPrepareFacade() : FsSetRangeReader(@ProofFsReplacingReader) : proofFsCallbackFault=0
+ h=FsMountBegin(1)
+ If FsMountStep(h)<>0 Or FsMountStep(h)<>-1 : ProcedureReturn 13 : EndIf
+ If FsMountPending()<>0 Or FsErrorKind()<>#FS_FACADE Or FsLastError()<>#FS_E_MOUNT_HANDLE Or proofFsCallbackFault<>0 : ProcedureReturn 14 : EndIf
+ ; Cancellation during unmount must not start a new driver job afterward.
+ ProofPrepareFacade() : If FsMount(1)=0 : ProcedureReturn 15 : EndIf
+ exfat_dirty=1 : FsSetBlockFlusher(@ProofFsCancelFlusher)
+ h=FsMountBegin(2)
+ If FsMountStep(h)<>-1 Or FsMountPending()<>0 Or ExFatMountPending()<>0 : ProcedureReturn 16 : EndIf
+ ; Two MBR names alias this virtual volume for recovery-path testing.
+ ProofPrepareFacade() : If FsMount(1)=0 : ProcedureReturn 17 : EndIf
+ gateDisk[$1CE+4]=7 : exfat_Put32(@gateDisk[0],$1CE+8,1) : exfat_Put32(@gateDisk[0],$1CE+12,2048)
+ exfat_Put16(@gateDisk[0]+512,106,2) : exfat_Put16(@gateDisk[0]+13*512,106,2)
+ exfat_dirty=1 : FsSetBlockFlusher(@ProofFsFailedFlusher) : gateWrites=0
+ h=FsMountBegin(2)
+ If FsMountStep(h)<>1 Or FsPartition()<>2 Or gateWrites<>0 Or exfat_inheritedDirty<>1 : ProcedureReturn 18 : EndIf
+ FsSetBlockFlusher(0)
+ ; Corrupt exFAT must not be reinterpreted as FAT32.
+ ProofPrepareFacade() : gateDisk[512+200]=1 : h=FsMountBegin(1)
+ Repeat : rc=FsMountStep(h) : Until rc<>0
+ If rc<>-1 Or FsErrorKind()<>#FS_EXFAT Or ExFatLastError()<>#EXFAT_E_BOOT_CHECKSUM : ProcedureReturn 19 : EndIf
+ ; Sparse FAT32 metadata fixture: only the mount's metadata reads are backed.
+ ProofPrepareFacade() : exfat_Zero(@gateDisk[0],#GATE_BYTES)
+ gateDisk[510]=$55 : gateDisk[511]=$AA : gateDisk[$1BE+4]=$0C
+ exfat_Put32(@gateDisk[0],$1BE+8,1) : exfat_Put32(@gateDisk[0],$1BE+12,70000)
+ exfat_Put16(@gateDisk[0]+512,11,512) : gateDisk[512+13]=1
+ exfat_Put16(@gateDisk[0]+512,14,32) : gateDisk[512+16]=1
+ exfat_Put32(@gateDisk[0]+512,32,70000) : exfat_Put32(@gateDisk[0]+512,36,600)
+ exfat_Put32(@gateDisk[0]+512,44,2) : exfat_Put16(@gateDisk[0]+512,48,1)
+ gateDisk[512+510]=$55 : gateDisk[512+511]=$AA
+ exfat_Put32(@gateDisk[0]+1024,0,$41615252) : exfat_Put32(@gateDisk[0]+1024,484,$61417272)
+ exfat_Put32(@gateDisk[0]+1024,488,$FFFFFFFF) : exfat_Put32(@gateDisk[0]+1024,492,$FFFFFFFF)
+ exfat_Put32(@gateDisk[0]+1024,508,$AA550000)
+ h=FsMountBegin(1) : i=0
+ Repeat : rc=FsMountStep(h) : i=i+1 : Until rc<>0 Or i>8
+ If rc<>1 Or FsType()<>#FS_FAT Or FsPartition()<>1 : ProcedureReturn 70 : EndIf
+ ProofPrepareFacade()
+ ProcedureReturn 0
+EndProcedure
 Procedure.i Main()
  Define rc.i,i.i,j.i,n.i,start.i,slow.i,fast.i,old.i,new.i,p.i,reads.i
  For i=0 To 65535 : PokeA($E1C00000+i,0) : Next
  MmuClearNc() : rc=MmuBuildTables($4F80000) : If rc<>0 : ProcedureReturn 9999 : EndIf
  MmuEnableCached()
- PokeI($E1C00000,$58464336)
+ PokeI($E1C00000,$58464337)
  PokeI($E1C00040,ExFatProfileBegin())
  ExFatProfileSetClock(@ProofProfileClock)
  start=ExFatProfileBegin() : ExFatProfileEnd(0,start)
@@ -371,6 +463,8 @@ Procedure.i Main()
  If rc<>0 : MmuDisableCachedFlushed() : ProcedureReturn 9900+rc : EndIf
  rc=ProofMountJobs() : PokeI($E1C000A0,rc)
  If rc<>0 : MmuDisableCachedFlushed() : ProcedureReturn 10000+rc : EndIf
+ rc=ProofFacadeJobs() : PokeI($E1C000A8,rc)
+ If rc<>0 : MmuDisableCachedFlushed() : ProcedureReturn 11000+rc : EndIf
  rc=ProofDirectoryCache() : PokeI($E1C00080,rc)
  If rc<>0 : MmuDisableCachedFlushed() : ProcedureReturn 9500+rc : EndIf
  GateFormat() : ExFatSetRangeReader(@GateReader) : ExFatSetRangeWriter(0) : exfat_MountReset()

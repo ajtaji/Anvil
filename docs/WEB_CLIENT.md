@@ -2102,3 +2102,47 @@ The filesystem facade and TLS cancellation path do not yet use this job API.
 They still need to coordinate ownership before cold TLS opening can yield.
 No new HTTPS latency improvement is claimed. Remaining networking work includes
 that integration, IPv6/off-link/PMTU and DNS transport, HTTP/2-3 and managed cookies.
+
+
+### Cooperative TLS volume preparation (installed build472)
+
+The shared filesystem facade now owns staged mount jobs. FsMountBegin and
+FsMountPathBegin perform no device I/O; FsMountStep returns 0 pending, 1 ready
+or -1 failed. FsMountCancel accepts only the current token. Competing operations
+are refused before changing volume or path state. Reader replacement invalidates
+an unfinished job, including replacement inside a device callback.
+
+The shared block-backed HwFilePrepareBegin/Step/Cancel seam exposes these jobs
+to TLS without a Core-to-filesystem dependency. A suspended TLS worker releases
+its matching preparation token when cancelled. Files stay closed across yields.
+The UNO Q backend explicitly reports unsupported preparation and retains its
+ordinary firmware-open fallback. Non-cooperative root loads remain synchronous.
+
+The strict exFAT Begin API still refuses open or dirty volumes. The legacy
+synchronous ExFatMount retains its explicit replacement semantics, including
+recovery when a failed dirty-volume unmount would otherwise strand another
+partition. FAT32 fallback, unmount and that recovery path are synchronous stages;
+this change is serialized ownership, not SMP locking or a hard device-I/O bound.
+Corrupt exFAT metadata is never reinterpreted as FAT32.
+
+Physical capture96 passed facade ownership, competing/stale handles, seven
+cancellation boundaries, same-volume completion, callback reader rebinding,
+cancellation during failed unmount, dirty-volume recovery, sparse FAT32 metadata
+fallback and the existing checksum/cache/boot regressions. The sparse FAT case
+checks mounting, not arbitrary FAT data reads.
+
+Actual verified HTTPS tests on installed472 cancel an unopened connection and
+a connection suspended during preparation, reject stale handles, then fetch and
+decode gzip and deflate responses successfully. Cores, fonts, Vulkan and watchdog
+checks pass. Root open/preparation timing now records the maximum individual
+Begin, Step or Open call; a separate elapsed counter includes yields. Timing
+results below distinguish these from the whole network service call.
+
+Observed maximum root preparation step: 1036 us (previous unsliced root open3515 us). Maximum root-open elapsed time including yields: 3091 us. Maximum whole network service call: 3866 us. These are observed maxima, not worst-case guarantees; the earlier whole-call maximum was3674 us.
+
+Pi4build472, Pi3build86 and UNO Q build100 compile the relevant shared contracts;
+only Pi4 is physically validated. Evidence: docs/evidence/anvil-ipv6-20261030/tls-mount472.
+
+Remaining TLS atomic work and synchronous device callbacks are not fully bounded.
+IPv6 off-link/PMTU, IPv6 DNS transport/address selection, HTTP/2-3 and managed
+cookies remain open. This is not a claim that networking is finished.

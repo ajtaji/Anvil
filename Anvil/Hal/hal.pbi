@@ -224,6 +224,13 @@
 ;                                        held before this seam existed:
 ;                                        SettingsLoad has never brought a
 ;                                        medium up.
+;                 HwFilePrepareBegin(*name) optionally prepare the volume
+;                                        without retaining an open file:
+;                                        >0 owner token, 0 failure, -1 means
+;                                        unsupported (use ordinary Open).
+;                 HwFilePrepareStep(h)   0 pending, 1 ready, -1 failed.
+;                 HwFilePrepareCancel(h) cancel only that owner; 1 accepted.
+;                                        Steps may use synchronous device I/O.
 ;                 HwFileOpen(*name)      open one file by name for
 ;                                        reading, on the medium that is
 ;                                        already up. 1 on success, 0 on
