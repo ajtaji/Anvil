@@ -678,7 +678,24 @@ permission to transmit could still leave it polling until the 100 ms timeout.
 Build 430 adds the credit-ready exit after retaining received data and before
 continuing an aggregate. Malformed frames and queue failures still take
 precedence. Control/event waits retain their existing completion rules.
-The full image and a 14-case controlled-RX policy fixture compile, but neither
-has run on the Pi; build 430 is not installed. No measured latency reduction
-or fix for the console outage is claimed. Waiting when credits remain absent
+The 14-case controlled-RX policy fixture passed on the Pi (capture 287).
+Build 430 is installed and verified by its complete live image digest; HTTPS
+gzip/deflate and cancellation passed (capture 290). No measured latency
+reduction or fix for the earlier lost console reply is claimed. Waiting when credits remain absent
 and synchronous low-level transfers are still separate blocking work.
+
+
+Build 429 capture 286 passed 31 cooperative key/context cases, including
+worker-hook isolation and cancellation. Capture 288 then passed live HTTPS
+and measured the root bundle file path separately: first open 18,273 us,
+second open 1,097 us, 4 KB reads 282/196 us. After this deliberate storage
+warm-up, the preparation cancellation call took 2,419 us. Build 430 repeated
+this distinction (first open 18,336 us, second 1,078 us, preparation 2,401 us).
+These results locate a cold file-open cost; they do not identify which mount
+suboperation causes it or make file access asynchronous. Cores, fonts and
+Vulkan stayed healthy and the watchdog was off after each returning run.
+
+The earlier partial `net` reply was followed by a successful reconnect without
+reset: prompt 0.66 s and complete `net` 0.79 s. The host's read-only recovery
+prompt window is now 60 s instead of 5 s. Only allowlisted read-only queries
+may be replayed; uploads, boot, reset and writes remain excluded.

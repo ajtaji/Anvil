@@ -27,6 +27,38 @@ Procedure.i IPv6AddressUnspecified(address.i)
  ProcedureReturn 1
 EndProcedure
 
+; RFC 4861 section 4.1: ask all routers on this link for advertisements.
+; Before address assignment, omit the source link-layer option. The caller
+; owns source-address selection, interface membership and solicitation timing.
+Procedure.i IPv6RouterSolicit(out.i,capacity.i,source.i,mac.i)
+ Define dst.IPv6AddressStorage
+ Define i.i,n.i,rc.i,unspecified.i
+ If out=0 Or source=0 : ProcedureReturn #IPV6_ND_INVALID : EndIf
+ If capacity<48 : ProcedureReturn #IPV6_ND_INVALID : EndIf
+ If out<source+16 And source<out+capacity : ProcedureReturn #IPV6_ND_INVALID : EndIf
+ If PeekA(source)=255 : ProcedureReturn #IPV6_ND_INVALID : EndIf
+ unspecified=IPv6AddressUnspecified(source) : n=8
+ If unspecified=0
+  If mac=0 Or capacity<56 : ProcedureReturn #IPV6_ND_INVALID : EndIf
+  If out<mac+6 And mac<out+capacity : ProcedureReturn #IPV6_ND_INVALID : EndIf
+  If (PeekA(mac)&1)<>0 : ProcedureReturn #IPV6_ND_INVALID : EndIf
+  n=16
+ EndIf
+ dst\high=0 : dst\low=0
+ PokeA(@dst,255) : PokeA(@dst+1,2) : PokeA(@dst+15,2)
+ rc=IPv6PacketHeader(out,capacity,source,@dst,n,58,255,0,0)
+ If rc<>40 : ProcedureReturn rc : EndIf
+ For i=0 To n-1 : PokeA(out+40+i,0) : Next
+ PokeA(out+40,133)
+ If n=16
+  PokeA(out+48,1) : PokeA(out+49,1)
+  For i=0 To 5 : PokeA(out+50+i,PeekA(mac+i)) : Next
+ EndIf
+ rc=IPv6TransportChecksum(source,@dst,58,out+40,n)
+ NetWriteBE16(out+42,rc)
+ ProcedureReturn n+40
+EndProcedure
+
 ; Build a complete IPv6 Neighbor Solicitation. An unspecified source emits
 ; the DAD form without a link-layer option. Other sources require a six-byte
 ; Ethernet MAC. Input spans must be separate from the output capacity.

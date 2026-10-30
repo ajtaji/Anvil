@@ -25,6 +25,7 @@ def build(compiler,out):
   p=packet(source,dest,body,**kwargs);c=dict(name=name,rc=rc)
   if rc==0:
    kind=body[0];c.update(kind=kind,flags=int.from_bytes(body[4:8],'big') if kind==136 else 0)
+   if kind==133:c['built']=packet(source,addr('ff02::2'),bytes([133,0,0,0])+bytes(4)+(b'' if source==zero else slla)).hex()
    if kind in [135,136]:c['target']=body[8:24].hex()
    if kind==135:c['built']=packet(source,sol,ns(options=b'' if source==zero else slla)).hex()
    if kind==136:c['built']=packet(body[8:24],dest,na(body[8:24],int.from_bytes(body[4:8],'big'),tlla)).hex()
@@ -85,13 +86,17 @@ Procedure NeighborFixture(index.i,data.i,n.i)
   EndIf
   For i=0 To 127 : output[i]=$A5 : Next
   built=0 : small=0 : guard=1
-  If nd\kind=135
+  If nd\kind=133
+   small=IPv6RouterSolicit(@output[0],47,ip\source,nd\sourceMac)
+  ElseIf nd\kind=135
    small=IPv6NeighborSolicit(@output[0],63,ip\source,nd\target,nd\sourceMac)
   ElseIf nd\kind=136
    small=IPv6NeighborAdvertise(@output[0],63,nd\target,ip\destination,nd\targetMac,nd\flags)
   EndIf
   For i=0 To 127 : If output[i]<>$A5 : guard=0 : EndIf : Next
-  If nd\kind=135
+  If nd\kind=133
+   built=IPv6RouterSolicit(@output[0],128,ip\source,nd\sourceMac)
+  ElseIf nd\kind=135
    built=IPv6NeighborSolicit(@output[0],128,ip\source,nd\target,nd\sourceMac)
   ElseIf nd\kind=136
    built=IPv6NeighborAdvertise(@output[0],128,nd\target,ip\destination,nd\targetMac,nd\flags)

@@ -138,3 +138,11 @@ Capture 284 on Anvil 427 passed 388 cases: 336 advertisement combinations,
 timer boundaries, retry limits, upper-layer confirmation, use/learning and init.
 All cores, fonts and Vulkan remained healthy. Pi 3/Rock Pi compilation passed.
 This is physical execution of shared policy, not an IPv6 wire qualification.
+
+
+`IPv6RouterSolicit` emits a checksummed Router Solicitation to ff02::2,
+hop limit 255, with a source MAC option only when the source is assigned.
+The caller owns address selection, multicast membership and timing. Capture
+289 on Anvil 430 passed the 30-case ND suite with independently generated
+byte-exact Router Solicitation output and capacity guards. The addition also
+compiles on Pi 3 and Rock Pi. This is packet construction, not wire traffic.
