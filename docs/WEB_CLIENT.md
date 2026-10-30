@@ -1337,3 +1337,30 @@ All 45 physical Pi CPU cases passed on Anvil 444 with exact copy-out bytes and
 unchanged output/guard checks. The payload returned normally, and cores, fonts
 and Vulkan remained healthy. Resident router/prefix tables and solicitation
 scheduling are still required before routed IPv6 TCP and web requests.
+
+
+## Shared default-router list
+
+`Anvil/Network/ipv6_default_routers.pbi` owns generation-scoped default-router
+state in caller-provided storage for 2..16 entries. Each router has an independent
+expiry and preference. Updates preserve omitted routers; a full list declines a
+new router without evicting a live one. Zero lifetime withdraws only the named
+router. Expiry and changes to membership/preference advance a revision so the
+owner can invalidate cached next hops. Refreshing an unchanged router's deadline
+does not require a new next-hop choice.
+
+Selection prioritizes reachability, then advertised preference, and rotates
+among equal-ranked entries. The caller marks only known-unreachable neighbors;
+unknown reachability is assumed reachable. Reserved preference bits mean medium.
+The selection result includes a mask of avoided higher-preference failed routers
+for the owner to probe when sending actual traffic, subject to the RFC 4191
+one-probe-per-minute limit. The table itself never sends packets or reads clocks.
+Neighbor-cache updates, probe rate limiting and resident dispatch remain with
+the integration layer.
+
+All 34 physical Pi CPU cases passed on installed Anvil 444: insertion, refresh,
+withdrawal, independent exact expiry, full-table retention, preference/failover,
+equal-rank rotation, generation reset and invalid argument preservation. Exact
+router slots, revisions and output guards were checked. The payload returned
+normally, with healthy cores, fonts and Vulkan. This policy is not yet wired to
+resident RA input or outbound IPv6 connections.
