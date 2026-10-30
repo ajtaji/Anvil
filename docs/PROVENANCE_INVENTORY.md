@@ -1567,3 +1567,5 @@ text is unchanged; no new board execution or boot claim follows.
 | `Anvil/Network/ipv6_router.pbi` | protocol-facts | ietf-rfc | IETF specification | independent RA copy-out codec; cite RFC 4861 |
 
 | `Anvil/Network/ipv6_default_routers.pbi` | protocol-facts | ietf-rfc | IETF specification | independent default-router policy; cite RFC 4861/4191 |
+
+| `Anvil/Network/ipv6_prefix_list.pbi` | protocol-facts | ietf-rfc | IETF specification | independent on-link prefix list; cite RFC 4861 |

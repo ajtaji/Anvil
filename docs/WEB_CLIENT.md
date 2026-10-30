@@ -1397,3 +1397,29 @@ active CYW43 composition; other link adapters remain unfinished.
 This establishes live router discovery, not routed web access. Prefix-table
 union, global-address DAD/membership, neighbor-cache ownership and IPv6 TCP/DNS
 integration remain required. The existing TLS and HTTP/2-3 gaps remain open.
+
+
+## Persistent on-link prefix policy
+
+`Anvil/Network/ipv6_prefix_list.pbi` merges validated on-link advertisements
+into a caller-owned, generation-scoped table with 1..64 entries. Prefix and
+length identify entries, independently of the advertising router. Omitted
+prefixes and L=0 preserve earlier information. L=1 with zero lifetime withdraws
+only the matching prefix; each other entry retains its own expiry. A full list
+declines a new prefix without evicting an existing live entry.
+
+Host bits are normalized for lengths 0..128, including non-octet prefixes.
+Longest-prefix matching returns length+1, distinguishing a /0 match from no
+match. Infinite lifetimes are explicit and the largest finite 32-bit seconds
+value converts to milliseconds without overflow. Membership changes and expiry
+advance a revision; refreshing an unchanged prefix does not. The list is separate
+from SLAAC address validity and preferred lifetimes. Inherent link-local routing
+belongs to the interface owner; link-local and multicast PIOs are ignored.
+
+All 36 physical Pi CPU cases passed on installed Anvil 447, including merged
+information, overlap, independent expiry, withdrawal, infinite and maximum finite
+lifetimes, generation reset, capacity retention, and unchanged state on invalid
+arguments. Exact table bytes and guards were checked. The payload returned
+normally and cores, fonts and Vulkan remained healthy. This policy is ready for
+resident integration; the installed service still reports latest-prefix snapshots
+and does not yet assign routed IPv6 addresses or open IPv6 web connections.
