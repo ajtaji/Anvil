@@ -1,0 +1,490 @@
+{
+  "bytes": 16296,
+  "sha256": "975aa5ce741b9108f50d0df0fd393b283a74af35361bff7f69debe35d7bc916d",
+  "checked_ranges": {
+    "code": [
+      "0x1000000",
+      "0x1003F27"
+    ],
+    "bss": [
+      "0x1080000",
+      "0x10800EF"
+    ],
+    "stack": [
+      "0x4e00000",
+      "0x4efffff"
+    ],
+    "report": [
+      "0xe1c00000",
+      "0xe1c1ffff"
+    ],
+    "tables": [
+      "0x4f80000",
+      "0x4f82fff"
+    ]
+  },
+  "source_hashes": {
+    "Anvil/Network/ipv6_slaac.pbi": "f9be3afafd76427d2b975c5926eef6df7b90d29b4ae43cdcd7e096be97c01371",
+    "Anvil/Network/ipv6_address.pbi": "4ee83accc377916dfc50432f5278156c7b4d74375fe89eae81bfc5eec0c156e4",
+    "Anvil/Network/byte_order.pbi": "d39666ab6746adf123cba3c12c17270ca6e5f72bb2c8ddcb3ff3a84245e1355d",
+    "RaspberryPi4/Lib/mmu.pi4": "014b7c2092426146c8e0eb6bb8dde2fb3af26cef63e55193e49c1ca826f6435a"
+  },
+  "cases": [
+    {
+      "name": "empty entry",
+      "expected": [
+        0,
+        1,
+        1000,
+        0,
+        0,
+        0
+      ],
+      "address": "20010db8000100021122334455667788"
+    },
+    {
+      "name": "new address needs DAD",
+      "expected": [
+        1,
+        1,
+        1000,
+        10001000,
+        10001000,
+        5001000
+      ],
+      "address": "20010db8000100021122334455667788"
+    },
+    {
+      "name": "preferred valid onlink",
+      "expected": [
+        7,
+        1,
+        1000,
+        10001000,
+        10001000,
+        5001000
+      ],
+      "address": "20010db8000100021122334455667788"
+    },
+    {
+      "name": "zero lifetime clamps address but removes route",
+      "expected": [
+        0,
+        1,
+        2000,
+        2000,
+        7202000,
+        2000
+      ],
+      "address": "20010db8000100021122334455667788"
+    },
+    {
+      "name": "deprecated but valid",
+      "expected": [
+        1,
+        1,
+        2000,
+        2000,
+        7202000,
+        2000
+      ],
+      "address": "20010db8000100021122334455667788"
+    },
+    {
+      "name": "short update preserves remaining validity",
+      "expected": [
+        0,
+        1,
+        3000,
+        2000,
+        7202000,
+        33000
+      ],
+      "address": "20010db8000100021122334455667788"
+    },
+    {
+      "name": "preferred deadline exact",
+      "expected": [
+        1,
+        1,
+        33000,
+        2000,
+        7202000,
+        33000
+      ],
+      "address": "20010db8000100021122334455667788"
+    },
+    {
+      "name": "authenticated short remaining lifetime invalidates",
+      "expected": [
+        0,
+        1,
+        34000,
+        2000,
+        34000,
+        34000
+      ],
+      "address": "20010db8000100021122334455667788"
+    },
+    {
+      "name": "invalid exact deadline",
+      "expected": [
+        0,
+        1,
+        34000,
+        2000,
+        34000,
+        34000
+      ],
+      "address": "20010db8000100021122334455667788"
+    },
+    {
+      "name": "recreated address requires DAD again",
+      "expected": [
+        1,
+        1,
+        35000,
+        2000,
+        135000,
+        85000
+      ],
+      "address": "20010db8000100021122334455667788"
+    },
+    {
+      "name": "autonomous without onlink",
+      "expected": [
+        3,
+        1,
+        35000,
+        2000,
+        135000,
+        85000
+      ],
+      "address": "20010db8000100021122334455667788"
+    },
+    {
+      "name": "onlink independent of autonomous",
+      "expected": [
+        0,
+        1,
+        36000,
+        46000,
+        135000,
+        85000
+      ],
+      "address": "20010db8000100021122334455667788"
+    },
+    {
+      "name": "route expiry does not expire address",
+      "expected": [
+        3,
+        1,
+        46000,
+        46000,
+        135000,
+        85000
+      ],
+      "address": "20010db8000100021122334455667788"
+    },
+    {
+      "name": "preferred expiry",
+      "expected": [
+        1,
+        1,
+        85000,
+        46000,
+        135000,
+        85000
+      ],
+      "address": "20010db8000100021122334455667788"
+    },
+    {
+      "name": "valid expiry",
+      "expected": [
+        0,
+        1,
+        135000,
+        46000,
+        135000,
+        85000
+      ],
+      "address": "20010db8000100021122334455667788"
+    },
+    {
+      "name": "infinite lifetimes",
+      "expected": [
+        1,
+        1,
+        136000,
+        9223372036854775807,
+        9223372036854775807,
+        9223372036854775807
+      ],
+      "address": "20010db8000100021122334455667788"
+    },
+    {
+      "name": "infinite to short clamps two hours",
+      "expected": [
+        0,
+        1,
+        137000,
+        9223372036854775807,
+        7337000,
+        138000
+      ],
+      "address": "20010db8000100021122334455667788"
+    },
+    {
+      "name": "long lifetime replaces clamp",
+      "expected": [
+        0,
+        1,
+        138000,
+        9223372036854775807,
+        9138000,
+        8138000
+      ],
+      "address": "20010db8000100021122334455667788"
+    },
+    {
+      "name": "invalid autonomous lifetime still updates route",
+      "expected": [
+        0,
+        1,
+        139000,
+        141000,
+        9138000,
+        8138000
+      ],
+      "address": "20010db8000100021122334455667788"
+    },
+    {
+      "name": "short route expires independently",
+      "expected": [
+        3,
+        1,
+        141000,
+        141000,
+        9138000,
+        8138000
+      ],
+      "address": "20010db8000100021122334455667788"
+    },
+    {
+      "name": "neither flag leaves lifetime state",
+      "expected": [
+        0,
+        1,
+        142000,
+        141000,
+        9138000,
+        8138000
+      ],
+      "address": "20010db8000100021122334455667788"
+    },
+    {
+      "name": "largest finite lifetime converted in 64 bits",
+      "expected": [
+        0,
+        1,
+        143000,
+        141000,
+        4294967437000,
+        143000
+      ],
+      "address": "20010db8000100021122334455667788"
+    },
+    {
+      "name": "authenticated long remaining reduction follows rule three",
+      "expected": [
+        0,
+        1,
+        144000,
+        141000,
+        7344000,
+        144000
+      ],
+      "address": "20010db8000100021122334455667788"
+    },
+    {
+      "name": "stale generation refused",
+      "expected": [
+        -821,
+        1,
+        144000,
+        141000,
+        7344000,
+        144000
+      ],
+      "address": "20010db8000100021122334455667788"
+    },
+    {
+      "name": "backwards time refused",
+      "expected": [
+        -820,
+        1,
+        144000,
+        141000,
+        7344000,
+        144000
+      ],
+      "address": "20010db8000100021122334455667788"
+    },
+    {
+      "name": "negative lifetime refused",
+      "expected": [
+        -820,
+        1,
+        144000,
+        141000,
+        7344000,
+        144000
+      ],
+      "address": "20010db8000100021122334455667788"
+    },
+    {
+      "name": "lifetime exceeds wire width refused",
+      "expected": [
+        -820,
+        1,
+        144000,
+        141000,
+        7344000,
+        144000
+      ],
+      "address": "20010db8000100021122334455667788"
+    },
+    {
+      "name": "invalid authentication flag refused",
+      "expected": [
+        -820,
+        1,
+        144000,
+        141000,
+        7344000,
+        144000
+      ],
+      "address": "20010db8000100021122334455667788"
+    },
+    {
+      "name": "invalid onlink flag refused",
+      "expected": [
+        -820,
+        1,
+        144000,
+        141000,
+        7344000,
+        144000
+      ],
+      "address": "20010db8000100021122334455667788"
+    },
+    {
+      "name": "invalid autonomous flag refused",
+      "expected": [
+        -820,
+        1,
+        144000,
+        141000,
+        7344000,
+        144000
+      ],
+      "address": "20010db8000100021122334455667788"
+    },
+    {
+      "name": "clock overflow refused",
+      "expected": [
+        -820,
+        1,
+        144000,
+        141000,
+        7344000,
+        144000
+      ],
+      "address": "20010db8000100021122334455667788"
+    },
+    {
+      "name": "generation restart",
+      "expected": [
+        0,
+        2,
+        0,
+        0,
+        0,
+        0
+      ],
+      "address": "20010db8000100021122334455667788"
+    },
+    {
+      "name": "zero initial lifetime creates nothing",
+      "expected": [
+        0,
+        2,
+        1,
+        1,
+        0,
+        0
+      ],
+      "address": "20010db8000100021122334455667788"
+    },
+    {
+      "name": "overlapping init refused",
+      "expected": [
+        -820,
+        2,
+        1,
+        1,
+        0,
+        0
+      ],
+      "address": "20010db8000100021122334455667788"
+    },
+    {
+      "name": "same generation init refused",
+      "expected": [
+        -821,
+        2,
+        1,
+        1,
+        0,
+        0
+      ],
+      "address": "20010db8000100021122334455667788"
+    },
+    {
+      "name": "linklocal prefix refused",
+      "expected": [
+        -820,
+        2,
+        1,
+        1,
+        0,
+        0
+      ],
+      "address": "20010db8000100021122334455667788"
+    },
+    {
+      "name": "multicast prefix refused",
+      "expected": [
+        -820,
+        2,
+        1,
+        1,
+        0,
+        0
+      ],
+      "address": "20010db8000100021122334455667788"
+    },
+    {
+      "name": "absent interface ID refused",
+      "expected": [
+        -820,
+        2,
+        1,
+        1,
+        0,
+        0
+      ],
+      "address": "20010db8000100021122334455667788"
+    }
+  ]
+}

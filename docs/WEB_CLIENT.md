@@ -1283,3 +1283,28 @@ Its rebuilt 40-case qualification image is byte-identical to the tested image.
 Full monitor build 445 differs from installed 444 only in fourteen MOVZ
 instructions carrying build-number/time constants (21 bytes); no protocol
 code changed. Build 445 was compiled and compared, not installed.
+
+
+## SLAAC lifetime policy
+
+`Anvil/Network/ipv6_slaac.pbi` provides caller-owned per-/64 address lifetime
+state, independent of the interface driver. `IPv6SlaacInit` copies the prefix
+and interface identifier. `IPv6SlaacApply` consumes a validated matching PIO's
+L/A flags and 32-bit valid/preferred lifetimes. On-link routing and autonomous
+address lifetimes update independently; absence of L does not withdraw a route.
+Malformed autonomous preferred lifetimes do not discard valid L information.
+
+RFC 4862's two-hour reduction rules apply to an existing valid address, while
+preferred lifetime always follows the accepted autonomous advertisement.
+Infinite lifetimes are explicit; the largest finite wire value converts to
+milliseconds without 32-bit overflow. Generation, clock, alias and argument
+refusals leave the old state intact. Status reports lifetime eligibility,
+not DAD success. A newly created or recreated address returns 1 so its owner
+must run DAD before use. Only actual authenticated router advertisements may
+set the authentication flag; Wi-Fi encryption or a known router is insufficient.
+
+All 38 physical Pi CPU cases passed on installed Anvil 444, checking exact
+state, address bytes and untouched record guards. The payload returned normally
+with cores, font slots and Vulkan healthy. This shared policy is not yet wired
+to live router advertisements. PIO decoding, router/prefix tables and resident
+address ownership still precede routed IPv6 TCP and actual web requests.

@@ -1,0 +1,107 @@
+XIncludeFile "RaspberryPi4/Lib/mmu.pi4"
+XIncludeFile "Anvil/Network/ipv6_address.pbi"
+XIncludeFile "Anvil/Network/ipv6_slaac.pbi"
+
+Global ctx.IPv6Slaac
+Procedure Save(index.i,rc.i)
+ Define p.i,i.i
+ p=$E1C00100+index*128
+ PokeI(p,rc)
+ For i=0 To 55 : PokeA(p+8+i,PeekA(@ctx+i)) : Next
+EndProcedure
+Procedure.i Main()
+ Define rc.i,i.i
+ For i=0 To 131071 : PokeA($E1C00000+i,$A5) : Next
+ PokeI($E1C00000,$534C4141)
+ MmuClearNc() : rc=MmuBuildTables($4F80000) : If rc<>0 : ProcedureReturn 2 : EndIf
+ MmuEnableCached()
+rc=IPv6SlaacInit(@ctx,1,?Prefix,?Iid,1000)
+ Save(0,rc)
+rc=IPv6SlaacApply(@ctx,1,1000,1,1,10000,5000,0)
+ Save(1,rc)
+rc=IPv6SlaacStatus(@ctx,1,1000)
+ Save(2,rc)
+rc=IPv6SlaacApply(@ctx,1,2000,1,1,0,0,0)
+ Save(3,rc)
+rc=IPv6SlaacStatus(@ctx,1,2000)
+ Save(4,rc)
+rc=IPv6SlaacApply(@ctx,1,3000,0,1,60,30,0)
+ Save(5,rc)
+rc=IPv6SlaacStatus(@ctx,1,33000)
+ Save(6,rc)
+rc=IPv6SlaacApply(@ctx,1,34000,0,1,0,0,1)
+ Save(7,rc)
+rc=IPv6SlaacStatus(@ctx,1,34000)
+ Save(8,rc)
+rc=IPv6SlaacApply(@ctx,1,35000,0,1,100,50,0)
+ Save(9,rc)
+rc=IPv6SlaacStatus(@ctx,1,35000)
+ Save(10,rc)
+rc=IPv6SlaacApply(@ctx,1,36000,1,0,10,100,0)
+ Save(11,rc)
+rc=IPv6SlaacStatus(@ctx,1,46000)
+ Save(12,rc)
+rc=IPv6SlaacStatus(@ctx,1,85000)
+ Save(13,rc)
+rc=IPv6SlaacStatus(@ctx,1,135000)
+ Save(14,rc)
+rc=IPv6SlaacApply(@ctx,1,136000,1,1,4294967295,4294967295,0)
+ Save(15,rc)
+rc=IPv6SlaacApply(@ctx,1,137000,0,1,1,1,0)
+ Save(16,rc)
+rc=IPv6SlaacApply(@ctx,1,138000,0,1,9000,8000,0)
+ Save(17,rc)
+rc=IPv6SlaacApply(@ctx,1,139000,1,1,2,3,0)
+ Save(18,rc)
+rc=IPv6SlaacStatus(@ctx,1,141000)
+ Save(19,rc)
+rc=IPv6SlaacApply(@ctx,1,142000,0,0,0,0,0)
+ Save(20,rc)
+rc=IPv6SlaacApply(@ctx,1,143000,0,1,4294967294,0,0)
+ Save(21,rc)
+rc=IPv6SlaacApply(@ctx,1,144000,0,1,0,0,1)
+ Save(22,rc)
+rc=IPv6SlaacApply(@ctx,2,145000,1,1,1,1,0)
+ Save(23,rc)
+rc=IPv6SlaacStatus(@ctx,1,143999)
+ Save(24,rc)
+rc=IPv6SlaacApply(@ctx,1,145000,1,1,-1,0,0)
+ Save(25,rc)
+rc=IPv6SlaacApply(@ctx,1,145000,1,1,4294967296,0,0)
+ Save(26,rc)
+rc=IPv6SlaacApply(@ctx,1,145000,1,1,1,1,2)
+ Save(27,rc)
+rc=IPv6SlaacApply(@ctx,1,145000,2,1,1,1,0)
+ Save(28,rc)
+rc=IPv6SlaacApply(@ctx,1,145000,1,2,1,1,0)
+ Save(29,rc)
+rc=IPv6SlaacStatus(@ctx,1,9223372036854775807)
+ Save(30,rc)
+rc=IPv6SlaacInit(@ctx,2,?Prefix,?Iid,0)
+ Save(31,rc)
+rc=IPv6SlaacApply(@ctx,2,1,1,1,0,0,0)
+ Save(32,rc)
+rc=IPv6SlaacInit(@ctx,3,@ctx,?Iid,0)
+ Save(33,rc)
+rc=IPv6SlaacInit(@ctx,2,?Prefix,?Iid,0)
+ Save(34,rc)
+rc=IPv6SlaacInit(@ctx,3,?LinkLocal,?Iid,0)
+ Save(35,rc)
+rc=IPv6SlaacInit(@ctx,3,?Multicast,?Iid,0)
+ Save(36,rc)
+rc=IPv6SlaacInit(@ctx,3,?Prefix,0,0)
+ Save(37,rc)
+ PokeI($E1C00008,38)
+ MmuDisableCachedFlushed()
+ ProcedureReturn 0
+EndProcedure
+DataSection
+Prefix:
+ Data.a 32,1,13,184,0,1,0,2,255,255,255,255,255,255,255,255
+Iid:
+ Data.a 17,34,51,68,85,102,119,136
+LinkLocal:
+ Data.a 254,128,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+Multicast:
+ Data.a 255,2,0,0,0,0,0,0,0,0,0,0,0,0,0,1
+EndDataSection

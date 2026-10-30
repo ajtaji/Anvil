@@ -1561,3 +1561,5 @@ text is unchanged; no new board execution or boot claim follows.
 
 | `Anvil/Network/ipv6_host.pbi` | protocol-facts | ietf-rfc | IETF specification | independent lifecycle composition; cite specifications |
 | `Anvil/Core/ipv6_service.pbi` | protocol-facts | ietf-rfc | IETF specification | modified EUI-64 address facts; independent implementation |
+
+| `Anvil/Network/ipv6_slaac.pbi` | protocol-facts | ietf-rfc | IETF specification | independent SLAAC lifetime policy; cite RFC 4861/4862 |
