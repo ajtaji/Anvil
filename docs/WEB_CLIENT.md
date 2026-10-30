@@ -1559,3 +1559,26 @@ This proves local-link outbound resolution and echo, plus retained inbound
 operation. Off-link traffic, automatic source selection, rate-limited probing
 of avoided preferred routers, generic queued data, IPv6 TCP/DNS/web, remaining
 TLS blocking work and HTTP/2-3 are still unfinished.
+
+
+## Shared IPv6 TCP wire boundary
+
+`Network/ipv6_tcp.pbi` emits a fixed IPv6 header around a caller-prepared TCP
+segment and validates received TCP packets through the shared IPv6 parser.
+It checks unicast addresses, segment bounds and TCP data offsets, calculates
+the full pseudo-header checksum, and excludes extension headers and Ethernet
+padding from the transport length. A computed zero checksum remains zero.
+Build refusal preserves packet bytes; parse refusal preserves the borrowed
+view. The endpoint still owns address assignment, routing, neighbor resolution,
+socket state and link transmission.
+
+All 28 independent wire/view cases passed on physical Pi 4 build 450, including
+maximum Ethernet payload, odd lengths, MSS options, stale and zero checksums,
+destination extensions, atomic fragments, rejection of fragments requiring
+reassembly, corruption, truncation and aliases. Output guards remained intact.
+The RAM proof returned normally; cores, fonts and Vulkan remained healthy.
+Evidence is under `docs/evidence/anvil-ipv6-20261030/tcp616`.
+
+This is a qualified transport codec, not a connected IPv6 socket or HTTP result.
+The resident monitor is still build 450. Family-aware TCP socket integration,
+asynchronous route resolution and actual IPv6 web traffic remain next.
