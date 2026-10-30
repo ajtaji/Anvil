@@ -17,7 +17,7 @@ class FakeConsole:
 
 class RecoveryChecks(unittest.TestCase):
  def test_exact_read_only_allowlist(self):
-  for line in ['boot mem 1000000 shot','net recv 1000000 10','deadman 15','shot','shot arm','shot disarm','screen vulkan','last run','version\nboot','shot status ']:
+  for line in ['boot mem 1000000 shot','net recv 1000000 10','deadman 15','shot','shot arm','shot disarm','screen vulkan','version\nboot','shot status ']:
    c=FakeConsole()
    with self.assertRaises(ValueError):br.read_only_command_with_recovery(c,line,1)
    self.assertEqual(c.calls,[])

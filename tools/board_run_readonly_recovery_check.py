@@ -11,7 +11,9 @@ class Console:
         self.calls.append(line)
         if self.error:raise self.error
         return self.answer
-    def at_prompt(self,timeout):return self.prompt
+    def at_prompt(self,timeout):
+        self.prompt_timeout=timeout
+        return self.prompt
     def close(self):self.closed=True
 
 def main():
@@ -28,6 +30,7 @@ def main():
             out,text,detail=br.read_only_command_with_recovery(old,'last run',10,preserve_console=preserve)
             assert text=='LASTRUN checked' and detail['command']=='last run' and detail['first_received_datagrams']==0
             assert created==[old.addr] and old.calls==fresh.calls==['last run']
+            assert fresh.prompt_timeout==60.0
             assert out is (old if preserve else fresh)
             assert (old.closed,fresh.closed)==((False,True) if preserve else (True,False));checks+=1
         for fresh in [Console(prompt=False),Console(error=timeout())]:

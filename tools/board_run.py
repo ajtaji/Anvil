@@ -1156,7 +1156,9 @@ def read_only_command_with_recovery(
                 f"{'seen' if first.echo_seen else 'not seen'}); could not open "
                 f"a fresh console for its one read-only retry: {error}") from error
         try:
-            if not fresh.at_prompt(timeout=5.0):
+            # A lost UDP reply is not evidence that the monitor stopped.
+            # Allow the same bounded recovery window used for live console checks.
+            if not fresh.at_prompt(timeout=60.0):
                 raise StreamError("fresh console did not answer its prompt")
             answer = fresh.command(line, seconds)
         except (StreamError, OSError) as error:
