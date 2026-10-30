@@ -65,6 +65,7 @@ XIncludeFile "Anvil/Storage/exfat_profile.pbi"
 ; of clusters. Not a fault in the volume - it means only that a caller
 ; which needs a single extent cannot be served from this file.
 #EXFAT_E_FRAGMENTED = 43
+#EXFAT_E_MOUNT_HANDLE = 44
 
 #EXFAT_ENTRY_BITMAP = $81
 #EXFAT_ENTRY_UPCASE = $82
@@ -88,6 +89,11 @@ Global *exfat_writer
 Global *exfat_flusher
 Global exfat_error.i
 Global exfat_lastLba.i = -1
+Global exfat_mountRunning.i
+Global exfat_mountHandle.i
+Global exfat_mountNext.i
+Global exfat_mountPhase.i
+Global exfat_mountPartition.i
 Global exfat_mounted.i
 Global exfat_dirty.i
 Global exfat_inheritedDirty.i
@@ -295,7 +301,12 @@ EndProcedure
 ; 2026-09-17; the names changed with the contract so that a one-block
 ; procedure left installed anywhere is a compile error, not a call with its
 ; arguments shifted.
+Declare exfat_MountReset()
 Procedure ExFatSetRangeReader(address.i)
+  ; Rebinding invalidates an unfinished mount, including its old token.
+  If exfat_mountHandle<>0
+    exfat_mountHandle=0 : exfat_MountReset()
+  EndIf
   *exfat_reader = address
   exfat_DropCaches()
 EndProcedure
@@ -328,6 +339,7 @@ Procedure.i exfat_BlockInPartition(lba.i)
 EndProcedure
 
 Procedure.i exfat_ReadBlocks(lba.i, count.i, *dst)
+  If exfat_mountRunning<>0 And exfat_mountHandle=0 : ProcedureReturn exfat_Fail(#EXFAT_E_MOUNT_HANDLE) : EndIf
   If *exfat_reader = 0
     ProcedureReturn exfat_Fail(#EXFAT_E_NO_READER)
   EndIf
@@ -346,6 +358,7 @@ Procedure.i exfat_ReadBlocks(lba.i, count.i, *dst)
     EndIf
     ProcedureReturn exfat_Fail(#EXFAT_E_READ)
   EndIf
+  If exfat_mountRunning<>0 And exfat_mountHandle=0 : ProcedureReturn exfat_Fail(#EXFAT_E_MOUNT_HANDLE) : EndIf
   ProcedureReturn 1
 EndProcedure
 
@@ -1011,6 +1024,7 @@ EndProcedure
 ; not mount a volume, write media, or expose mutable parser globals to callers.
 Procedure.i ExFatProbePartition(partition.i,*firstBlock,*blockCount)
   Define oldFirst.i,oldCount.i,rc.i
+  If exfat_mountHandle<>0 Or exfat_mountRunning<>0 : exfat_Fail(#EXFAT_E_BUSY) : ProcedureReturn 0 : EndIf
   If *firstBlock=0 Or *blockCount=0 : ProcedureReturn exfat_Fail(#EXFAT_E_NULL) : EndIf
   If exfat_mounted<>0 : ProcedureReturn exfat_Fail(#EXFAT_E_BUSY) : EndIf
   PokeI(*firstBlock,0) : PokeI(*blockCount,0)
@@ -1750,8 +1764,8 @@ Procedure.i exfat_ReadSystemEntries()
   ProcedureReturn 1
 EndProcedure
 
-; Mount stages remain private: callers must serialize all driver state.
-; This does not expose an asynchronous API or permit yielding without ownership.
+; Validation stages remain private; the owned mount API below serializes them.
+; Each stage still uses synchronous block callbacks.
 Procedure exfat_MountReset()
   exfat_error = #EXFAT_OK
   exfat_DropCaches()
@@ -1759,6 +1773,9 @@ Procedure exfat_MountReset()
   exfat_upcaseFastReady = 0
   exfat_open = 0
   exfat_partBlocks = 0
+  exfat_dirEnd=1 : exfat_dirLimit=0 : exfat_dirIndex=0
+  exfat_dirCurrentNameLength=0 : exfat_dirCurrentAttr=0 : exfat_dirCurrentLength=0
+  exfat_filePos=0 : exfat_fileLength=0
 EndProcedure
 
 Procedure.i exfat_MountStage(partition.i, stage.i)
@@ -1794,15 +1811,63 @@ Procedure exfat_MountFinish()
   exfat_error = #EXFAT_OK
 EndProcedure
 
-Procedure.i ExFatMount(partition.i)
-  Define stage.i
+; One serialized mount job owns the driver between steps. Begin performs no
+; device I/O. Step returns 0 pending, 1 complete, -1 failed; errors stay in
+; ExFatLastError. Cancellation and reader rebinding invalidate the token.
+; A step is a validation stage, not a hard time bound on device callbacks.
+Procedure.i ExFatMountPending()
+  ProcedureReturn Bool(exfat_mountHandle<>0 Or exfat_mountRunning<>0)
+EndProcedure
+
+Procedure.i ExFatMountBegin(partition.i)
+  If exfat_mountHandle<>0 Or exfat_mountRunning<>0 Or exfat_open<>0 Or (exfat_mounted<>0 And exfat_dirty<>0) Or exfat_mountNext=$7FFFFFFF
+    ProcedureReturn exfat_Fail(#EXFAT_E_BUSY)
+  EndIf
   exfat_MountReset()
-  For stage=0 To 5
-    If exfat_MountStage(partition,stage)=0 : ProcedureReturn 0 : EndIf
-  Next
-  ; Publish the mounted volume only after all validation stages succeeded.
-  exfat_MountFinish()
+  exfat_mountNext=exfat_mountNext+1 : exfat_mountHandle=exfat_mountNext
+  exfat_mountPhase=0 : exfat_mountPartition=partition
+  ProcedureReturn exfat_mountHandle
+EndProcedure
+
+Procedure.i ExFatMountCancel(handle.i)
+  If handle<=0 Or handle<>exfat_mountHandle : ProcedureReturn exfat_Fail(#EXFAT_E_MOUNT_HANDLE) : EndIf
+  exfat_mountHandle=0 : exfat_MountReset()
   ProcedureReturn 1
+EndProcedure
+
+Procedure.i ExFatMountStep(handle.i)
+  Define rc.i
+  If exfat_mountRunning<>0 : exfat_Fail(#EXFAT_E_BUSY) : ProcedureReturn -1 : EndIf
+  If handle<=0 Or handle<>exfat_mountHandle
+    exfat_Fail(#EXFAT_E_MOUNT_HANDLE) : ProcedureReturn -1
+  EndIf
+  exfat_error=#EXFAT_OK
+  exfat_mountRunning=1
+  rc=exfat_MountStage(exfat_mountPartition,exfat_mountPhase)
+  exfat_mountRunning=0
+  ; A provider may cancel or replace its reader while a callback is active.
+  ; No other mount may begin until this step has discarded the old result.
+  If handle<>exfat_mountHandle
+    exfat_MountReset() : exfat_Fail(#EXFAT_E_MOUNT_HANDLE)
+    ProcedureReturn -1
+  EndIf
+  If rc=0
+    exfat_mountHandle=0 : exfat_DropCaches()
+    ProcedureReturn -1
+  EndIf
+  exfat_mountPhase=exfat_mountPhase+1
+  If exfat_mountPhase<6 : ProcedureReturn 0 : EndIf
+  exfat_MountFinish() : exfat_mountHandle=0
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i ExFatMount(partition.i)
+  Define handle.i,rc.i
+  handle=ExFatMountBegin(partition) : If handle=0 : ProcedureReturn 0 : EndIf
+  Repeat
+    rc=ExFatMountStep(handle)
+  Until rc<>0
+  ProcedureReturn Bool(rc=1)
 EndProcedure
 
 Procedure.i exfat_PathNext(*path, offset.i)
@@ -1868,6 +1933,7 @@ EndProcedure
 
 Procedure.i ExFatOpen(*path)
   Define started.i,rc.i
+  If exfat_mountHandle<>0 Or exfat_mountRunning<>0 : exfat_Fail(#EXFAT_E_BUSY) : ProcedureReturn 0 : EndIf
   exfat_open = 0
   started=ExFatProfileBegin() : rc=exfat_Resolve(*path) : ExFatProfileEnd(6,started)
   If rc = 0
@@ -1884,6 +1950,7 @@ EndProcedure
 
 Procedure.i ExFatRead(*dst, count.i)
   Define got.i
+  If exfat_mountHandle<>0 Or exfat_mountRunning<>0 : exfat_Fail(#EXFAT_E_BUSY) : ProcedureReturn -1 : EndIf
   If exfat_open = 0
     exfat_error = #EXFAT_E_NO_FILE
     ProcedureReturn -1
@@ -1921,6 +1988,7 @@ Procedure.i ExFatRead(*dst, count.i)
 EndProcedure
 
 Procedure.i ExFatSeek(position.i)
+  If exfat_mountHandle<>0 Or exfat_mountRunning<>0 : exfat_Fail(#EXFAT_E_BUSY) : ProcedureReturn 0 : EndIf
   If exfat_open = 0
     ProcedureReturn exfat_Fail(#EXFAT_E_NO_FILE)
   EndIf
@@ -1953,6 +2021,7 @@ Procedure.i ExFatExtentOf(*name, *firstLba, *blocks, *bytes)
   Define n.i
   Define first.i
   Define flags.i
+  If exfat_mountHandle<>0 Or exfat_mountRunning<>0 : exfat_Fail(#EXFAT_E_BUSY) : ProcedureReturn 0 : EndIf
   If ExFatOpen(*name) = 0
     ProcedureReturn 0
   EndIf
@@ -1992,6 +2061,7 @@ Procedure.i ExFatExtentOf(*name, *firstLba, *blocks, *bytes)
 EndProcedure
 
 Procedure.i ExFatSize()
+  If exfat_mountHandle<>0 Or exfat_mountRunning<>0 : exfat_Fail(#EXFAT_E_BUSY) : ProcedureReturn 0 : EndIf
   If exfat_open = 0
     exfat_Fail(#EXFAT_E_NO_FILE)
     ProcedureReturn 0
@@ -2000,11 +2070,13 @@ Procedure.i ExFatSize()
 EndProcedure
 
 Procedure.i ExFatTell()
+  If exfat_mountHandle<>0 Or exfat_mountRunning<>0 : exfat_Fail(#EXFAT_E_BUSY) : ProcedureReturn 0 : EndIf
   ProcedureReturn exfat_filePos
 EndProcedure
 
 Procedure.i ExFatDirOpen(*path)
   Define root.i
+  If exfat_mountHandle<>0 Or exfat_mountRunning<>0 : exfat_Fail(#EXFAT_E_BUSY) : ProcedureReturn 0 : EndIf
   If exfat_mounted = 0
     ProcedureReturn exfat_Fail(#EXFAT_E_NOT_MOUNTED)
   EndIf
@@ -2040,6 +2112,7 @@ Procedure.i ExFatDirOpen(*path)
 EndProcedure
 
 Procedure.i ExFatDirRewind()
+  If exfat_mountHandle<>0 Or exfat_mountRunning<>0 : exfat_Fail(#EXFAT_E_BUSY) : ProcedureReturn 0 : EndIf
   exfat_dirIndex = 0
   exfat_dirEnd = 0
   ProcedureReturn 1
@@ -2052,6 +2125,7 @@ Procedure.i ExFatDirNext()
   Define expectedHash.i
   Define streamFirst.i
   Define streamLength.i
+  If exfat_mountHandle<>0 Or exfat_mountRunning<>0 : exfat_Fail(#EXFAT_E_BUSY) : ProcedureReturn -1 : EndIf
   If exfat_dirEnd <> 0
     ProcedureReturn 0
   EndIf
@@ -2111,6 +2185,7 @@ Procedure.i ExFatDirNameUtf8(*dst, capacity.i)
   Define c.i
   Define cp.i
   Define hi.i
+  If exfat_mountHandle<>0 Or exfat_mountRunning<>0 : exfat_Fail(#EXFAT_E_BUSY) : ProcedureReturn 0 : EndIf
   If *dst = 0 Or capacity <= 0
     ProcedureReturn exfat_Fail(#EXFAT_E_NULL)
   EndIf
@@ -2170,10 +2245,12 @@ Procedure.i ExFatDirNameUtf8(*dst, capacity.i)
 EndProcedure
 
 Procedure.i ExFatDirIsDir()
+  If exfat_mountHandle<>0 Or exfat_mountRunning<>0 : exfat_Fail(#EXFAT_E_BUSY) : ProcedureReturn 0 : EndIf
   ProcedureReturn (exfat_dirCurrentAttr & #EXFAT_ATTR_DIRECTORY) <> 0
 EndProcedure
 
 Procedure.i ExFatDirSize()
+  If exfat_mountHandle<>0 Or exfat_mountRunning<>0 : exfat_Fail(#EXFAT_E_BUSY) : ProcedureReturn 0 : EndIf
   ProcedureReturn exfat_dirCurrentLength
 EndProcedure
 
@@ -2823,6 +2900,7 @@ Procedure.i ExFatWrite(*src, count.i)
   Define gap.i
   Define take.i
   Define allocation.i
+  If exfat_mountHandle<>0 Or exfat_mountRunning<>0 : exfat_Fail(#EXFAT_E_BUSY) : ProcedureReturn -1 : EndIf
   If exfat_open = 0
     ProcedureReturn exfat_Fail(#EXFAT_E_NO_FILE)
   EndIf
@@ -2894,6 +2972,7 @@ Procedure.i ExFatTruncate(newLength.i)
   Define oldFlags.i
   Define oldLength.i
   Define oldValid.i
+  If exfat_mountHandle<>0 Or exfat_mountRunning<>0 : exfat_Fail(#EXFAT_E_BUSY) : ProcedureReturn 0 : EndIf
   If exfat_open = 0
     ProcedureReturn exfat_Fail(#EXFAT_E_NO_FILE)
   EndIf
@@ -3426,6 +3505,7 @@ Procedure.i exfat_CreateCommon(*path, attr.i)
 EndProcedure
 
 Procedure.i ExFatCreate(*path)
+  If exfat_mountHandle<>0 Or exfat_mountRunning<>0 : exfat_Fail(#EXFAT_E_BUSY) : ProcedureReturn 0 : EndIf
   If exfat_CreateCommon(*path, #EXFAT_ATTR_ARCHIVE) = 0
     ProcedureReturn 0
   EndIf
@@ -3436,6 +3516,7 @@ Procedure.i ExFatCreate(*path)
 EndProcedure
 
 Procedure.i ExFatMkdir(*path)
+  If exfat_mountHandle<>0 Or exfat_mountRunning<>0 : exfat_Fail(#EXFAT_E_BUSY) : ProcedureReturn 0 : EndIf
   ProcedureReturn exfat_CreateCommon(*path, #EXFAT_ATTR_DIRECTORY)
 EndProcedure
 
@@ -3488,6 +3569,7 @@ EndProcedure
 
 Procedure.i ExFatRemove(*path)
   Define empty.i
+  If exfat_mountHandle<>0 Or exfat_mountRunning<>0 : exfat_Fail(#EXFAT_E_BUSY) : ProcedureReturn 0 : EndIf
   If exfat_Resolve(*path) = 0
     ProcedureReturn 0
   EndIf
@@ -3522,6 +3604,7 @@ Procedure.i ExFatRemove(*path)
 EndProcedure
 
 Procedure.i ExFatRename(*oldPath, *newPath)
+  If exfat_mountHandle<>0 Or exfat_mountRunning<>0 : exfat_Fail(#EXFAT_E_BUSY) : ProcedureReturn 0 : EndIf
   Dim oldPrimary.a[32]
   Define oldFirst.i
   Define oldLength.i
@@ -3598,6 +3681,7 @@ Procedure.i ExFatRescanFree()
   Define cluster.i
   Define used.i
   Define free.i
+  If exfat_mountHandle<>0 Or exfat_mountRunning<>0 : exfat_Fail(#EXFAT_E_BUSY) : ProcedureReturn 0 : EndIf
   If exfat_mounted = 0
     ProcedureReturn exfat_Fail(#EXFAT_E_NOT_MOUNTED)
   EndIf
@@ -3619,6 +3703,7 @@ Procedure.i ExFatRescanFree()
 EndProcedure
 
 Procedure.i ExFatFreeClusters()
+  If exfat_mountHandle<>0 Or exfat_mountRunning<>0 : exfat_Fail(#EXFAT_E_BUSY) : ProcedureReturn -1 : EndIf
   If exfat_freeClusters < 0
     If ExFatRescanFree() = 0
       ProcedureReturn -1
@@ -3628,6 +3713,7 @@ Procedure.i ExFatFreeClusters()
 EndProcedure
 
 Procedure.i ExFatFlush()
+  If exfat_mountHandle<>0 Or exfat_mountRunning<>0 : exfat_Fail(#EXFAT_E_BUSY) : ProcedureReturn 0 : EndIf
   If exfat_mounted = 0
     ProcedureReturn exfat_Fail(#EXFAT_E_NOT_MOUNTED)
   EndIf
@@ -3657,6 +3743,7 @@ Procedure.i ExFatFlush()
 EndProcedure
 
 Procedure.i ExFatUnmount()
+  If exfat_mountHandle<>0 Or exfat_mountRunning<>0 : exfat_Fail(#EXFAT_E_BUSY) : ProcedureReturn 0 : EndIf
   If exfat_open <> 0
     ProcedureReturn exfat_Fail(#EXFAT_E_BUSY)
   EndIf
@@ -3693,12 +3780,14 @@ Procedure.i ExFatLastLba()
 EndProcedure
 
 Procedure.i ExFatBytesPerCluster()
+  If exfat_mountHandle<>0 Or exfat_mountRunning<>0 : exfat_Fail(#EXFAT_E_BUSY) : ProcedureReturn 0 : EndIf
   ProcedureReturn exfat_bytesPerCluster
 EndProcedure
 
 Procedure.i ExFatErrorText()
   Select exfat_error
     Case #EXFAT_OK : ProcedureReturn "nothing went wrong"
+    Case #EXFAT_E_MOUNT_HANDLE : ProcedureReturn "exFAT error 44: the mount handle is stale or belongs to another operation"
     Case #EXFAT_E_NO_READER : ProcedureReturn "exFAT error 1: no block reader is installed; bring up a storage device first"
     Case #EXFAT_E_READ : ProcedureReturn "exFAT error 2: a block read failed; check the medium and connection"
     Case #EXFAT_E_NO_MBR : ProcedureReturn "exFAT error 3: sector zero is neither an exFAT boot sector nor a valid MBR"
@@ -3735,7 +3824,7 @@ Procedure.i ExFatErrorText()
     Case #EXFAT_E_READ_ONLY : ProcedureReturn "exFAT error 34: the entry is read-only; clear the attribute before changing it"
     Case #EXFAT_E_DIR_FULL : ProcedureReturn "exFAT error 35: the directory has no contiguous entry slots; remove entries or repair it"
     Case #EXFAT_E_FLUSH : ProcedureReturn "exFAT error 36: the device did not flush writes; do not remove power"
-    Case #EXFAT_E_BUSY : ProcedureReturn "exFAT error 37: a file is still open; close it before unmounting"
+    Case #EXFAT_E_BUSY : ProcedureReturn "exFAT error 37: an open file, dirty volume, active mount or exhausted mount handles prevents replacing the mount"
     Case #EXFAT_E_CRITICAL : ProcedureReturn "exFAT error 38: an unknown critical directory entry is present; this implementation cannot mount it safely"
     Case #EXFAT_E_TEXFAT : ProcedureReturn "exFAT error 39: TexFAT transactional mode is unsupported; use ordinary exFAT"
     Case #EXFAT_E_RESERVED_NAME : ProcedureReturn "exFAT error 42: . and .. are reserved names for a folder and its parent and cannot name a file or folder"

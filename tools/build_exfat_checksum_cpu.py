@@ -281,12 +281,78 @@ Procedure.i ProofMountStages()
  If ExFatMount(1)=0 Or exfat_mounted<>1 : ProcedureReturn 8 : EndIf
  ProcedureReturn 0
 EndProcedure
+Global proofMountCallbackFault.i
+Procedure.i ProofReplacingReader(lba.i,count.i,dst.i)
+ ExFatSetRangeReader(@GateReader)
+ If ExFatMountBegin(1)<>0 : proofMountCallbackFault=1 : EndIf
+ If ExFatMountPending()<>1 : proofMountCallbackFault=2 : EndIf
+ ProcedureReturn GateReader(lba,count,dst)
+EndProcedure
+Procedure.i ProofMountJobs()
+ Define h.i,nextHandle.i,stage.i,stopAt.i,rc.i,reads.i,saved.i
+ ProofPrepareBoot() : exfat_MountReset() : reads=gateReads
+ h=ExFatMountBegin(1)
+ If h<=0 Or gateReads<>reads Or ExFatMountPending()<>1 : ProcedureReturn 1 : EndIf
+ If ExFatMountBegin(1)<>0 Or ExFatLastError()<>#EXFAT_E_BUSY : ProcedureReturn 2 : EndIf
+ If ExFatMount(1)<>0 Or ExFatLastError()<>#EXFAT_E_BUSY : ProcedureReturn 3 : EndIf
+ If ExFatMountStep(h+1)<>-1 Or ExFatMountCancel(h+1)<>0 Or ExFatMountPending()<>1 : ProcedureReturn 4 : EndIf
+ exfat_mountRunning=1 : rc=ExFatMountStep(h) : exfat_mountRunning=0
+ If rc<>-1 Or ExFatLastError()<>#EXFAT_E_BUSY Or gateReads<>reads : ProcedureReturn 69 : EndIf
+ If ExFatProbePartition(1,0,0)<>0 Or ExFatUnmount()<>0 Or ExFatDirRewind()<>0 : ProcedureReturn 5 : EndIf
+ If ExFatDirNext()<>-1 Or ExFatOpen(0)<>0 Or ExFatBytesPerCluster()<>0 Or gateReads<>reads : ProcedureReturn 6 : EndIf
+ For stage=0 To 5
+  rc=ExFatMountStep(h)
+  If rc<>Bool(stage=5) Or ExFatMounted()<>Bool(stage=5) : ProcedureReturn 10+stage : EndIf
+ Next
+ If ExFatMountPending()<>0 Or ExFatMountStep(h)<>-1 Or ExFatMounted()<>1 : ProcedureReturn 7 : EndIf
+ For stopAt=0 To 5
+  ProofPrepareBoot() : exfat_MountReset() : h=ExFatMountBegin(1)
+  For stage=0 To stopAt-1
+   If ExFatMountStep(h)<>0 : ProcedureReturn 20+stage : EndIf
+  Next
+  reads=gateReads
+  If ExFatMountCancel(h)<>1 Or ExFatMountPending()<>0 Or ExFatMounted()<>0 Or gateReads<>reads : ProcedureReturn 30+stopAt : EndIf
+  nextHandle=ExFatMountBegin(1)
+  If nextHandle<=h Or ExFatMountCancel(h)<>0 Or ExFatMountPending()<>1 : ProcedureReturn 40+stopAt : EndIf
+  If ExFatMountCancel(nextHandle)<>1 : ProcedureReturn 50+stopAt : EndIf
+ Next
+ ProofPrepareBoot() : exfat_MountReset() : h=ExFatMountBegin(1)
+ If ExFatMountStep(h)<>0 : ProcedureReturn 8 : EndIf
+ ExFatSetRangeReader(@GateReader) : reads=gateReads
+ If ExFatMountStep(h)<>-1 Or ExFatMountPending()<>0 Or ExFatMounted()<>0 Or gateReads<>reads : ProcedureReturn 9 : EndIf
+ ProofPrepareBoot() : exfat_MountReset() : h=ExFatMountBegin(1)
+ If ExFatMountStep(h)<>0 : ProcedureReturn 60 : EndIf
+ gateFailLba=1 : rc=ExFatMountStep(h) : gateFailLba=-1
+ If rc<>-1 Or ExFatLastError()<>#EXFAT_E_READ Or ExFatMountPending()<>0 Or ExFatMounted()<>0 : ProcedureReturn 61 : EndIf
+ ProofPrepareBoot() : exfat_MountReset() : ExFatSetRangeReader(@ProofReplacingReader)
+ proofMountCallbackFault=0 : h=ExFatMountBegin(1)
+ If ExFatMountStep(h)<>-1 Or ExFatLastError()<>#EXFAT_E_MOUNT_HANDLE : ProcedureReturn 66 : EndIf
+ If ExFatMountPending()<>0 Or ExFatMounted()<>0 Or proofMountCallbackFault<>0 : ProcedureReturn 67 : EndIf
+ If ExFatMount(1)=0 : ProcedureReturn 68 : EndIf
+ ProofPrepareBoot() : exfat_MountReset() : ExFatSetRangeReader(@ProofReplacingReader)
+ h=ExFatMountBegin(1) : exfat_mountRunning=1
+ rc=exfat_ReadBlocks(0,1,@gateRead[0]) : exfat_mountRunning=0
+ If rc<>0 Or ExFatLastError()<>#EXFAT_E_MOUNT_HANDLE Or ExFatMountPending()<>0 : ProcedureReturn 70 : EndIf
+ reads=gateReads : exfat_mountRunning=1
+ rc=exfat_ReadBlocks(0,1,@gateRead[0]) : exfat_mountRunning=0
+ If rc<>0 Or gateReads<>reads Or ExFatLastError()<>#EXFAT_E_MOUNT_HANDLE : ProcedureReturn 71 : EndIf
+ saved=exfat_mountNext : exfat_mountNext=$7FFFFFFF : reads=gateReads
+ rc=ExFatMountBegin(1) : exfat_mountNext=saved
+ If rc<>0 Or ExFatLastError()<>#EXFAT_E_BUSY Or gateReads<>reads : ProcedureReturn 62 : EndIf
+ ProofPrepareBoot() : exfat_MountReset()
+ If ExFatMount(1)=0 : ProcedureReturn 63 : EndIf
+ exfat_open=1 : rc=ExFatMountBegin(1) : exfat_open=0
+ If rc<>0 Or ExFatMounted()<>1 : ProcedureReturn 64 : EndIf
+ exfat_dirty=1 : rc=ExFatMountBegin(1) : exfat_dirty=0
+ If rc<>0 Or ExFatMounted()<>1 : ProcedureReturn 65 : EndIf
+ ProcedureReturn 0
+EndProcedure
 Procedure.i Main()
  Define rc.i,i.i,j.i,n.i,start.i,slow.i,fast.i,old.i,new.i,p.i,reads.i
  For i=0 To 65535 : PokeA($E1C00000+i,0) : Next
  MmuClearNc() : rc=MmuBuildTables($4F80000) : If rc<>0 : ProcedureReturn 9999 : EndIf
  MmuEnableCached()
- PokeI($E1C00000,$58464335)
+ PokeI($E1C00000,$58464336)
  PokeI($E1C00040,ExFatProfileBegin())
  ExFatProfileSetClock(@ProofProfileClock)
  start=ExFatProfileBegin() : ExFatProfileEnd(0,start)
@@ -303,9 +369,11 @@ Procedure.i Main()
  If rc<>0 : MmuDisableCachedFlushed() : ProcedureReturn 9800+rc : EndIf
  rc=ProofMountStages() : PokeI($E1C00098,rc)
  If rc<>0 : MmuDisableCachedFlushed() : ProcedureReturn 9900+rc : EndIf
+ rc=ProofMountJobs() : PokeI($E1C000A0,rc)
+ If rc<>0 : MmuDisableCachedFlushed() : ProcedureReturn 10000+rc : EndIf
  rc=ProofDirectoryCache() : PokeI($E1C00080,rc)
  If rc<>0 : MmuDisableCachedFlushed() : ProcedureReturn 9500+rc : EndIf
- GateFormat() : ExFatSetRangeReader(@GateReader) : ExFatSetRangeWriter(0)
+ GateFormat() : ExFatSetRangeReader(@GateReader) : ExFatSetRangeWriter(0) : exfat_MountReset()
  rc=ExFatMount(1) : If rc=0 : MmuDisableCachedFlushed() : ProcedureReturn 9000+ExFatLastError() : EndIf
  For i=10 To 73 : exfat_Put32(@gateDisk[0]+25*512,i*4,i+1) : Next
  exfat_Put32(@gateDisk[0]+25*512,73*4,$FFFFFFFF)

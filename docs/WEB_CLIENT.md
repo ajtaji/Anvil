@@ -2067,3 +2067,38 @@ cancellation handling: another operation must not replace or reuse partial mount
 state. Wiring a pause into the current global-state mount without that protection
 would be unsafe. Cooperative cold open and the remaining networking protocols
 are still unfinished.
+
+
+### Owned mount jobs (compiled build470; installed build467)
+
+The shared exFAT driver now provides ExFatMountBegin, ExFatMountStep,
+ExFatMountCancel and ExFatMountPending. Begin returns a positive owner handle
+without device I/O, or zero on refusal. Step returns zero while pending, one on
+completion or minus one on failure. Cancel accepts only the current handle;
+stale handles cannot affect another operation. Handles do not wrap. The existing
+ExFatMount API drains the same stages synchronously.
+
+A pending mount refuses competing mounts and volume/file/directory operations.
+An open file or dirty mounted volume also prevents replacement. Reader rebinding
+cancels an unfinished job. If a provider changes its reader during a callback,
+the old result is discarded before publication; further reads from the cancelled
+step are refused. Beginning another mount is prohibited until that active step
+has returned. This is serialized ownership, not an SMP synchronization primitive,
+and individual device callbacks remain synchronous.
+
+Physical Pi tests passed the full filesystem/checksum/cache/boot regression,
+competing and stale handles, completion, cancellation at all six boundaries,
+reader rebinding, cancellation during a reader callback, subsequent-read refusal,
+read failure, handle exhaustion and preservation of open/dirty volumes. Final
+capture95 returned zero with healthy cores, fonts, Vulkan and watchdog state.
+The compiler rejected an earlier test's guarded recursive callback, so that test
+was rewritten without recursion; no compiler check was weakened.
+
+Pi4build470 and Pi3build84 compile the shared implementation. Build470 has not
+been installed; the Pi remains on verified467. Evidence:
+`docs/evidence/anvil-ipv6-20261030/mount-owner470`.
+
+The filesystem facade and TLS cancellation path do not yet use this job API.
+They still need to coordinate ownership before cold TLS opening can yield.
+No new HTTPS latency improvement is claimed. Remaining networking work includes
+that integration, IPv6/off-link/PMTU and DNS transport, HTTP/2-3 and managed cookies.
