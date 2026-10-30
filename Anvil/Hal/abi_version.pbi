@@ -132,6 +132,7 @@
 ; No table index moves; targets without an entropy provider return ENOCAP.
 ; 1.11 - reserved net slot88: IPv6 TCP open with automatic source selection.
 ; Existing handles/send/receive/state/close and the200-entry shape are unchanged.
-#SVC_ABI_MINOR   = 11
+; 1.12 - reserved net slot89: cooperative AAAA resolution into caller storage.
+#SVC_ABI_MINOR   = 12
 #SVC_SLOT_COUNT  = 200         ; 184 at 1.0-1.2; 192 at 1.3; file handles appended at 1.4.
                                ; The boot code sizes its check by it.

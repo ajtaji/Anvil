@@ -205,6 +205,8 @@ Global paynet_dnsTries.i
 Global paynet_dnsStart.i
 Global paynet_dnsDue.i
 Global paynet_dnsDeadline.i
+Global paynet_dnsType.i = #DNS_QTYPE_A
+Global Dim paynet_dnsAnswer6.a[16]
 Global paynet_dnsAnswer.i
 Global paynet_dnsTtl.i
 Global paynet_dnsAnswerAt.i
@@ -215,6 +217,8 @@ Global paynet_dnsRejects.i       ; datagrams on our port that were not our answe
 Global Dim paynet_dnsName.a[#PAYNET_DNS_NAME]
 Global Dim paynet_cacheName.a[#PAYNET_DNS_CACHE * #PAYNET_DNS_NAME]
 Global Dim paynet_cacheIp.i[#PAYNET_DNS_CACHE]
+Global Dim paynet_cacheType.i[#PAYNET_DNS_CACHE]
+Global Dim paynet_cacheIp6.a[#PAYNET_DNS_CACHE*16]
 Global Dim paynet_cacheAt.i[#PAYNET_DNS_CACHE]
 Global Dim paynet_cacheMs.i[#PAYNET_DNS_CACHE]
 Global Dim paynet_cacheUsed.i[#PAYNET_DNS_CACHE]
@@ -292,29 +296,45 @@ Procedure paynet_CopyName(*dst, *src)
   PokeA(*dst + i, 0)
 EndProcedure
 
-Procedure.i paynet_CacheFind(*name, now.i)
+Procedure.i paynet_CacheSlot(*name, now.i, qtype.i)
   Define i.i
   For i = 0 To #PAYNET_DNS_CACHE - 1
     If paynet_cacheUsed[i] <> 0
       If ((now - paynet_cacheAt[i]) & $FFFFFFFF) >= paynet_cacheMs[i]
         paynet_cacheUsed[i] = 0
-      ElseIf paynet_SameName(@paynet_cacheName[i * #PAYNET_DNS_NAME], *name) <> 0
+      ElseIf paynet_cacheType[i]=qtype And paynet_SameName(@paynet_cacheName[i * #PAYNET_DNS_NAME], *name) <> 0
         ; TTL zero is a one-delivery transaction result, never reusable.
         If paynet_cacheUsed[i]=2 : paynet_cacheUsed[i]=0 : EndIf
-        ProcedureReturn paynet_cacheIp[i]
+        ProcedureReturn i+1
       EndIf
     EndIf
   Next
   ProcedureReturn 0
 EndProcedure
 
-Procedure paynet_CachePut(*name, ip.i, now.i, ttl.i)
+Procedure.i paynet_CacheFind(*name,now.i)
+  Define slot.i
+  slot=paynet_CacheSlot(*name,now,#DNS_QTYPE_A)
+  If slot=0 : ProcedureReturn 0 : EndIf
+  ProcedureReturn paynet_cacheIp[slot-1]
+EndProcedure
+
+Procedure.i paynet_CacheFind6(*name,now.i,destination.i)
+  Define slot.i,j.i
+  If destination=0 : ProcedureReturn 0 : EndIf
+  slot=paynet_CacheSlot(*name,now,#DNS_QTYPE_AAAA)
+  If slot=0 : ProcedureReturn 0 : EndIf
+  For j=0 To 15 : PokeA(destination+j,paynet_cacheIp6[(slot-1)*16+j]) : Next
+  ProcedureReturn 16
+EndProcedure
+
+Procedure.i paynet_CacheStore(*name,now.i,ttl.i,qtype.i)
   Define i.i
   Define slot.i
   slot = -1
   For i = 0 To #PAYNET_DNS_CACHE - 1
     If paynet_cacheUsed[i] <> 0
-      If paynet_SameName(@paynet_cacheName[i * #PAYNET_DNS_NAME], *name) <> 0
+      If paynet_cacheType[i]=qtype And paynet_SameName(@paynet_cacheName[i * #PAYNET_DNS_NAME], *name) <> 0
         slot = i
       EndIf
     EndIf
@@ -324,7 +344,7 @@ Procedure paynet_CachePut(*name, ip.i, now.i, ttl.i)
     paynet_cacheNext = (paynet_cacheNext + 1) % #PAYNET_DNS_CACHE
   EndIf
   paynet_CopyName(@paynet_cacheName[slot * #PAYNET_DNS_NAME], *name)
-  paynet_cacheIp[slot] = ip
+  paynet_cacheType[slot] = qtype
   paynet_cacheAt[slot] = now
   If ttl<1
     paynet_cacheUsed[slot]=2
@@ -334,6 +354,19 @@ Procedure paynet_CachePut(*name, ip.i, now.i, ttl.i)
     paynet_cacheMs[slot]=ttl*1000
     paynet_cacheUsed[slot]=1
   EndIf
+  ProcedureReturn slot
+EndProcedure
+
+Procedure paynet_CachePut(*name,ip.i,now.i,ttl.i)
+  Define slot.i
+  slot=paynet_CacheStore(*name,now,ttl,#DNS_QTYPE_A)
+  paynet_cacheIp[slot]=ip
+EndProcedure
+
+Procedure paynet_CachePut6(*name,source.i,now.i,ttl.i)
+  Define slot.i,j.i
+  slot=paynet_CacheStore(*name,now,ttl,#DNS_QTYPE_AAAA)
+  For j=0 To 15 : paynet_cacheIp6[slot*16+j]=PeekA(source+j) : Next
 EndProcedure
 
 ; ======================================================================
@@ -391,6 +424,18 @@ EndProcedure
 ;  datagram it is reading is the receive scratch. The step owns the rest.
 ;  1 = the datagram was ours (consumed, accepted or not), 0 = not ours.
 ; ----------------------------------------------------------------------
+; Copy the selected record before another codec user reuses its storage.
+Procedure paynet_DnsCaptureAnswer(now.i)
+  If paynet_dnsType=#DNS_QTYPE_AAAA
+    DnsResultIp6(0,@paynet_dnsAnswer6[0])
+    paynet_dnsAnswer=0
+  Else
+    paynet_dnsAnswer=DnsResultIp(0)
+  EndIf
+  paynet_dnsTtl=DnsResultTtl(0)
+  paynet_dnsAnswerAt=now
+EndProcedure
+
 Procedure.i PayNetDnsInput(kind.i)
   Define c.i
   If paynet_dnsState <> #PAYNET_DNS_WAIT And paynet_dnsState <> #PAYNET_DNS_SEND
@@ -406,17 +451,15 @@ Procedure.i PayNetDnsInput(kind.i)
     paynet_dnsRejects = paynet_dnsRejects + 1
     ProcedureReturn 1
   EndIf
-  c = DnsParseReplyFor(NetUdpRxData(), NetUdpRxLen(), paynet_dnsQid, @paynet_dnsName[0])
+  c = DnsParseReplyTypeFor(NetUdpRxData(), NetUdpRxLen(), paynet_dnsQid, @paynet_dnsName[0],paynet_dnsType)
   If c > 0
-    paynet_dnsAnswer = DnsResultIp(0)
-    paynet_dnsTtl = DnsResultTtl(0)
-    paynet_dnsAnswerAt = millis()
+    paynet_DnsCaptureAnswer(millis())
     paynet_dnsState = #PAYNET_DNS_DONE
     ProcedureReturn 1
   EndIf
   If c = 0
     paynet_dnsErr = #SVC_EIO
-    paynet_dnsWhy = "the DNS server answered and had no IPv4 address for that name"
+    paynet_dnsWhy = "the DNS server answered and had no address of the requested type for that name"
     paynet_dnsState = #PAYNET_DNS_FAIL
     ProcedureReturn 1
   EndIf
@@ -444,7 +487,7 @@ Procedure paynet_DnsSend(now.i)
     paynet_DnsFail(#SVC_ESTATE, "the interface the query was going out of lost its address")
     ProcedureReturn
   EndIf
-  n = DnsBuildQuery(@paynet_dnsName[0], paynet_dnsQid)
+  n = DnsBuildQueryType(@paynet_dnsName[0], paynet_dnsQid,paynet_dnsType)
   If n <= 0
     paynet_DnsFail(#SVC_EARG, "that is not a host name DNS can carry: a part between two dots is empty or longer than 63 characters")
     ProcedureReturn
@@ -488,7 +531,7 @@ Procedure paynet_DnsTcpStep(now.i)
     ProcedureReturn
   EndIf
   If paynet_dnsTcp=0
-    n=DnsBuildQuery(@paynet_dnsName[0],paynet_dnsQid)
+    n=DnsBuildQueryType(@paynet_dnsName[0],paynet_dnsQid,paynet_dnsType)
     If n<=0 Or n>#DNS_OUT_MAX
       paynet_DnsFail(#SVC_EARG,"the DNS TCP query could not be serialized")
       ProcedureReturn
@@ -543,13 +586,12 @@ Procedure paynet_DnsTcpStep(now.i)
       paynet_DnsFail(#SVC_EIO,"the resolver replied before the DNS query was transmitted")
       ProcedureReturn
     EndIf
-    rc=DnsParseReplyFor(@paynet_dnsTcpRx[2],paynet_dnsTcpRxLen-2,paynet_dnsQid,@paynet_dnsName[0])
+    rc=DnsParseReplyTypeFor(@paynet_dnsTcpRx[2],paynet_dnsTcpRxLen-2,paynet_dnsQid,@paynet_dnsName[0],paynet_dnsType)
     If rc<=0
       paynet_DnsFail(#SVC_EIO,"the DNS TCP answer was refused or contained no matching address")
       ProcedureReturn
     EndIf
-    paynet_dnsAnswer=DnsResultIp(0) : paynet_dnsTtl=DnsResultTtl(0)
-    paynet_dnsAnswerAt=now
+    paynet_DnsCaptureAnswer(now)
     paynet_DnsCloseTcp()
     paynet_dnsState=#PAYNET_DNS_DONE
   ElseIf n=0 And st=#SVC_TCP_PEER_CLOSED
@@ -564,7 +606,11 @@ Procedure paynet_DnsStep(now.i)
   EndIf
   If paynet_dnsState = #PAYNET_DNS_DONE
     paynet_DnsCloseListener()
-    paynet_CachePut(@paynet_dnsName[0], paynet_dnsAnswer, paynet_dnsAnswerAt, paynet_dnsTtl)
+    If paynet_dnsType=#DNS_QTYPE_AAAA
+      paynet_CachePut6(@paynet_dnsName[0],@paynet_dnsAnswer6[0],paynet_dnsAnswerAt,paynet_dnsTtl)
+    Else
+      paynet_CachePut(@paynet_dnsName[0],paynet_dnsAnswer,paynet_dnsAnswerAt,paynet_dnsTtl)
+    EndIf
     paynet_dnsState = #PAYNET_DNS_IDLE
     ProcedureReturn
   EndIf
@@ -613,7 +659,7 @@ EndProcedure
 ;  PayNetDnsResolve(*name) - slot 75. An IPv4 address (positive), or a
 ;  negative #SVC_* code; #SVC_EAGAIN means "asked, ask again".
 ; ----------------------------------------------------------------------
-Procedure.i PayNetDnsResolve(*name)
+Procedure.i paynet_DnsResolveType(*name,qtype.i,destination.i)
   Define now.i
   Define n.i
   Define ip.i
@@ -622,6 +668,12 @@ Procedure.i PayNetDnsResolve(*name)
   Define code.i
 
   now = millis()
+  If qtype<>#DNS_QTYPE_A And qtype<>#DNS_QTYPE_AAAA
+    gSvcDetail="unsupported address query type" : ProcedureReturn #SVC_EARG
+  EndIf
+  If qtype=#DNS_QTYPE_AAAA And destination=0
+    gSvcDetail="the IPv6 result pointer was zero" : ProcedureReturn #SVC_EARG
+  EndIf
   If *name = 0
     gSvcDetail = "the name pointer was zero"
     ProcedureReturn #SVC_EARG
@@ -637,7 +689,8 @@ Procedure.i PayNetDnsResolve(*name)
   EndIf
 
   ; A dotted quad is already an address and is never sent anywhere.
-  ip = ParseDotted(*name)
+  ip=-1
+  If qtype=#DNS_QTYPE_A : ip=ParseDotted(*name) : EndIf
   If ip >= 0
     If ip = 0 Or ip = $FFFFFFFF
       gSvcDetail = "0.0.0.0 and 255.255.255.255 are not the address of any one host"
@@ -648,14 +701,18 @@ Procedure.i PayNetDnsResolve(*name)
   EndIf
 
   paynet_DnsStep(now)
-  ip = paynet_CacheFind(*name, now)
+  If qtype=#DNS_QTYPE_AAAA
+    ip=paynet_CacheFind6(*name,now,destination)
+  Else
+    ip=paynet_CacheFind(*name,now)
+  EndIf
   If ip > 0
     gSvcDetail = 0
     ProcedureReturn ip
   EndIf
 
   If paynet_dnsState = #PAYNET_DNS_SEND Or paynet_dnsState = #PAYNET_DNS_WAIT Or paynet_dnsState = #PAYNET_DNS_TCP
-    If paynet_SameName(@paynet_dnsName[0], *name) <> 0
+    If paynet_dnsType=qtype And paynet_SameName(@paynet_dnsName[0], *name) <> 0
       gSvcDetail = "the query for that name is still in flight; ask again with the same name"
       ProcedureReturn #SVC_EAGAIN
     EndIf
@@ -663,7 +720,7 @@ Procedure.i PayNetDnsResolve(*name)
     ProcedureReturn #SVC_EBUSY
   EndIf
   If paynet_dnsState = #PAYNET_DNS_FAIL
-    If paynet_SameName(@paynet_dnsName[0], *name) <> 0
+    If paynet_dnsType=qtype And paynet_SameName(@paynet_dnsName[0], *name) <> 0
       ; Said once. The next call for this name starts again from nothing.
       code = paynet_dnsErr
       gSvcDetail = paynet_dnsWhy
@@ -697,7 +754,7 @@ Procedure.i PayNetDnsResolve(*name)
     ProcedureReturn #SVC_ESTATE
   EndIf
   ; Refuse a malformed name now, at the call that made it, not a second later.
-  If DnsBuildQuery(*name, 1) <= 0
+  If DnsBuildQueryType(*name, 1,qtype) <= 0
     paynet_dnsKind = #HW_LINK_NONE
     gSvcDetail = "that is not a host name DNS can carry: a part between two dots is empty or longer than 63 characters"
     ProcedureReturn #SVC_EARG
@@ -715,6 +772,7 @@ Procedure.i PayNetDnsResolve(*name)
   If paynet_dnsQid = 0
     paynet_dnsQid = 1
   EndIf
+  paynet_dnsType=qtype
   paynet_dnsTries = 0
   paynet_dnsStart = now
   paynet_dnsDue = now
@@ -729,6 +787,16 @@ Procedure.i PayNetDnsResolve(*name)
   EndIf
   gSvcDetail = "the query has been sent; ask again with the same name"
   ProcedureReturn #SVC_EAGAIN
+EndProcedure
+
+; A and AAAA share one bounded query owner; cache and in-flight identity
+; include the requested type. AAAA success copies 16 bytes and returns 16.
+Procedure.i PayNetDnsResolve(*name)
+  ProcedureReturn paynet_DnsResolveType(*name,#DNS_QTYPE_A,0)
+EndProcedure
+
+Procedure.i PayNetDnsResolve6(*name,destination.i)
+  ProcedureReturn paynet_DnsResolveType(*name,#DNS_QTYPE_AAAA,destination)
 EndProcedure
 
 Procedure.i PayNetDnsState() : ProcedureReturn paynet_dnsState : EndProcedure

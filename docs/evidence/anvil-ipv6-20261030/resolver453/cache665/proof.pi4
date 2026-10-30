@@ -1,0 +1,549 @@
+XIncludeFile "Anvil/Network/dns_codec.pbi"
+
+#PAYNET_DNS_NAME=256
+#PAYNET_DNS_CACHE=4
+#PAYNET_DNS_CACHE_MS=300000
+#PAYNET_DNS_TRY_MS=1500
+#PAYNET_DNS_TRIES=3
+Global Dim paynet_cacheName.a[1024]
+Global Dim paynet_cacheIp.i[4]
+Global Dim paynet_cacheType.i[4]
+Global Dim paynet_cacheIp6.a[64]
+Global Dim cache6.a[16]
+Global Dim paynet_cacheAt.i[4]
+Global Dim paynet_cacheMs.i[4]
+Global Dim paynet_cacheUsed.i[4]
+Global paynet_cacheNext.i
+Global Dim wire.a[4096]
+Procedure.i paynet_Lower(c.i)
+  If c >= 65 And c <= 90
+    ProcedureReturn c + 32
+  EndIf
+  ProcedureReturn c
+EndProcedure
+
+; Length of a NUL-terminated name, or -1 past 253 characters (RFC 1035
+; 2.3.4 allows 255 octets on the wire, which is 253 characters written out).
+Procedure.i paynet_NameLen(*name)
+  Define i.i
+  i = 0
+  While (PeekA(*name + i) & $FF) <> 0
+    i = i + 1
+    If i > 253
+      ProcedureReturn -1
+    EndIf
+  Wend
+  ProcedureReturn i
+EndProcedure
+
+; Host names are compared without regard to case (RFC 4343).
+Procedure.i paynet_SameName(*a, *b)
+  Define i.i
+  Define ca.i
+  Define cb.i
+  i = 0
+  Repeat
+    ca = paynet_Lower(PeekA(*a + i) & $FF)
+    cb = paynet_Lower(PeekA(*b + i) & $FF)
+    If ca <> cb
+      ProcedureReturn 0
+    EndIf
+    If ca = 0
+      ProcedureReturn 1
+    EndIf
+    i = i + 1
+  Until i >= #PAYNET_DNS_NAME
+  ProcedureReturn 0
+EndProcedure
+
+Procedure paynet_CopyName(*dst, *src)
+  Define i.i
+  Define c.i
+  i = 0
+  c = PeekA(*src) & $FF
+  While c <> 0 And i < #PAYNET_DNS_NAME - 1
+    PokeA(*dst + i, c)
+    i = i + 1
+    c = PeekA(*src + i) & $FF
+  Wend
+  PokeA(*dst + i, 0)
+EndProcedure
+
+Procedure.i paynet_CacheSlot(*name, now.i, qtype.i)
+  Define i.i
+  For i = 0 To #PAYNET_DNS_CACHE - 1
+    If paynet_cacheUsed[i] <> 0
+      If ((now - paynet_cacheAt[i]) & $FFFFFFFF) >= paynet_cacheMs[i]
+        paynet_cacheUsed[i] = 0
+      ElseIf paynet_cacheType[i]=qtype And paynet_SameName(@paynet_cacheName[i * #PAYNET_DNS_NAME], *name) <> 0
+        ; TTL zero is a one-delivery transaction result, never reusable.
+        If paynet_cacheUsed[i]=2 : paynet_cacheUsed[i]=0 : EndIf
+        ProcedureReturn i+1
+      EndIf
+    EndIf
+  Next
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i paynet_CacheFind(*name,now.i)
+  Define slot.i
+  slot=paynet_CacheSlot(*name,now,#DNS_QTYPE_A)
+  If slot=0 : ProcedureReturn 0 : EndIf
+  ProcedureReturn paynet_cacheIp[slot-1]
+EndProcedure
+
+Procedure.i paynet_CacheFind6(*name,now.i,destination.i)
+  Define slot.i,j.i
+  If destination=0 : ProcedureReturn 0 : EndIf
+  slot=paynet_CacheSlot(*name,now,#DNS_QTYPE_AAAA)
+  If slot=0 : ProcedureReturn 0 : EndIf
+  For j=0 To 15 : PokeA(destination+j,paynet_cacheIp6[(slot-1)*16+j]) : Next
+  ProcedureReturn 16
+EndProcedure
+
+Procedure.i paynet_CacheStore(*name,now.i,ttl.i,qtype.i)
+  Define i.i
+  Define slot.i
+  slot = -1
+  For i = 0 To #PAYNET_DNS_CACHE - 1
+    If paynet_cacheUsed[i] <> 0
+      If paynet_cacheType[i]=qtype And paynet_SameName(@paynet_cacheName[i * #PAYNET_DNS_NAME], *name) <> 0
+        slot = i
+      EndIf
+    EndIf
+  Next
+  If slot < 0
+    slot = paynet_cacheNext
+    paynet_cacheNext = (paynet_cacheNext + 1) % #PAYNET_DNS_CACHE
+  EndIf
+  paynet_CopyName(@paynet_cacheName[slot * #PAYNET_DNS_NAME], *name)
+  paynet_cacheType[slot] = qtype
+  paynet_cacheAt[slot] = now
+  If ttl<1
+    paynet_cacheUsed[slot]=2
+    paynet_cacheMs[slot]=#PAYNET_DNS_TRY_MS * #PAYNET_DNS_TRIES
+  Else
+    If ttl>#PAYNET_DNS_CACHE_MS/1000 : ttl=#PAYNET_DNS_CACHE_MS/1000 : EndIf
+    paynet_cacheMs[slot]=ttl*1000
+    paynet_cacheUsed[slot]=1
+  EndIf
+  ProcedureReturn slot
+EndProcedure
+
+Procedure paynet_CachePut(*name,ip.i,now.i,ttl.i)
+  Define slot.i
+  slot=paynet_CacheStore(*name,now,ttl,#DNS_QTYPE_A)
+  paynet_cacheIp[slot]=ip
+EndProcedure
+
+Procedure paynet_CachePut6(*name,source.i,now.i,ttl.i)
+  Define slot.i,j.i
+  slot=paynet_CacheStore(*name,now,ttl,#DNS_QTYPE_AAAA)
+  For j=0 To 15 : paynet_cacheIp6[slot*16+j]=PeekA(source+j) : Next
+EndProcedure
+
+
+Procedure Run(index.i,bytes.i,expected.i,qtype.i)
+ Define i.i,p.i,rc.i
+ For i=0 To bytes-1 : Read.a wire[i] : Next
+ p=$E1C00100+index*64
+ rc=DnsParseReplyTypeFor(@wire[0],bytes,$1234,expected,qtype)
+ PokeI(p,rc) : PokeI(p+8,DnsError()) : PokeI(p+16,DnsResultCount())
+ PokeI(p+24,DnsResultIp(0)) : PokeI(p+32,DnsResultTtl(0))
+ PokeI(p+40,DnsResultTtl(-1)) : PokeI(p+48,DnsResultTtl(DnsResultCount()))
+ p=$E1C02000+index*32
+ PokeI(p,DnsResultIp6(0,p+8))
+EndProcedure
+Procedure Cache(index.i,ttl.i,at.i,first.i,second.i)
+ Define i.i,p.i
+ For i=0 To 3 : paynet_cacheUsed[i]=0 : Next
+ paynet_cacheNext=0
+ paynet_CachePut("example.test",$01020304,at,ttl)
+ p=$E1C01000+index*32
+ PokeI(p,paynet_CacheFind("EXAMPLE.TEST",first))
+ PokeI(p+8,paynet_CacheFind("example.test",second))
+EndProcedure
+Procedure CheckCache6()
+ Define i.i,p.i
+ p=$E1C03500
+ For i=0 To 3 : paynet_cacheUsed[i]=0 : Next
+ For i=0 To 15 : cache6[i]=i+16 : Next
+ paynet_cacheNext=0
+ paynet_CachePut("same.test",$01020304,1000,60)
+ paynet_CachePut6("same.test",@cache6[0],1000,2)
+ PokeI(p,paynet_CacheFind("same.test",2000))
+ PokeI(p+8,paynet_CacheFind6("SAME.TEST",2999,p+64))
+ PokeI(p+16,paynet_CacheFind6("same.test",3000,p+80))
+ PokeI(p+24,paynet_CacheFind("same.test",3001))
+ paynet_CachePut6("same.test",@cache6[0],4000,0)
+ PokeI(p+32,paynet_CacheFind6("same.test",4001,p+96))
+ PokeI(p+40,paynet_CacheFind6("same.test",4002,p+112))
+ PokeI(p+48,paynet_CacheFind6("same.test",4002,0))
+ PokeI(p+56,paynet_CacheFind("same.test",4002))
+EndProcedure
+Procedure.i Main(services.i)
+ Define i.i
+ For i=0 To 16383 : PokeA($E1C00000+i,$A5) : Next
+ PokeI($E1C00000,$444E5332)
+ PokeI($E1C00008,45)
+ Restore Packet0
+ Run(0,46,"example.test",1)
+ Restore Packet1
+ Run(1,46,"EXAMPLE.TEST.",1)
+ Restore Packet2
+ Run(2,46,"example.test",1)
+ Restore Packet3
+ Run(3,60,"example.test",1)
+ Restore Packet4
+ Run(4,80,"example.test",1)
+ Restore Packet5
+ Run(5,80,"example.test",1)
+ Restore Packet6
+ Run(6,112,"example.test",1)
+ Restore Packet7
+ Run(7,46,"example.test",1)
+ Restore Packet8
+ Run(8,46,"example.test",1)
+ Restore Packet9
+ Run(9,62,"example.test",1)
+ Restore Packet10
+ Run(10,30,"example.test",1)
+ Restore Packet11
+ Run(11,30,"example.test",1)
+ Restore Packet12
+ Run(12,46,"example.test",1)
+ Restore Packet13
+ Run(13,61,"example.test",1)
+ Restore Packet14
+ Run(14,46,"example.test",1)
+ Restore Packet15
+ Run(15,46,"example.test",1)
+ Restore Packet16
+ Run(16,46,"example.test",1)
+ Restore Packet17
+ Run(17,46,"example.test",1)
+ Restore Packet18
+ Run(18,78,"example.test",1)
+ Restore Packet19
+ Run(19,90,"example.test",1)
+ Restore Packet20
+ Run(20,70,"example.test",1)
+ Restore Packet21
+ Run(21,81,"example.test",1)
+ Restore Packet22
+ Run(22,80,"example.test",1)
+ Restore Packet23
+ Run(23,80,"example.test",1)
+ Restore Packet24
+ Run(24,104,"example.test",1)
+ Restore Packet25
+ Run(25,174,"example.test",1)
+ Restore Packet26
+ Run(26,82,"example.test",1)
+ Restore Packet27
+ Run(27,1070,"example.test",1)
+ Restore Packet28
+ Run(28,46,"example.test",1)
+ Restore Packet29
+ Run(29,11,"example.test",1)
+ Restore Packet30
+ Run(30,58,"example.test",28)
+ Restore Packet31
+ Run(31,92,"example.test",28)
+ Restore Packet32
+ Run(32,92,"example.test",28)
+ Restore Packet33
+ Run(33,74,"example.test",28)
+ Restore Packet34
+ Run(34,46,"example.test",28)
+ Restore Packet35
+ Run(35,57,"example.test",28)
+ Restore Packet36
+ Run(36,59,"example.test",28)
+ Restore Packet37
+ Run(37,56,"example.test",28)
+ Restore Packet38
+ Run(38,68,"example.test",28)
+ Restore Packet39
+ Run(39,82,"example.test",28)
+ Restore Packet40
+ Run(40,90,"example.test",28)
+ Restore Packet41
+ Run(41,58,"example.test",28)
+ Restore Packet42
+ Run(42,58,"example.test",28)
+ Restore Packet43
+ Run(43,282,"example.test",28)
+ Restore Packet44
+ Run(44,58,"example.test",28)
+ PokeI($E1C03000+0*32,DnsBuildQueryType("example.test",$1234,28))
+ PokeI($E1C03008+0*32,DnsError())
+ PokeI($E1C03010+0*32,DnsQueryLen())
+ PokeI($E1C03000+1*32,DnsBuildQueryType("example.test",$1234,1))
+ PokeI($E1C03008+1*32,DnsError())
+ PokeI($E1C03010+1*32,DnsQueryLen())
+ PokeI($E1C03000+2*32,DnsBuildQueryType("example.test",$1234,15))
+ PokeI($E1C03008+2*32,DnsError())
+ PokeI($E1C03010+2*32,DnsQueryLen())
+ PokeI($E1C03000+3*32,DnsBuildQueryType("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",$1234,28))
+ PokeI($E1C03008+3*32,DnsError())
+ PokeI($E1C03010+3*32,DnsQueryLen())
+ PokeI($E1C03000+4*32,DnsBuildQueryType(".bad",$1234,28))
+ PokeI($E1C03008+4*32,DnsError())
+ PokeI($E1C03010+4*32,DnsQueryLen())
+ PokeI($E1C03000+5*32,DnsBuildQueryType("bad..name",$1234,28))
+ PokeI($E1C03008+5*32,DnsError())
+ PokeI($E1C03010+5*32,DnsQueryLen())
+ PokeI($E1C03000+6*32,DnsBuildQueryType("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",$1234,28))
+ PokeI($E1C03008+6*32,DnsError())
+ PokeI($E1C03010+6*32,DnsQueryLen())
+ PokeI($E1C03000+7*32,DnsBuildQueryType("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",$1234,28))
+ PokeI($E1C03008+7*32,DnsError())
+ PokeI($E1C03010+7*32,DnsQueryLen())
+ Cache(0,2,1000,2999,3000)
+ Cache(1,0,1000,1001,1002)
+ Cache(2,0,1000,5500,5501)
+ Cache(3,2,$FFFFFF00,$100,$6D0)
+ Cache(4,$7FFFFFFF,1000,300999,301000)
+ CheckCache6()
+ ProcedureReturn 0
+EndProcedure
+DataSection
+Packet0:
+ Data.a 18,52,129,128,0,1,0,1,0,0,0,0,7,101,120,97,109,112,108,101,4,116,101,115
+ Data.a 116,0,0,1,0,1,192,12,0,1,0,1,0,0,0,60,0,4,1,2,3,4
+Packet1:
+ Data.a 18,52,129,128,0,1,0,1,0,0,0,0,7,69,120,65,109,80,108,69,4,84,101,83
+ Data.a 116,0,0,1,0,1,192,12,0,1,0,1,0,0,0,60,0,4,1,2,3,4
+Packet2:
+ Data.a 18,52,129,128,0,1,0,1,0,0,0,0,7,97,110,111,116,104,101,114,4,116,101,115
+ Data.a 116,0,0,1,0,1,192,12,0,1,0,1,0,0,0,60,0,4,1,2,3,4
+Packet3:
+ Data.a 18,52,129,128,0,1,0,1,0,0,0,0,7,101,120,97,109,112,108,101,4,116,101,115
+ Data.a 116,0,0,1,0,1,9,117,110,114,101,108,97,116,101,100,4,116,101,115,116,0,0,1
+ Data.a 0,1,0,0,0,60,0,4,1,2,3,4
+Packet4:
+ Data.a 18,52,129,128,0,1,0,2,0,0,0,0,7,101,120,97,109,112,108,101,4,116,101,115
+ Data.a 116,0,0,1,0,1,5,97,108,105,97,115,4,116,101,115,116,0,0,1,0,1,0,0
+ Data.a 0,30,0,4,1,2,3,4,192,12,0,5,0,1,0,0,0,7,0,12,5,97,108,105
+ Data.a 97,115,4,116,101,115,116,0
+Packet5:
+ Data.a 18,52,129,128,0,1,0,2,0,0,0,0,7,101,120,97,109,112,108,101,4,116,101,115
+ Data.a 116,0,0,1,0,1,192,12,0,5,0,1,0,0,0,7,0,12,5,97,108,105,97,115
+ Data.a 4,116,101,115,116,0,5,97,108,105,97,115,4,116,101,115,116,0,0,1,0,1,0,0
+ Data.a 0,30,0,4,1,2,3,4
+Packet6:
+ Data.a 18,52,129,128,0,1,0,3,0,0,0,0,7,101,120,97,109,112,108,101,4,116,101,115
+ Data.a 116,0,0,1,0,1,5,97,108,105,97,115,4,116,101,115,116,0,0,5,0,1,0,0
+ Data.a 0,3,0,11,4,108,97,115,116,4,116,101,115,116,0,4,108,97,115,116,4,116,101,115
+ Data.a 116,0,0,1,0,1,0,0,0,30,0,4,1,2,3,4,192,12,0,5,0,1,0,0
+ Data.a 0,7,0,12,5,97,108,105,97,115,4,116,101,115,116,0
+Packet7:
+ Data.a 18,52,129,128,0,1,0,1,0,0,0,0,7,101,120,97,109,112,108,101,4,116,101,115
+ Data.a 116,0,0,1,0,1,192,12,0,1,0,1,0,0,0,0,0,4,1,2,3,4
+Packet8:
+ Data.a 18,52,129,128,0,1,0,1,0,0,0,0,7,101,120,97,109,112,108,101,4,116,101,115
+ Data.a 116,0,0,1,0,1,192,12,0,1,0,1,128,0,0,1,0,4,1,2,3,4
+Packet9:
+ Data.a 18,52,129,128,0,1,0,2,0,0,0,0,7,101,120,97,109,112,108,101,4,116,101,115
+ Data.a 116,0,0,1,0,1,192,12,0,1,0,1,0,0,0,60,0,4,1,2,3,4,192,12
+ Data.a 0,1,0,1,0,0,0,15,0,4,1,2,3,4
+Packet10:
+ Data.a 18,52,129,131,0,1,0,0,0,0,0,0,7,101,120,97,109,112,108,101,4,116,101,115
+ Data.a 116,0,0,1,0,1
+Packet11:
+ Data.a 18,52,129,131,0,1,0,0,0,0,0,0,7,97,110,111,116,104,101,114,4,116,101,115
+ Data.a 116,0,0,1,0,1
+Packet12:
+ Data.a 18,52,131,128,0,1,0,1,0,0,0,0,7,101,120,97,109,112,108,101,4,116,101,115
+ Data.a 116,0,0,1,0,1,192,12,0,1,0,1,0,0,0,60,0,4,1,2,3,4
+Packet13:
+ Data.a 18,52,129,128,0,1,0,2,0,0,0,0,7,101,120,97,109,112,108,101,4,116,101,115
+ Data.a 116,0,0,1,0,1,192,12,0,1,0,1,0,0,0,60,0,4,1,2,3,4,192,12
+ Data.a 0,1,0,1,0,0,0,60,0,4,1,2,3
+Packet14:
+ Data.a 18,52,129,128,0,1,0,1,0,0,0,0,7,101,120,97,109,112,108,101,4,116,101,115
+ Data.a 116,0,0,1,0,1,192,30,0,1,0,1,0,0,0,60,0,4,1,2,3,4
+Packet15:
+ Data.a 18,52,129,128,0,1,0,1,0,0,0,0,7,101,120,97,109,112,108,101,4,116,101,115
+ Data.a 116,0,0,28,0,1,192,12,0,1,0,1,0,0,0,60,0,4,1,2,3,4
+Packet16:
+ Data.a 18,52,129,128,0,0,0,1,0,0,0,0,7,101,120,97,109,112,108,101,4,116,101,115
+ Data.a 116,0,0,1,0,1,192,12,0,1,0,1,0,0,0,60,0,4,1,2,3,4
+Packet17:
+ Data.a 18,52,137,128,0,1,0,1,0,0,0,0,7,101,120,97,109,112,108,101,4,116,101,115
+ Data.a 116,0,0,1,0,1,192,12,0,1,0,1,0,0,0,60,0,4,1,2,3,4
+Packet18:
+ Data.a 18,52,129,128,0,1,0,2,0,0,0,0,7,101,120,97,109,112,108,101,4,116,101,115
+ Data.a 116,0,0,1,0,1,192,12,0,5,0,1,0,0,0,7,0,12,5,97,108,105,97,115
+ Data.a 4,116,101,115,116,0,192,12,0,5,0,1,0,0,0,7,0,12,5,111,116,104,101,114
+ Data.a 4,116,101,115,116,0
+Packet19:
+ Data.a 18,52,129,128,0,1,0,2,0,0,0,0,7,101,120,97,109,112,108,101,4,116,101,115
+ Data.a 116,0,0,1,0,1,192,12,0,5,0,1,0,0,0,7,0,12,5,97,108,105,97,115
+ Data.a 4,116,101,115,116,0,5,97,108,105,97,115,4,116,101,115,116,0,0,5,0,1,0,0
+ Data.a 0,7,0,14,7,101,120,97,109,112,108,101,4,116,101,115,116,0
+Packet20:
+ Data.a 18,52,129,128,0,1,0,2,0,0,0,0,7,101,120,97,109,112,108,101,4,116,101,115
+ Data.a 116,0,0,1,0,1,192,12,0,5,0,1,0,0,0,7,0,12,5,97,108,105,97,115
+ Data.a 4,116,101,115,116,0,192,12,0,1,0,1,0,0,0,60,0,4,1,2,3,4
+Packet21:
+ Data.a 18,52,129,128,0,1,0,2,0,0,0,0,7,101,120,97,109,112,108,101,4,116,101,115
+ Data.a 116,0,0,1,0,1,192,12,0,5,0,1,0,0,0,7,0,13,5,97,108,105,97,115
+ Data.a 4,116,101,115,116,0,0,5,97,108,105,97,115,4,116,101,115,116,0,0,1,0,1,0
+ Data.a 0,0,60,0,4,1,2,3,4
+Packet22:
+ Data.a 18,52,129,128,0,1,0,2,0,0,0,0,7,101,120,97,109,112,108,101,4,116,101,115
+ Data.a 116,0,0,1,0,1,192,12,0,5,0,1,0,0,0,0,0,12,5,97,108,105,97,115
+ Data.a 4,116,101,115,116,0,5,97,108,105,97,115,4,116,101,115,116,0,0,1,0,1,0,0
+ Data.a 0,60,0,4,1,2,3,4
+Packet23:
+ Data.a 18,52,129,128,0,1,0,2,0,0,0,0,7,101,120,97,109,112,108,101,4,116,101,115
+ Data.a 116,0,0,1,0,1,192,12,0,5,0,1,255,255,255,255,0,12,5,97,108,105,97,115
+ Data.a 4,116,101,115,116,0,5,97,108,105,97,115,4,116,101,115,116,0,0,1,0,1,0,0
+ Data.a 0,60,0,4,1,2,3,4
+Packet24:
+ Data.a 18,52,129,128,0,1,0,3,0,0,0,0,7,101,120,97,109,112,108,101,4,116,101,115
+ Data.a 116,0,0,1,0,1,192,12,0,5,0,1,0,0,0,30,0,12,5,97,108,105,97,115
+ Data.a 4,116,101,115,116,0,192,12,0,5,0,1,0,0,0,4,0,12,5,97,108,105,97,115
+ Data.a 4,116,101,115,116,0,5,97,108,105,97,115,4,116,101,115,116,0,0,1,0,1,0,0
+ Data.a 0,60,0,4,1,2,3,4
+Packet25:
+ Data.a 18,52,129,128,0,1,0,9,0,0,0,0,7,101,120,97,109,112,108,101,4,116,101,115
+ Data.a 116,0,0,1,0,1,192,12,0,1,0,1,0,0,0,60,0,4,1,2,3,4,192,12
+ Data.a 0,1,0,1,0,0,0,60,0,4,1,2,3,4,192,12,0,1,0,1,0,0,0,60
+ Data.a 0,4,1,2,3,4,192,12,0,1,0,1,0,0,0,60,0,4,1,2,3,4,192,12
+ Data.a 0,1,0,1,0,0,0,60,0,4,1,2,3,4,192,12,0,1,0,1,0,0,0,60
+ Data.a 0,4,1,2,3,4,192,12,0,1,0,1,0,0,0,60,0,4,1,2,3,4,192,12
+ Data.a 0,1,0,1,0,0,0,60,0,4,1,2,3,4,192,12,0,1,0,1,0,0,0,1
+ Data.a 0,4,1,2,3,4
+Packet26:
+ Data.a 18,52,129,128,0,1,0,2,0,0,0,0,7,101,120,97,109,112,108,101,4,116,101,115
+ Data.a 116,0,0,1,0,1,192,12,0,1,0,1,0,0,0,60,0,4,1,2,3,4,5,111
+ Data.a 116,104,101,114,4,116,101,115,116,0,0,5,0,1,0,0,0,0,0,14,7,109,105,115
+ Data.a 115,105,110,103,4,116,101,115,116,0
+Packet27:
+ Data.a 18,52,129,128,0,1,0,65,0,0,0,0,7,101,120,97,109,112,108,101,4,116,101,115
+ Data.a 116,0,0,1,0,1,192,12,0,1,0,1,0,0,0,60,0,4,1,2,3,4,192,12
+ Data.a 0,1,0,1,0,0,0,60,0,4,1,2,3,4,192,12,0,1,0,1,0,0,0,60
+ Data.a 0,4,1,2,3,4,192,12,0,1,0,1,0,0,0,60,0,4,1,2,3,4,192,12
+ Data.a 0,1,0,1,0,0,0,60,0,4,1,2,3,4,192,12,0,1,0,1,0,0,0,60
+ Data.a 0,4,1,2,3,4,192,12,0,1,0,1,0,0,0,60,0,4,1,2,3,4,192,12
+ Data.a 0,1,0,1,0,0,0,60,0,4,1,2,3,4,192,12,0,1,0,1,0,0,0,60
+ Data.a 0,4,1,2,3,4,192,12,0,1,0,1,0,0,0,60,0,4,1,2,3,4,192,12
+ Data.a 0,1,0,1,0,0,0,60,0,4,1,2,3,4,192,12,0,1,0,1,0,0,0,60
+ Data.a 0,4,1,2,3,4,192,12,0,1,0,1,0,0,0,60,0,4,1,2,3,4,192,12
+ Data.a 0,1,0,1,0,0,0,60,0,4,1,2,3,4,192,12,0,1,0,1,0,0,0,60
+ Data.a 0,4,1,2,3,4,192,12,0,1,0,1,0,0,0,60,0,4,1,2,3,4,192,12
+ Data.a 0,1,0,1,0,0,0,60,0,4,1,2,3,4,192,12,0,1,0,1,0,0,0,60
+ Data.a 0,4,1,2,3,4,192,12,0,1,0,1,0,0,0,60,0,4,1,2,3,4,192,12
+ Data.a 0,1,0,1,0,0,0,60,0,4,1,2,3,4,192,12,0,1,0,1,0,0,0,60
+ Data.a 0,4,1,2,3,4,192,12,0,1,0,1,0,0,0,60,0,4,1,2,3,4,192,12
+ Data.a 0,1,0,1,0,0,0,60,0,4,1,2,3,4,192,12,0,1,0,1,0,0,0,60
+ Data.a 0,4,1,2,3,4,192,12,0,1,0,1,0,0,0,60,0,4,1,2,3,4,192,12
+ Data.a 0,1,0,1,0,0,0,60,0,4,1,2,3,4,192,12,0,1,0,1,0,0,0,60
+ Data.a 0,4,1,2,3,4,192,12,0,1,0,1,0,0,0,60,0,4,1,2,3,4,192,12
+ Data.a 0,1,0,1,0,0,0,60,0,4,1,2,3,4,192,12,0,1,0,1,0,0,0,60
+ Data.a 0,4,1,2,3,4,192,12,0,1,0,1,0,0,0,60,0,4,1,2,3,4,192,12
+ Data.a 0,1,0,1,0,0,0,60,0,4,1,2,3,4,192,12,0,1,0,1,0,0,0,60
+ Data.a 0,4,1,2,3,4,192,12,0,1,0,1,0,0,0,60,0,4,1,2,3,4,192,12
+ Data.a 0,1,0,1,0,0,0,60,0,4,1,2,3,4,192,12,0,1,0,1,0,0,0,60
+ Data.a 0,4,1,2,3,4,192,12,0,1,0,1,0,0,0,60,0,4,1,2,3,4,192,12
+ Data.a 0,1,0,1,0,0,0,60,0,4,1,2,3,4,192,12,0,1,0,1,0,0,0,60
+ Data.a 0,4,1,2,3,4,192,12,0,1,0,1,0,0,0,60,0,4,1,2,3,4,192,12
+ Data.a 0,1,0,1,0,0,0,60,0,4,1,2,3,4,192,12,0,1,0,1,0,0,0,60
+ Data.a 0,4,1,2,3,4,192,12,0,1,0,1,0,0,0,60,0,4,1,2,3,4,192,12
+ Data.a 0,1,0,1,0,0,0,60,0,4,1,2,3,4,192,12,0,1,0,1,0,0,0,60
+ Data.a 0,4,1,2,3,4,192,12,0,1,0,1,0,0,0,60,0,4,1,2,3,4,192,12
+ Data.a 0,1,0,1,0,0,0,60,0,4,1,2,3,4,192,12,0,1,0,1,0,0,0,60
+ Data.a 0,4,1,2,3,4,192,12,0,1,0,1,0,0,0,60,0,4,1,2,3,4,192,12
+ Data.a 0,1,0,1,0,0,0,60,0,4,1,2,3,4,192,12,0,1,0,1,0,0,0,60
+ Data.a 0,4,1,2,3,4,192,12,0,1,0,1,0,0,0,60,0,4,1,2,3,4,192,12
+ Data.a 0,1,0,1,0,0,0,60,0,4,1,2,3,4,192,12,0,1,0,1,0,0,0,60
+ Data.a 0,4,1,2,3,4,192,12,0,1,0,1,0,0,0,60,0,4,1,2,3,4,192,12
+ Data.a 0,1,0,1,0,0,0,60,0,4,1,2,3,4,192,12,0,1,0,1,0,0,0,60
+ Data.a 0,4,1,2,3,4,192,12,0,1,0,1,0,0,0,60,0,4,1,2,3,4,192,12
+ Data.a 0,1,0,1,0,0,0,60,0,4,1,2,3,4,192,12,0,1,0,1,0,0,0,60
+ Data.a 0,4,1,2,3,4,192,12,0,1,0,1,0,0,0,60,0,4,1,2,3,4,192,12
+ Data.a 0,1,0,1,0,0,0,60,0,4,1,2,3,4,192,12,0,1,0,1,0,0,0,60
+ Data.a 0,4,1,2,3,4,192,12,0,1,0,1,0,0,0,60,0,4,1,2,3,4,192,12
+ Data.a 0,1,0,1,0,0,0,60,0,4,1,2,3,4
+Packet28:
+ Data.a 67,33,129,128,0,1,0,1,0,0,0,0,7,101,120,97,109,112,108,101,4,116,101,115
+ Data.a 116,0,0,1,0,1,192,12,0,1,0,1,0,0,0,60,0,4,1,2,3,4
+Packet29:
+ Data.a 0,0,0,0,0,0,0,0,0,0,0
+Packet30:
+ Data.a 18,52,129,128,0,1,0,1,0,0,0,0,7,101,120,97,109,112,108,101,4,116,101,115
+ Data.a 116,0,0,28,0,1,192,12,0,28,0,1,0,0,0,60,0,16,32,1,13,184,0,0
+ Data.a 0,0,18,52,86,120,154,188,222,240
+Packet31:
+ Data.a 18,52,129,128,0,1,0,2,0,0,0,0,7,101,120,97,109,112,108,101,4,116,101,115
+ Data.a 116,0,0,28,0,1,192,12,0,5,0,1,0,0,0,7,0,12,5,97,108,105,97,115
+ Data.a 4,116,101,115,116,0,5,97,108,105,97,115,4,116,101,115,116,0,0,28,0,1,0,0
+ Data.a 0,60,0,16,32,1,13,184,0,0,0,0,18,52,86,120,154,188,222,240
+Packet32:
+ Data.a 18,52,129,128,0,1,0,2,0,0,0,0,7,101,120,97,109,112,108,101,4,116,101,115
+ Data.a 116,0,0,28,0,1,5,97,108,105,97,115,4,116,101,115,116,0,0,28,0,1,0,0
+ Data.a 0,60,0,16,32,1,13,184,0,0,0,0,18,52,86,120,154,188,222,240,192,12,0,5
+ Data.a 0,1,0,0,0,7,0,12,5,97,108,105,97,115,4,116,101,115,116,0
+Packet33:
+ Data.a 18,52,129,128,0,1,0,2,0,0,0,0,7,101,120,97,109,112,108,101,4,116,101,115
+ Data.a 116,0,0,28,0,1,192,12,0,1,0,1,0,0,0,60,0,4,1,2,3,4,192,12
+ Data.a 0,28,0,1,0,0,0,60,0,16,32,1,13,184,0,0,0,0,18,52,86,120,154,188
+ Data.a 222,240
+Packet34:
+ Data.a 18,52,129,128,0,1,0,1,0,0,0,0,7,101,120,97,109,112,108,101,4,116,101,115
+ Data.a 116,0,0,28,0,1,192,12,0,1,0,1,0,0,0,60,0,4,1,2,3,4
+Packet35:
+ Data.a 18,52,129,128,0,1,0,1,0,0,0,0,7,101,120,97,109,112,108,101,4,116,101,115
+ Data.a 116,0,0,28,0,1,192,12,0,28,0,1,0,0,0,60,0,15,32,1,13,184,0,0
+ Data.a 0,0,18,52,86,120,154,188,222
+Packet36:
+ Data.a 18,52,129,128,0,1,0,1,0,0,0,0,7,101,120,97,109,112,108,101,4,116,101,115
+ Data.a 116,0,0,28,0,1,192,12,0,28,0,1,0,0,0,60,0,17,32,1,13,184,0,0
+ Data.a 0,0,18,52,86,120,154,188,222,240,0
+Packet37:
+ Data.a 18,52,129,128,0,1,0,1,0,0,0,0,5,119,114,111,110,103,4,116,101,115,116,0
+ Data.a 0,28,0,1,192,12,0,28,0,1,0,0,0,60,0,16,32,1,13,184,0,0,0,0
+ Data.a 18,52,86,120,154,188,222,240
+Packet38:
+ Data.a 18,52,129,128,0,1,0,1,0,0,0,0,7,101,120,97,109,112,108,101,4,116,101,115
+ Data.a 116,0,0,28,0,1,5,119,114,111,110,103,4,116,101,115,116,0,0,28,0,1,0,0
+ Data.a 0,60,0,16,32,1,13,184,0,0,0,0,18,52,86,120,154,188,222,240
+Packet39:
+ Data.a 18,52,129,128,0,1,0,2,0,0,0,0,7,101,120,97,109,112,108,101,4,116,101,115
+ Data.a 116,0,0,28,0,1,192,12,0,5,0,1,0,0,0,7,0,12,5,97,108,105,97,115
+ Data.a 4,116,101,115,116,0,192,12,0,28,0,1,0,0,0,60,0,16,32,1,13,184,0,0
+ Data.a 0,0,18,52,86,120,154,188,222,240
+Packet40:
+ Data.a 18,52,129,128,0,1,0,2,0,0,0,0,7,101,120,97,109,112,108,101,4,116,101,115
+ Data.a 116,0,0,28,0,1,192,12,0,5,0,1,0,0,0,7,0,12,5,97,108,105,97,115
+ Data.a 4,116,101,115,116,0,5,97,108,105,97,115,4,116,101,115,116,0,0,5,0,1,0,0
+ Data.a 0,7,0,14,7,101,120,97,109,112,108,101,4,116,101,115,116,0
+Packet41:
+ Data.a 18,52,131,128,0,1,0,1,0,0,0,0,7,101,120,97,109,112,108,101,4,116,101,115
+ Data.a 116,0,0,28,0,1,192,12,0,28,0,1,0,0,0,60,0,16,32,1,13,184,0,0
+ Data.a 0,0,18,52,86,120,154,188,222,240
+Packet42:
+ Data.a 18,52,129,128,0,1,0,1,0,0,0,0,7,101,120,97,109,112,108,101,4,116,101,115
+ Data.a 116,0,0,28,0,1,192,12,0,28,0,1,0,0,0,0,0,16,32,1,13,184,0,0
+ Data.a 0,0,18,52,86,120,154,188,222,240
+Packet43:
+ Data.a 18,52,129,128,0,1,0,9,0,0,0,0,7,101,120,97,109,112,108,101,4,116,101,115
+ Data.a 116,0,0,28,0,1,192,12,0,28,0,1,0,0,0,60,0,16,32,1,13,184,0,0
+ Data.a 0,0,18,52,86,120,154,188,222,240,192,12,0,28,0,1,0,0,0,60,0,16,32,1
+ Data.a 13,184,0,0,0,0,18,52,86,120,154,188,222,240,192,12,0,28,0,1,0,0,0,60
+ Data.a 0,16,32,1,13,184,0,0,0,0,18,52,86,120,154,188,222,240,192,12,0,28,0,1
+ Data.a 0,0,0,60,0,16,32,1,13,184,0,0,0,0,18,52,86,120,154,188,222,240,192,12
+ Data.a 0,28,0,1,0,0,0,60,0,16,32,1,13,184,0,0,0,0,18,52,86,120,154,188
+ Data.a 222,240,192,12,0,28,0,1,0,0,0,60,0,16,32,1,13,184,0,0,0,0,18,52
+ Data.a 86,120,154,188,222,240,192,12,0,28,0,1,0,0,0,60,0,16,32,1,13,184,0,0
+ Data.a 0,0,18,52,86,120,154,188,222,240,192,12,0,28,0,1,0,0,0,60,0,16,32,1
+ Data.a 13,184,0,0,0,0,18,52,86,120,154,188,222,240,192,12,0,28,0,1,0,0,0,2
+ Data.a 0,16,32,1,13,184,0,0,0,0,18,52,86,120,154,188,222,240
+Packet44:
+ Data.a 18,52,129,128,0,1,0,1,0,0,0,0,7,101,120,97,109,112,108,101,4,116,101,115
+ Data.a 116,0,0,1,0,1,192,12,0,28,0,1,0,0,0,60,0,16,32,1,13,184,0,0
+ Data.a 0,0,18,52,86,120,154,188,222,240
+EndDataSection

@@ -20,4 +20,7 @@ def check(data,cases):
     for i,(length,error) in enumerate([(30,0),(30,0),(0,-200),(0,-202),(0,-202),(0,-202),(271,0),(0,-201)]):
         actual=[q(12288+i*32+j*8) for j in range(3)]
         assert actual==[length,error,length],('query',i,actual)
-    return dict(replies=rows,cache_cases=5,query_cases=8)
+    assert [q(13568+i*8) for i in range(8)]==[0x01020304,16,0,0x01020304,16,0,0,0x01020304]
+    for i in range(4):
+        assert data[13632+i*16:13648+i*16]==(bytes(range(16,32)) if i in (0,2) else b'\xa5'*16)
+    return dict(replies=rows,cache_cases=5,typed_cache_checks=12,query_cases=8)

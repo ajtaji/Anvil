@@ -1,0 +1,883 @@
+XIncludeFile "Anvil/Network/dns_codec.pbi"
+#HW_LINK_NONE=0
+#PAYNET_TCP_HANDLES   = 4
+#PAYNET_TCP_RETRY_MS  = 250      ; spacing of ARP-pending connect attempts
+#PAYNET_TCP_OPEN_MS   = 5000     ; a next hop that never answers ARP
+#PAYNET_DNS_PORT_BASE = 49240    ; + interface kind. NTP owns 49200.. and 49216..
+#PAYNET_DNS_TRY_MS    = 1500
+#PAYNET_DNS_TRIES     = 3
+#PAYNET_DNS_ARP_MS    = 250
+#PAYNET_DNS_NAME      = 256      ; 253 characters, the terminator, and slack
+#PAYNET_DNS_CACHE     = 4
+#PAYNET_DNS_CACHE_MS  = 300000   ; local upper bound; shorter DNS TTLs win
+#PAYNET_SLICE_MAX     = 50       ; the most SvcNetService may spend draining
+#PAYNET_DRAIN_PASSES  = 64       ; and the most receive passes it will make
+#PAYNET_DNS_IDLE = 0
+#PAYNET_DNS_SEND = 1             ; due to send (first try, retry, or ARP wait)
+#PAYNET_DNS_WAIT = 2             ; sent; waiting for the reply
+#PAYNET_DNS_DONE = 3             ; answered; the next step caches it
+#PAYNET_DNS_TCP = 5             ; truncated UDP answer, retrying over TCP
+#PAYNET_DNS_FAIL = 4             ; failed; the next ask for that name hears why
+#SVC_EARG      = -102    ; a bad argument
+#SVC_EBUSY     = -103    ; the resource is in use
+#SVC_ETIMEOUT  = -104    ; the operation did not complete in its bound
+#SVC_EIO       = -105    ; the hardware answered, and answered badly
+#SVC_ESTATE    = -108    ; called in the wrong order
+#SVC_EAGAIN    = -110    ; NEW AT 1.5. Not finished yet, and not failed:
+#SVC_TCP_CONNECTING  = 1   ; the next hop or the handshake still to answer
+#SVC_TCP_OPEN        = 2   ; established; sends are taken
+#SVC_TCP_PEER_CLOSED = 3   ; the peer finished sending; its bytes are still
+Global paynet_dnsTcp.i
+Global paynet_dnsTcpTxLen.i
+Global paynet_dnsTcpTxOff.i
+Global paynet_dnsTcpRxLen.i
+Global paynet_dnsTcpRxWant.i
+Global Dim paynet_dnsTcpTx.a[#DNS_OUT_MAX+2]
+Global Dim paynet_dnsTcpRx.a[65537]
+Global paynet_dnsState.i
+Global paynet_dnsKind.i
+Global paynet_dnsServer.i
+Global paynet_dnsLocalIp.i
+Global paynet_dnsPort.i
+Global paynet_dnsQid.i
+Global paynet_dnsTries.i
+Global paynet_dnsStart.i
+Global paynet_dnsDue.i
+Global paynet_dnsDeadline.i
+Global paynet_dnsType.i = #DNS_QTYPE_A
+Global Dim paynet_dnsAnswer6.a[16]
+Global paynet_dnsAnswer.i
+Global paynet_dnsTtl.i
+Global paynet_dnsAnswerAt.i
+Global paynet_dnsErr.i
+Global paynet_dnsWhy.i
+Global paynet_dnsQueries.i       ; queries sent, ever
+Global paynet_dnsRejects.i       ; datagrams on our port that were not our answer
+Global Dim paynet_dnsName.a[#PAYNET_DNS_NAME]
+Global Dim paynet_cacheName.a[#PAYNET_DNS_CACHE * #PAYNET_DNS_NAME]
+Global Dim paynet_cacheIp.i[#PAYNET_DNS_CACHE]
+Global Dim paynet_cacheType.i[#PAYNET_DNS_CACHE]
+Global Dim paynet_cacheIp6.a[#PAYNET_DNS_CACHE*16]
+Global Dim paynet_cacheAt.i[#PAYNET_DNS_CACHE]
+Global Dim paynet_cacheMs.i[#PAYNET_DNS_CACHE]
+Global Dim paynet_cacheUsed.i[#PAYNET_DNS_CACHE]
+Global paynet_cacheNext.i
+
+
+Global gSvcDetail.i
+Global Dim pendingOut.a[16]
+Global mode.i,opens.i,closes.i,listeners.i,sends.i,received.i,sent.i,replyLen.i
+Global Dim mockWire.a[4096]
+Global Dim mockSent.a[512]
+Global Dim udp.a[1024]
+Global udpLen.i
+Procedure.i NetIfUsable(kind.i)
+ ProcedureReturn 1
+EndProcedure
+Procedure.i NetIfUsableCount()
+ ProcedureReturn 0
+EndProcedure
+Procedure.i NetIfNext(kind.i)
+ ProcedureReturn 0
+EndProcedure
+Procedure.i NetNextHop(kind.i,ip.i)
+ ProcedureReturn 0
+EndProcedure
+Procedure.i paynet_DnsFor(kind.i)
+ ProcedureReturn 0
+EndProcedure
+Procedure.i ParseDotted(name.i)
+ ProcedureReturn -1
+EndProcedure
+Procedure NetServiceSetUdpHook(callback.i)
+EndProcedure
+Procedure paynet_DnsSend(now.i)
+EndProcedure
+Procedure.i millis()
+ ProcedureReturn 100
+EndProcedure
+Procedure.i NetUdpRxData()
+ ProcedureReturn @udp[0]
+EndProcedure
+Procedure.i NetUdpRxLen()
+ ProcedureReturn udpLen
+EndProcedure
+Procedure.i NetUdpRxDstPort()
+ ProcedureReturn 5300
+EndProcedure
+Procedure.i NetUdpRxPort()
+ ProcedureReturn 53
+EndProcedure
+Procedure.i NetUdpRxFrom()
+ If mode=102 : ProcedureReturn $02020202 : EndIf
+ ProcedureReturn $01010101
+EndProcedure
+Procedure.i NetRxTo()
+ ProcedureReturn $C0000202
+EndProcedure
+Procedure.i NetUdpListen(kind.i,port.i,enabled.i)
+ listeners=listeners+1 : ProcedureReturn 1
+EndProcedure
+Procedure.i PayNetTcpOpen(ip.i,port.i)
+ opens=opens+1
+ If mode=8 And opens<3 : ProcedureReturn #SVC_EBUSY : EndIf
+ If mode=9 : ProcedureReturn #SVC_EIO : EndIf
+ ProcedureReturn 7
+EndProcedure
+Procedure.i PayNetTcpClose(h.i)
+ closes=closes+1 : ProcedureReturn 0
+EndProcedure
+Procedure.i PayNetTcpState(h.i)
+ If mode=3 Or mode=14 Or mode=15 : ProcedureReturn #SVC_TCP_CONNECTING : EndIf
+ If (mode=1 Or mode=2) And sent=paynet_dnsTcpTxLen : ProcedureReturn #SVC_TCP_PEER_CLOSED : EndIf
+ ProcedureReturn #SVC_TCP_OPEN
+EndProcedure
+Procedure.i PayNetTcpSend(h.i,p.i,n.i)
+ Define i.i
+ sends=sends+1
+ If mode=4 : ProcedureReturn #SVC_EIO : EndIf
+ If mode=12 : ProcedureReturn n+1 : EndIf
+ If n>3 : n=3 : EndIf
+ For i=0 To n-1 : mockSent[sent+i]=PeekA(p+i) : Next
+ sent=sent+n : ProcedureReturn n
+EndProcedure
+Procedure.i PayNetTcpRecv(h.i,p.i,n.i)
+ Define i.i,remaining.i
+ If sent<paynet_dnsTcpTxLen : ProcedureReturn 0 : EndIf
+ If mode=5 : ProcedureReturn #SVC_EIO : EndIf
+ If mode=11 : ProcedureReturn n+1 : EndIf
+ remaining=replyLen-received
+ If mode=2 : remaining=6-received : EndIf
+ If remaining<=0 : ProcedureReturn 0 : EndIf
+ If n>remaining : n=remaining : EndIf
+ If received<2 : n=1 : ElseIf n>7 : n=7 : EndIf
+ For i=0 To n-1 : PokeA(p+i,mockWire[received+i]) : Next
+ received=received+n : ProcedureReturn n
+EndProcedure
+Procedure.i paynet_Lower(c.i)
+  If c >= 65 And c <= 90
+    ProcedureReturn c + 32
+  EndIf
+  ProcedureReturn c
+EndProcedure
+
+; Length of a NUL-terminated name, or -1 past 253 characters (RFC 1035
+; 2.3.4 allows 255 octets on the wire, which is 253 characters written out).
+Procedure.i paynet_NameLen(*name)
+  Define i.i
+  i = 0
+  While (PeekA(*name + i) & $FF) <> 0
+    i = i + 1
+    If i > 253
+      ProcedureReturn -1
+    EndIf
+  Wend
+  ProcedureReturn i
+EndProcedure
+
+; Host names are compared without regard to case (RFC 4343).
+Procedure.i paynet_SameName(*a, *b)
+  Define i.i
+  Define ca.i
+  Define cb.i
+  i = 0
+  Repeat
+    ca = paynet_Lower(PeekA(*a + i) & $FF)
+    cb = paynet_Lower(PeekA(*b + i) & $FF)
+    If ca <> cb
+      ProcedureReturn 0
+    EndIf
+    If ca = 0
+      ProcedureReturn 1
+    EndIf
+    i = i + 1
+  Until i >= #PAYNET_DNS_NAME
+  ProcedureReturn 0
+EndProcedure
+
+Procedure paynet_CopyName(*dst, *src)
+  Define i.i
+  Define c.i
+  i = 0
+  c = PeekA(*src) & $FF
+  While c <> 0 And i < #PAYNET_DNS_NAME - 1
+    PokeA(*dst + i, c)
+    i = i + 1
+    c = PeekA(*src + i) & $FF
+  Wend
+  PokeA(*dst + i, 0)
+EndProcedure
+
+Procedure.i paynet_CacheSlot(*name, now.i, qtype.i)
+  Define i.i
+  For i = 0 To #PAYNET_DNS_CACHE - 1
+    If paynet_cacheUsed[i] <> 0
+      If ((now - paynet_cacheAt[i]) & $FFFFFFFF) >= paynet_cacheMs[i]
+        paynet_cacheUsed[i] = 0
+      ElseIf paynet_cacheType[i]=qtype And paynet_SameName(@paynet_cacheName[i * #PAYNET_DNS_NAME], *name) <> 0
+        ; TTL zero is a one-delivery transaction result, never reusable.
+        If paynet_cacheUsed[i]=2 : paynet_cacheUsed[i]=0 : EndIf
+        ProcedureReturn i+1
+      EndIf
+    EndIf
+  Next
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i paynet_CacheFind(*name,now.i)
+  Define slot.i
+  slot=paynet_CacheSlot(*name,now,#DNS_QTYPE_A)
+  If slot=0 : ProcedureReturn 0 : EndIf
+  ProcedureReturn paynet_cacheIp[slot-1]
+EndProcedure
+
+Procedure.i paynet_CacheFind6(*name,now.i,destination.i)
+  Define slot.i,j.i
+  If destination=0 : ProcedureReturn 0 : EndIf
+  slot=paynet_CacheSlot(*name,now,#DNS_QTYPE_AAAA)
+  If slot=0 : ProcedureReturn 0 : EndIf
+  For j=0 To 15 : PokeA(destination+j,paynet_cacheIp6[(slot-1)*16+j]) : Next
+  ProcedureReturn 16
+EndProcedure
+
+Procedure.i paynet_CacheStore(*name,now.i,ttl.i,qtype.i)
+  Define i.i
+  Define slot.i
+  slot = -1
+  For i = 0 To #PAYNET_DNS_CACHE - 1
+    If paynet_cacheUsed[i] <> 0
+      If paynet_cacheType[i]=qtype And paynet_SameName(@paynet_cacheName[i * #PAYNET_DNS_NAME], *name) <> 0
+        slot = i
+      EndIf
+    EndIf
+  Next
+  If slot < 0
+    slot = paynet_cacheNext
+    paynet_cacheNext = (paynet_cacheNext + 1) % #PAYNET_DNS_CACHE
+  EndIf
+  paynet_CopyName(@paynet_cacheName[slot * #PAYNET_DNS_NAME], *name)
+  paynet_cacheType[slot] = qtype
+  paynet_cacheAt[slot] = now
+  If ttl<1
+    paynet_cacheUsed[slot]=2
+    paynet_cacheMs[slot]=#PAYNET_DNS_TRY_MS * #PAYNET_DNS_TRIES
+  Else
+    If ttl>#PAYNET_DNS_CACHE_MS/1000 : ttl=#PAYNET_DNS_CACHE_MS/1000 : EndIf
+    paynet_cacheMs[slot]=ttl*1000
+    paynet_cacheUsed[slot]=1
+  EndIf
+  ProcedureReturn slot
+EndProcedure
+
+Procedure paynet_CachePut(*name,ip.i,now.i,ttl.i)
+  Define slot.i
+  slot=paynet_CacheStore(*name,now,ttl,#DNS_QTYPE_A)
+  paynet_cacheIp[slot]=ip
+EndProcedure
+
+Procedure paynet_CachePut6(*name,source.i,now.i,ttl.i)
+  Define slot.i,j.i
+  slot=paynet_CacheStore(*name,now,ttl,#DNS_QTYPE_AAAA)
+  For j=0 To 15 : paynet_cacheIp6[slot*16+j]=PeekA(source+j) : Next
+EndProcedure
+
+
+Procedure paynet_DnsCloseListener()
+  If paynet_dnsPort <> 0 And paynet_dnsKind <> #HW_LINK_NONE
+    NetUdpListen(paynet_dnsKind, paynet_dnsPort, 0)
+  EndIf
+  paynet_dnsPort = 0
+EndProcedure
+Procedure paynet_DnsCloseTcp()
+  If paynet_dnsTcp>0 : PayNetTcpClose(paynet_dnsTcp) : EndIf
+  paynet_dnsTcp=0
+EndProcedure
+Procedure paynet_DnsFail(code.i, *why)
+  paynet_DnsCloseTcp()
+  paynet_DnsCloseListener()
+  paynet_dnsErr = code
+  paynet_dnsWhy = *why
+  paynet_dnsState = #PAYNET_DNS_FAIL
+EndProcedure
+Procedure paynet_DnsCaptureAnswer(now.i)
+  If paynet_dnsType=#DNS_QTYPE_AAAA
+    DnsResultIp6(0,@paynet_dnsAnswer6[0])
+    paynet_dnsAnswer=0
+  Else
+    paynet_dnsAnswer=DnsResultIp(0)
+  EndIf
+  paynet_dnsTtl=DnsResultTtl(0)
+  paynet_dnsAnswerAt=now
+EndProcedure
+Procedure.i PayNetDnsInput(kind.i)
+  Define c.i
+  If paynet_dnsState <> #PAYNET_DNS_WAIT And paynet_dnsState <> #PAYNET_DNS_SEND
+    ProcedureReturn 0
+  EndIf
+  If kind <> paynet_dnsKind Or paynet_dnsPort = 0
+    ProcedureReturn 0
+  EndIf
+  If NetUdpRxDstPort() <> paynet_dnsPort Or NetRxTo() <> paynet_dnsLocalIp
+    ProcedureReturn 0
+  EndIf
+  If NetUdpRxFrom() <> paynet_dnsServer Or NetUdpRxPort() <> #DNS_PORT
+    paynet_dnsRejects = paynet_dnsRejects + 1
+    ProcedureReturn 1
+  EndIf
+  c = DnsParseReplyTypeFor(NetUdpRxData(), NetUdpRxLen(), paynet_dnsQid, @paynet_dnsName[0],paynet_dnsType)
+  If c > 0
+    paynet_DnsCaptureAnswer(millis())
+    paynet_dnsState = #PAYNET_DNS_DONE
+    ProcedureReturn 1
+  EndIf
+  If c = 0
+    paynet_dnsErr = #SVC_EIO
+    paynet_dnsWhy = "the DNS server answered and had no address of the requested type for that name"
+    paynet_dnsState = #PAYNET_DNS_FAIL
+    ProcedureReturn 1
+  EndIf
+  If c = #DNS_E_TRUNCATED
+    paynet_dnsState=#PAYNET_DNS_TCP
+    ProcedureReturn 1
+  EndIf
+  If c = #DNS_E_RCODE
+    paynet_dnsErr = #SVC_EIO
+    paynet_dnsWhy = "the DNS server refused the name: it does not exist, or the server would not look it up"
+    paynet_dnsState = #PAYNET_DNS_FAIL
+    ProcedureReturn 1
+  EndIf
+  ; A reply to an older try (another ID), or one that does not parse. Not
+  ; an answer and not a verdict: keep waiting for the real one, and count
+  ; it so a resolver sending garbage shows up somewhere.
+  paynet_dnsRejects = paynet_dnsRejects + 1
+  ProcedureReturn 1
+EndProcedure
+Procedure paynet_DnsTcpStep(now.i)
+  Define rc.i,st.i,n.i,i.i,capacity.i
+  paynet_DnsCloseListener()
+  If ((now-paynet_dnsStart) & $FFFFFFFF)>=(#PAYNET_DNS_TRY_MS * #PAYNET_DNS_TRIES)
+    paynet_DnsFail(#SVC_ETIMEOUT,"the DNS TCP retry exceeded the query deadline")
+    ProcedureReturn
+  EndIf
+  If paynet_dnsTcp=0
+    n=DnsBuildQueryType(@paynet_dnsName[0],paynet_dnsQid,paynet_dnsType)
+    If n<=0 Or n>#DNS_OUT_MAX
+      paynet_DnsFail(#SVC_EARG,"the DNS TCP query could not be serialized")
+      ProcedureReturn
+    EndIf
+    NetWriteBE16(@paynet_dnsTcpTx[0],n)
+    For i=0 To n-1 : paynet_dnsTcpTx[i+2]=PeekA(DnsQueryBuf()+i) : Next
+    rc=PayNetTcpOpen(paynet_dnsServer,#DNS_PORT)
+    If rc=#SVC_EBUSY : ProcedureReturn : EndIf
+    If rc<0
+      paynet_DnsFail(rc,"TCP to the DNS resolver could not be opened")
+      ProcedureReturn
+    EndIf
+    paynet_dnsTcp=rc : paynet_dnsTcpTxLen=n+2 : paynet_dnsTcpTxOff=0
+    paynet_dnsTcpRxLen=0 : paynet_dnsTcpRxWant=2
+  EndIf
+  st=PayNetTcpState(paynet_dnsTcp)
+  If st<0
+    paynet_DnsFail(st,"TCP to the DNS resolver failed")
+    ProcedureReturn
+  EndIf
+  If st=#SVC_TCP_CONNECTING : ProcedureReturn : EndIf
+  If st<>#SVC_TCP_OPEN And st<>#SVC_TCP_PEER_CLOSED
+    paynet_DnsFail(#SVC_EIO,"the DNS TCP connection entered an invalid state")
+    ProcedureReturn
+  EndIf
+  If paynet_dnsTcpTxOff<paynet_dnsTcpTxLen And st=#SVC_TCP_OPEN
+    n=PayNetTcpSend(paynet_dnsTcp,@paynet_dnsTcpTx[paynet_dnsTcpTxOff],paynet_dnsTcpTxLen-paynet_dnsTcpTxOff)
+    If n<0 Or n>paynet_dnsTcpTxLen-paynet_dnsTcpTxOff
+      paynet_DnsFail(#SVC_EIO,"the DNS TCP query could not be transmitted")
+      ProcedureReturn
+    EndIf
+    paynet_dnsTcpTxOff=paynet_dnsTcpTxOff+n
+  EndIf
+  capacity=paynet_dnsTcpRxWant-paynet_dnsTcpRxLen
+  If capacity>2048 : capacity=2048 : EndIf
+  n=PayNetTcpRecv(paynet_dnsTcp,@paynet_dnsTcpRx[paynet_dnsTcpRxLen],capacity)
+  If n<0 Or n>capacity
+    paynet_DnsFail(#SVC_EIO,"receiving the DNS TCP answer failed")
+    ProcedureReturn
+  EndIf
+  paynet_dnsTcpRxLen=paynet_dnsTcpRxLen+n
+  If paynet_dnsTcpRxLen=2 And paynet_dnsTcpRxWant=2
+    i=NetReadBE16(@paynet_dnsTcpRx[0])
+    If i<#DNS_HDR
+      paynet_DnsFail(#SVC_EIO,"the DNS TCP answer has an invalid message length")
+      ProcedureReturn
+    EndIf
+    paynet_dnsTcpRxWant=i+2
+  EndIf
+  If paynet_dnsTcpRxLen=paynet_dnsTcpRxWant
+    If paynet_dnsTcpTxOff<>paynet_dnsTcpTxLen
+      paynet_DnsFail(#SVC_EIO,"the resolver replied before the DNS query was transmitted")
+      ProcedureReturn
+    EndIf
+    rc=DnsParseReplyTypeFor(@paynet_dnsTcpRx[2],paynet_dnsTcpRxLen-2,paynet_dnsQid,@paynet_dnsName[0],paynet_dnsType)
+    If rc<=0
+      paynet_DnsFail(#SVC_EIO,"the DNS TCP answer was refused or contained no matching address")
+      ProcedureReturn
+    EndIf
+    paynet_DnsCaptureAnswer(now)
+    paynet_DnsCloseTcp()
+    paynet_dnsState=#PAYNET_DNS_DONE
+  ElseIf n=0 And st=#SVC_TCP_PEER_CLOSED
+    paynet_DnsFail(#SVC_EIO,"the DNS resolver closed an incomplete TCP answer")
+  EndIf
+EndProcedure
+Procedure paynet_DnsCancel()
+  paynet_DnsCloseTcp()
+  paynet_DnsCloseListener()
+  paynet_dnsState = #PAYNET_DNS_IDLE
+  paynet_dnsKind = #HW_LINK_NONE
+EndProcedure
+Procedure paynet_DnsStep(now.i)
+  If paynet_dnsState=#PAYNET_DNS_TCP
+    paynet_DnsTcpStep(now) : ProcedureReturn
+  EndIf
+  If paynet_dnsState = #PAYNET_DNS_DONE
+    paynet_DnsCloseListener()
+    If paynet_dnsType=#DNS_QTYPE_AAAA
+      paynet_CachePut6(@paynet_dnsName[0],@paynet_dnsAnswer6[0],paynet_dnsAnswerAt,paynet_dnsTtl)
+    Else
+      paynet_CachePut(@paynet_dnsName[0],paynet_dnsAnswer,paynet_dnsAnswerAt,paynet_dnsTtl)
+    EndIf
+    paynet_dnsState = #PAYNET_DNS_IDLE
+    ProcedureReturn
+  EndIf
+  If paynet_dnsState = #PAYNET_DNS_FAIL
+    paynet_DnsCloseListener()
+    ProcedureReturn
+  EndIf
+  If paynet_dnsState = #PAYNET_DNS_IDLE
+    ProcedureReturn
+  EndIf
+  If NetIfUsable(paynet_dnsKind) = 0
+    paynet_DnsFail(#SVC_ESTATE, "the interface the query went out of lost its address before the answer came")
+    ProcedureReturn
+  EndIf
+  If (now - paynet_dnsStart) >= (#PAYNET_DNS_TRY_MS * #PAYNET_DNS_TRIES)
+    paynet_DnsFail(#SVC_ETIMEOUT, "no DNS answer came back in three tries of one and a half seconds; the resolver or the route to it is not answering")
+    ProcedureReturn
+  EndIf
+  If paynet_dnsState = #PAYNET_DNS_WAIT
+    If (now - paynet_dnsDeadline) >= 0
+      If paynet_dnsTries >= #PAYNET_DNS_TRIES
+        paynet_DnsFail(#SVC_ETIMEOUT, "no DNS answer came back in three tries of one and a half seconds; the resolver or the route to it is not answering")
+        ProcedureReturn
+      EndIf
+      paynet_dnsState = #PAYNET_DNS_SEND
+      paynet_dnsDue = now
+    Else
+      ProcedureReturn
+    EndIf
+  EndIf
+  If paynet_dnsState = #PAYNET_DNS_SEND
+    If (now - paynet_dnsDue) >= 0
+      paynet_DnsSend(now)
+    EndIf
+  EndIf
+EndProcedure
+Procedure.i paynet_DnsResolveType(*name,qtype.i,destination.i)
+  Define now.i
+  Define n.i
+  Define ip.i
+  Define kind.i
+  Define dns.i
+  Define code.i
+
+  now = millis()
+  If qtype<>#DNS_QTYPE_A And qtype<>#DNS_QTYPE_AAAA
+    gSvcDetail="unsupported address query type" : ProcedureReturn #SVC_EARG
+  EndIf
+  If qtype=#DNS_QTYPE_AAAA And destination=0
+    gSvcDetail="the IPv6 result pointer was zero" : ProcedureReturn #SVC_EARG
+  EndIf
+  If *name = 0
+    gSvcDetail = "the name pointer was zero"
+    ProcedureReturn #SVC_EARG
+  EndIf
+  n = paynet_NameLen(*name)
+  If n = 0
+    gSvcDetail = "the name is empty"
+    ProcedureReturn #SVC_EARG
+  EndIf
+  If n < 0
+    gSvcDetail = "the name is longer than the 253 characters a DNS name can be"
+    ProcedureReturn #SVC_EARG
+  EndIf
+
+  ; A dotted quad is already an address and is never sent anywhere.
+  ip=-1
+  If qtype=#DNS_QTYPE_A : ip=ParseDotted(*name) : EndIf
+  If ip >= 0
+    If ip = 0 Or ip = $FFFFFFFF
+      gSvcDetail = "0.0.0.0 and 255.255.255.255 are not the address of any one host"
+      ProcedureReturn #SVC_EARG
+    EndIf
+    gSvcDetail = 0
+    ProcedureReturn ip
+  EndIf
+
+  paynet_DnsStep(now)
+  If qtype=#DNS_QTYPE_AAAA
+    ip=paynet_CacheFind6(*name,now,destination)
+  Else
+    ip=paynet_CacheFind(*name,now)
+  EndIf
+  If ip > 0
+    gSvcDetail = 0
+    ProcedureReturn ip
+  EndIf
+
+  If paynet_dnsState = #PAYNET_DNS_SEND Or paynet_dnsState = #PAYNET_DNS_WAIT Or paynet_dnsState = #PAYNET_DNS_TCP
+    If paynet_dnsType=qtype And paynet_SameName(@paynet_dnsName[0], *name) <> 0
+      gSvcDetail = "the query for that name is still in flight; ask again with the same name"
+      ProcedureReturn #SVC_EAGAIN
+    EndIf
+    gSvcDetail = "another name is being resolved; keep asking for that one until it answers, then ask for this one"
+    ProcedureReturn #SVC_EBUSY
+  EndIf
+  If paynet_dnsState = #PAYNET_DNS_FAIL
+    If paynet_dnsType=qtype And paynet_SameName(@paynet_dnsName[0], *name) <> 0
+      ; Said once. The next call for this name starts again from nothing.
+      code = paynet_dnsErr
+      gSvcDetail = paynet_dnsWhy
+      paynet_dnsState = #PAYNET_DNS_IDLE
+      ProcedureReturn code
+    EndIf
+    paynet_dnsState = #PAYNET_DNS_IDLE
+  EndIf
+
+  ; ---- a new question ----
+  If NetIfUsableCount() = 0
+    gSvcDetail = "no interface holds an address; ask the net-up service, and call the network service slot until it answers"
+    ProcedureReturn #SVC_ESTATE
+  EndIf
+  ; Every usable interface in order - the wired row first when it has one -
+  ; taking the first that has a resolver and a route to it, so a cable
+  ; with no gateway cannot starve a radio that has both.
+  paynet_dnsKind = #HW_LINK_NONE
+  kind = NetIfNext(0)
+  While kind <> #HW_LINK_NONE
+    dns = paynet_DnsFor(kind)
+    If dns <> 0 And NetNextHop(kind, dns) <> 0
+      paynet_dnsKind = kind
+      paynet_dnsServer = dns
+      Break
+    EndIf
+    kind = NetIfNext(kind)
+  Wend
+  If paynet_dnsKind = #HW_LINK_NONE
+    gSvcDetail = "no DNS resolver is known on any interface that holds an address: the lease did not name one and net.dns is not set"
+    ProcedureReturn #SVC_ESTATE
+  EndIf
+  ; Refuse a malformed name now, at the call that made it, not a second later.
+  If DnsBuildQueryType(*name, 1,qtype) <= 0
+    paynet_dnsKind = #HW_LINK_NONE
+    gSvcDetail = "that is not a host name DNS can carry: a part between two dots is empty or longer than 63 characters"
+    ProcedureReturn #SVC_EARG
+  EndIf
+  paynet_dnsPort = #PAYNET_DNS_PORT_BASE + paynet_dnsKind
+  If NetUdpListen(paynet_dnsKind, paynet_dnsPort, 1) = 0
+    paynet_dnsPort = 0
+    paynet_dnsKind = #HW_LINK_NONE
+    gSvcDetail = "no UDP listener slot is free on that interface for the DNS reply"
+    ProcedureReturn #SVC_EBUSY
+  EndIf
+  NetServiceSetUdpHook(@PayNetDnsInput)
+  paynet_CopyName(@paynet_dnsName[0], *name)
+  paynet_dnsQid = (now ! (paynet_dnsQueries << 7) ! (paynet_dnsServer & $FFFF)) & $FFFF
+  If paynet_dnsQid = 0
+    paynet_dnsQid = 1
+  EndIf
+  paynet_dnsType=qtype
+  paynet_dnsTries = 0
+  paynet_dnsStart = now
+  paynet_dnsDue = now
+  paynet_dnsLocalIp = 0
+  paynet_dnsState = #PAYNET_DNS_SEND
+  paynet_DnsStep(now)
+  If paynet_dnsState = #PAYNET_DNS_FAIL
+    code = paynet_dnsErr
+    gSvcDetail = paynet_dnsWhy
+    paynet_dnsState = #PAYNET_DNS_IDLE
+    ProcedureReturn code
+  EndIf
+  gSvcDetail = "the query has been sent; ask again with the same name"
+  ProcedureReturn #SVC_EAGAIN
+EndProcedure
+Procedure.i PayNetDnsResolve(*name)
+  ProcedureReturn paynet_DnsResolveType(*name,#DNS_QTYPE_A,0)
+EndProcedure
+Procedure.i PayNetDnsResolve6(*name,destination.i)
+  ProcedureReturn paynet_DnsResolveType(*name,#DNS_QTYPE_AAAA,destination)
+EndProcedure
+Procedure Run(index.i,bytes.i,qtype.i)
+ Define i.i,now.i,p.i,wrong.i,host.i,transition.i
+ mode=index % 16 : paynet_dnsType=qtype : opens=0 : closes=0 : listeners=0 : sends=0 : received=0 : sent=0
+ replyLen=bytes
+ For i=0 To bytes-1 : Read.a mockWire[i] : Next
+ paynet_dnsState=#PAYNET_DNS_WAIT : paynet_dnsTcp=0 : paynet_dnsPort=5300
+ paynet_dnsKind=1 : paynet_dnsServer=$01010101 : paynet_dnsQid=$1234
+ For i=0 To 15 : paynet_dnsAnswer6[i]=0 : Next
+ paynet_dnsAnswer=0 : paynet_dnsTtl=0 : paynet_dnsErr=0 : paynet_dnsStart=100
+ If mode=14 : paynet_dnsStart=$FFFFFF00 : EndIf
+ host="example.test"
+ For i=0 To 11 : paynet_dnsName[i]=PeekA(host+i) : Next
+ paynet_dnsName[12]=0 : paynet_dnsLocalIp=$C0000202
+ transition=PayNetDnsInput(1)
+ If paynet_dnsState<>#PAYNET_DNS_TCP : transition=-1 : EndIf
+ now=paynet_dnsStart
+ For i=0 To 99
+  paynet_DnsTcpStep(now)
+  If mode=15 : paynet_DnsCancel() : Break : EndIf
+  If paynet_dnsState<>#PAYNET_DNS_TCP : Break : EndIf
+  now=(now+100) & $FFFFFFFF
+ Next
+ If sent>0 And sent=paynet_dnsTcpTxLen
+  If NetReadBE16(@mockSent[0])<>DnsQueryLen() : wrong=1 : EndIf
+  For i=0 To DnsQueryLen()-1
+   If mockSent[i+2]<>PeekA(DnsQueryBuf()+i) : wrong=1 : EndIf
+  Next
+ EndIf
+ p=$E1C00100+index*96
+ PokeI(p,paynet_dnsState) : PokeI(p+8,paynet_dnsErr)
+ PokeI(p+16,paynet_dnsAnswer) : PokeI(p+24,paynet_dnsTtl)
+ PokeI(p+32,opens) : PokeI(p+40,closes) : PokeI(p+48,listeners)
+ For i=0 To 15 : PokeA($E1C02800+index*16+i,paynet_dnsAnswer6[i]) : Next
+ PokeI(p+56,sent) : PokeI(p+64,wrong) : PokeI(p+72,paynet_dnsTcp) : PokeI(p+80,transition)
+EndProcedure
+Procedure ProofDnsDispatch(which.i)
+ Define host.i,i.i,p.i,rc.i
+ paynet_dnsType=#DNS_QTYPE_A
+ mode=100+which : paynet_dnsState=#PAYNET_DNS_WAIT : paynet_dnsRejects=0
+ paynet_dnsPort=5300 : paynet_dnsLocalIp=$C0000202 : paynet_dnsKind=1
+ paynet_dnsServer=$01010101 : paynet_dnsQid=$1234
+ host="example.test"
+ For i=0 To 11 : paynet_dnsName[i]=PeekA(host+i) : Next
+ paynet_dnsName[12]=0
+ If which=0 : paynet_dnsName[0]=122 : EndIf
+ If which=1 : paynet_dnsQid=$4321 : EndIf
+ rc=PayNetDnsInput(1)
+ p=$E1C02000+which*24
+ PokeI(p,rc) : PokeI(p+8,paynet_dnsState) : PokeI(p+16,paynet_dnsRejects)
+EndProcedure
+Procedure PendingType()
+ Define i.i,name.i,p.i
+ name="example.test" : p=$E1C03000
+ For i=0 To 3 : paynet_cacheUsed[i]=0 : Next
+ paynet_CopyName(@paynet_dnsName[0],name)
+ paynet_dnsType=#DNS_QTYPE_AAAA : paynet_dnsState=#PAYNET_DNS_WAIT
+ paynet_dnsStart=100 : paynet_dnsDeadline=1000 : paynet_dnsKind=1
+ For i=0 To 15 : pendingOut[i]=$A5 : Next
+ PokeI(p,PayNetDnsResolve(name))
+ PokeI(p+8,PayNetDnsResolve6(name,@pendingOut[0]))
+ PokeI(p+16,PayNetDnsResolve6("other.test",@pendingOut[0]))
+ PokeI(p+24,paynet_dnsType) : PokeI(p+32,paynet_dnsState)
+ paynet_dnsState=#PAYNET_DNS_FAIL : paynet_dnsErr=#SVC_EIO
+ PokeI(p+40,PayNetDnsResolve6(name,@pendingOut[0]))
+ PokeI(p+48,paynet_dnsState)
+ PokeI(p+56,PayNetDnsResolve6(name,0))
+ For i=0 To 15 : PokeA(p+64+i,pendingOut[i]) : Next
+EndProcedure
+Procedure.i Main(services.i)
+ Define i.i
+ For i=0 To 16383 : PokeA($E1C00000+i,$A5) : Next
+ PokeI($E1C00000,$444E5431) : PokeI($E1C00008,32)
+ Restore UdpPacket1
+ udpLen=46
+ For i=0 To udpLen-1 : Read.a udp[i] : Next
+ Restore Packet0
+ Run(0,48,1)
+ Restore Packet1
+ Run(1,48,1)
+ Restore Packet2
+ Run(2,48,1)
+ Restore Packet3
+ Run(3,48,1)
+ Restore Packet4
+ Run(4,48,1)
+ Restore Packet5
+ Run(5,48,1)
+ Restore Packet6
+ Run(6,48,1)
+ Restore Packet7
+ Run(7,48,1)
+ Restore Packet8
+ Run(8,48,1)
+ Restore Packet9
+ Run(9,48,1)
+ Restore Packet10
+ Run(10,48,1)
+ Restore Packet11
+ Run(11,48,1)
+ Restore Packet12
+ Run(12,48,1)
+ Restore Packet13
+ Run(13,32,1)
+ Restore Packet14
+ Run(14,48,1)
+ Restore Packet15
+ Run(15,48,1)
+ Restore UdpPacket28
+ udpLen=58
+ For i=0 To udpLen-1 : Read.a udp[i] : Next
+ Restore Packet16
+ Run(16,60,28)
+ Restore Packet17
+ Run(17,60,28)
+ Restore Packet18
+ Run(18,60,28)
+ Restore Packet19
+ Run(19,60,28)
+ Restore Packet20
+ Run(20,60,28)
+ Restore Packet21
+ Run(21,60,28)
+ Restore Packet22
+ Run(22,60,28)
+ Restore Packet23
+ Run(23,60,28)
+ Restore Packet24
+ Run(24,60,28)
+ Restore Packet25
+ Run(25,60,28)
+ Restore Packet26
+ Run(26,60,28)
+ Restore Packet27
+ Run(27,60,28)
+ Restore Packet28
+ Run(28,60,28)
+ Restore Packet29
+ Run(29,32,28)
+ Restore Packet30
+ Run(30,60,28)
+ Restore Packet31
+ Run(31,60,28)
+ Restore UdpPacket1
+ udpLen=46
+ For i=0 To udpLen-1 : Read.a udp[i] : Next
+ ProofDnsDispatch(0) : ProofDnsDispatch(1) : ProofDnsDispatch(2)
+ PendingType()
+ ProcedureReturn 0
+EndProcedure
+DataSection
+ UdpPacket1:
+ Data.a 18,52,131,128,0,1,0,1,0,0,0,0,7,101,120,97,109,112,108,101,4,116,101,115,116,0,0,1,0,1,192,12,0,1,0,1,0,0,0,45,0,4,1,2,3,4
+ UdpPacket28:
+ Data.a 18,52,131,128,0,1,0,1,0,0,0,0,7,101,120,97,109,112,108,101,4,116,101,115,116,0,0,28,0,1,192,12,0,28,0,1,0,0,0,45,0,16,32,1,13,184,0,0,0,0,18,52,86,120,154,188,222,240
+Packet0:
+ Data.a 0,46,18,52,129,128,0,1,0,1,0,0,0,0,7,101,120,97,109,112,108,101,4,116
+ Data.a 101,115,116,0,0,1,0,1,192,12,0,1,0,1,0,0,0,45,0,4,1,2,3,4
+Packet1:
+ Data.a 0,46,18,52,129,128,0,1,0,1,0,0,0,0,7,101,120,97,109,112,108,101,4,116
+ Data.a 101,115,116,0,0,1,0,1,192,12,0,1,0,1,0,0,0,45,0,4,1,2,3,4
+Packet2:
+ Data.a 0,46,18,52,129,128,0,1,0,1,0,0,0,0,7,101,120,97,109,112,108,101,4,116
+ Data.a 101,115,116,0,0,1,0,1,192,12,0,1,0,1,0,0,0,45,0,4,1,2,3,4
+Packet3:
+ Data.a 0,46,18,52,129,128,0,1,0,1,0,0,0,0,7,101,120,97,109,112,108,101,4,116
+ Data.a 101,115,116,0,0,1,0,1,192,12,0,1,0,1,0,0,0,45,0,4,1,2,3,4
+Packet4:
+ Data.a 0,46,18,52,129,128,0,1,0,1,0,0,0,0,7,101,120,97,109,112,108,101,4,116
+ Data.a 101,115,116,0,0,1,0,1,192,12,0,1,0,1,0,0,0,45,0,4,1,2,3,4
+Packet5:
+ Data.a 0,46,18,52,129,128,0,1,0,1,0,0,0,0,7,101,120,97,109,112,108,101,4,116
+ Data.a 101,115,116,0,0,1,0,1,192,12,0,1,0,1,0,0,0,45,0,4,1,2,3,4
+Packet6:
+ Data.a 0,46,18,52,129,128,0,1,0,1,0,0,0,0,7,97,110,111,116,104,101,114,4,116
+ Data.a 101,115,116,0,0,1,0,1,192,12,0,1,0,1,0,0,0,45,0,4,1,2,3,4
+Packet7:
+ Data.a 0,11,18,52,129,128,0,1,0,1,0,0,0,0,7,101,120,97,109,112,108,101,4,116
+ Data.a 101,115,116,0,0,1,0,1,192,12,0,1,0,1,0,0,0,45,0,4,1,2,3,4
+Packet8:
+ Data.a 0,46,18,52,129,128,0,1,0,1,0,0,0,0,7,101,120,97,109,112,108,101,4,116
+ Data.a 101,115,116,0,0,1,0,1,192,12,0,1,0,1,0,0,0,45,0,4,1,2,3,4
+Packet9:
+ Data.a 0,46,18,52,129,128,0,1,0,1,0,0,0,0,7,101,120,97,109,112,108,101,4,116
+ Data.a 101,115,116,0,0,1,0,1,192,12,0,1,0,1,0,0,0,45,0,4,1,2,3,4
+Packet10:
+ Data.a 0,46,18,52,131,128,0,1,0,1,0,0,0,0,7,101,120,97,109,112,108,101,4,116
+ Data.a 101,115,116,0,0,1,0,1,192,12,0,1,0,1,0,0,0,45,0,4,1,2,3,4
+Packet11:
+ Data.a 0,46,18,52,129,128,0,1,0,1,0,0,0,0,7,101,120,97,109,112,108,101,4,116
+ Data.a 101,115,116,0,0,1,0,1,192,12,0,1,0,1,0,0,0,45,0,4,1,2,3,4
+Packet12:
+ Data.a 0,46,18,52,129,128,0,1,0,1,0,0,0,0,7,101,120,97,109,112,108,101,4,116
+ Data.a 101,115,116,0,0,1,0,1,192,12,0,1,0,1,0,0,0,45,0,4,1,2,3,4
+Packet13:
+ Data.a 0,30,18,52,129,128,0,1,0,0,0,0,0,0,7,101,120,97,109,112,108,101,4,116
+ Data.a 101,115,116,0,0,1,0,1
+Packet14:
+ Data.a 0,46,18,52,129,128,0,1,0,1,0,0,0,0,7,101,120,97,109,112,108,101,4,116
+ Data.a 101,115,116,0,0,1,0,1,192,12,0,1,0,1,0,0,0,45,0,4,1,2,3,4
+Packet15:
+ Data.a 0,46,18,52,129,128,0,1,0,1,0,0,0,0,7,101,120,97,109,112,108,101,4,116
+ Data.a 101,115,116,0,0,1,0,1,192,12,0,1,0,1,0,0,0,45,0,4,1,2,3,4
+Packet16:
+ Data.a 0,58,18,52,129,128,0,1,0,1,0,0,0,0,7,101,120,97,109,112,108,101,4,116
+ Data.a 101,115,116,0,0,28,0,1,192,12,0,28,0,1,0,0,0,45,0,16,32,1,13,184
+ Data.a 0,0,0,0,18,52,86,120,154,188,222,240
+Packet17:
+ Data.a 0,58,18,52,129,128,0,1,0,1,0,0,0,0,7,101,120,97,109,112,108,101,4,116
+ Data.a 101,115,116,0,0,28,0,1,192,12,0,28,0,1,0,0,0,45,0,16,32,1,13,184
+ Data.a 0,0,0,0,18,52,86,120,154,188,222,240
+Packet18:
+ Data.a 0,58,18,52,129,128,0,1,0,1,0,0,0,0,7,101,120,97,109,112,108,101,4,116
+ Data.a 101,115,116,0,0,28,0,1,192,12,0,28,0,1,0,0,0,45,0,16,32,1,13,184
+ Data.a 0,0,0,0,18,52,86,120,154,188,222,240
+Packet19:
+ Data.a 0,58,18,52,129,128,0,1,0,1,0,0,0,0,7,101,120,97,109,112,108,101,4,116
+ Data.a 101,115,116,0,0,28,0,1,192,12,0,28,0,1,0,0,0,45,0,16,32,1,13,184
+ Data.a 0,0,0,0,18,52,86,120,154,188,222,240
+Packet20:
+ Data.a 0,58,18,52,129,128,0,1,0,1,0,0,0,0,7,101,120,97,109,112,108,101,4,116
+ Data.a 101,115,116,0,0,28,0,1,192,12,0,28,0,1,0,0,0,45,0,16,32,1,13,184
+ Data.a 0,0,0,0,18,52,86,120,154,188,222,240
+Packet21:
+ Data.a 0,58,18,52,129,128,0,1,0,1,0,0,0,0,7,101,120,97,109,112,108,101,4,116
+ Data.a 101,115,116,0,0,28,0,1,192,12,0,28,0,1,0,0,0,45,0,16,32,1,13,184
+ Data.a 0,0,0,0,18,52,86,120,154,188,222,240
+Packet22:
+ Data.a 0,58,18,52,129,128,0,1,0,1,0,0,0,0,7,97,110,111,116,104,101,114,4,116
+ Data.a 101,115,116,0,0,28,0,1,192,12,0,28,0,1,0,0,0,45,0,16,32,1,13,184
+ Data.a 0,0,0,0,18,52,86,120,154,188,222,240
+Packet23:
+ Data.a 0,11,18,52,129,128,0,1,0,1,0,0,0,0,7,101,120,97,109,112,108,101,4,116
+ Data.a 101,115,116,0,0,28,0,1,192,12,0,28,0,1,0,0,0,45,0,16,32,1,13,184
+ Data.a 0,0,0,0,18,52,86,120,154,188,222,240
+Packet24:
+ Data.a 0,58,18,52,129,128,0,1,0,1,0,0,0,0,7,101,120,97,109,112,108,101,4,116
+ Data.a 101,115,116,0,0,28,0,1,192,12,0,28,0,1,0,0,0,45,0,16,32,1,13,184
+ Data.a 0,0,0,0,18,52,86,120,154,188,222,240
+Packet25:
+ Data.a 0,58,18,52,129,128,0,1,0,1,0,0,0,0,7,101,120,97,109,112,108,101,4,116
+ Data.a 101,115,116,0,0,28,0,1,192,12,0,28,0,1,0,0,0,45,0,16,32,1,13,184
+ Data.a 0,0,0,0,18,52,86,120,154,188,222,240
+Packet26:
+ Data.a 0,58,18,52,131,128,0,1,0,1,0,0,0,0,7,101,120,97,109,112,108,101,4,116
+ Data.a 101,115,116,0,0,28,0,1,192,12,0,28,0,1,0,0,0,45,0,16,32,1,13,184
+ Data.a 0,0,0,0,18,52,86,120,154,188,222,240
+Packet27:
+ Data.a 0,58,18,52,129,128,0,1,0,1,0,0,0,0,7,101,120,97,109,112,108,101,4,116
+ Data.a 101,115,116,0,0,28,0,1,192,12,0,28,0,1,0,0,0,45,0,16,32,1,13,184
+ Data.a 0,0,0,0,18,52,86,120,154,188,222,240
+Packet28:
+ Data.a 0,58,18,52,129,128,0,1,0,1,0,0,0,0,7,101,120,97,109,112,108,101,4,116
+ Data.a 101,115,116,0,0,28,0,1,192,12,0,28,0,1,0,0,0,45,0,16,32,1,13,184
+ Data.a 0,0,0,0,18,52,86,120,154,188,222,240
+Packet29:
+ Data.a 0,30,18,52,129,128,0,1,0,0,0,0,0,0,7,101,120,97,109,112,108,101,4,116
+ Data.a 101,115,116,0,0,28,0,1
+Packet30:
+ Data.a 0,58,18,52,129,128,0,1,0,1,0,0,0,0,7,101,120,97,109,112,108,101,4,116
+ Data.a 101,115,116,0,0,28,0,1,192,12,0,28,0,1,0,0,0,45,0,16,32,1,13,184
+ Data.a 0,0,0,0,18,52,86,120,154,188,222,240
+Packet31:
+ Data.a 0,58,18,52,129,128,0,1,0,1,0,0,0,0,7,101,120,97,109,112,108,101,4,116
+ Data.a 101,115,116,0,0,28,0,1,192,12,0,28,0,1,0,0,0,45,0,16,32,1,13,184
+ Data.a 0,0,0,0,18,52,86,120,154,188,222,240
+EndDataSection

@@ -11,17 +11,44 @@ def build(compiler,out):
     owner=(root/names[0]).read_text(encoding='utf8')
     def proc(name):
         m=re.search(r'^Procedure(?:\.i)? '+name+r'\([^\n]*\n.*?^EndProcedure',owner,re.M|re.S);assert m,name;return m[0]
-    shared='\n'.join(proc(n) for n in ['paynet_DnsCloseListener','paynet_DnsCloseTcp','paynet_DnsFail','PayNetDnsInput','paynet_DnsTcpStep','paynet_DnsCancel'])
+    shared='\n'.join(proc(n) for n in ['paynet_DnsCloseListener','paynet_DnsCloseTcp','paynet_DnsFail','paynet_DnsCaptureAnswer','PayNetDnsInput','paynet_DnsTcpStep','paynet_DnsCancel','paynet_DnsStep','paynet_DnsResolveType','PayNetDnsResolve','PayNetDnsResolve6'])
+    start=owner.index('Procedure.i paynet_Lower(')
+    end=owner.index('; ======================================================================',owner.index('Procedure paynet_CachePut(',start))
+    shared=owner[start:end]+'\n'+shared
     constants='\n'.join(line for line in owner.splitlines() if line.startswith('#PAYNET_'))
     needed=set(re.findall(r'#[A-Z][A-Z_0-9]*',shared))|{'#SVC_EIO','#SVC_TCP_CONNECTING','#SVC_TCP_OPEN','#SVC_TCP_PEER_CLOSED'}
     constants+='\n'+'\n'.join(line for line in (root/names[1]).read_text(encoding='utf8').splitlines() if re.match(r'^#[A-Z][A-Z_0-9]*\s*=',line) and line.split('=')[0].strip() in needed)
     globals_=owner[owner.index('Global paynet_dnsTcp.i'):owner.index('; ---- TCP ----')]
     s='XIncludeFile "Anvil/Network/dns_codec.pbi"\n#HW_LINK_NONE=0\n'+constants+'\n'+globals_+r'''
+Global gSvcDetail.i
+Global Dim pendingOut.a[16]
 Global mode.i,opens.i,closes.i,listeners.i,sends.i,received.i,sent.i,replyLen.i
 Global Dim mockWire.a[4096]
 Global Dim mockSent.a[512]
 Global Dim udp.a[1024]
 Global udpLen.i
+Procedure.i NetIfUsable(kind.i)
+ ProcedureReturn 1
+EndProcedure
+Procedure.i NetIfUsableCount()
+ ProcedureReturn 0
+EndProcedure
+Procedure.i NetIfNext(kind.i)
+ ProcedureReturn 0
+EndProcedure
+Procedure.i NetNextHop(kind.i,ip.i)
+ ProcedureReturn 0
+EndProcedure
+Procedure.i paynet_DnsFor(kind.i)
+ ProcedureReturn 0
+EndProcedure
+Procedure.i ParseDotted(name.i)
+ ProcedureReturn -1
+EndProcedure
+Procedure NetServiceSetUdpHook(callback.i)
+EndProcedure
+Procedure paynet_DnsSend(now.i)
+EndProcedure
 Procedure.i millis()
  ProcedureReturn 100
 EndProcedure
@@ -84,13 +111,14 @@ Procedure.i PayNetTcpRecv(h.i,p.i,n.i)
  received=received+n : ProcedureReturn n
 EndProcedure
 '''+shared+r'''
-Procedure Run(index.i,bytes.i)
+Procedure Run(index.i,bytes.i,qtype.i)
  Define i.i,now.i,p.i,wrong.i,host.i,transition.i
- mode=index : opens=0 : closes=0 : listeners=0 : sends=0 : received=0 : sent=0
+ mode=index % 16 : paynet_dnsType=qtype : opens=0 : closes=0 : listeners=0 : sends=0 : received=0 : sent=0
  replyLen=bytes
  For i=0 To bytes-1 : Read.a mockWire[i] : Next
  paynet_dnsState=#PAYNET_DNS_WAIT : paynet_dnsTcp=0 : paynet_dnsPort=5300
  paynet_dnsKind=1 : paynet_dnsServer=$01010101 : paynet_dnsQid=$1234
+ For i=0 To 15 : paynet_dnsAnswer6[i]=0 : Next
  paynet_dnsAnswer=0 : paynet_dnsTtl=0 : paynet_dnsErr=0 : paynet_dnsStart=100
  If mode=14 : paynet_dnsStart=$FFFFFF00 : EndIf
  host="example.test"
@@ -115,10 +143,12 @@ Procedure Run(index.i,bytes.i)
  PokeI(p,paynet_dnsState) : PokeI(p+8,paynet_dnsErr)
  PokeI(p+16,paynet_dnsAnswer) : PokeI(p+24,paynet_dnsTtl)
  PokeI(p+32,opens) : PokeI(p+40,closes) : PokeI(p+48,listeners)
+ For i=0 To 15 : PokeA($E1C02800+index*16+i,paynet_dnsAnswer6[i]) : Next
  PokeI(p+56,sent) : PokeI(p+64,wrong) : PokeI(p+72,paynet_dnsTcp) : PokeI(p+80,transition)
 EndProcedure
-Procedure Dispatch(which.i)
+Procedure ProofDnsDispatch(which.i)
  Define host.i,i.i,p.i,rc.i
+ paynet_dnsType=#DNS_QTYPE_A
  mode=100+which : paynet_dnsState=#PAYNET_DNS_WAIT : paynet_dnsRejects=0
  paynet_dnsPort=5300 : paynet_dnsLocalIp=$C0000202 : paynet_dnsKind=1
  paynet_dnsServer=$01010101 : paynet_dnsQid=$1234
@@ -131,20 +161,42 @@ Procedure Dispatch(which.i)
  p=$E1C02000+which*24
  PokeI(p,rc) : PokeI(p+8,paynet_dnsState) : PokeI(p+16,paynet_dnsRejects)
 EndProcedure
+Procedure PendingType()
+ Define i.i,name.i,p.i
+ name="example.test" : p=$E1C03000
+ For i=0 To 3 : paynet_cacheUsed[i]=0 : Next
+ paynet_CopyName(@paynet_dnsName[0],name)
+ paynet_dnsType=#DNS_QTYPE_AAAA : paynet_dnsState=#PAYNET_DNS_WAIT
+ paynet_dnsStart=100 : paynet_dnsDeadline=1000 : paynet_dnsKind=1
+ For i=0 To 15 : pendingOut[i]=$A5 : Next
+ PokeI(p,PayNetDnsResolve(name))
+ PokeI(p+8,PayNetDnsResolve6(name,@pendingOut[0]))
+ PokeI(p+16,PayNetDnsResolve6("other.test",@pendingOut[0]))
+ PokeI(p+24,paynet_dnsType) : PokeI(p+32,paynet_dnsState)
+ paynet_dnsState=#PAYNET_DNS_FAIL : paynet_dnsErr=#SVC_EIO
+ PokeI(p+40,PayNetDnsResolve6(name,@pendingOut[0]))
+ PokeI(p+48,paynet_dnsState)
+ PokeI(p+56,PayNetDnsResolve6(name,0))
+ For i=0 To 15 : PokeA(p+64+i,pendingOut[i]) : Next
+EndProcedure
 Procedure.i Main(services.i)
  Define i.i
  For i=0 To 16383 : PokeA($E1C00000+i,$A5) : Next
- PokeI($E1C00000,$444E5431) : PokeI($E1C00008,16)
+ PokeI($E1C00000,$444E5431) : PokeI($E1C00008,32)
 '''
-    udp=packet([answer(b'\xc0\x0c',1,b'\x01\x02\x03\x04',45)],flags=0x8380)
-    s+=f' Restore UdpPacket\n udpLen={len(udp)}\n For i=0 To udpLen-1 : Read.a udp[i] : Next\n'
-    cases=[];packets=[]
-    for i in range(16):
-        raw=packet([answer(b'\xc0\x0c',1,b'\x01\x02\x03\x04',45)],question='another.test' if i==6 else 'example.test',flags=0x8380 if i==10 else 0x8180)
-        if i==13:raw=packet([])
-        raw=struct.pack('>H',11 if i==7 else len(raw))+raw
-        packets.append(raw);cases.append(i);s+=f' Restore Packet{i}\n Run({i},{len(raw)})\n'
-    s+=' Dispatch(0) : Dispatch(1) : Dispatch(2)\n ProcedureReturn 0\nEndProcedure\nDataSection\nUdpPacket:\n Data.a '+','.join(map(str,udp))+'\n'
+    cases=[];packets=[];udps=[]
+    for qtype in [1,28]:
+        addr=b'\x01\x02\x03\x04' if qtype==1 else bytes.fromhex('20010db800000000123456789abcdef0')
+        udp=packet([answer(b'\xc0\x0c',qtype,addr,45)],flags=0x8380,qtype=qtype);udps.append(udp)
+        s+=f' Restore UdpPacket{qtype}\n udpLen={len(udp)}\n For i=0 To udpLen-1 : Read.a udp[i] : Next\n'
+        for i in range(16):
+            raw=packet([answer(b'\xc0\x0c',qtype,addr,45)],question='another.test' if i==6 else 'example.test',flags=0x8380 if i==10 else 0x8180,qtype=qtype)
+            if i==13:raw=packet([],qtype=qtype)
+            raw=struct.pack('>H',11 if i==7 else len(raw))+raw
+            index=len(cases);packets.append(raw);cases.append(index);s+=f' Restore Packet{index}\n Run({index},{len(raw)},{qtype})\n'
+    s+=f' Restore UdpPacket1\n udpLen={len(udps[0])}\n For i=0 To udpLen-1 : Read.a udp[i] : Next\n'
+    s+=' ProofDnsDispatch(0) : ProofDnsDispatch(1) : ProofDnsDispatch(2)\n PendingType()\n ProcedureReturn 0\nEndProcedure\nDataSection\n'
+    for kind,raw in zip([1,28],udps):s+=f' UdpPacket{kind}:\n Data.a '+','.join(map(str,raw))+'\n'
     for i,raw in enumerate(packets):
         s+=f'Packet{i}:\n'
         for j in range(0,len(raw),24):s+=' Data.a '+','.join(map(str,raw[j:j+24]))+'\n'

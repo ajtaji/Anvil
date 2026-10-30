@@ -87,6 +87,9 @@ def build(compiler, out):
 #PAYNET_DNS_TRIES=3
 Global Dim paynet_cacheName.a[1024]
 Global Dim paynet_cacheIp.i[4]
+Global Dim paynet_cacheType.i[4]
+Global Dim paynet_cacheIp6.a[64]
+Global Dim cache6.a[16]
 Global Dim paynet_cacheAt.i[4]
 Global Dim paynet_cacheMs.i[4]
 Global Dim paynet_cacheUsed.i[4]
@@ -113,6 +116,24 @@ Procedure Cache(index.i,ttl.i,at.i,first.i,second.i)
  PokeI(p,paynet_CacheFind("EXAMPLE.TEST",first))
  PokeI(p+8,paynet_CacheFind("example.test",second))
 EndProcedure
+Procedure CheckCache6()
+ Define i.i,p.i
+ p=$E1C03500
+ For i=0 To 3 : paynet_cacheUsed[i]=0 : Next
+ For i=0 To 15 : cache6[i]=i+16 : Next
+ paynet_cacheNext=0
+ paynet_CachePut("same.test",$01020304,1000,60)
+ paynet_CachePut6("same.test",@cache6[0],1000,2)
+ PokeI(p,paynet_CacheFind("same.test",2000))
+ PokeI(p+8,paynet_CacheFind6("SAME.TEST",2999,p+64))
+ PokeI(p+16,paynet_CacheFind6("same.test",3000,p+80))
+ PokeI(p+24,paynet_CacheFind("same.test",3001))
+ paynet_CachePut6("same.test",@cache6[0],4000,0)
+ PokeI(p+32,paynet_CacheFind6("same.test",4001,p+96))
+ PokeI(p+40,paynet_CacheFind6("same.test",4002,p+112))
+ PokeI(p+48,paynet_CacheFind6("same.test",4002,0))
+ PokeI(p+56,paynet_CacheFind("same.test",4002))
+EndProcedure
 Procedure.i Main(services.i)
  Define i.i
  For i=0 To 16383 : PokeA($E1C00000+i,$A5) : Next
@@ -129,6 +150,7 @@ Procedure.i Main(services.i)
  Cache(2,0,1000,5500,5501)
  Cache(3,2,$FFFFFF00,$100,$6D0)
  Cache(4,$7FFFFFFF,1000,300999,301000)
+ CheckCache6()
  ProcedureReturn 0
 EndProcedure
 DataSection

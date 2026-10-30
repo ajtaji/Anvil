@@ -1690,3 +1690,37 @@ cases, eight query-boundary cases, and five existing cache cases passed.
 Evidence is in docs/evidence/anvil-ipv6-20261030/dns653. This qualifies the codec;
 the resident DNS owner and web adapter still need AAAA integration. The boot
 image remains 452, and this codec change has not been installed in that image.
+
+
+### Resident AAAA resolver: ABI 1.12
+
+Build 453 installs SvcDnsResolve6(name,destination16) in reserved slot 89.
+A successful call copies 16 network-order bytes and returns 16. Pending,
+busy and error results preserve caller output; callers continue to pump the
+network service. Existing IPv4 resolution and the 200-slot table are unchanged.
+A and AAAA queries share the cooperative DNS owner, retry deadline and TCP
+fallback. Cache keys and in-flight identity now include the requested type,
+so one hostname can retain both address families without cross-delivery.
+Each family currently exposes the first matching answer; multi-address
+connection racing and destination ordering are not yet implemented.
+
+The physical Pi passed 45 codec reply cases, eight query-boundary cases,
+five legacy cache cases, twelve typed-cache assertions, 32 TCP fallback
+scenarios, and nine pending-type/output assertions. One host test expectation
+incorrectly used -100 for SVC_EARG; it was corrected to the ABI's -102, and
+the original board report was rechecked without a redundant board run.
+
+The complete monitor also builds for Pi 3 as build 69. Pi 4 build 453 was
+installed with a verified 452 rollback, allowed 90 seconds to boot, and checked
+against its full running-image hash. The live ABI test resolved both AAAA
+and A records for one.one.one.one through the configured DNS resolver, then
+alternated repeat calls to verify that both cached answers remained distinct.
+Full reports, compiled proofs, boot image and install checks are under
+`docs/evidence/anvil-ipv6-20261030/resolver453`.
+
+AAAA resource records are queried over the existing IPv4 resolver transport;
+this does not yet provide DNS server transport over IPv6. The web adapter
+still uses IPv4 for hostname resolution and IPv6 for explicit HTTP literals.
+Connecting the new resolver to automatic dual-stack HTTP/TLS, multi-address
+selection, off-link IPv6 validation, remaining TLS blocking and HTTP/2-3
+remains open.
