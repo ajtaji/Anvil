@@ -11,7 +11,19 @@ Procedure BoardLinkTxProgress(kind.i)
  LinkCywTxProgress(kind)
 EndProcedure
 
+Procedure.i BoardLinkTxSubmitReceipt(kind.i,frame.i,bytes.i)
+ Define rc.i
+ rc=LinkDmaTxSubmitReceipt(kind,frame,bytes)
+ If rc<>-2 : ProcedureReturn rc : EndIf
+ ProcedureReturn LinkCywTxSubmitReceipt(kind,frame,bytes)
+EndProcedure
+Procedure.i BoardLinkTxReceipt(kind.i,token.i)
+ If kind=#HW_LINK_WIRED : ProcedureReturn LinkDmaTxReceipt(kind,token) : EndIf
+ ProcedureReturn LinkCywTxReceipt(kind,token)
+EndProcedure
+
 Procedure BoardLinkTxInstall()
  LinkDmaTxConfigure(#HW_LINK_WIRED,@HwLinkDmaTry,@HwLinkDmaPoll,@HwLinkDmaReady,@HwLinkDmaGeneration)
  LinkTxSetHooks(@BoardLinkTxSubmit,@BoardLinkTxProgress)
+ LinkTxSetReceiptHooks(@BoardLinkTxSubmitReceipt,@BoardLinkTxReceipt)
 EndProcedure

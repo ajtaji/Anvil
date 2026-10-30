@@ -1,0 +1,278 @@
+XIncludeFile "RaspberryPi4/Lib/mmu.pi4"
+XIncludeFile "Anvil/Network/link_tx_queue.pbi"
+
+#HW_LINK_WIRED=1
+#HW_LINK_WIFI=2
+Global gLinkTxPending.i,gLinkTxCompleted.i,gLinkTxDropped.i,gLinkTxBusy.i,gLinkTxFail.i
+Global fakeReady.i=1,fakeDevice.i=1,fakeAddress.i=1,fakeTime.i,fakeDone.i,fakePending.i,fakePollError.i,fakeTryError.i
+Global tries.i,wireBytes.i
+Global hwLinkDmaActive.i,hwLinkDmaResult.i,hwLinkDmaEpoch.i
+Global Dim hwLinkDmaShort.a[60]
+Global Dim wireFrame.a[1514]
+Global Dim inputFrame.a[1514]
+Procedure.i millis()
+ fakeTime=fakeTime+1 : ProcedureReturn fakeTime
+EndProcedure
+Procedure.i NetIfGeneration(kind.i)
+ ProcedureReturn fakeAddress
+EndProcedure
+Procedure.i GenetStarted()
+ ProcedureReturn fakeReady
+EndProcedure
+Procedure.i GenetStartCount()
+ ProcedureReturn fakeDevice
+EndProcedure
+Procedure.i GenetPollSend()
+ If fakePollError<>0 : ProcedureReturn -1 : EndIf
+ If fakePending=0 : ProcedureReturn 1 : EndIf
+ If fakeDone=0 : ProcedureReturn 0 : EndIf
+ fakePending=0 : ProcedureReturn 1
+EndProcedure
+Procedure.i GenetTrySend(p.i,n.i)
+ Define i.i
+ tries=tries+1
+ If GenetPollSend()=0 : ProcedureReturn -1 : EndIf
+ For i=0 To 1513 : wireFrame[i]=0 : Next
+ For i=0 To n-1 : wireFrame[i]=PeekA(p+i) : Next
+ wireBytes=n : fakePending=1 : fakeDone=0
+ If fakeTryError<>0 : ProcedureReturn 0 : EndIf
+ ProcedureReturn 1
+EndProcedure
+Procedure.i GenetSend(p.i,n.i,ms.i)
+ If GenetTrySend(p,n)<>1 : ProcedureReturn 0 : EndIf
+ fakeDone=1 : ProcedureReturn GenetPollSend()
+EndProcedure
+Procedure.i Cyw43DataMax()
+ ProcedureReturn 0
+EndProcedure
+Procedure.i Cyw43DataPtr()
+ ProcedureReturn 0
+EndProcedure
+Procedure.i Cyw43Send(n.i)
+ ProcedureReturn -1
+EndProcedure
+Procedure.i HwLinkDmaReady()
+ CompilerIf #PMF_CHIP = 2712
+  ProcedureReturn GemStarted()
+ CompilerElse
+  ProcedureReturn GenetStarted()
+ CompilerEndIf
+EndProcedure
+Procedure.i HwLinkDmaGeneration()
+ CompilerIf #PMF_CHIP = 2712
+  ProcedureReturn GemStartCount()
+ CompilerElse
+  ProcedureReturn GenetStartCount()
+ CompilerEndIf
+EndProcedure
+Procedure.i HwLinkDmaPoll()
+ Define rc.i
+ If hwLinkDmaActive=0 : ProcedureReturn -1 : EndIf
+ If HwLinkDmaReady()=0 Or HwLinkDmaGeneration()<>hwLinkDmaEpoch
+  hwLinkDmaResult=-1
+ EndIf
+ If hwLinkDmaResult<>0 : ProcedureReturn hwLinkDmaResult : EndIf
+ CompilerIf #PMF_CHIP = 2712
+  rc=GemPollSend()
+ CompilerElse
+  rc=GenetPollSend()
+ CompilerEndIf
+ If rc<>0 : hwLinkDmaResult=rc : EndIf
+ ProcedureReturn rc
+EndProcedure
+Procedure.i HwLinkDmaTry(frame.i,bytes.i)
+ Define rc.i,i.i
+ If frame=0 Or bytes<14 Or bytes>1514 : ProcedureReturn -1 : EndIf
+ If hwLinkDmaActive<>0
+  If HwLinkDmaPoll()=0 : ProcedureReturn 0 : EndIf
+ EndIf
+ hwLinkDmaActive=0 : hwLinkDmaResult=0
+ ; GENET requires a padded Ethernet frame; both drivers copy before return.
+ If bytes<60
+  For i=0 To 59 : hwLinkDmaShort[i]=0 : Next
+  For i=0 To bytes-1 : hwLinkDmaShort[i]=PeekA(frame+i) : Next
+  frame=@hwLinkDmaShort[0] : bytes=60
+ EndIf
+ CompilerIf #PMF_CHIP = 2712
+  rc=GemTrySend(frame,bytes)
+ CompilerElse
+  rc=GenetTrySend(frame,bytes)
+ CompilerEndIf
+ If rc=1
+  hwLinkDmaActive=1 : hwLinkDmaEpoch=HwLinkDmaGeneration()
+  ProcedureReturn 1
+ EndIf
+ If rc=-1 : ProcedureReturn 0 : EndIf
+ ProcedureReturn -1
+EndProcedure
+Procedure.i HwLinkDmaDrain(ms.i)
+ Define start.i
+ If ms<=0 : ProcedureReturn 0 : EndIf
+ start=millis()
+ While hwLinkDmaActive<>0
+  If HwLinkDmaPoll()<>0 : ProcedureReturn 1 : EndIf
+  If ((millis()-start) & $FFFFFFFF)>=ms : ProcedureReturn 0 : EndIf
+ Wend
+ ProcedureReturn 1
+EndProcedure
+Procedure.i HwLinkSend(kind.i, buf.i, n.i, ms.i)
+  Define dst.i
+  Define i.i
+  If n <= 0
+    ProcedureReturn 0
+  EndIf
+  If kind = #HW_LINK_WIRED
+    If HwLinkDmaDrain(ms)=0 : ProcedureReturn 0 : EndIf
+    CompilerIf #PMF_CHIP = 2712
+    ; GemSend copies into its own DMA buffer and waits for the GEM to
+    ; hand the descriptor back, the same 1/0 contract as GenetSend.
+    If GemSend(buf, n, ms) <> 1
+      ProcedureReturn 0
+    EndIf
+    ProcedureReturn 1
+    CompilerElse
+    If GenetSend(buf, n, ms) <> 1
+      ProcedureReturn 0
+    EndIf
+    ProcedureReturn 1
+    CompilerEndIf
+  EndIf
+  If kind = #HW_LINK_WIFI
+    If n > Cyw43DataMax()
+      ProcedureReturn 0
+    EndIf
+    dst = Cyw43DataPtr()
+    If dst = 0
+      ProcedureReturn 0
+    EndIf
+    i = 0
+    While i < n
+      PokeB(dst + i, PeekA(buf + i))
+      i = i + 1
+    Wend
+    ; Cyw43Send answers 0 for success, which is the opposite of
+    ; GenetSend's convention. Normalising it is exactly what this seam
+    ; is for: nothing above here should have to remember which driver
+    ; reports which way round.
+    If Cyw43Send(n) <> 0
+      ProcedureReturn 0
+    EndIf
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+XIncludeFile "Anvil/Network/link_dma_tx.pbi"
+
+Procedure Fill(seed.i)
+ Define i.i
+ For i=0 To 1513 : inputFrame[i]=(i*7+seed)&255 : Next
+EndProcedure
+Procedure Save(index.i,rc.i)
+ Define p.i,i.i
+ p=$E1C00100+index*2048
+ PokeI(p,rc) : PokeI(p+8,gLinkTxPending) : PokeI(p+16,gLinkTxCompleted)
+ PokeI(p+24,gLinkTxDropped) : PokeI(p+32,gLinkTxFail) : PokeI(p+40,tries)
+ PokeI(p+48,wireBytes) : PokeI(p+56,linkDmaTxActive)
+ PokeI(p+64,hwLinkDmaActive) : PokeI(p+72,hwLinkDmaResult)
+ For i=0 To 1513 : PokeA(p+80+i,wireFrame[i]) : Next
+EndProcedure
+Procedure.i Main()
+ Define i.i,rc.i,receipt.i,oldReceipt.i
+ For i=0 To 131071 : PokeA($E1C00000+i,0) : Next
+ PokeI($E1C00000,$444D5131)
+ MmuClearNc() : rc=MmuBuildTables($4F80000) : If rc<>0 : ProcedureReturn 2 : EndIf
+ MmuEnableCached()
+ rc=LinkDmaTxConfigure(1,@HwLinkDmaTry,@HwLinkDmaPoll,@HwLinkDmaReady,@HwLinkDmaGeneration)
+ If rc<>1 : ProcedureReturn 3 : EndIf
+Fill(3) : rc=LinkDmaTxSubmit(1,@inputFrame[0],14)
+ Save(0,rc)
+Fill(9) : LinkDmaTxProgress(1) : rc=0
+ Save(1,rc)
+rc=LinkDmaTxSubmit(1,@inputFrame[0],60)
+ Save(2,rc)
+Fill(11) : rc=LinkDmaTxSubmit(1,@inputFrame[0],60)
+ Save(3,rc)
+Fill(12) : rc=LinkDmaTxSubmit(1,@inputFrame[0],60)
+ Save(4,rc)
+Fill(13) : rc=LinkDmaTxSubmit(1,@inputFrame[0],60)
+ Save(5,rc)
+fakeDone=1 : LinkDmaTxProgress(1) : rc=0
+ Save(6,rc)
+LinkDmaTxProgress(1) : rc=0
+ Save(7,rc)
+fakeDone=1 : rc=HwLinkSend(1,@inputFrame[0],60,10)
+ Save(8,rc)
+LinkDmaTxProgress(1) : rc=0
+ Save(9,rc)
+LinkDmaTxProgress(1) : rc=0
+ Save(10,rc)
+fakeReady=0 : LinkDmaTxProgress(1) : rc=0
+ Save(11,rc)
+rc=LinkDmaTxSubmit(1,@inputFrame[0],60)
+ Save(12,rc)
+fakeReady=1 : fakeDevice=2 : fakePending=0 : Fill(20) : fakeTime=0 : rc=LinkDmaTxSubmit(1,@inputFrame[0],60)
+ Save(13,rc)
+fakeTime=102 : LinkDmaTxProgress(1) : rc=0
+ Save(14,rc)
+Fill(21) : rc=LinkDmaTxSubmit(1,@inputFrame[0],60)
+ Save(15,rc)
+fakeDone=1 : LinkDmaTxProgress(1) : rc=0
+ Save(16,rc)
+fakeDevice=3 : fakePending=0 : LinkDmaTxProgress(1) : rc=0
+ Save(17,rc)
+fakeTime=$FFFFFFF0 : Fill(22) : rc=LinkDmaTxSubmit(1,@inputFrame[0],60)
+ Save(18,rc)
+fakeTime=40 : LinkDmaTxProgress(1) : rc=0
+ Save(19,rc)
+fakeTime=90 : LinkDmaTxProgress(1) : rc=0
+ Save(20,rc)
+fakeDone=1 : Fill(30) : rc=LinkDmaTxSubmit(1,@inputFrame[0],1514)
+ Save(21,rc)
+fakePollError=1 : LinkDmaTxProgress(1) : rc=0
+ Save(22,rc)
+fakePollError=0 : Fill(31) : rc=LinkDmaTxSubmit(1,@inputFrame[0],60)
+ Save(23,rc)
+fakeDone=1 : LinkDmaTxProgress(1) : rc=0
+ Save(24,rc)
+fakeAddress=2 : LinkDmaTxProgress(1) : rc=0
+ Save(25,rc)
+fakeDone=1 : fakeTryError=1 : Fill(32) : rc=LinkDmaTxSubmit(1,@inputFrame[0],60)
+ Save(26,rc)
+fakeTryError=0 : Fill(33) : rc=LinkDmaTxSubmit(1,@inputFrame[0],60)
+ Save(27,rc)
+fakeReady=0 : LinkDmaTxProgress(1) : rc=0
+ Save(28,rc)
+rc=LinkDmaTxSubmit(2,@inputFrame[0],60)
+ Save(29,rc)
+rc=LinkDmaTxConfigure(1,@HwLinkDmaTry,@HwLinkDmaPoll,@HwLinkDmaReady,@HwLinkDmaGeneration)
+ Save(30,rc)
+fakeReady=1 : fakeDevice=fakeDevice+1 : fakePending=0 : fakeTime=0 : receipt=LinkDmaTxSubmitReceipt(1,@inputFrame[0],60) : rc=LinkDmaTxReceipt(1,receipt)
+ PokeI($E1C10000+0*8,rc)
+rc=0 : If receipt>0 : rc=1 : EndIf
+ PokeI($E1C10000+1*8,rc)
+rc=LinkDmaTxReceipt(2,receipt)
+ PokeI($E1C10000+2*8,rc)
+rc=LinkDmaTxReceipt(1,receipt+1)
+ PokeI($E1C10000+3*8,rc)
+fakeDone=1 : LinkDmaTxProgress(1) : rc=LinkDmaTxReceipt(1,receipt)
+ PokeI($E1C10000+4*8,rc)
+oldReceipt=receipt : receipt=LinkDmaTxSubmitReceipt(1,@inputFrame[0],60) : rc=LinkDmaTxReceipt(1,receipt)
+ PokeI($E1C10000+5*8,rc)
+rc=LinkDmaTxReceipt(1,oldReceipt)
+ PokeI($E1C10000+6*8,rc)
+fakePollError=1 : LinkDmaTxProgress(1) : rc=LinkDmaTxReceipt(1,receipt)
+ PokeI($E1C10000+7*8,rc)
+fakeDevice=fakeDevice+1 : rc=LinkDmaTxReceipt(1,oldReceipt)
+ PokeI($E1C10000+8*8,rc)
+fakePollError=0 : fakePending=0 : fakeTryError=1 : receipt=LinkDmaTxSubmitReceipt(1,@inputFrame[0],60) : rc=LinkDmaTxReceipt(1,receipt)
+ PokeI($E1C10000+9*8,rc)
+fakeReady=0 : rc=LinkDmaTxReceipt(1,receipt)
+ PokeI($E1C10000+10*8,rc)
+rc=LinkDmaTxSubmitReceipt(2,@inputFrame[0],60)
+ PokeI($E1C10000+11*8,rc)
+rc=LinkDmaTxReceipt(1,0)
+ PokeI($E1C10000+12*8,rc)
+ PokeI($E1C00008,31)
+ MmuDisableCachedFlushed()
+ ProcedureReturn 0
+EndProcedure

@@ -11,8 +11,13 @@ def check(raw,cases):
    if gen<=0 or (q is not None and gen<=q['gen']):rc=-1
    else:
     rc=len(q['fifo']) if q else 0
-    q=dict(gen=gen,head=0,next=1,accepted=0,sent=0,failed=0,error=0,fifo=[],slots=[None]*4)
+    q=dict(gen=gen,head=0,next=1,accepted=0,sent=0,failed=0,error=0,fifo=[],slots=[None]*4,receipts=[None]*4)
     contexts[which]=q
+  elif op=='result':
+   if not valid or a<=0 or a>=q['next']:rc=-2
+   elif any(t==a for t,_ in q['fifo']):rc=0
+   else:rc=next((entry[1] for entry in q['receipts'] if entry and entry[0]==a),-2)
+  elif op=='next':rc=q['next'] if valid and q['next']<0x7fffffff else 0
   elif op in ('submit','alias'):
    if not valid or op=='alias' or not 1<=a<=1514:rc=-1
    elif len(q['fifo'])==4:rc=0
@@ -25,22 +30,25 @@ def check(raw,cases):
    if not valid or not q['fifo'] or q['fifo'][0][0]!=a or b>1:rc=-1
    elif b==0:rc=0
    else:
+    q['receipts'][(q['sent']+q['failed'])%4]=(a,1 if b==1 else -1)
     q['slots'][q['head']]=None;q['head']=(q['head']+1)%4;q['fifo'].pop(0)
     if b==1:q['sent']+=1
     else:q['failed']+=1;q['error']=b
     rc=1
-  expected=bytearray(6224)
+  expected=bytearray(6288)
   if q:
-   struct.pack_into('<9q',expected,0,0x54585131,q['gen'],q['head'],len(q['fifo']),q['next'],q['accepted'],q['sent'],q['failed'],q['error'])
+   struct.pack_into('<9q',expected,0,0x54585132,q['gen'],q['head'],len(q['fifo']),q['next'],q['accepted'],q['sent'],q['failed'],q['error'])
+   for i,receipt in enumerate(q['receipts']):
+    if receipt:struct.pack_into('<2q',expected,80+i*16,*receipt)
    for slot,packet in enumerate(q['slots']):
     if packet:
-     ticket,data=packet;p=80+slot*1536
+     ticket,data=packet;p=144+slot*1536
      struct.pack_into('<2q',expected,p,len(data),ticket);expected[p+16:p+16+len(data)]=data
   current=q is not None and q['gen']==gen and gen>0
   front=q['fifo'][0] if current and q['fifo'] else None
   metadata=(rc,len(q['fifo']) if current else -1,len(front[1]) if front else 0,front[0] if front else 0)
-  p=256+index*6272
+  p=256+index*6400
   assert struct.unpack_from('<4q',raw,p)==metadata,(index,op,struct.unpack_from('<4q',raw,p),metadata)
-  actual=raw[p+32:p+32+6224]
+  actual=raw[p+32:p+32+6288]
   assert actual==expected,(index,op,'queue bytes',next((i for i,(x,y) in enumerate(zip(actual,expected)) if x!=y),None))
  return dict(passed=True,cases=len(cases),scope='owned FIFO state, exact copied frames, backpressure, stale completions and generation reset; no live driver integration')

@@ -15,6 +15,7 @@ def build(compiler,out):
 #CYW43_IO_BADFRAME=-4
 #CYW43_IO_OK=0
 Global *gLinkTxSubmitHook=0,*gLinkTxProgressHook=0
+Global *gLinkTxReceiptSubmitHook=0,*gLinkTxReceiptResultHook=0
 Global gLinkTxPending.i,gLinkTxCompleted.i,gLinkTxDropped.i,gLinkTxBusy.i,gLinkTxFail.i
 Global fakeReady.i=1,fakeRadio.i=1,fakeAddress.i=1,fakeTime.i,fakeCredit.i,fakeResult.i
 Global tries.i,fallbacks.i,wireBytes.i
@@ -55,7 +56,7 @@ EndProcedure
 '''
  driver=(root/'Anvil/Net/cyw43.pbi').read_text()
  s+=re.search(r'^Procedure\.i Cyw43CanSend\([^\n]*\n.*?^EndProcedure',driver,re.M|re.S).group()+'\n'
- s+='\n'.join(proc(n) for n in ['LinkTxSetHooks','LinkTxProgress','LinkSendFrame'])+'\nXIncludeFile "Anvil/Network/link_cyw_tx.pbi"\n'+r'''
+ s+='\n'.join(proc(n) for n in ['LinkTxSetHooks','LinkTxSetReceiptHooks','LinkSendTracked','LinkTxReceipt','LinkTxProgress','LinkSendFrame'])+'\nXIncludeFile "Anvil/Network/link_cyw_tx.pbi"\n'+r'''
 Procedure Fill(seed.i)
  Define i.i
  For i=0 To 1513 : inputFrame[i]=(i*7+seed)&255 : Next
@@ -69,8 +70,8 @@ Procedure Save(index.i,rc.i)
  For i=0 To 1513 : PokeA(p+80+i,wireFrame[i]) : Next
 EndProcedure
 Procedure.i Main()
- Define i.i,rc.i
- For i=0 To 65535 : PokeA($E1C00000+i,0) : Next
+ Define i.i,rc.i,receipt.i,oldReceipt.i
+ For i=0 To 131071 : PokeA($E1C00000+i,0) : Next
  PokeI($E1C00000,$43595131)
  MmuClearNc() : rc=MmuBuildTables($4F80000) : If rc<>0 : ProcedureReturn 2 : EndIf
  MmuEnableCached() : LinkCywTxInstall()
@@ -104,12 +105,14 @@ Procedure.i Main()
  ('terminal bus error','fakeCredit=1 : fakeResult=-4 : Fill(33) : rc=LinkSendFrame(2,@inputFrame[0],60)',[1,0,6,5,9,5,7,1,60],33),
  ('no replay','LinkTxProgress(2) : rc=0',[0,0,6,5,9,5,7,1,60],33)]
  for k,(_,code,_,_) in enumerate(steps):s+=code+f'\n Save({k},rc)\n'
+ receipt_cases=['fakeReady=1 : fakeRadio=fakeRadio+1 : fakeCredit=0 : fakeTime=0 : receipt=LinkSendTracked(2,@inputFrame[0],60) : rc=LinkTxReceipt(2,receipt)', 'rc=0 : If receipt>0 : rc=1 : EndIf', 'rc=LinkTxReceipt(1,receipt)', 'rc=LinkTxReceipt(2,receipt+1)', 'fakeCredit=1 : fakeResult=0 : LinkTxProgress(2) : rc=LinkTxReceipt(2,receipt)', 'fakeCredit=0 : oldReceipt=receipt : receipt=LinkSendTracked(2,@inputFrame[0],60) : rc=LinkTxReceipt(2,receipt)', 'rc=LinkTxReceipt(2,oldReceipt)', 'fakeCredit=1 : fakeResult=-4 : LinkTxProgress(2) : rc=LinkTxReceipt(2,receipt)', 'fakeRadio=fakeRadio+1 : rc=LinkTxReceipt(2,oldReceipt)', 'fakeResult=0 : receipt=LinkSendTracked(2,@inputFrame[0],60) : rc=LinkTxReceipt(2,receipt)', 'fakeReady=0 : rc=LinkTxReceipt(2,receipt)', 'rc=LinkSendTracked(1,@inputFrame[0],60)', 'rc=LinkTxReceipt(2,0)']
+ for k,code in enumerate(receipt_cases):s+=code+f"\n PokeI($E1C10000+{k}*8,rc)\n"
  s+=f' PokeI($E1C00008,{len(steps)})\n MmuDisableCachedFlushed()\n ProcedureReturn 0\nEndProcedure\n'
  source=out/'proof.pi4';source.write_text(s,encoding='utf8')
  q=subprocess.run([str(resolve_compiler(compiler)),'--compile',str(source),'-t','pi4','--load-addr','0x1000000','--stack-addr','0x4f00000','--entry-returns','--wants-services','-o',str(out/'proof.img')],env=dict(os.environ,PMF_ROOT=str(root)),capture_output=True,text=True,encoding='utf8',timeout=180,creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
  log=q.stdout+q.stderr;(out/'compile.txt').write_text(log,encoding='utf8');print(log[-1800:]);assert q.returncode==0
  code=re.search(r'occupying \$([0-9A-Fa-f]+)\.\.\$([0-9A-Fa-f]+)',log);bss=re.search(r'bss \$([0-9A-Fa-f]+)\.\.\$([0-9A-Fa-f]+)',log)
- payload=(out/'proof.img.pmf').read_bytes();ranges={'code':['0x'+x for x in code.groups()],'bss':['0x'+x for x in bss.groups()],'stack':['0x4e00000','0x4efffff'],'report':['0xe1c00000','0xe1c0ffff'],'tables':['0x4f80000','0x4f82fff']}
+ payload=(out/'proof.img.pmf').read_bytes();ranges={'code':['0x'+x for x in code.groups()],'bss':['0x'+x for x in bss.groups()],'stack':['0x4e00000','0x4efffff'],'report':['0xe1c00000','0xe1c1ffff'],'tables':['0x4f80000','0x4f82fff']}
  (out/'identity.json').write_text(json.dumps(dict(bytes=len(payload),sha256=hashlib.sha256(payload).hexdigest(),checked_ranges=ranges,source_hashes={n:hashlib.sha256((root/n).read_bytes()).hexdigest() for n in names},cases=[dict(name=n,expected=e,seed=seed) for n,_,e,seed in steps]),indent=2),encoding='utf8')
 if __name__=='__main__':
  ap=argparse.ArgumentParser(description=__doc__);ap.add_argument('--compiler',required=True);ap.add_argument('--out',type=Path,required=True);a=ap.parse_args();build(a.compiler,a.out.resolve())

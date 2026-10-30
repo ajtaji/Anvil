@@ -1,0 +1,179 @@
+XIncludeFile "RaspberryPi4/Lib/mmu.pi4"
+XIncludeFile "Anvil/Network/link_tx_queue.pbi"
+
+#HW_LINK_WIFI=2
+#CYW43_IO_TIMEOUT=-1
+#CYW43_IO_AGAIN=-8
+#CYW43_IO_BADFRAME=-4
+#CYW43_IO_OK=0
+Global *gLinkTxSubmitHook=0,*gLinkTxProgressHook=0
+Global *gLinkTxReceiptSubmitHook=0,*gLinkTxReceiptResultHook=0
+Global gLinkTxPending.i,gLinkTxCompleted.i,gLinkTxDropped.i,gLinkTxBusy.i,gLinkTxFail.i
+Global fakeReady.i=1,fakeRadio.i=1,fakeAddress.i=1,fakeTime.i,fakeCredit.i,fakeResult.i
+Global tries.i,fallbacks.i,wireBytes.i
+Global Dim stageFrame.a[1514]
+Global Dim wireFrame.a[1514]
+Global Dim inputFrame.a[1514]
+Procedure.i HwLinkReady(kind.i)
+ ProcedureReturn fakeReady
+EndProcedure
+Procedure.i Cyw43TxGeneration()
+ ProcedureReturn fakeRadio
+EndProcedure
+Procedure.i NetIfGeneration(kind.i)
+ ProcedureReturn fakeAddress
+EndProcedure
+Procedure.i millis()
+ ProcedureReturn fakeTime
+EndProcedure
+Procedure.i cyw43_DataCreditReady()
+ ProcedureReturn fakeCredit
+EndProcedure
+Procedure.i Cyw43DataPtr()
+ ProcedureReturn @stageFrame[0]
+EndProcedure
+Procedure.i Cyw43TrySend(bytes.i)
+ Define i.i
+ tries=tries+1 : wireBytes=bytes
+ For i=0 To 1513 : wireFrame[i]=0 : Next
+ For i=0 To bytes-1 : wireFrame[i]=stageFrame[i] : Next
+ ProcedureReturn fakeResult
+EndProcedure
+Procedure.i LinkTxMaxOn(kind.i)
+ ProcedureReturn 1514
+EndProcedure
+Procedure.i HwLinkSend(kind.i,p.i,n.i,ms.i)
+ fallbacks=fallbacks+1 : ProcedureReturn 1
+EndProcedure
+Procedure.i Cyw43CanSend()
+  ProcedureReturn cyw43_DataCreditReady()
+EndProcedure
+Procedure LinkTxSetHooks(*submit, *progress)
+  *gLinkTxSubmitHook = *submit : *gLinkTxProgressHook = *progress
+EndProcedure
+Procedure LinkTxSetReceiptHooks(*submit,*result)
+ *gLinkTxReceiptSubmitHook=*submit : *gLinkTxReceiptResultHook=*result
+EndProcedure
+Procedure.i LinkSendTracked(kind.i,frame.i,bytes.i)
+ If frame=0 Or bytes<14 Or bytes>LinkTxMaxOn(kind) : ProcedureReturn 0 : EndIf
+ If *gLinkTxReceiptSubmitHook=0 : ProcedureReturn -2 : EndIf
+ ProcedureReturn gLinkTxReceiptSubmitHook(kind,frame,bytes)
+EndProcedure
+Procedure.i LinkTxReceipt(kind.i,token.i)
+ If token<=0 Or *gLinkTxReceiptResultHook=0 : ProcedureReturn -2 : EndIf
+ ProcedureReturn gLinkTxReceiptResultHook(kind,token)
+EndProcedure
+Procedure LinkTxProgress(kind.i)
+  If *gLinkTxProgressHook <> 0 : gLinkTxProgressHook(kind) : EndIf
+EndProcedure
+Procedure.i LinkSendFrame(kind.i, frame.i, bytes.i)
+  Define rc.i
+  If frame=0 Or bytes<14 Or bytes>LinkTxMaxOn(kind) : ProcedureReturn 0 : EndIf
+  If *gLinkTxSubmitHook <> 0
+    rc=gLinkTxSubmitHook(kind,frame,bytes)
+    If rc<>-2 : ProcedureReturn rc : EndIf
+  EndIf
+  ProcedureReturn HwLinkSend(kind,frame,bytes,100)
+EndProcedure
+XIncludeFile "Anvil/Network/link_cyw_tx.pbi"
+
+Procedure Fill(seed.i)
+ Define i.i
+ For i=0 To 1513 : inputFrame[i]=(i*7+seed)&255 : Next
+EndProcedure
+Procedure Save(index.i,rc.i)
+ Define p.i,i.i
+ p=$E1C00100+index*2048
+ PokeI(p,rc) : PokeI(p+8,gLinkTxPending) : PokeI(p+16,gLinkTxCompleted)
+ PokeI(p+24,gLinkTxDropped) : PokeI(p+32,gLinkTxBusy) : PokeI(p+40,gLinkTxFail)
+ PokeI(p+48,tries) : PokeI(p+56,fallbacks) : PokeI(p+64,wireBytes)
+ For i=0 To 1513 : PokeA(p+80+i,wireFrame[i]) : Next
+EndProcedure
+Procedure.i Main()
+ Define i.i,rc.i,receipt.i,oldReceipt.i
+ For i=0 To 131071 : PokeA($E1C00000+i,0) : Next
+ PokeI($E1C00000,$43595131)
+ MmuClearNc() : rc=MmuBuildTables($4F80000) : If rc<>0 : ProcedureReturn 2 : EndIf
+ MmuEnableCached() : LinkCywTxInstall()
+Fill(3) : rc=LinkSendFrame(2,@inputFrame[0],1514)
+ Save(0,rc)
+Fill(9) : LinkTxProgress(2) : rc=0
+ Save(1,rc)
+fakeCredit=1 : LinkTxProgress(2) : rc=0
+ Save(2,rc)
+rc=LinkSendFrame(2,@inputFrame[0],64)
+ Save(3,rc)
+fakeCredit=0 : Fill(11) : rc=LinkSendFrame(2,@inputFrame[0],60)
+ Save(4,rc)
+Fill(12) : rc=LinkSendFrame(2,@inputFrame[0],60)
+ Save(5,rc)
+Fill(13) : rc=LinkSendFrame(2,@inputFrame[0],60)
+ Save(6,rc)
+Fill(14) : rc=LinkSendFrame(2,@inputFrame[0],60)
+ Save(7,rc)
+Fill(99) : rc=LinkSendFrame(2,@inputFrame[0],60)
+ Save(8,rc)
+fakeCredit=1 : LinkTxProgress(2) : rc=0
+ Save(9,rc)
+LinkTxProgress(2) : rc=0
+ Save(10,rc)
+LinkTxProgress(2) : rc=0
+ Save(11,rc)
+LinkTxProgress(2) : rc=0
+ Save(12,rc)
+fakeCredit=0 : Fill(20) : rc=LinkSendFrame(2,@inputFrame[0],60)
+ Save(13,rc)
+fakeAddress=2 : LinkTxProgress(2) : rc=0
+ Save(14,rc)
+rc=LinkSendFrame(2,@inputFrame[0],60)
+ Save(15,rc)
+fakeRadio=2 : LinkTxProgress(2) : rc=0
+ Save(16,rc)
+rc=LinkSendFrame(2,@inputFrame[0],60)
+ Save(17,rc)
+fakeReady=0 : LinkTxProgress(2) : rc=0
+ Save(18,rc)
+rc=LinkSendFrame(2,@inputFrame[0],60)
+ Save(19,rc)
+fakeReady=1 : fakeTime=$FFFFFFF0 : rc=LinkSendFrame(2,@inputFrame[0],60)
+ Save(20,rc)
+fakeTime=40 : LinkTxProgress(2) : rc=0
+ Save(21,rc)
+fakeTime=90 : LinkTxProgress(2) : rc=0
+ Save(22,rc)
+rc=LinkSendFrame(1,@inputFrame[0],60)
+ Save(23,rc)
+fakeCredit=1 : fakeResult=-4 : Fill(33) : rc=LinkSendFrame(2,@inputFrame[0],60)
+ Save(24,rc)
+LinkTxProgress(2) : rc=0
+ Save(25,rc)
+fakeReady=1 : fakeRadio=fakeRadio+1 : fakeCredit=0 : fakeTime=0 : receipt=LinkSendTracked(2,@inputFrame[0],60) : rc=LinkTxReceipt(2,receipt)
+ PokeI($E1C10000+0*8,rc)
+rc=0 : If receipt>0 : rc=1 : EndIf
+ PokeI($E1C10000+1*8,rc)
+rc=LinkTxReceipt(1,receipt)
+ PokeI($E1C10000+2*8,rc)
+rc=LinkTxReceipt(2,receipt+1)
+ PokeI($E1C10000+3*8,rc)
+fakeCredit=1 : fakeResult=0 : LinkTxProgress(2) : rc=LinkTxReceipt(2,receipt)
+ PokeI($E1C10000+4*8,rc)
+fakeCredit=0 : oldReceipt=receipt : receipt=LinkSendTracked(2,@inputFrame[0],60) : rc=LinkTxReceipt(2,receipt)
+ PokeI($E1C10000+5*8,rc)
+rc=LinkTxReceipt(2,oldReceipt)
+ PokeI($E1C10000+6*8,rc)
+fakeCredit=1 : fakeResult=-4 : LinkTxProgress(2) : rc=LinkTxReceipt(2,receipt)
+ PokeI($E1C10000+7*8,rc)
+fakeRadio=fakeRadio+1 : rc=LinkTxReceipt(2,oldReceipt)
+ PokeI($E1C10000+8*8,rc)
+fakeResult=0 : receipt=LinkSendTracked(2,@inputFrame[0],60) : rc=LinkTxReceipt(2,receipt)
+ PokeI($E1C10000+9*8,rc)
+fakeReady=0 : rc=LinkTxReceipt(2,receipt)
+ PokeI($E1C10000+10*8,rc)
+rc=LinkSendTracked(1,@inputFrame[0],60)
+ PokeI($E1C10000+11*8,rc)
+rc=LinkTxReceipt(2,0)
+ PokeI($E1C10000+12*8,rc)
+ PokeI($E1C00008,26)
+ MmuDisableCachedFlushed()
+ ProcedureReturn 0
+EndProcedure

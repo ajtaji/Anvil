@@ -8,4 +8,6 @@ def check(raw,cases):
   assert actual==c['expected'],(i,c['name'],actual,c['expected'])
   expected=bytes((j*7+c['seed'])&255 for j in range(c['copied']))+bytes(1514-c['copied'])
   assert raw[p+80:p+80+1514]==expected,(i,c['name'],'owned frame bytes')
- return dict(passed=True,cases=len(cases),scope='physical CPU, controlled driver completion; no Ethernet wire claim')
+ expected_receipts=[0,1,-2,-2,1,0,1,-1,-2,-1,-2,-2,-2]
+ assert list(struct.unpack_from('<13q',raw,65536))==expected_receipts,('packet receipts',list(struct.unpack_from('<13q',raw,65536)))
+ return dict(passed=True,cases=len(cases)+13,scope='physical CPU, controlled driver completion; no Ethernet wire claim')

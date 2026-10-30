@@ -7,6 +7,7 @@
 Global Dim linkCywTxQueue.a[#LINK_TXQ_BYTES]
 Global Dim linkCywTxAt.i[#LINK_TXQ_SLOTS]
 Global linkCywTxEpoch.i,linkCywTxRadio.i,linkCywTxAddress.i,linkCywTxReady.i
+Global linkCywTxLastReceipt.i
 Global linkCywTxBusy.i
 
 Procedure.i linkCywTxRefresh()
@@ -68,6 +69,7 @@ EndProcedure
 ; is explicit backpressure; no accepted frame is overwritten to make room.
 Procedure.i LinkCywTxSubmit(kind.i,frame.i,bytes.i)
  Define rc.i,ticket.i
+ linkCywTxLastReceipt=0
  If kind<>#HW_LINK_WIFI : ProcedureReturn -2 : EndIf
  If linkCywTxBusy<>0 Or linkCywTxRefresh()=0 : ProcedureReturn 0 : EndIf
  If LinkTxQueueCount(@linkCywTxQueue[0],linkCywTxEpoch)>=#LINK_TXQ_SLOTS
@@ -77,11 +79,32 @@ Procedure.i LinkCywTxSubmit(kind.i,frame.i,bytes.i)
  rc=LinkTxQueueSubmit(@linkCywTxQueue[0],linkCywTxEpoch,frame,bytes)
  If rc<>1 : ProcedureReturn 0 : EndIf
  linkCywTxAt[(ticket-1) % #LINK_TXQ_SLOTS]=millis()
+ If linkCywTxEpoch<$80000000 : linkCywTxLastReceipt=linkCywTxEpoch*$100000000+ticket : EndIf
  gLinkTxPending=gLinkTxPending+1
  If LinkTxQueueCount(@linkCywTxQueue[0],linkCywTxEpoch)=1 : LinkCywTxProgress(kind) : EndIf
  ProcedureReturn 1
 EndProcedure
 
+; Caller owns only a numeric token; no retained caller pointer or RX buffer.
+Procedure.i LinkCywTxSubmitReceipt(kind.i,frame.i,bytes.i)
+ Define rc.i
+ If kind<>#HW_LINK_WIFI : ProcedureReturn -2 : EndIf
+ If linkCywTxBusy<>0 Or linkCywTxRefresh()=0 : ProcedureReturn 0 : EndIf
+ If linkCywTxEpoch>=$80000000 : ProcedureReturn 0 : EndIf
+ rc=LinkCywTxSubmit(kind,frame,bytes)
+ If rc<>1 : ProcedureReturn rc : EndIf
+ ProcedureReturn linkCywTxLastReceipt
+EndProcedure
+Procedure.i LinkCywTxReceipt(kind.i,token.i)
+ Define generation.i,ticket.i
+ If kind<>#HW_LINK_WIFI : ProcedureReturn -2 : EndIf
+ If token<=0 Or linkCywTxBusy<>0 : ProcedureReturn -2 : EndIf
+ linkCywTxRefresh()
+ generation=token>>32 : ticket=token&$FFFFFFFF
+ ProcedureReturn LinkTxQueueResult(@linkCywTxQueue[0],generation,ticket)
+EndProcedure
+
 Procedure LinkCywTxInstall()
  LinkTxSetHooks(@LinkCywTxSubmit,@LinkCywTxProgress)
+ LinkTxSetReceiptHooks(@LinkCywTxSubmitReceipt,@LinkCywTxReceipt)
 EndProcedure

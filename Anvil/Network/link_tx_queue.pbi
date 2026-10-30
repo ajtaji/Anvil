@@ -10,10 +10,16 @@
 ; The consumer must finish its buffer access before Finish or Init: DMA that
 ; retains this pointer needs a separate completion owner, not this interface.
 ; A pump attempts at most one head per call and never waits for credit here.
-#LINK_TXQ_MAGIC = $54585131
+; A receipt is (generation,ticket). NextTicket predicts the next accepted Submit
+; under the serialized-caller contract; a refused Submit issues no receipt.
+; Result returns 0 pending, 1 completed, -1 failed, -2 stale/unknown/expired.
+; Four retired results are retained independently of the four pending slots.
+; Poll promptly: expiration is never completion and must not trigger replay.
+; Init invalidates old receipts, even if the new generation reuses a ticket.
+#LINK_TXQ_MAGIC = $54585132
 #LINK_TXQ_SLOTS = 4
 #LINK_TXQ_FRAME_MAX = 1514
-#LINK_TXQ_HEADER = 80
+#LINK_TXQ_HEADER = 144
 #LINK_TXQ_STRIDE = 1536
 #LINK_TXQ_BYTES = #LINK_TXQ_HEADER + #LINK_TXQ_SLOTS * #LINK_TXQ_STRIDE
 
@@ -82,11 +88,16 @@ Procedure.i LinkTxQueueTicket(q.i, generation.i)
 EndProcedure
 
 Procedure.i LinkTxQueueFinish(q.i, generation.i, ticket.i, result.i)
- Define p.i,i.i
+ Define p.i,i.i,receipt.i
  p=LinkTxQueuePeek(q,generation)
  If p=0 Or ticket<=0 : ProcedureReturn -1 : EndIf
  If PeekI(p-8)<>ticket Or result>1 : ProcedureReturn -1 : EndIf
  If result=0 : ProcedureReturn 0 : EndIf
+ ; Keep the exact retired ticket and normalized outcome; never infer a packet
+ ; result from aggregate counters or another packet's completion.
+ receipt=q+80+((PeekI(q+48)+PeekI(q+56)) % #LINK_TXQ_SLOTS)*16
+ PokeI(receipt,ticket)
+ If result=1 : PokeI(receipt+8,1) : Else : PokeI(receipt+8,-1) : EndIf
  ; Retired bytes cannot leak into a later shorter frame or survive reset.
  For i=0 To #LINK_TXQ_STRIDE-1 : PokeA(p-16+i,0) : Next
  PokeI(q+16,(PeekI(q+16)+1) % #LINK_TXQ_SLOTS)
@@ -97,4 +108,28 @@ Procedure.i LinkTxQueueFinish(q.i, generation.i, ticket.i, result.i)
   PokeI(q+56,PeekI(q+56)+1) : PokeI(q+64,result)
  EndIf
  ProcedureReturn 1
+EndProcedure
+
+Procedure.i LinkTxQueueNextTicket(q.i,generation.i)
+ Define ticket.i
+ If LinkTxQueueValid(q,generation)=0 : ProcedureReturn 0 : EndIf
+ ticket=PeekI(q+32)
+ If ticket<=0 Or ticket=$7FFFFFFF : ProcedureReturn 0 : EndIf
+ ProcedureReturn ticket
+EndProcedure
+
+Procedure.i LinkTxQueueResult(q.i,generation.i,ticket.i)
+ Define i.i,p.i,slot.i
+ If LinkTxQueueValid(q,generation)=0 Or ticket<=0 : ProcedureReturn -2 : EndIf
+ If ticket>=PeekI(q+32) : ProcedureReturn -2 : EndIf
+ For i=0 To PeekI(q+24)-1
+  slot=(PeekI(q+16)+i) % #LINK_TXQ_SLOTS
+  p=q+#LINK_TXQ_HEADER+slot*#LINK_TXQ_STRIDE
+  If PeekI(p+8)=ticket : ProcedureReturn 0 : EndIf
+ Next
+ For i=0 To #LINK_TXQ_SLOTS-1
+  p=q+80+i*16
+  If PeekI(p)=ticket : ProcedureReturn PeekI(p+8) : EndIf
+ Next
+ ProcedureReturn -2
 EndProcedure

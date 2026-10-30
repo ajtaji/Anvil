@@ -1046,3 +1046,32 @@ Pi radio reports `allmulti = 0`; multicast acceptance/membership must be handled
 before enabling this endpoint. Address configuration, routes, TCP IPv6 endpoints
 and web transport binding remain incomplete. No new monitor was installed for
 this isolated CPU test; the Pi remains healthy on build 441.
+
+
+## Individual protocol transmit results
+
+`LinkSendTracked(kind, frame, bytes)` returns a positive receipt for an accepted
+packet, zero for refusal, or -2 when that link has no receipt provider. Unlike
+`LinkSendFrame`, this path has no synchronous fallback. `LinkTxReceipt` returns
+0 pending, 1 driver-completed, -1 failed, or -2 stale/unknown/expired. The caller
+must retain the link kind with its receipt and service `LinkTxProgress`.
+Completion is the driver's reported outcome, not proof of remote delivery.
+
+Receipts carry a queue generation and ticket. Four retired outcomes are retained
+separately from four pending packets; promptly poll them. Expiration or an
+interface/address/device change cannot become a success or authorize replay of
+an accepted packet. A receiver may have seen a packet whose outcome is unknown.
+The queue layout version changed; contexts require the new size constant.
+No caller-owned receipt pointer is retained. Calls remain serialized.
+
+Shared Wi-Fi and DMA providers expose this contract, with Pi 3 Wi-Fi and Pi 4/5
+board dispatch installing the hooks. Other boards without a provider explicitly
+return unsupported. IPv6 can now inspect its own DAD probe instead of guessing
+from aggregate completion counters; multicast and live endpoint binding are
+still required before IPv6 web traffic is available.
+
+Physical Pi CPU qualification passed 102 FIFO/receipt cases, 39 Wi-Fi provider
+cases and 44 DMA provider cases, with controlled bus/driver outcomes. Existing
+frame-copy, padding, queue, timeout and console-interleaving coverage remains.
+Pi 4 build 443 and Pi 3 build 60 compile. These images were not installed in this
+step; the bench remains on 441. No new Ethernet-wire or IPv6-web pass is claimed.

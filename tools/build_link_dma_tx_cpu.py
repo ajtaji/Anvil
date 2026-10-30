@@ -75,8 +75,8 @@ Procedure Save(index.i,rc.i)
  For i=0 To 1513 : PokeA(p+80+i,wireFrame[i]) : Next
 EndProcedure
 Procedure.i Main()
- Define i.i,rc.i
- For i=0 To 65535 : PokeA($E1C00000+i,0) : Next
+ Define i.i,rc.i,receipt.i,oldReceipt.i
+ For i=0 To 131071 : PokeA($E1C00000+i,0) : Next
  PokeI($E1C00000,$444D5131)
  MmuClearNc() : rc=MmuBuildTables($4F80000) : If rc<>0 : ProcedureReturn 2 : EndIf
  MmuEnableCached()
@@ -116,12 +116,14 @@ Procedure.i Main()
  ('unsupported delegates', 'rc=LinkDmaTxSubmit(2,@inputFrame[0],60)', [-2, 0, 2, 9, 9, 12, 60, 0, 0, 0], 32, 60),
  ('configure cannot replace owner', 'rc=LinkDmaTxConfigure(1,@HwLinkDmaTry,@HwLinkDmaPoll,@HwLinkDmaReady,@HwLinkDmaGeneration)', [0, 0, 2, 9, 9, 12, 60, 0, 0, 0], 32, 60),]
  for k,(_,code,_,_,_) in enumerate(steps):s+=code+f"\n Save({k},rc)\n"
+ receipt_cases=['fakeReady=1 : fakeDevice=fakeDevice+1 : fakePending=0 : fakeTime=0 : receipt=LinkDmaTxSubmitReceipt(1,@inputFrame[0],60) : rc=LinkDmaTxReceipt(1,receipt)', 'rc=0 : If receipt>0 : rc=1 : EndIf', 'rc=LinkDmaTxReceipt(2,receipt)', 'rc=LinkDmaTxReceipt(1,receipt+1)', 'fakeDone=1 : LinkDmaTxProgress(1) : rc=LinkDmaTxReceipt(1,receipt)', 'oldReceipt=receipt : receipt=LinkDmaTxSubmitReceipt(1,@inputFrame[0],60) : rc=LinkDmaTxReceipt(1,receipt)', 'rc=LinkDmaTxReceipt(1,oldReceipt)', 'fakePollError=1 : LinkDmaTxProgress(1) : rc=LinkDmaTxReceipt(1,receipt)', 'fakeDevice=fakeDevice+1 : rc=LinkDmaTxReceipt(1,oldReceipt)', 'fakePollError=0 : fakePending=0 : fakeTryError=1 : receipt=LinkDmaTxSubmitReceipt(1,@inputFrame[0],60) : rc=LinkDmaTxReceipt(1,receipt)', 'fakeReady=0 : rc=LinkDmaTxReceipt(1,receipt)', 'rc=LinkDmaTxSubmitReceipt(2,@inputFrame[0],60)', 'rc=LinkDmaTxReceipt(1,0)']
+ for k,code in enumerate(receipt_cases):s+=code+f"\n PokeI($E1C10000+{k}*8,rc)\n"
  s+=f" PokeI($E1C00008,{len(steps)})\n MmuDisableCachedFlushed()\n ProcedureReturn 0\nEndProcedure\n"
  source=out/'proof.pi4';source.write_text(s,encoding='utf8')
  q=subprocess.run([str(resolve_compiler(compiler)),'--compile',str(source),'-t','pi4','--load-addr','0x1000000','--stack-addr','0x4f00000','--entry-returns','--wants-services','-o',str(out/'proof.img')],env=dict(os.environ,PMF_ROOT=str(root)),capture_output=True,text=True,encoding='utf8',timeout=180,creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
  log=q.stdout+q.stderr;(out/'compile.txt').write_text(log,encoding='utf8');print(log[-1800:]);assert q.returncode==0
  code=re.search(r'occupying \$([0-9A-Fa-f]+)\.\.\$([0-9A-Fa-f]+)',log);bss=re.search(r'bss \$([0-9A-Fa-f]+)\.\.\$([0-9A-Fa-f]+)',log)
- payload=(out/'proof.img.pmf').read_bytes();ranges={'code':['0x'+x for x in code.groups()],'bss':['0x'+x for x in bss.groups()],'stack':['0x4e00000','0x4efffff'],'report':['0xe1c00000','0xe1c0ffff'],'tables':['0x4f80000','0x4f82fff']}
+ payload=(out/'proof.img.pmf').read_bytes();ranges={'code':['0x'+x for x in code.groups()],'bss':['0x'+x for x in bss.groups()],'stack':['0x4e00000','0x4efffff'],'report':['0xe1c00000','0xe1c1ffff'],'tables':['0x4f80000','0x4f82fff']}
  (out/'identity.json').write_text(json.dumps(dict(bytes=len(payload),sha256=hashlib.sha256(payload).hexdigest(),checked_ranges=ranges,source_hashes={n:hashlib.sha256((root/n).read_bytes()).hexdigest() for n in names},cases=[dict(name=n,expected=e,seed=seed,copied=copied) for n,_,e,seed,copied in steps]),indent=2),encoding='utf8')
 if __name__=='__main__':
  ap=argparse.ArgumentParser(description=__doc__);ap.add_argument('--compiler',required=True);ap.add_argument('--out',type=Path,required=True);a=ap.parse_args();build(a.compiler,a.out.resolve())

@@ -8,6 +8,7 @@
 Global Dim linkDmaTxQueue.a[#LINK_TXQ_BYTES]
 Global Dim linkDmaTxAt.i[#LINK_TXQ_SLOTS]
 Global linkDmaTxKind.i,linkDmaTxEpoch.i,linkDmaTxDevice.i,linkDmaTxAddress.i,linkDmaTxReady.i
+Global linkDmaTxLastReceipt.i
 Global linkDmaTxBusy.i,linkDmaTxActive.i
 Global *linkDmaTry,*linkDmaPoll,*linkDmaReady,*linkDmaGeneration
 
@@ -72,6 +73,7 @@ EndProcedure
 
 Procedure.i LinkDmaTxSubmit(kind.i,frame.i,bytes.i)
  Define rc.i,ticket.i
+ linkDmaTxLastReceipt=0
  If linkDmaTxKind=0 Or kind<>linkDmaTxKind : ProcedureReturn -2 : EndIf
  If linkDmaTxBusy<>0 Or linkDmaTxRefresh()=0 : ProcedureReturn 0 : EndIf
  If bytes<14 : ProcedureReturn 0 : EndIf
@@ -80,7 +82,27 @@ Procedure.i LinkDmaTxSubmit(kind.i,frame.i,bytes.i)
  rc=LinkTxQueueSubmit(@linkDmaTxQueue[0],linkDmaTxEpoch,frame,bytes)
  If rc<>1 : ProcedureReturn 0 : EndIf
  linkDmaTxAt[(ticket-1) % #LINK_TXQ_SLOTS]=millis()
+ If linkDmaTxEpoch<$80000000 : linkDmaTxLastReceipt=linkDmaTxEpoch*$100000000+ticket : EndIf
  gLinkTxPending=gLinkTxPending+1
  If LinkTxQueueCount(@linkDmaTxQueue[0],linkDmaTxEpoch)=1 : LinkDmaTxProgress(kind) : EndIf
  ProcedureReturn 1
+EndProcedure
+
+; Caller owns only a numeric token; no retained caller pointer or RX buffer.
+Procedure.i LinkDmaTxSubmitReceipt(kind.i,frame.i,bytes.i)
+ Define rc.i
+ If linkDmaTxKind=0 Or kind<>linkDmaTxKind : ProcedureReturn -2 : EndIf
+ If linkDmaTxBusy<>0 Or linkDmaTxRefresh()=0 : ProcedureReturn 0 : EndIf
+ If linkDmaTxEpoch>=$80000000 : ProcedureReturn 0 : EndIf
+ rc=LinkDmaTxSubmit(kind,frame,bytes)
+ If rc<>1 : ProcedureReturn rc : EndIf
+ ProcedureReturn linkDmaTxLastReceipt
+EndProcedure
+Procedure.i LinkDmaTxReceipt(kind.i,token.i)
+ Define generation.i,ticket.i
+ If linkDmaTxKind=0 Or kind<>linkDmaTxKind : ProcedureReturn -2 : EndIf
+ If token<=0 Or linkDmaTxBusy<>0 : ProcedureReturn -2 : EndIf
+ linkDmaTxRefresh()
+ generation=token>>32 : ticket=token&$FFFFFFFF
+ ProcedureReturn LinkTxQueueResult(@linkDmaTxQueue[0],generation,ticket)
 EndProcedure

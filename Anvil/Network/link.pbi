@@ -590,6 +590,24 @@ Procedure LinkTxSetHooks(*submit, *progress)
   *gLinkTxSubmitHook = *submit : *gLinkTxProgressHook = *progress
 EndProcedure
 
+ ; Optional receipt providers have no synchronous fallback. Positive tokens
+; identify accepted packets, zero refuses, -2 means unsupported. Result is
+; 0 pending, 1 completed, -1 failed, -2 stale/unknown/expired. Never replay an
+; accepted packet just because its receipt expired. Serialized callers only.
+Global *gLinkTxReceiptSubmitHook=0,*gLinkTxReceiptResultHook=0
+Procedure LinkTxSetReceiptHooks(*submit,*result)
+ *gLinkTxReceiptSubmitHook=*submit : *gLinkTxReceiptResultHook=*result
+EndProcedure
+Procedure.i LinkSendTracked(kind.i,frame.i,bytes.i)
+ If frame=0 Or bytes<14 Or bytes>LinkTxMaxOn(kind) : ProcedureReturn 0 : EndIf
+ If *gLinkTxReceiptSubmitHook=0 : ProcedureReturn -2 : EndIf
+ ProcedureReturn gLinkTxReceiptSubmitHook(kind,frame,bytes)
+EndProcedure
+Procedure.i LinkTxReceipt(kind.i,token.i)
+ If token<=0 Or *gLinkTxReceiptResultHook=0 : ProcedureReturn -2 : EndIf
+ ProcedureReturn gLinkTxReceiptResultHook(kind,token)
+EndProcedure
+
 Procedure LinkTxProgress(kind.i)
   If *gLinkTxProgressHook <> 0 : gLinkTxProgressHook(kind) : EndIf
 EndProcedure
