@@ -127,6 +127,32 @@ def build(compiler,out):
  merge('unaligned capacity',[],sources[:1],cap=17)
  merge('too large capacity',[],sources[:1],cap=1440)
  merge('count exceeds capacity',sources[:2],[],cap=16)
+ # Receive reports never write output or membership state.
+ report=bytes([131,0,0,0])+bytes(4)+group
+ def heard(name,b,ok=False,local=addr('fe80::9999'),g=group):
+  sourced('receive '+name,f'rc=IPv6MldHeardReport({vector(b)},{len(b)},{vector(g)},{vector(local)})',0 if ok else -760)
+ heard('valid',packet(report,dst=group),True)
+ heard('before local assignment',packet(report,dst=group),True,local=zero)
+ heard('ignored fields',packet(bytes([131,99,0,0,1,2,3,4])+group,dst=group),True)
+ heard('trailing data checksum',packet(report+b'abc',dst=group),True)
+ heard('own source',packet(report,dst=group),local=ll)
+ heard('unspecified source',packet(report,src=zero,dst=group))
+ heard('global source',packet(report,src=addr('2001:db8::1'),dst=group))
+ heard('noncanonical link local',packet(report,src=addr('fe80:1::1'),dst=group))
+ heard('wrong destination',packet(report))
+ heard('wrong membership',packet(report,dst=group),g=addr('ff02::123'))
+ heard('wrong body group',packet(report[:8]+addr('ff02::123'),dst=group))
+ heard('done not report',packet(bytes([132])+report[1:],dst=group))
+ heard('query not report',packet(bytes([130])+report[1:],dst=group))
+ heard('short body',packet(report[:-1],dst=group))
+ heard('hop limit',packet(report,dst=group,hop=2))
+ heard('no alert',packet(report,dst=group,hbh=b''))
+ heard('wrong alert',packet(report,dst=group,hbh=b'\x3a\0\x05\x02\0\1\x01\0'))
+ heard('duplicate alert',packet(report,dst=group,hbh=b'\x3a\1\x05\x02\0\0\x05\x02\0\0\x01\x04\0\0\0\0'))
+ broken=bytearray(packet(report,dst=group));broken[-1]^=1
+ heard('corrupt checksum',bytes(broken))
+ heard('invalid local identity',packet(report,dst=group),local=group)
+ heard('short packet',b'\x60'*20)
  s='XIncludeFile "RaspberryPi4/Lib/mmu.pi4"\nXIncludeFile "Anvil/Network/ipv6_neighbor.pbi"\nXIncludeFile "Anvil/Network/ipv6_mld.pbi"\nXIncludeFile "Anvil/Network/ipv6_mld_policy.pbi"\n'
  s+='Global Dim output.a[1500]\nGlobal Dim sourceStore.a[1424]\nGlobal queryView.IPv6MldQueryView\nGlobal policyState.IPv6MldInterface\nProcedure Save(index.i,rc.i)\n Define p.i,i.i\n p=$E1C00100+index*4096\n PokeI(p,rc) : PokeI(p+8,queryView\\version) : PokeI(p+16,queryView\\maxDelay)\n PokeI(p+24,queryView\\robustness) : PokeI(p+32,queryView\\interval) : PokeI(p+40,queryView\\sourceCount)\n For i=0 To 1499 : PokeA(p+64+i,output[i]) : Next\n For i=0 To 1423 : PokeA(p+1728+i,sourceStore[i]) : Next\n For i=0 To 7 : PokeI(p+1600+i*8,PeekI(@policyState+i*8)) : Next\nEndProcedure\n'
  s+='Procedure.i Main()\n Define i.i,rc.i\n For i=0 To 524287 : PokeA($E1C00000+i,0) : Next\n PokeI($E1C00000,$4D4C4431)\n MmuClearNc() : rc=MmuBuildTables($4F80000) : If rc<>0 : ProcedureReturn 2 : EndIf\n MmuEnableCached()\n'

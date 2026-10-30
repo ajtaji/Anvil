@@ -1176,3 +1176,21 @@ backwards time and output/context overlap. Packet bytes and owned lists were
 checked independently. This scheduler is not yet connected to live multicast:
 receive-side report validation, device filtering, membership ownership and
 network-loop binding remain. Anvil 441 remains installed and healthy.
+
+
+## Incoming multicast report validation
+
+`IPv6MldHeardReport` validates a received v1 report against an exact group
+before the membership scheduler may suppress its own pending response. It
+checks link-local source, hop limit one, Router Alert, destination, reported
+group and checksum, and rejects reports from the local assigned address.
+Unspecified-source reports do not suppress responses. The caller must also
+exclude local Ethernet loopback and only invoke v1 suppression in v1 mode.
+Code and reserved fields are ignored; trailing bytes remain checksum-covered.
+No packet pointer escapes and validation changes no membership state.
+
+The expanded 110-case packet/policy/source-list suite passed on physical Pi 4
+under Anvil 441, including 21 receive-report cases. The RAM payload returned
+normally; cores, fonts and Vulkan remained healthy. This adds the receive
+validator but does not yet connect multicast membership to live device filters
+or the network service loop. IPv6 web traffic and HTTP/2-3 remain unfinished.

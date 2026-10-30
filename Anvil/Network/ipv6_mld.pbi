@@ -220,3 +220,43 @@ Procedure.i IPv6MldMergeSources(storage.i,capacity.i,count.i,input.i,added.i)
  Next
  ProcedureReturn total
 EndProcedure
+
+; Validate another listener's v1 Report for one exact membership before
+; suppressing our pending response. The caller excludes local MAC loopback
+; and supplies its assigned link-local address (or :: before assignment).
+; Unspecified-source reports are for switch snooping, not suppression here.
+; No packet pointer escapes; no state is changed by validation.
+Procedure.i IPv6MldHeardReport(packet.i,bytes.i,group.i,local.i)
+ Define view.IPv6PacketView
+ Define at.i,last.i,kind.i,n.i,alerts.i,body.i
+ If ipv6mld_Span(packet,bytes)=0 Or bytes>1500 : ProcedureReturn #IPV6_MLD_INVALID : EndIf
+ If ipv6mld_Span(group,16)=0 Or ipv6mld_Span(local,16)=0 : ProcedureReturn #IPV6_MLD_INVALID : EndIf
+ If ipv6mld_Group(group)=0 : ProcedureReturn #IPV6_MLD_INVALID : EndIf
+ If ipv6mld_LinkLocal(local)=0 And IPv6AddressUnspecified(local)=0 : ProcedureReturn #IPV6_MLD_INVALID : EndIf
+ If IPv6PacketParse(packet,bytes,@view)<>0 : ProcedureReturn #IPV6_MLD_INVALID : EndIf
+ If view\protocol<>58 Or view\hopLimit<>1 Or view\fragmented<>0 : ProcedureReturn #IPV6_MLD_INVALID : EndIf
+ If ipv6mld_LinkLocal(view\source)=0 Or PeekA(packet+6)<>0 : ProcedureReturn #IPV6_MLD_INVALID : EndIf
+ If ipv6mld_SameAddress(view\source,local)<>0 : ProcedureReturn #IPV6_MLD_INVALID : EndIf
+ If ipv6mld_SameAddress(view\destination,group)=0 : ProcedureReturn #IPV6_MLD_INVALID : EndIf
+ last=40+(PeekA(packet+41)+1)*8 : at=42 : alerts=0
+ While at<last
+  kind=PeekA(packet+at)
+  If kind=0
+   at=at+1
+  Else
+   n=PeekA(packet+at+1)
+   If kind=5
+    If n<>2 : ProcedureReturn #IPV6_MLD_INVALID : EndIf
+    If NetReadBE16(packet+at+2)<>0 : ProcedureReturn #IPV6_MLD_INVALID : EndIf
+    alerts=alerts+1
+   EndIf
+   at=at+n+2
+  EndIf
+ Wend
+ If alerts<>1 Or view\payloadBytes<24 : ProcedureReturn #IPV6_MLD_INVALID : EndIf
+ body=view\payload
+ If PeekA(body)<>131 : ProcedureReturn #IPV6_MLD_INVALID : EndIf
+ If ipv6mld_SameAddress(body+8,group)=0 : ProcedureReturn #IPV6_MLD_INVALID : EndIf
+ If IPv6TransportChecksum(view\source,view\destination,58,body,view\payloadBytes)<>0 : ProcedureReturn #IPV6_MLD_INVALID : EndIf
+ ProcedureReturn 0
+EndProcedure
