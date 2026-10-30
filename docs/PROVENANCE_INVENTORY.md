@@ -1594,3 +1594,5 @@ text is unchanged; no new board execution or boot claim follows.
 
 | `Anvil/Network/hpack_tables.pbi` | protocol-facts | ietf-rfc | IETF specification | RFC 7541 Appendices A/B static fields and Huffman codes, independently arranged into lookup tables; no implementation copied. |
 | `Anvil/Network/hpack_decode.pbi` | protocol-facts | ietf-rfc | IETF specification | RFC 7541 sections 4-6; original bounded decoder, dynamic-table handling, integers, strings and padding validation. |
+
+| `Anvil/Network/h2_client.pbi` | protocol-facts | ietf-rfc | IETF specification | RFC 9113 sections 3-8; original asynchronous GET connection engine, stream state, receive credit and response validation. |

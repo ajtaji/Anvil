@@ -2661,3 +2661,79 @@ validation, full control-frame rules, flow control, multiplexing and WebClient
 integration remain unfinished. Existing HTTP/1 behavior is unchanged. HTTP/3 and
 the broader networking gaps remain open. Evidence:
 `docs/evidence/anvil-ipv6-20261030/hpack-http2-483`.
+
+
+### Asynchronous HTTP/2 GET connections
+
+`Anvil/Network/h2_client.pbi` now implements a shared, caller-owned HTTP/2
+connection engine. It explicitly negotiates h2 over the existing verified TLS
+transport. `H2ClientStep` performs at most one send, one receive, or one HPACK
+step per call; it does not wait for network progress. The application separately
+pumps the existing network service. Transport calls can still perform bounded
+TLS work, so this is not a hard real-time latency guarantee.
+
+Create an `H2Client`, a parsed HTTPS `WebUrl`, and `H2Buffers` with disjoint,
+persistent storage: 16384-byte tx and rx buffers, a 65536-byte compressed-header
+buffer, 4096-byte dynamic table, 8192-byte field workspace, and 1..16 `H2Stream`
+records. Keep the origin host alive throughout the connection. Start only a
+fresh or explicitly closed context; starting again does not close an old handle.
+`H2ClientStart(context, url, buffers, now, timeout)` establishes ownership.
+`now` and `timeout` use the caller's same monotonic units; elapsed time is modulo
+32 bits and timeout must be 1..2147483647. This first implementation has one
+whole-connection deadline, not independently renewable stream deadlines.
+
+State 1 waits for TLS, state 2 exchanges the preface/settings, and state 3 can
+accept requests. `H2ClientGet(context, target, bytes)` copies an origin-form
+GET target (use the validated output of `WebUrlParse`) and returns a positive
+stream ID or `H2_BUSY`. Requests use static/literal HPACK and END_STREAM; there
+is no request body or arbitrary request-header API yet. The peer concurrency
+limit and header-list limit are respected. Multiple requests can be active on
+one connection, and response HPACK state persists across streams.
+
+`H2ClientStep` returns zero for progress/no event, a negative latched error, or
+FIELD, DATA, END, RESET or GOAWAY. Events and their byte spans remain stable until
+`H2ClientConsume`. FIELD exposes the opaque name/value spans, sensitive flag and
+stream ID. Informational headers and trailers are exposed too; inspect the
+block status/trailer state when distinguishing them. DATA exposes only content
+bytes, excluding padding. Consumption queues connection/stream WINDOW_UPDATE
+credit for the complete DATA payload, including padding. Parsing is backpressured
+while an event is outstanding. This currently stalls all streams, so callers
+should consume promptly. After consuming END or RESET, `H2ClientRelease` frees
+that caller-owned stream slot for another monotonically increasing stream ID.
+
+The engine validates SETTINGS values, ACK state, continuation ordering, frame
+payload bounds, receive windows and send-window arithmetic; handles PING,
+RST_STREAM and GOAWAY; and rejects unsolicited push. HTTP response checks include
+lowercase field names, prohibited connection fields, pseudo-header order and
+uniqueness, status, field-value controls, content length, informational responses
+and trailers. `H2ClientCancel` cancels the entire connection, and `H2ClientClose`
+releases transport ownership. It does not yet provide per-stream cancellation,
+request DATA uploads, graceful local GOAWAY/error transmission, complete handling
+of late frames on closed/reset streams, or automatic WebClient protocol dispatch.
+Errors currently close the connection, including stream-local failures. The
+existing HTTP/1 WebClient remains the default; HTTP/2 is explicit opt-in.
+
+Physical qualification on Anvil 483 passed 40 cases through a fake transport
+running on the Pi, with three-byte writes, five-byte reads, injected pending
+operations, stable-event checks and independently decoded outgoing headers.
+It covers interleaved streams and persistent HPACK, padded DATA credit, a
+70000-byte body, informational/trailer headers, malformed messages, reset,
+GOAWAY, cancellation, deadlines, drained EOF and queued bytes after closure.
+The first expanded run was rejected because its fake transport injected a
+zero-byte read after reporting CLOSED despite retaining queued data. Topic 1535
+records that fixture correction; the rejected report remains in the evidence.
+
+A separate real-network run negotiated h2 with certificate verification and kept
+two requests active simultaneously: `https://httpbin.org/uuid` returned a valid
+53-byte JSON UUID, and `/bytes/70000` returned all 70000 bytes. The latter exceeds
+the initial 65535-byte receive window. Total elapsed time was 989330 microseconds;
+the maximum observed client step was 2523 microseconds and separate network
+service call 2937 microseconds. These are observations, not worst-case bounds.
+Captures 149/150 returned zero with healthy cores, fonts and Vulkan, watchdog off,
+and the temporary DNS override removed. The same shared code compiled for Pi 3;
+that compile-only fixture was not run. No monitor update was needed. Evidence:
+`docs/evidence/anvil-ipv6-20261030/http2-engine483`.
+
+Networking is not complete. Alongside the HTTP/2 limitations above, HTTP/3/QUIC,
+remaining atomic TLS/device work, automatic RDNSS-to-web qualification and public
+off-link IPv6 traffic remain open.
