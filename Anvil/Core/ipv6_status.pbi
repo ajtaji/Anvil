@@ -1,8 +1,11 @@
 ; Optional status renderer for the shared resident IPv6 service.
 Procedure IPv6ServiceSay()
  Define kind.i,n.i,phase.i,state.i,error.i,i.i,slot.i,addressState.i
+ Define now.i
+ Define *dns.IPv6RdnssEntry
  Define *row.IPv6DefaultRouter
  Define Dim text.a[48]
+ now=ipv6svcClock
  For kind=1 To #NET_IF_KINDS-1
   state=ipv6svcState[kind]
   If state<>0
@@ -38,6 +41,23 @@ Procedure IPv6ServiceSay()
      Print("  remaining ms ") : PrintDec(*row\until-ipv6svcClock) : PrintNl()
     EndIf
    Next
+   If NetIfDns(kind)<>0
+    Print("  DHCP IPv4 DNS ") : PutIp(NetIfDns(kind)) : PrintNl()
+   EndIf
+   Print("  RDNSS decode/storage result ") : PrintDec(ipv6svcDnsError[kind]) : PrintNl()
+   For i=0 To ipv6svcDns[kind]\count-1
+    *dns=@ipv6svcDnsRows[kind*#IPV6_SERVICE_DNS+i]
+    If ipv6svcDns[kind]\generation=ipv6svcEpoch[kind] And *dns\until>now
+     n=IPv6AddressFormat(@*dns\address,@text[0],48)
+     Print("  advertised DNS ") : UartWriteStr(@text[0])
+     Print("  generation ") : PrintDec(ipv6svcDns[kind]\generation)
+     If *dns\until=$7FFFFFFFFFFFFFFF
+      PrintN("  lifetime infinite")
+     Else
+      Print("  remaining ms ") : PrintDec(*dns\until-now) : PrintNl()
+     EndIf
+    EndIf
+   Next
    If ipv6svcRaCount[kind]>0
     Print("  latest advertised prefixes ") : PrintDec(ipv6svcRa[kind]\prefixCount)
     Print(", address error ") : PrintDec(ipv6svcAddressError[kind]) : PrintNl()
@@ -61,6 +81,25 @@ Procedure IPv6ServiceSay()
    EndIf
   EndIf
  Next
+ If dnsTrace\sequence>0
+  Print("Last network DNS query ") : PrintDec(dnsTrace\sequence)
+  Print(" on ") : UartWriteStr(HwLinkName(dnsTrace\kind)) : Print(": ")
+  Select dnsTrace\origin
+   Case 1 : Print("configured IPv4")
+   Case 2 : Print("DHCP IPv4")
+   Case 3 : Print("configured IPv6")
+   Case 4 : Print("router-advertised IPv6")
+  EndSelect
+  Print(" resolver ")
+  If dnsTrace\family=6
+   n=IPv6AddressFormat(@dnsTrace\server6,@text[0],48) : UartWriteStr(@text[0])
+  Else
+   PutIp(dnsTrace\server4)
+  EndIf
+  Print("  query type ") : PrintDec(dnsTrace\qtype)
+  Print("  result ") : PrintDec(dnsTrace\result) : PrintNl()
+  PrintN("  Result 0: matching answer accepted; -110: pending; other negatives: failure or cancellation.")
+ EndIf
 EndProcedure
 
 ; Diagnostic uses explicit source and destination; no DNS or source-selection

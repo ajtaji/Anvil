@@ -59,3 +59,35 @@ Procedure.i NetDnsLearned6Valid(*lease.NetDns6Lease)
  If *lease=0 Or dnsLearned6Valid=0 : ProcedureReturn 0 : EndIf
  ProcedureReturn dnsLearned6Valid(*lease)
 EndProcedure
+
+
+; Last network DNS selection, retained after payload cleanup. Cache hits and
+; rejected starts do not invent a new network query. No hostname is retained.
+Structure NetDnsTraceState
+ sequence.i
+ family.i
+ kind.i
+ origin.i
+ generation.i
+ qtype.i
+ result.i
+ pending.i
+ server4.i
+ server6.IPv6AddressStorage
+EndStructure
+Global dnsTrace.NetDnsTraceState
+Procedure NetDnsTraceStart(family.i,kind.i,origin.i,generation.i,qtype.i,server4.i,server6.i)
+ Define i.i
+ dnsTrace\sequence=dnsTrace\sequence+1 : dnsTrace\family=family
+ dnsTrace\kind=kind : dnsTrace\origin=origin : dnsTrace\generation=generation
+ dnsTrace\qtype=qtype : dnsTrace\server4=server4
+ For i=0 To 15
+  If family=6 : PokeA(@dnsTrace\server6+i,PeekA(server6+i)) : Else : PokeA(@dnsTrace\server6+i,0) : EndIf
+ Next
+ dnsTrace\result=-110 : dnsTrace\pending=1
+EndProcedure
+Procedure NetDnsTraceFinish(code.i)
+ If dnsTrace\pending<>0
+  dnsTrace\result=code : dnsTrace\pending=0
+ EndIf
+EndProcedure

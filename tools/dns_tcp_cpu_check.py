@@ -37,4 +37,10 @@ def check(data,cases):
         assert [q(p+j) for j in (80,88,96)]==[0,0,1 if i in (0,1,8,12) else 0]
         assert q(p+104)==(2 if i in (0,1,6,7,8,12) else 0),(i,q(p+104))
         if i==12:assert [q(p+112),q(p+120)]==[4,-108]
-    return dict(tcp_cases=rows,pending_type_checks=9,ipv6_start_cases=13)
+    assert [q(16128+j*8) for j in range(6)]==[7,4,2,1,-108,0]
+    for i in range(8):
+        p=15360+i*96;answer=16 if i%2 else 0x01020304;ttl=45 if (i//2)%2 else 0
+        assert [q(p+j*8) for j in range(4)]==[answer,1,1,0],('poll completion',i,[q(p+j*8) for j in range(4)])
+        assert data[p+32:p+48]==(bytes.fromhex('20010db800000000123456789abcdef0') if i%2 else b'\xa5'*16)
+        assert [q(p+48),q(p+56)]==([answer,1] if ttl else [-110,2]),('TTL reuse',i,q(p+48),q(p+56))
+    return dict(poll_completion_cases=8,tcp_cases=rows,pending_type_checks=9,ipv6_start_cases=13)

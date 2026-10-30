@@ -397,6 +397,7 @@ Procedure paynet_DnsCloseTcp()
 EndProcedure
 
 Procedure paynet_DnsFail(code.i, *why)
+  NetDnsTraceFinish(code)
   paynet_DnsCloseTcp()
   paynet_DnsCloseListener()
   paynet_dnsErr = code
@@ -413,6 +414,7 @@ EndProcedure
 ; ----------------------------------------------------------------------
 ; Copy the selected record before another codec user reuses its storage.
 Procedure paynet_DnsCaptureAnswer(now.i)
+  NetDnsTraceFinish(0)
   If paynet_dnsType=#DNS_QTYPE_AAAA
     DnsResultIp6(0,@paynet_dnsAnswer6[0])
     paynet_dnsAnswer=0
@@ -448,6 +450,7 @@ Procedure.i PayNetDnsInput(kind.i)
     paynet_dnsErr = #SVC_EIO
     paynet_dnsWhy = "the DNS server answered and had no address of the requested type for that name"
     paynet_dnsState = #PAYNET_DNS_FAIL
+    NetDnsTraceFinish(paynet_dnsErr)
     ProcedureReturn 1
   EndIf
   If c = #DNS_E_TRUNCATED
@@ -458,6 +461,7 @@ Procedure.i PayNetDnsInput(kind.i)
     paynet_dnsErr = #SVC_EIO
     paynet_dnsWhy = "the DNS server refused the name: it does not exist, or the server would not look it up"
     paynet_dnsState = #PAYNET_DNS_FAIL
+    NetDnsTraceFinish(paynet_dnsErr)
     ProcedureReturn 1
   EndIf
   ; A reply to an older try (another ID), or one that does not parse. Not
@@ -600,7 +604,10 @@ EndProcedure
 
 Procedure paynet_DnsStep(now.i)
   If paynet_dnsState=#PAYNET_DNS_TCP
-    paynet_DnsTcpStep(now) : ProcedureReturn
+    paynet_DnsTcpStep(now)
+    ; A reply may complete inside this call. Stage its result before the
+    ; resolver checks the cache, or it can replace DONE with a new query.
+    If paynet_dnsState<>#PAYNET_DNS_DONE : ProcedureReturn : EndIf
   EndIf
   If paynet_dnsState = #PAYNET_DNS_DONE
     paynet_DnsCloseListener()
@@ -647,6 +654,7 @@ Procedure paynet_DnsStep(now.i)
 EndProcedure
 
 Procedure paynet_DnsCancel()
+  NetDnsTraceFinish(#SVC_ESTATE)
   paynet_DnsCloseTcp()
   paynet_DnsCloseListener()
   paynet_dnsState = #PAYNET_DNS_IDLE
@@ -665,7 +673,7 @@ Procedure.i paynet_DnsResolveType(*name,qtype.i,destination.i)
   Define dns.i
   Define code.i
   Define resolver6.IPv6AddressStorage,source6.IPv6AddressStorage
-  Define family.i,i.i
+  Define family.i,i.i,origin.i,generation.i
 
   now = millis()
   If qtype<>#DNS_QTYPE_A And qtype<>#DNS_QTYPE_AAAA
@@ -794,6 +802,14 @@ Procedure.i paynet_DnsResolveType(*name,qtype.i,destination.i)
   If paynet_dnsQid = 0
     paynet_dnsQid = 1
   EndIf
+  origin=2 : generation=0
+  If family=6
+    origin=3
+    If paynet_dnsLearned<>0 : origin=4 : generation=paynet_dnsLease\generation : EndIf
+  ElseIf SettingsGet(EthKeyDns())<>0
+    origin=1
+  EndIf
+  NetDnsTraceStart(family,paynet_dnsKind,origin,generation,qtype,paynet_dnsServer,@paynet_dnsServer6[0])
   paynet_dnsType=qtype
   paynet_dnsTries = 0
   paynet_dnsStart = now

@@ -19,7 +19,8 @@ def build(compiler,out):
     needed=set(re.findall(r'#[A-Z][A-Z_0-9]*',shared))|{'#SVC_EIO','#SVC_TCP_CONNECTING','#SVC_TCP_OPEN','#SVC_TCP_PEER_CLOSED'}
     constants+='\n'+'\n'.join(line for line in (root/names[1]).read_text(encoding='utf8').splitlines() if re.match(r'^#[A-Z][A-Z_0-9]*\s*=',line) and line.split('=')[0].strip() in needed)
     lease=re.search(r'^Structure NetDns6Lease.*?^EndStructure',(root/'Anvil/Core/dns_policy.pbi').read_text(encoding='utf8'),re.M|re.S).group(0)
-    globals_=lease+'\n'+owner[owner.index('Global paynet_dnsTcp.i'):owner.index('; ---- TCP ----')]
+    trace=(root/'Anvil/Core/dns_policy.pbi').read_text(encoding='utf8');trace=trace[trace.index('Structure NetDnsTraceState'):]
+    globals_=lease+'\n'+trace+'\n'+owner[owner.index('Global paynet_dnsTcp.i'):owner.index('; ---- TCP ----')]
     s='XIncludeFile "Anvil/Network/ipv6_address.pbi"\nXIncludeFile "Anvil/Network/dns_codec.pbi"\n#HW_LINK_NONE=0\n'+constants+'\n'+globals_+r'''
 Global gSvcDetail.i
 Global chosenFamily.i,openedFamily.i,resolverResult.i,routeResult.i,v4Checks.i
@@ -255,6 +256,29 @@ Procedure Start6(index.i)
  PokeI(p+104,openedScope)
  PokeI(p+80,paynet_dnsState) : PokeI(p+88,paynet_dnsTcp) : PokeI(p+96,closes)
 EndProcedure
+Procedure PollCompletion(index.i,bytes.i,qtype.i,family.i,ttl.i)
+ Define i.i,p.i,rc.i,offset.i
+ paynet_DnsCancel()
+ For i=0 To 3 : paynet_cacheUsed[i]=0 : Next
+ For i=0 To bytes-1 : Read.a mockWire[i] : Next
+ offset=bytes-10 : If qtype=28 : offset=bytes-22 : EndIf
+ NetWriteBE32(@mockWire[offset],ttl)
+ For i=0 To bytes-2 : paynet_dnsTcpRx[i]=mockWire[i] : Next
+ For i=0 To 15 : pendingOut[i]=$A5 : Next
+ paynet_CopyName(@paynet_dnsName[0],"example.test")
+ mode=0 : replyLen=bytes : received=bytes-1 : sent=2 : opens=1 : closes=0 : sends=0
+ paynet_dnsState=#PAYNET_DNS_TCP : paynet_dnsTcp=7 : paynet_dnsKind=1
+ paynet_dnsFamily=family : paynet_dnsLearned=0 : paynet_dnsType=qtype : paynet_dnsQid=$1234
+ paynet_dnsTcpTxLen=2 : paynet_dnsTcpTxOff=2 : paynet_dnsTcpRxLen=bytes-1 : paynet_dnsTcpRxWant=bytes
+ paynet_dnsStart=100 : paynet_dnsPort=0 : resolverResult=16 : routeResult=2 : static4=0
+ rc=paynet_DnsResolveType("example.test",qtype,@pendingOut[0])
+ p=$E1C03C00+index*96
+ PokeI(p,rc) : PokeI(p+8,opens) : PokeI(p+16,closes) : PokeI(p+24,paynet_dnsState)
+ For i=0 To 15 : PokeA(p+32+i,pendingOut[i]) : Next
+ rc=paynet_DnsResolveType("example.test",qtype,@pendingOut[0])
+ PokeI(p+48,rc) : PokeI(p+56,opens)
+ paynet_DnsCancel()
+EndProcedure
 Procedure.i Main(services.i)
  Define i.i
  For i=0 To 16383 : PokeA($E1C00000+i,$A5) : Next
@@ -272,7 +296,12 @@ Procedure.i Main(services.i)
             raw=struct.pack('>H',11 if i==7 else len(raw))+raw
             index=len(cases);packets.append(raw);cases.append(index);s+=f' Restore Packet{index}\n Run({index},{len(raw)},{qtype})\n'
     s+=f' Restore UdpPacket1\n udpLen={len(udps[0])}\n For i=0 To udpLen-1 : Read.a udp[i] : Next\n'
-    s+=' ProofDnsDispatch(0) : ProofDnsDispatch(1) : ProofDnsDispatch(2)\n PendingType()\n For i=0 To 12 : Start6(i) : Next\n ProcedureReturn 0\nEndProcedure\nDataSection\n'
+    s+=' ProofDnsDispatch(0) : ProofDnsDispatch(1) : ProofDnsDispatch(2)\n PendingType()\n For i=0 To 12 : Start6(i) : Next\n PokeI($E1C03F00,dnsTrace\\sequence) : PokeI($E1C03F08,dnsTrace\\origin) : PokeI($E1C03F10,dnsTrace\\kind) : PokeI($E1C03F18,dnsTrace\\generation) : PokeI($E1C03F20,dnsTrace\\result) : PokeI($E1C03F28,dnsTrace\\pending)\n'
+    for index in range(8):
+        qtype=28 if index%2 else 1;family=6 if index>=4 else 4;ttl=45 if (index//2)%2 else 0
+        packet_index=16 if qtype==28 else 0
+        s+=f' Restore Packet{packet_index}\n PollCompletion({index},{len(packets[packet_index])},{qtype},{family},{ttl})\n'
+    s+=' ProcedureReturn 0\nEndProcedure\nDataSection\n'
     for kind,raw in zip([1,28],udps):s+=f' UdpPacket{kind}:\n Data.a '+','.join(map(str,raw))+'\n'
     for i,raw in enumerate(packets):
         s+=f'Packet{i}:\n'

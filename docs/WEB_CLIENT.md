@@ -2404,3 +2404,48 @@ source and interface. Public off-link IPv6 and HTTP/2-3 remain unfinished, as do
 remaining atomic TLS/device work. LAN IPv6 traffic is not evidence of public IPv6
 reachability. The bounded managed application cookie library is already described
 above; broader browser cookie/site behavior is outside that implemented subset.
+
+
+### Resolver provenance and same-poll DNS completion: build 481
+
+`net` / `net ipv6` now distinguish DHCP IPv4 DNS, current advertised IPv6
+resolvers, and the last payload network DNS selection. The retained selection
+records resolver address, interface, origin, query type and outcome. A matching
+accepted answer has result 0; pending is -110; other negatives identify failure
+or cancellation. Cache hits do not invent another network query, and payload
+cleanup preserves a completed record. No queried hostname is retained.
+
+On build 479, capture 122 established that the unconfigured public lookups used
+DHCP IPv4 DNS at the LAN router. No RDNSS entries were learned from the observed
+advertisements. This resolves the ambiguity in the previous checkpoint; it does
+not establish successful automatic IPv6 resolver selection.
+
+The diagnostics exposed a resolver completion defect, filed as forum topic 1530.
+A TCP reply could complete inside `paynet_DnsStep` during the caller's resolver
+poll, yet that step returned before staging the answer for delivery. The caller
+then saw an empty cache and started another question. The live HTTP request
+returned its correct body but sent one A query and seven AAAA queries.
+
+The step now stages a newly completed TCP result before returning. Eight physical
+regressions all failed before the fix (capture 124) and all passed afterward
+(capture 125): A/AAAA, IPv4/IPv6 resolver transport, zero/positive TTL. The first
+answer returns without reopening DNS. Zero TTL permits only that delivery;
+positive TTL permits the next cache lookup without another connection. Existing
+64 transport cases, 13 start/pending-lease cases and query-type checks also pass.
+
+Build 481 was installed and verified against its full running image hash, with
+479 rollback retained. Build 480 was staged but never booted; the final status
+renderer uses the service's published clock rather than calling a private helper
+across modules. Pi 3 build 95 compiles from the same shared source.
+
+The installed image's live hostname test now sent exactly one A and one AAAA
+query and received the exact 20,000-byte IPv6 HTTP body, status 200 in
+804 ms. This is a single correctness regression, not a general
+throughput claim. Verified HTTPS, cancellation and compressed-response tests
+also passed. Core/font/Vulkan/watchdog checks passed throughout.
+
+Evidence: docs/evidence/anvil-ipv6-20261030/dns-completion481. The archived
+build-479 HTTP result passed its body check but failed the exact DNS-query-count
+assertion; its wire log and the expected failing CPU regression are retained.
+Automatic RDNSS needs a suitable live advertisement-to-web qualification. Public
+off-link IPv6, HTTP/2-3 and remaining atomic TLS/device work remain open.
