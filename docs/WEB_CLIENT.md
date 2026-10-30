@@ -1518,3 +1518,44 @@ router demotion, and invalid argument/generation/clock/buffer cases. The payload
 returned normally; cores, fonts and Vulkan remained healthy. This shared owner
 is ready for resident cache integration. Outbound IPv6 TCP/DNS and web requests
 remain unfinished; this qualification does not claim live outbound web traffic.
+
+
+## Resident neighbor cache and Pi-initiated IPv6 echo
+
+Installed Anvil 450 adds eight owned neighbor entries per interface. Validated
+Router Advertisement and Neighbor Solicitation hardware options seed stale
+entries; advertisements and matching forward-path confirmations update
+reachability. Every entry keeps its source, generation, pending link receipt
+and token separately. Only unused or failed slots may be reused. Link loss
+invalidates the table, and a full live table refuses new entries rather than
+silently evicting active state. Probes run cooperatively between receive calls.
+
+The explicit diagnostic `net ipv6 ping <assigned-source> <destination>` starts
+one asynchronous echo. `net ipv6` shows addresses, cache entries and its result.
+The source must currently belong to exactly one active interface. On-link
+prefixes and link-local destinations select direct neighbors; other destinations
+select a default router while considering known neighbor failures. Link-local
+sources cannot cross a router. The job rechecks source, route and cache generation,
+uses tracked transmission, validates the reply checksum and random echo data,
+and has a ten-second total deadline. The console remains available throughout.
+This explicit-source interface does not claim automatic RFC 6724 source selection.
+
+Echo states are 0 idle, 1 resolving, 2 queued, 3 awaiting reply and 4 verified.
+Errors distinguish cache capacity (-880), source/argument refusal (-881), busy
+(-882), route loss (-883), link failure (-884), router demotion (-885), source
+or interface loss (-886), timeout (-887), and failed/replaced neighbor (-888).
+Reported elapsed time includes neighbor resolution and queueing, not just RTT.
+
+On physical Pi 4 build 450, a Pi-initiated link-local router echo completed in
+85 ms, and a ULA echo to the PC completed in 198 ms after neighbor resolution.
+Both replies passed the full payload/checksum checks. An unassigned source was
+refused. The PC then received all six inbound echo replies from the Pi at
+32-byte and 1,200-byte payload sizes, with zero loss. Running-image hash,
+cores, fonts and Vulkan passed; the verified 449 backup remains on the boot drive.
+The shared composition also builds as Pi 3 build 66, with activation still
+waiting on that target's entropy provider.
+
+This proves local-link outbound resolution and echo, plus retained inbound
+operation. Off-link traffic, automatic source selection, rate-limited probing
+of avoided preferred routers, generic queued data, IPv6 TCP/DNS/web, remaining
+TLS blocking work and HTTP/2-3 are still unfinished.

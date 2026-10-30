@@ -92,7 +92,10 @@
 ;  frame leave by" are different questions and merging them is how the
 ;  old single-address report came to be believed.
 ; ----------------------------------------------------------------------
-Global *gNetIPv6StatusHook=0
+Global *gNetIPv6StatusHook=0,*gNetIPv6CommandHook=0
+Procedure NetSetIPv6CommandHook(*fn)
+ *gNetIPv6CommandHook=*fn
+EndProcedure
 Procedure NetSetIPv6StatusHook(*fn)
  *gNetIPv6StatusHook=*fn
 EndProcedure
@@ -1422,6 +1425,15 @@ Procedure CmdNet()
   gWordAt = gPos
   SkipWord()
   gWordLen = gPos - gWordAt
+
+  If WordIs("ipv6")<>0
+    If *gNetIPv6CommandHook<>0
+      gNetIPv6CommandHook()
+    Else
+      PrintN("IPv6 service is not active on this target.")
+    EndIf
+    ProcedureReturn
+  EndIf
 
   ; ---- net, or net show ---------------------------------------------
   If gWordLen = 0 Or WordIs("show") <> 0

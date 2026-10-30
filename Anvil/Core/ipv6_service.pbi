@@ -45,6 +45,19 @@ Global Dim ipv6svcOwnerReceipt.i[#NET_IF_KINDS*#IPV6_SERVICE_ADDRESSES]
 Global Dim ipv6svcOwnerToken.i[#NET_IF_KINDS*#IPV6_SERVICE_ADDRESSES]
 Global Dim ipv6svcOwnerCursor.i[#NET_IF_KINDS]
 Global Dim ipv6svcAddressError.i[#NET_IF_KINDS]
+#IPV6_SERVICE_NEIGHBORS=8
+Global Dim ipv6svcNeighbor.IPv6NeighborOwner[#NET_IF_KINDS*#IPV6_SERVICE_NEIGHBORS]
+Global Dim ipv6svcNeighborUsed.i[#NET_IF_KINDS*#IPV6_SERVICE_NEIGHBORS]
+Global Dim ipv6svcNeighborReceipt.i[#NET_IF_KINDS*#IPV6_SERVICE_NEIGHBORS]
+Global Dim ipv6svcNeighborToken.i[#NET_IF_KINDS*#IPV6_SERVICE_NEIGHBORS]
+Global Dim ipv6svcNeighborSource.IPv6AddressStorage[#NET_IF_KINDS*#IPV6_SERVICE_NEIGHBORS]
+Global Dim ipv6svcNeighborCursor.i[#NET_IF_KINDS]
+Global Dim ipv6svcNeighborError.i[#NET_IF_KINDS]
+; One explicit diagnostic job. Network protocols will own their own data queues.
+Global ipv6svcEchoState.i,ipv6svcEchoKind.i,ipv6svcEchoEpoch.i,ipv6svcEchoSlot.i,ipv6svcEchoGeneration.i
+Global ipv6svcEchoStarted.i,ipv6svcEchoDeadline.i,ipv6svcEchoDue.i,ipv6svcEchoReceipt.i,ipv6svcEchoElapsed.i,ipv6svcEchoSerial.i
+Global ipv6svcEchoSource.IPv6AddressStorage,ipv6svcEchoDestination.IPv6AddressStorage,ipv6svcEchoHop.IPv6AddressStorage
+Global Dim ipv6svcEchoData.a[64]
 Procedure.i ipv6svc_Now()
  Define raw.i,elapsed.i
  raw=millis()&$FFFFFFFF
@@ -64,6 +77,254 @@ Procedure.i ipv6svc_Delay(limit.i)
  If rc<>4 : ProcedureReturn -810 : EndIf
  ProcedureReturn 1+((value&$FFFFFFFF) % limit)
 EndProcedure
+Procedure.i ipv6svc_Assigned(kind.i,now.i,address.i)
+ Define i.i,slot.i,state.i
+ If ipv6svcState[kind]<>2 Or ipv6svcHost[kind]\phase<>#IPV6_HOST_READY : ProcedureReturn 0 : EndIf
+ If IPv6EndpointBytesEqual(address,@ipv6svcAddresses[kind*16],16)<>0 : ProcedureReturn 1 : EndIf
+ For i=0 To #IPV6_SERVICE_ADDRESSES-1
+  slot=kind*#IPV6_SERVICE_ADDRESSES+i
+  If ipv6svcOwnerUsed[slot]<>0
+   state=IPv6AddressOwnerStatus(@ipv6svcOwner[slot],ipv6svcOwner[slot]\generation,now)
+   If state=2 Or state=3
+    If IPv6EndpointBytesEqual(address,@ipv6svcOwner[slot]\lifetime\address,16)<>0 : ProcedureReturn 1 : EndIf
+   EndIf
+  EndIf
+ Next
+ ProcedureReturn 0
+EndProcedure
+Procedure.i ipv6svc_NeighborFind(kind.i,address.i)
+ Define i.i,slot.i
+ For i=0 To #IPV6_SERVICE_NEIGHBORS-1
+  slot=kind*#IPV6_SERVICE_NEIGHBORS+i
+  If ipv6svcNeighborUsed[slot]<>0
+   If IPv6EndpointBytesEqual(address,@ipv6svcNeighbor[slot]\target,16)<>0 : ProcedureReturn slot : EndIf
+  EndIf
+ Next
+ ProcedureReturn -1
+EndProcedure
+; Reuse only an unused/failed slot. Live cache entries and their receipts are
+; never silently evicted. force starts fresh resolution for an explicit request.
+Procedure.i ipv6svc_NeighborGet(kind.i,now.i,address.i,source.i,force.i)
+ Define i.i,slot.i,rc.i,generation.i
+ slot=ipv6svc_NeighborFind(kind,address)
+ If slot>=0
+  If ipv6svcNeighbor[slot]\policy\state<>#IPV6_NC_FAILED Or force=0 : ProcedureReturn slot : EndIf
+ Else
+  For i=0 To #IPV6_SERVICE_NEIGHBORS-1
+   rc=kind*#IPV6_SERVICE_NEIGHBORS+i
+   If ipv6svcNeighborUsed[rc]=0 Or ipv6svcNeighbor[rc]\policy\state=#IPV6_NC_FAILED
+    slot=rc : Break
+   EndIf
+  Next
+ EndIf
+ If slot<0 : ProcedureReturn -880 : EndIf
+ generation=ipv6svcNeighbor[slot]\generation+1
+ rc=IPv6NeighborOwnerInit(@ipv6svcNeighbor[slot],generation,address,HwLinkMacPtr(kind),now,ipv6svcRetransmit[kind])
+ If rc<>0 : ProcedureReturn rc : EndIf
+ ipv6svcNeighborUsed[slot]=1 : ipv6svcNeighborReceipt[slot]=0 : ipv6svcNeighborToken[slot]=0
+ For i=0 To 15 : PokeA(@ipv6svcNeighborSource[slot]+i,PeekA(source+i)) : Next
+ ProcedureReturn slot
+EndProcedure
+Procedure ipv6svc_NeighborLearn(kind.i,now.i,address.i,mac.i,router.i)
+ Define slot.i,rc.i,i.i,nonzero.i
+ If mac<>0
+  If (PeekA(mac)&1)<>0 : ProcedureReturn : EndIf
+  nonzero=0 : For i=0 To 5 : nonzero=nonzero|PeekA(mac+i) : Next
+  If nonzero=0 : ProcedureReturn : EndIf
+ EndIf
+ slot=ipv6svc_NeighborFind(kind,address)
+ If slot<0 And mac<>0 : slot=ipv6svc_NeighborGet(kind,now,address,@ipv6svcAddresses[kind*16],0) : EndIf
+ If slot>=0
+  rc=IPv6NeighborOwnerLearn(@ipv6svcNeighbor[slot],ipv6svcNeighbor[slot]\generation,now,mac,router)
+  If rc<0 : ipv6svcNeighborError[kind]=rc : EndIf
+  If ipv6svcNeighbor[slot]\awaiting=0 : ipv6svcNeighborReceipt[slot]=0 : EndIf
+ EndIf
+EndProcedure
+Procedure ipv6svc_NeighborTick(kind.i,now.i)
+ Define i.i,slot.i,rc.i,n.i,token.i
+ If ipv6svcHost[kind]\phase<>#IPV6_HOST_READY : ProcedureReturn : EndIf
+ For i=0 To #IPV6_SERVICE_NEIGHBORS-1
+  slot=kind*#IPV6_SERVICE_NEIGHBORS+i
+  If ipv6svcNeighborUsed[slot]<>0 And ipv6svcNeighborReceipt[slot]>0
+   rc=LinkTxReceipt(kind,ipv6svcNeighborReceipt[slot])
+   If rc<>0
+    ipv6svcNeighborReceipt[slot]=0
+    rc=IPv6NeighborOwnerSent(@ipv6svcNeighbor[slot],ipv6svcNeighbor[slot]\generation,now,ipv6svcNeighborToken[slot],rc)
+    If rc<0 And rc<>#IPV6_NEIGHBOR_OWNER_STALE : ipv6svcNeighborError[kind]=rc : EndIf
+   EndIf
+  EndIf
+ Next
+ slot=kind*#IPV6_SERVICE_NEIGHBORS+ipv6svcNeighborCursor[kind]
+ ipv6svcNeighborCursor[kind]=(ipv6svcNeighborCursor[kind]+1) % #IPV6_SERVICE_NEIGHBORS
+ If ipv6svcNeighborUsed[slot]=0 Or ipv6svcNeighborReceipt[slot]<>0 : ProcedureReturn : EndIf
+ If ipv6svc_Assigned(kind,now,@ipv6svcNeighborSource[slot])=0
+  ; A solicitation must always use an assigned source. Fall back to the
+  ; confirmed LL address if a prior data source expired between packets.
+  For i=0 To 15 : PokeA(@ipv6svcNeighborSource[slot]+i,PeekA(@ipv6svcAddresses[kind*16]+i)) : Next
+ EndIf
+ n=IPv6NeighborOwnerStep(@ipv6svcNeighbor[slot],ipv6svcNeighbor[slot]\generation,now,@ipv6svcNeighborSource[slot],@ipv6svcFrame[0],1514)
+ If n>0
+  token=ipv6svcNeighbor[slot]\awaiting
+  rc=LinkSendTracked(kind,@ipv6svcFrame[0],n)
+  If rc>0
+   ipv6svcNeighborReceipt[slot]=rc : ipv6svcNeighborToken[slot]=token
+  Else
+   rc=IPv6NeighborOwnerSent(@ipv6svcNeighbor[slot],ipv6svcNeighbor[slot]\generation,now,token,rc)
+   If rc<0 : ipv6svcNeighborError[kind]=rc : EndIf
+  EndIf
+ ElseIf n<0
+  ipv6svcNeighborError[kind]=n
+ EndIf
+EndProcedure
+Procedure ipv6svc_NeighborInput(kind.i,now.i,frame.i,bytes.i)
+ Define ip.IPv6PacketView,nd.IPv6NeighborView,group.IPv6AddressStorage
+ Define slot.i,rc.i,reachable.i,i.i,local.i
+ If ipv6svcHost[kind]\phase<>#IPV6_HOST_READY Or bytes<54 : ProcedureReturn : EndIf
+ rc=IPv6NeighborParse(frame+14,bytes-14,@ip,@nd) : If rc<>0 : ProcedureReturn : EndIf
+ If nd\kind=135 And nd\sourceMac<>0 And IPv6AddressUnspecified(ip\source)=0
+  If ipv6svc_Assigned(kind,now,nd\target)<>0
+   rc=IPv6SolicitedNode(nd\target,@group)
+   If IPv6EndpointBytesEqual(ip\destination,nd\target,16)<>0 Or IPv6EndpointBytesEqual(ip\destination,@group,16)<>0
+    ipv6svc_NeighborLearn(kind,now,ip\source,nd\sourceMac,-1)
+   EndIf
+  EndIf
+ ElseIf nd\kind=136
+  slot=ipv6svc_NeighborFind(kind,nd\target) : If slot<0 : ProcedureReturn : EndIf
+  local=@ipv6svcAddresses[kind*16]
+  If ipv6svc_Assigned(kind,now,ip\destination)<>0 : local=ip\destination : EndIf
+  reachable=ipv6svc_Delay(ipv6svcReachable[kind])
+  If reachable<0 : ipv6svcNeighborError[kind]=reachable : ProcedureReturn : EndIf
+  reachable=ipv6svcReachable[kind]/2+reachable
+  rc=IPv6NeighborOwnerInput(@ipv6svcNeighbor[slot],ipv6svcNeighbor[slot]\generation,now,local,frame,bytes,reachable)
+  If ipv6svcNeighbor[slot]\awaiting=0 : ipv6svcNeighborReceipt[slot]=0 : EndIf
+  If rc=2
+   rc=IPv6DefaultRoutersApply(@ipv6svcRouters[kind],ipv6svcEpoch[kind],now,nd\target,0,0)
+   If ipv6svcEchoState>0 And ipv6svcEchoState<4 And ipv6svcEchoKind=kind
+    If IPv6EndpointBytesEqual(@ipv6svcEchoHop,nd\target,16)<>0 And IPv6EndpointBytesEqual(@ipv6svcEchoDestination,nd\target,16)=0 : ipv6svcEchoState=-885 : EndIf
+   EndIf
+  EndIf
+ EndIf
+EndProcedure
+; Explicit source avoids pretending the unfinished RFC6724 automatic source
+; selection policy is complete. Caller selects a currently assigned source.
+Procedure.i IPv6ServiceEchoStart(source.i,destination.i)
+ Define kind.i,found.i,now.i,rc.i,i.i,slot.i,failed.i,j.i,index.i
+ Define *router.IPv6DefaultRouter
+ If source=0 Or destination=0 : ProcedureReturn -881 : EndIf
+ If IPv6AddressUnspecified(source)<>0 Or IPv6AddressUnspecified(destination)<>0 Or PeekA(source)=255 Or PeekA(destination)=255 : ProcedureReturn -881 : EndIf
+ If ipv6svcEchoState>0 And ipv6svcEchoState<4 : ProcedureReturn -882 : EndIf
+ now=ipv6svc_Now() : found=0
+ For kind=1 To #NET_IF_KINDS-1
+  If ipv6svc_Assigned(kind,now,source)<>0
+   If found<>0 : ProcedureReturn -881 : EndIf
+   found=kind
+  EndIf
+ Next
+ If found=0 : ProcedureReturn -881 : EndIf
+ kind=found
+ For i=0 To 15
+  PokeA(@ipv6svcEchoSource+i,PeekA(source+i)) : PokeA(@ipv6svcEchoDestination+i,PeekA(destination+i))
+  PokeA(@ipv6svcEchoHop+i,PeekA(destination+i))
+ Next
+ rc=IPv6PrefixListMatch(@ipv6svcOnLink[kind],ipv6svcEpoch[kind],now,destination)
+ If PeekA(destination)=254 And (PeekA(destination+1)&192)=128 : rc=1 : EndIf
+ If rc=0
+  ; Link-local source addresses must never cross a router.
+  If PeekA(source)=254 And (PeekA(source+1)&192)=128 : ProcedureReturn -883 : EndIf
+  failed=0
+  For j=0 To 3
+   *router=@ipv6svcRouterRows[kind*128+j*32]
+   slot=ipv6svc_NeighborFind(kind,@*router\address)
+   If slot>=0
+    If ipv6svcNeighbor[slot]\policy\state=#IPV6_NC_FAILED : failed=failed|(1<<j) : EndIf
+   EndIf
+  Next
+  index=IPv6DefaultRoutersSelect(@ipv6svcRouters[kind],ipv6svcEpoch[kind],now,failed)
+  If index<=0 : ProcedureReturn -883 : EndIf
+  *router=@ipv6svcRouterRows[kind*128+(index-1)*32]
+  For i=0 To 15 : PokeA(@ipv6svcEchoHop+i,PeekA(@*router\address+i)) : Next
+ ElseIf rc<0
+  ProcedureReturn rc
+ EndIf
+ slot=ipv6svc_NeighborGet(kind,now,@ipv6svcEchoHop,source,1) : If slot<0 : ProcedureReturn slot : EndIf
+ For i=0 To 15 : PokeA(@ipv6svcNeighborSource[slot]+i,PeekA(source+i)) : Next
+ rc=RandomServiceBytes(@ipv6svcEchoData[0],64) : If rc<>64 : ProcedureReturn -810 : EndIf
+ ipv6svcEchoData[0]=128 : ipv6svcEchoData[1]=0 : ipv6svcEchoData[2]=0 : ipv6svcEchoData[3]=0
+ ipv6svcEchoKind=kind : ipv6svcEchoEpoch=ipv6svcEpoch[kind] : ipv6svcEchoSlot=slot
+ ipv6svcEchoGeneration=ipv6svcNeighbor[slot]\generation
+ ipv6svcEchoStarted=now : ipv6svcEchoDeadline=now+10000 : ipv6svcEchoDue=now : ipv6svcEchoReceipt=0 : ipv6svcEchoElapsed=0
+ ipv6svcEchoSerial=ipv6svcEchoSerial+1 : ipv6svcEchoState=1
+ ProcedureReturn 0
+EndProcedure
+Procedure ipv6svc_EchoTick(kind.i,now.i)
+ Define rc.i,slot.i,p.i,i.i,routeValid.i
+ Define *router.IPv6DefaultRouter
+ If ipv6svcEchoState<1 Or ipv6svcEchoState>3 Or ipv6svcEchoKind<>kind : ProcedureReturn : EndIf
+ If ipv6svcEchoEpoch<>ipv6svcEpoch[kind] Or ipv6svc_Assigned(kind,now,@ipv6svcEchoSource)=0 : ipv6svcEchoState=-886 : ProcedureReturn : EndIf
+ If now>=ipv6svcEchoDeadline : ipv6svcEchoState=-887 : ProcedureReturn : EndIf
+ routeValid=0
+ If IPv6EndpointBytesEqual(@ipv6svcEchoHop,@ipv6svcEchoDestination,16)<>0
+  routeValid=IPv6PrefixListMatch(@ipv6svcOnLink[kind],ipv6svcEpoch[kind],now,@ipv6svcEchoDestination)
+  If PeekA(@ipv6svcEchoDestination)=254 And (PeekA(@ipv6svcEchoDestination+1)&192)=128 : routeValid=1 : EndIf
+ Else
+  For i=0 To 3
+   *router=@ipv6svcRouterRows[kind*128+i*32]
+   If *router\until>now And IPv6EndpointBytesEqual(@*router\address,@ipv6svcEchoHop,16)<>0 : routeValid=1 : EndIf
+  Next
+ EndIf
+ If routeValid<=0 : ipv6svcEchoState=-883 : ProcedureReturn : EndIf
+ slot=ipv6svcEchoSlot
+ If ipv6svcNeighborUsed[slot]=0 Or ipv6svcNeighbor[slot]\generation<>ipv6svcEchoGeneration : ipv6svcEchoState=-888 : ProcedureReturn : EndIf
+ If ipv6svcEchoState=2
+  rc=LinkTxReceipt(kind,ipv6svcEchoReceipt)
+  If rc<0 : ipv6svcEchoState=-884 : ElseIf rc=1 : ipv6svcEchoState=3 : EndIf
+  ProcedureReturn
+ EndIf
+ If ipv6svcEchoState<>1 Or now<ipv6svcEchoDue : ProcedureReturn : EndIf
+ rc=IPv6NeighborOwnerUse(@ipv6svcNeighbor[slot],ipv6svcEchoGeneration,now)
+ If rc<0 : ipv6svcEchoState=-888 : ProcedureReturn : EndIf
+ If rc=0 : ProcedureReturn : EndIf
+ p=@ipv6svcFrame[0]
+ rc=IPv6PacketHeader(p+14,1500,@ipv6svcEchoSource,@ipv6svcEchoDestination,64,58,ipv6svcHop[kind],0,0)
+ If rc<>40 : ipv6svcEchoState=rc : ProcedureReturn : EndIf
+ For i=0 To 5
+  PokeA(p+i,PeekA(@ipv6svcNeighbor[slot]\policy\mac+i)) : PokeA(p+6+i,PeekA(HwLinkMacPtr(kind)+i))
+ Next
+ NetWriteBE16(p+12,$86DD)
+ For i=0 To 63 : PokeA(p+54+i,ipv6svcEchoData[i]) : Next
+ rc=IPv6TransportChecksum(@ipv6svcEchoSource,@ipv6svcEchoDestination,58,p+54,64)
+ NetWriteBE16(p+56,rc)
+ rc=LinkSendTracked(kind,p,118)
+ If rc>0
+  ipv6svcEchoReceipt=rc : ipv6svcEchoState=2
+ ElseIf rc<0
+  ipv6svcEchoState=-884
+ Else
+  ipv6svcEchoDue=now+100
+ EndIf
+EndProcedure
+Procedure ipv6svc_EchoInput(kind.i,now.i,frame.i,bytes.i)
+ Define ip.IPv6PacketView
+ Define rc.i,slot.i,reachable.i
+ If ipv6svcEchoState<2 Or ipv6svcEchoState>3 Or ipv6svcEchoKind<>kind : ProcedureReturn : EndIf
+ If ipv6svcEchoEpoch<>ipv6svcEpoch[kind] Or now>=ipv6svcEchoDeadline : ProcedureReturn : EndIf
+ If ipv6svc_Assigned(kind,now,@ipv6svcEchoSource)=0 : ProcedureReturn : EndIf
+ If IPv6EndpointBytesEqual(frame,HwLinkMacPtr(kind),6)=0 : ProcedureReturn : EndIf
+ rc=IPv6PacketParse(frame+14,bytes-14,@ip) : If rc<>0 : ProcedureReturn : EndIf
+ If ip\protocol<>58 Or ip\payloadBytes<>64 Or PeekA(ip\payload)<>129 Or PeekA(ip\payload+1)<>0 : ProcedureReturn : EndIf
+ If IPv6EndpointBytesEqual(ip\source,@ipv6svcEchoDestination,16)=0 Or IPv6EndpointBytesEqual(ip\destination,@ipv6svcEchoSource,16)=0 : ProcedureReturn : EndIf
+ If IPv6EndpointBytesEqual(ip\payload+4,@ipv6svcEchoData[4],60)=0 : ProcedureReturn : EndIf
+ rc=IPv6TransportChecksum(ip\source,ip\destination,58,ip\payload,64) : If rc<>0 : ProcedureReturn : EndIf
+ ipv6svcEchoElapsed=now-ipv6svcEchoStarted : ipv6svcEchoState=4
+ slot=ipv6svcEchoSlot
+ If ipv6svcNeighborUsed[slot]<>0 And ipv6svcNeighbor[slot]\generation=ipv6svcEchoGeneration
+  reachable=ipv6svc_Delay(ipv6svcReachable[kind])
+  If reachable>0
+   rc=IPv6NeighborOwnerConfirm(@ipv6svcNeighbor[slot],ipv6svcEchoGeneration,now,ipv6svcReachable[kind]/2+reachable)
+   ipv6svcNeighborReceipt[slot]=0
+  EndIf
+ EndIf
+EndProcedure
 Procedure ipv6svc_DiscardAddresses(kind.i)
  Define i.i,slot.i
  For i=0 To #IPV6_SERVICE_ADDRESSES-1
@@ -71,6 +332,12 @@ Procedure ipv6svc_DiscardAddresses(kind.i)
   ipv6svcOwnerUsed[slot]=0 : ipv6svcOwnerReceipt[slot]=0 : ipv6svcOwnerToken[slot]=0
  Next
  ipv6svcOwnerCursor[kind]=0
+ For i=0 To #IPV6_SERVICE_NEIGHBORS-1
+  slot=kind*#IPV6_SERVICE_NEIGHBORS+i
+  ipv6svcNeighborUsed[slot]=0 : ipv6svcNeighborReceipt[slot]=0 : ipv6svcNeighborToken[slot]=0
+ Next
+ ipv6svcNeighborCursor[kind]=0
+ If ipv6svcEchoKind=kind And ipv6svcEchoState>0 And ipv6svcEchoState<4 : ipv6svcEchoState=-886 : EndIf
 EndProcedure
 ; Merge only the advertised information. Omission never withdraws another
 ; router's address/prefix, and L/A are independently applied.
@@ -243,6 +510,8 @@ Procedure.i IPv6ServiceInput(kind.i,frame.i,bytes.i,out.i,capacity.i)
        If ipv6svcRa[kind]\retransmit<>0 : ipv6svcRetransmit[kind]=ipv6svcRa[kind]\retransmit : EndIf
        If ipv6svcRa[kind]\mtu<>0 : ipv6svcMtu[kind]=ipv6svcRa[kind]\mtu : EndIf
        ipv6svc_ApplyPrefixes(kind,now)
+       local=0 : If ipv6svcRa[kind]\hasMac<>0 : local=@ipv6svcRa[kind]\mac : EndIf
+       ipv6svc_NeighborLearn(kind,now,@ipv6svcRa[kind]\source,local,1)
       Else
        ipv6svcRaError[kind]=rc
       EndIf
@@ -253,6 +522,8 @@ Procedure.i IPv6ServiceInput(kind.i,frame.i,bytes.i,out.i,capacity.i)
   EndIf
  EndIf
  If bytes>=54
+  ipv6svc_NeighborInput(kind,now,frame,bytes)
+  ipv6svc_EchoInput(kind,now,frame,bytes)
   rc=IPv6MldQuery(frame+14,bytes-14,@query)
   If rc=0
    delay=ipv6svc_Delay(query\maxDelay) : If delay<0 : ProcedureReturn delay : EndIf
@@ -351,6 +622,8 @@ Procedure IPv6ServiceTick()
  EndIf
  If ipv6svcState[kind]=2
   ipv6svc_AddressTick(kind,now)
+  ipv6svc_NeighborTick(kind,now)
+  ipv6svc_EchoTick(kind,now)
   ipv6svc_DiscoveryTick(kind,now)
  ElseIf ipv6svcState[kind]<0
   ipv6svc_DiscardAddresses(kind)

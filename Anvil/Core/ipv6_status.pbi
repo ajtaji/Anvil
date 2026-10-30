@@ -62,3 +62,52 @@ Procedure IPv6ServiceSay()
   EndIf
  Next
 EndProcedure
+
+; Diagnostic uses explicit source and destination; no DNS or source-selection
+; claim is implied. The resident protocol tick owns all network progress.
+Procedure IPv6ServiceCommand()
+ Define action.i,source.i,destination.i,n.i,rc.i,i.i,kind.i,slot.i
+ Define from.IPv6AddressStorage,to.IPv6AddressStorage
+ Define Dim text.a[48]
+ action=ArgWord()
+ If action<>0
+  If StrLenZ(action)=4
+   If PeekA(action)=112 And PeekA(action+1)=105 And PeekA(action+2)=110 And PeekA(action+3)=103 And PeekA(action+4)=0
+   source=ArgWord() : destination=ArgWord()
+   If source=0 Or destination=0
+    PrintN("net ipv6 ping <assigned-source> <destination>") : ProcedureReturn
+   EndIf
+   n=0 : While PeekA(source+n)<>0 And n<46 : n=n+1 : Wend
+   rc=IPv6AddressParse(source,n,@from)
+   If rc=0
+    n=0 : While PeekA(destination+n)<>0 And n<46 : n=n+1 : Wend
+    rc=IPv6AddressParse(destination,n,@to)
+   EndIf
+   If rc=0 : rc=IPv6ServiceEchoStart(@from,@to) : EndIf
+   If rc=0
+    PrintN("IPv6 echo queued; use net ipv6 for its result. The console remains available.")
+   Else
+    Print("IPv6 echo refused, code ") : PrintDec(rc) : PrintNl()
+   EndIf
+   ProcedureReturn
+  EndIf
+  EndIf
+  PrintN("net ipv6  - address/cache and last echo status")
+  PrintN("net ipv6 ping <assigned-source> <destination>  - one asynchronous echo")
+  ProcedureReturn
+ EndIf
+ IPv6ServiceSay()
+ For kind=1 To #NET_IF_KINDS-1
+  For i=0 To #IPV6_SERVICE_NEIGHBORS-1
+   slot=kind*#IPV6_SERVICE_NEIGHBORS+i
+   If ipv6svcNeighborUsed[slot]<>0
+    n=IPv6AddressFormat(@ipv6svcNeighbor[slot]\target,@text[0],48)
+    Print("  neighbor ") : UartWriteStr(@text[0]) : Print(" state ") : PrintDec(ipv6svcNeighbor[slot]\policy\state)
+    Print(" probes ") : PrintDec(ipv6svcNeighbor[slot]\policy\probes) : PrintNl()
+   EndIf
+  Next
+ Next
+ Print("IPv6 echo state ") : PrintDec(ipv6svcEchoState) : Print(", elapsed ms ") : PrintDec(ipv6svcEchoElapsed)
+ Print(", job ") : PrintDec(ipv6svcEchoSerial) : PrintNl()
+ PrintN("  0 idle, 1 resolving, 2 queued, 3 awaiting reply, 4 reply verified; negative is failure.")
+EndProcedure
