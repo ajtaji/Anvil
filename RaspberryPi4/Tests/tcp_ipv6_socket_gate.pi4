@@ -1,0 +1,94 @@
+; Scripted hardware seam, production IPv4/IPv6 net/link/TCP on physical CPU.
+Global Dim sixLocal.a[16]
+Global Dim sixRemote.a[16]
+Global Dim sixPacket.a[1600]
+Global sixValid.i=1,sixResolved.i=1
+Procedure.i SixSource(kind.i,source.i)
+ Define i.i
+ If sixValid=0 Or kind<>#HW_LINK_WIFI : ProcedureReturn 0 : EndIf
+ For i=0 To 15 : If PeekA(source+i)<>sixLocal[i] : ProcedureReturn 0 : EndIf : Next
+ ProcedureReturn 1
+EndProcedure
+Procedure.i SixResolve(kind.i,source.i,destination.i,mac.i)
+ Define i.i
+ If sixResolved<>1 : ProcedureReturn sixResolved : EndIf
+ For i=0 To 5 : PokeA(mac+i,$60+i) : Next
+ ProcedureReturn 1
+EndProcedure
+Procedure.i SixInput(kind.i,frame.i,bytes.i,out.i,capacity.i)
+ ProcedureReturn NetTcp6Input(kind,frame,bytes)
+EndProcedure
+Procedure.i SixReceive(port.i,seq.l,ack.l,flags.i,bytes.i)
+ Define p.i,i.i,n.i,rc.i
+ p=@sixPacket[0]
+ For i=0 To 1599 : sixPacket[i]=0 : Next
+ For i=0 To 5 : sixPacket[i]=gate_mac[#HW_LINK_WIFI*6+i] : sixPacket[6+i]=$60+i : Next
+ NetWriteBE16(p+12,$86DD)
+ NetWriteBE16(p+54,80) : NetWriteBE16(p+56,port)
+ NetWriteBE32(p+58,seq) : NetWriteBE32(p+62,ack)
+ PokeA(p+66,$50) : PokeA(p+67,flags) : NetWriteBE16(p+68,8192)
+ For i=0 To bytes-1 : PokeA(p+74+i,$41+i) : Next
+ n=IPv6TcpBuild(p+14,1500,@sixRemote[0],@sixLocal[0],20+bytes,64)
+ If n<0 : ProcedureReturn n : EndIf
+ rc=NetInput(#HW_LINK_WIFI,p,n+14)
+ If rc<>#NET_IN_TCP : ProcedureReturn -1000-rc : EndIf
+ TcpInput()
+ ProcedureReturn 0
+EndProcedure
+Procedure.i SixGate()
+ Define rc.i,i.i,port.i,ack.l,seq.l
+ Define view.IPv6TcpView
+ TcpInit()
+ sixLocal[0]=$fd : sixLocal[15]=1
+ sixRemote[0]=$fd : sixRemote[15]=2
+ NetSetTcp6Hooks(@SixSource,@SixResolve) : NetSetIPv6InputHook(@SixInput)
+ TcpUse(0)
+ sixResolved=0
+ If TcpConnect6(#HW_LINK_WIFI,@sixLocal[0],@sixRemote[0],80)<>#NET_TCP_E_ARP : ProcedureReturn 401 : EndIf
+ If TcpState()<>#TCP_CLOSED : ProcedureReturn 402 : EndIf
+ sixResolved=1
+ GateResetCapture()
+ If TcpConnect6(#HW_LINK_WIFI,@sixLocal[0],@sixRemote[0],80)<>0 : ProcedureReturn 403 : EndIf
+ If TcpState()<>#TCP_SYN_SENT Or tcp_family<>6 : ProcedureReturn 404 : EndIf
+ If gate_txLen<>78 Or gate_txKind<>#HW_LINK_WIFI : ProcedureReturn 405 : EndIf
+ rc=IPv6TcpParse(@gate_tx[14],gate_txLen-14,@view)
+ If rc<>0 Or view\sourcePort<>tcp_lport Or view\headerBytes<>24 : ProcedureReturn 406 : EndIf
+ If NetReadBE16(@gate_tx[76])<>1220 : ProcedureReturn 407 : EndIf
+ port=tcp_lport : ack=tcp_snd_nxt
+ ; Switching sockets must preserve the full addresses and family.
+ TcpUse(1) : If tcp_family<>4 : ProcedureReturn 408 : EndIf
+ TcpUse(0) : If tcp_family<>6 Or tcp_lip6[15]<>1 Or tcp_rip6[15]<>2 : ProcedureReturn 409 : EndIf
+ If SixReceive(port,100,ack,#TCP_SYN|#TCP_ACK,0)<>0 : ProcedureReturn 410 : EndIf
+ If TcpState()<>#TCP_ESTABLISHED Or tcp_snd_mss<>1220 : ProcedureReturn 411 : EndIf
+ ; A foreign port resets without changing the selected connection.
+ GateResetCapture()
+ If SixReceive(port+1,101,ack,#TCP_ACK,0)<>0 : ProcedureReturn 412 : EndIf
+ If (gate_tx[67]&#TCP_RST)=0 Or NetReadBE16(@gate_tx[54])<>port+1 : ProcedureReturn 413 : EndIf
+ If TcpState()<>#TCP_ESTABLISHED Or tcp_lport<>port Or tcp_family<>6 : ProcedureReturn 414 : EndIf
+ If tcp_lip6[15]<>1 Or tcp_rip6[15]<>2 : ProcedureReturn 415 : EndIf
+ ; Delivery to another socket preserves the application's selection.
+ TcpUse(1)
+ If SixReceive(port,101,ack,#TCP_ACK|#TCP_PSH,3)<>0 : ProcedureReturn 416 : EndIf
+ If TcpCurrent()<>1 : ProcedureReturn 417 : EndIf
+ TcpUse(0)
+ If TcpRead(@gate_upload[0],32)<>3 : ProcedureReturn 418 : EndIf
+ If gate_upload[0]<>$41 Or gate_upload[2]<>$43 : ProcedureReturn 419 : EndIf
+ GateResetCapture()
+ If TcpSend(@gate_upload[0],3)<>3 : ProcedureReturn 420 : EndIf
+ TcpPoll(0)
+ If IPv6TcpParse(@gate_tx[14],gate_txLen-14,@view)<>0 Or view\dataBytes<>3 : ProcedureReturn 421 : EndIf
+ If PeekA(view\data)<>$41 Or PeekA(view\data+2)<>$43 : ProcedureReturn 422 : EndIf
+ ; Exact source removal kills the endpoint rather than migrating it.
+ sixValid=0 : TcpPoll(0)
+ If TcpState()<>#TCP_CLOSED : ProcedureReturn 423 : EndIf
+ sixValid=1 : TcpInit() : TcpUse(0)
+ If TcpListen(5001)<>0 : ProcedureReturn 424 : EndIf
+ If SixReceive(5001,200,0,#TCP_SYN,0)<>0 : ProcedureReturn 425 : EndIf
+ If TcpState()<>#TCP_SYN_RECEIVED Or tcp_family<>6 : ProcedureReturn 426 : EndIf
+ ack=tcp_snd_nxt
+ If SixReceive(5001,201,ack,#TCP_ACK,0)<>0 : ProcedureReturn 427 : EndIf
+ If TcpState()<>#TCP_ESTABLISHED : ProcedureReturn 428 : EndIf
+ sixValid=0 : TcpPoll(0)
+ If TcpState()<>#TCP_LISTEN Or tcp_family<>4 : ProcedureReturn 429 : EndIf
+ ProcedureReturn 0
+EndProcedure

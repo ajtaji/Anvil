@@ -1582,3 +1582,42 @@ Evidence is under `docs/evidence/anvil-ipv6-20261030/tcp616`.
 This is a qualified transport codec, not a connected IPv6 socket or HTTP result.
 The resident monitor is still build 450. Family-aware TCP socket integration,
 asynchronous route resolution and actual IPv6 web traffic remain next.
+
+
+## IPv6 TCP sockets and live HTTP server traffic
+
+Anvil 451 connects IPv6 to the existing TCP state machine. Each socket saves
+its address family and both 16-byte addresses across socket switches. Matching
+includes interface, family, local/remote addresses and ports. Active IPv6 opens
+use `TcpConnect6(kind,source,destination,port)` with an explicit assigned source.
+Neighbor resolution is cooperative: the existing `NET_TCP_E_ARP` pending result
+means pump and retry for either family. The callback never waits or pumps RX.
+Wildcard listeners accept either family; accepted children retain their family.
+Reset responses preserve the selected connection's complete endpoint, and loss
+of its assigned source closes it rather than moving it to another address.
+
+The shared service hooks validate source ownership and resolve direct on-link
+neighbors or a default router. Every IPv6 send rechecks routing and neighbor
+usability. IPv6 stages TCP after a 40-byte header; IPv4 keeps its existing layout.
+IPv6 advertises and caps data at 1,220 bytes, the minimum-MTU baseline, until
+path-MTU discovery is integrated. No separate TCP state machine was introduced.
+
+The physical CPU passed the existing IPv4 multi-interface and upload regression
+plus an IPv6 socket suite: pending resolution, active handshake, socket switching,
+reset isolation, borrowed receive dispatch, data in both directions, source loss,
+passive acceptance and listener rearming. These used scripted links, not live
+IPv6 client traffic. The resident build also compiles for Pi 3 as build 67;
+IPv6 activation there still requires an entropy provider.
+
+Build 451 was installed with a verified build 450 backup. After a 90-second boot
+interval, the complete running image hash matched. Over actual Pi Wi-Fi, concurrent
+IPv4 and IPv6 connections to `http serve 8080` each reused their connection for
+`/health`, `/` and `/missing`. Both returned 200, 200 and 404 with matching bodies
+and correct lengths. The temporary server was stopped afterward. Cores, fonts,
+Vulkan and the disabled watchdog passed the post-checks. Full evidence and final
+monitor image are under `docs/evidence/anvil-ipv6-20261030/socket451`.
+
+This proves live local-link IPv6 HTTP server traffic. Outbound IPv6 HTTP/DNS,
+automatic source selection, path-MTU handling, off-link validation, remaining
+TLS blocking and HTTP/2-3 are not yet complete. The legacy IPv4-named pending
+error constant is retained for API compatibility, including IPv6 ND waits.

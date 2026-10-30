@@ -531,6 +531,11 @@ Global tcp_rport.i            ; the peer's
 ;  is why a listener needs no ARP at all.
 ; ----------------------------------------------------------------------
 Global tcp_kind.i             ; an #HW_LINK_* kind, 0 when closed
+Global tcp_family.i=4
+Global Dim tcp_lip6.a[16]
+Global Dim tcp_rip6.a[16]
+Global Dim tcp_saved6.a[32]
+Global Dim tcp_parked6.a[#TCP_SOCKETS*32]
 Global tcp_lip.i              ; the exact local address the peer named
 Global tcp_rip.i              ; the peer's address, 0..$FFFFFFFF
 Global Dim tcp_rmac.a[8]      ; the next hop's MAC, latched at connect
@@ -758,7 +763,8 @@ Global tcp_drop_hold.i        ; 1 while a retransmission is being emitted
 #TCP_SV_OOO_USED = 60          ; #TCP_OOO_SLOTS slots
 #TCP_SV_LIP      = 64
 #TCP_SV_KIND     = 65          ; the interface, parked with the peer (forum 829)
-#TCP_SV_N        = 66          ; must exceed every index above
+#TCP_SV_FAMILY   = 66
+#TCP_SV_N        = 67          ; must exceed every index above
 
 Global Dim tcp_parked.i[#TCP_SOCKETS * #TCP_SV_N]
 
@@ -773,6 +779,10 @@ Procedure tcp_Load(s.i)
   tcp_rip           = tcp_parked[b + #TCP_SV_RIP]
   tcp_lip           = tcp_parked[b + #TCP_SV_LIP]
   tcp_kind          = tcp_parked[b + #TCP_SV_KIND]
+  tcp_family=tcp_parked[b+#TCP_SV_FAMILY]
+  For i=0 To 15
+    tcp_lip6[i]=tcp_parked6[s*32+i] : tcp_rip6[i]=tcp_parked6[s*32+16+i]
+  Next
   i = 0
   While i < 6
     tcp_rmac[i]     = tcp_parked[b + #TCP_SV_MAC0 + i] & $FF
@@ -839,6 +849,10 @@ Procedure tcp_Save(s.i)
   tcp_parked[b + #TCP_SV_RIP]      = tcp_rip
   tcp_parked[b + #TCP_SV_LIP]      = tcp_lip
   tcp_parked[b + #TCP_SV_KIND]     = tcp_kind
+  tcp_parked[b+#TCP_SV_FAMILY]=tcp_family
+  For i=0 To 15
+    tcp_parked6[s*32+i]=tcp_lip6[i] : tcp_parked6[s*32+16+i]=tcp_rip6[i]
+  Next
   i = 0
   While i < 6
     tcp_parked[b + #TCP_SV_MAC0 + i] = tcp_rmac[i] & $FF
@@ -1055,6 +1069,10 @@ EndProcedure
 Procedure.i TcpTxCap()
   Define m.i
   m = LinkTxMaxOn(tcp_kind) - 14 - 20 - 20
+  If tcp_family=6
+    m=m-20
+    If m>1220 : m=1220 : EndIf
+  EndIf
   If m > #TCP_MSS_RX
     m = #TCP_MSS_RX
   EndIf
@@ -1529,7 +1547,7 @@ Procedure.i TcpSendSeg(seq.l, flags.i, datalen.i, withmss.i)
     ProcedureReturn #NET_TCP_E_TOOBIG
   EndIf
 
-  p = NetTcpSegBuf()
+  If tcp_family=6 : p=NetTcp6SegBuf() : Else : p=NetTcpSegBuf() : EndIf
   tcp_PutBE16(p + #TCP_H_SPORT, tcp_lport)
   tcp_PutBE16(p + #TCP_H_DPORT, tcp_rport)
   tcp_PutBE32(p + #TCP_H_SEQ, seq)
@@ -1564,7 +1582,7 @@ Procedure.i TcpSendSeg(seq.l, flags.i, datalen.i, withmss.i)
   If withmss <> 0
     PokeB(p + 20, 2)                    ; Kind = 2, Maximum Segment Size
     PokeB(p + 21, 4)                    ; Length = 4, the option's own size
-    tcp_PutBE16(p + 22, #TCP_MSS_RX)
+    If tcp_family=6 : tcp_PutBE16(p+22,1220) : Else : tcp_PutBE16(p + 22, #TCP_MSS_RX) : EndIf
   EndIf
 
   i = 0
@@ -1574,7 +1592,12 @@ Procedure.i TcpSendSeg(seq.l, flags.i, datalen.i, withmss.i)
   Wend
 
   seglen = hl + datalen
-  If NetTcpBuildFrom(tcp_kind, tcp_lip, tcp_rip, seglen, @tcp_rmac[0]) = 0
+  If tcp_family=6
+    i=NetTcp6BuildFrom(tcp_kind,@tcp_lip6[0],@tcp_rip6[0],seglen)
+  Else
+    i=NetTcpBuildFrom(tcp_kind,tcp_lip,tcp_rip,seglen,@tcp_rmac[0])
+  EndIf
+  If i=0
     tcp_txfail = tcp_txfail + 1
     ProcedureReturn #NET_TCP_E_TX
   EndIf
@@ -1646,6 +1669,9 @@ Procedure.i TcpListenerGeneration()
   ProcedureReturn tcp_listener_generation[tcp_s]
 EndProcedure
 Procedure TcpWipe()
+  Define wipeIndex.i
+  tcp_family=4
+  For wipeIndex=0 To 15 : tcp_lip6[wipeIndex]=0 : tcp_rip6[wipeIndex]=0 : Next
   If tcp_s >= 0 And tcp_s < #TCP_SOCKETS
     If tcp_generation[tcp_s] < $7FFFFFFFFFFFFFFF
       tcp_generation[tcp_s] = tcp_generation[tcp_s] + 1
@@ -1704,6 +1730,7 @@ EndProcedure
 ; it; TcpSendSeg deliberately does not recompute the receive window on a
 ; RST, so nothing else is touched.
 Procedure TcpSendRstFor(seq.l, ack.l, seglen.i, hadack.i, toip.i, toport.i, myport.i, tomac.i)
+  Define saved_family.i
   Define saved_rcv.l
   Define saved_rip.i
   Define saved_rport.i
@@ -1711,6 +1738,12 @@ Procedure TcpSendRstFor(seq.l, ack.l, seglen.i, hadack.i, toip.i, toport.i, mypo
   Define saved_kind.i
   Define saved_lip.i
   Define i.i
+  saved_family=tcp_family
+  For i=0 To 15 : tcp_saved6[i]=tcp_lip6[i] : tcp_saved6[16+i]=tcp_rip6[i] : Next
+  tcp_family=NetTcpRxFamily()
+  If tcp_family=6
+    For i=0 To 15 : tcp_lip6[i]=PeekA(NetTcpRxTo6()+i) : tcp_rip6[i]=PeekA(NetTcpRxFrom6()+i) : Next
+  EndIf
   saved_rcv = tcp_rcv_nxt
   saved_kind = tcp_kind
   ; The stranger's own interface, out of the frame it arrived in - the
@@ -1745,6 +1778,8 @@ Procedure TcpSendRstFor(seq.l, ack.l, seglen.i, hadack.i, toip.i, toport.i, mypo
     tcp_rcv_nxt = TcpSeqAdd(seq, seglen)
     TcpSendSeg(0, #TCP_RST | #TCP_ACK, 0, 0)
   EndIf
+  tcp_family=saved_family
+  For i=0 To 15 : tcp_lip6[i]=tcp_saved6[i] : tcp_rip6[i]=tcp_saved6[16+i] : Next
   tcp_rcv_nxt = saved_rcv
   tcp_kind = saved_kind
   tcp_lip = saved_lip
@@ -1996,6 +2031,7 @@ Procedure TcpSetSndMss(offered.i)
   Define m.i
   Define cap.i
   m = #TCP_MSS_DEFAULT
+  If tcp_family=6 : m=1220 : EndIf
   If offered > 0
     m = offered
   EndIf
@@ -2164,6 +2200,18 @@ EndProcedure
 ; SYN arriving for a connection that is already up is a retransmission
 ; of that connection's SYN and must reach that connection, not re-open
 ; it on the listener.
+Procedure.i tcp_AddressMatch()
+ Define i.i
+ If tcp_family<>NetTcpRxFamily() : ProcedureReturn 0 : EndIf
+ If tcp_family=6
+  For i=0 To 15
+   If tcp_lip6[i]<>PeekA(NetTcpRxTo6()+i) Or tcp_rip6[i]<>PeekA(NetTcpRxFrom6()+i) : ProcedureReturn 0 : EndIf
+  Next
+  ProcedureReturn 1
+ EndIf
+ If tcp_lip=NetRxTo() And tcp_rip=NetTcpRxFrom() : ProcedureReturn 1 : EndIf
+ ProcedureReturn 0
+EndProcedure
 Procedure.i tcp_Match()
   Define i.i
   Define keep.i
@@ -2180,13 +2228,11 @@ Procedure.i tcp_Match()
         ; and without this test a segment arriving over the radio can be
         ; delivered to the cable's otherwise-identical connection.
         If tcp_kind = NetRxKind()
-          If tcp_lip = NetRxTo()
+          If tcp_AddressMatch()<>0
             If tcp_lport = NetTcpRxDstPort()
               If tcp_rport = NetTcpRxSrcPort()
-                If tcp_rip = NetTcpRxFrom()
-                  hit = i
-                  i = #TCP_SOCKETS
-                EndIf
+                hit = i
+                i = #TCP_SOCKETS
               EndIf
             EndIf
           EndIf
@@ -2304,6 +2350,10 @@ Procedure.i tcp_InputCore()
     tcp_kind = NetRxKind()
     tcp_lip = NetRxTo()
     tcp_rip = NetTcpRxFrom()
+    tcp_family=NetTcpRxFamily()
+    If tcp_family=6
+      For n=0 To 15 : tcp_lip6[n]=PeekA(NetTcpRxTo6()+n) : tcp_rip6[n]=PeekA(NetTcpRxFrom6()+n) : Next
+    EndIf
     tcp_rport = NetTcpRxSrcPort()
     tcp_lport = NetTcpRxDstPort()
     n = 0
@@ -3179,6 +3229,51 @@ Procedure.i TcpConnect(kind.i, ip.i, port.i)
   ProcedureReturn #NET_TCP_OK
 EndProcedure
 
+; Explicit-source IPv6 open. ND is cooperative: callers retry after
+; pumping when NET_TCP_E_ARP is returned, exactly as for IPv4 resolution.
+Procedure.i TcpConnect6(kind.i,source.i,destination.i,port.i)
+ Define i.i,rc.i
+ If source=0 Or destination=0 : ProcedureReturn #NET_TCP_E_ARG : EndIf
+ If port<1 Or port>65535 : ProcedureReturn #NET_TCP_E_PORT : EndIf
+ If tcp_state<>#TCP_CLOSED And tcp_state<>#TCP_TIME_WAIT : ProcedureReturn #NET_TCP_E_BUSY : EndIf
+ If NetTcp6SourceValid(kind,source)<>1 : ProcedureReturn #NET_TCP_E_NOADDR : EndIf
+ If HwLinkReady(kind)=0 : ProcedureReturn #NET_TCP_E_NOLINK : EndIf
+ rc=NetTcp6Resolve(kind,source,destination,@tcp_rmac[0])
+ If rc=0 : ProcedureReturn #NET_TCP_E_ARP : EndIf
+ If rc<>1 : ProcedureReturn #NET_TCP_E_ROUTE : EndIf
+  TcpWipe()
+  tcp_inuse = 1
+  tcp_err = 0
+  tcp_reset_seen = 0
+  tcp_kind = kind
+  tcp_family=6
+  For i=0 To 15 : tcp_lip6[i]=PeekA(source+i) : tcp_rip6[i]=PeekA(destination+i) : Next
+  tcp_rport = port
+  tcp_ephemeral = tcp_ephemeral + 1
+  If tcp_ephemeral > 65535
+    tcp_ephemeral = 49152
+  EndIf
+  tcp_lport = tcp_ephemeral
+  tcp_iss = tcp_IssFor(tcp_lport)
+  tcp_snd_una = tcp_iss
+  tcp_snd_nxt = TcpSeqAdd(tcp_iss, 1)
+  tcp_snd_wnd = 0
+  tcp_snd_wl1 = 0
+  tcp_snd_wl2 = 0
+  tcp_snd_mss = 1220
+  tcp_rcv_nxt = 0
+  tcp_rcv_edge = 0
+  tcp_rcv_wnd = #TCP_RCVBUF
+  tcp_rto = #TCP_RTO_INIT_MS
+  tcp_keep_t0 = Micros()
+  tcp_keep_sent = 0
+  tcp_state = #TCP_SYN_SENT
+  ; <SEQ=ISS><CTL=SYN>, with our MSS on it.
+  TcpSendSeg(tcp_iss, #TCP_SYN, 0, 1)
+  TcpArmRto()
+  ProcedureReturn #NET_TCP_OK
+EndProcedure
+
 ; TcpListen - RFC 9293 3.10.1, a passive OPEN, on the CURRENT socket.
 ; A SYN for a port nobody is listening on gets a RST from TcpInput's
 ; table walk, which is a refusal rather than a silence.
@@ -3582,7 +3677,15 @@ Procedure.i TcpPoll(slice_ms.i)
       ; connected to. If DHCP expiry or explicit reconfiguration removes
       ; it, the connection cannot migrate to another address/interface.
       ; End it deterministically; a server socket becomes wildcard again.
-      If tcp_state <> #TCP_LISTEN And tcp_lip <> 0 And NetIfHoldsIp(tcp_kind, tcp_lip) = 0
+      n=0
+      If tcp_state<>#TCP_LISTEN
+        If tcp_family=6
+          If NetTcp6SourceValid(tcp_kind,@tcp_lip6[0])<>1 : n=1 : EndIf
+        ElseIf tcp_lip<>0 And NetIfHoldsIp(tcp_kind,tcp_lip)=0
+          n=1
+        EndIf
+      EndIf
+      If n<>0
         tcp_err = #NET_TCP_E_NOADDR
         TcpWipe()
         If tcp_listen_port <> 0

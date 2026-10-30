@@ -1,5 +1,6 @@
 XIncludeFile "Anvil/Network/internet_checksum.pbi"
 XIncludeFile "Anvil/Network/byte_order.pbi"
+XIncludeFile "Anvil/Network/ipv6_tcp.pbi"
 ; ======================================================================
 ;  net.pbi - target-neutral Ethernet II, ARP, IPv4, ICMP echo and UDP.
 ; ======================================================================
@@ -1003,6 +1004,8 @@ Global net_tcpRxMac.i           ; -> the six source-MAC bytes in the
                                 ; frame. A RST to a stranger has to be
                                 ; addressed, and the stranger is by
                                 ; definition not in the ARP cache.
+Global net_tcpRxFamily.i=4,net_tcpRxFrom6.i,net_tcpRxTo6.i
+Global *net_tcp6SourceHook,*net_tcp6ResolveHook
 Global net_tcpRxCount.i         ; segments handed up
 
 ; The last ICMP echo REPLY we received.
@@ -2929,6 +2932,64 @@ EndProcedure
 ;  which retransmitting the same segment twice produces two different
 ;  checksums.
 ; ----------------------------------------------------------------------
+; IPv6 transport hooks never pump receive or wait. Source returns 1 only
+; for a currently assigned address; resolve returns 1/MAC, 0/pending or error.
+Procedure NetSetTcp6Hooks(source.i,resolve.i)
+ *net_tcp6SourceHook=source : *net_tcp6ResolveHook=resolve
+EndProcedure
+Procedure.i NetTcp6SourceValid(kind.i,source.i)
+ If source=0 Or kind<1 Or kind>=#NET_IF_KINDS : ProcedureReturn 0 : EndIf
+ If net_tcp6SourceHook=0 : ProcedureReturn 0 : EndIf
+ ProcedureReturn net_tcp6SourceHook(kind,source)
+EndProcedure
+Procedure.i NetTcp6Resolve(kind.i,source.i,destination.i,mac.i)
+ If NetTcp6SourceValid(kind,source)<>1 Or destination=0 Or mac=0 : ProcedureReturn -881 : EndIf
+ If net_tcp6ResolveHook=0 : ProcedureReturn -883 : EndIf
+ ProcedureReturn net_tcp6ResolveHook(kind,source,destination,mac)
+EndProcedure
+Procedure.i NetTcp6SegBuf()
+ ProcedureReturn @net_out[54]
+EndProcedure
+; Use the IPv6 minimum MTU until path-MTU discovery is integrated.
+Procedure.i NetTcp6BuildFrom(kind.i,source.i,destination.i,segLen.i)
+ Define rc.i
+ net_outLen=0
+ If segLen<20 Or segLen>1240 : ProcedureReturn 0 : EndIf
+ rc=NetTcp6Resolve(kind,source,destination,@net_scratchMac[0])
+ If rc<>1 : net_err=rc : ProcedureReturn 0 : EndIf
+ rc=IPv6TcpBuild(@net_out[14],1280,source,destination,segLen,64)
+ If rc<0 : net_err=rc : ProcedureReturn 0 : EndIf
+ net_BeginFrame(kind,@net_scratchMac[0],$86DD)
+ ProcedureReturn net_Finish(14+rc)
+EndProcedure
+Procedure.i NetTcpRxFamily()
+ If net_tcpRxFamily=6 : ProcedureReturn 6 : EndIf
+ ProcedureReturn 4
+EndProcedure
+Procedure.i NetTcpRxFrom6()
+ ProcedureReturn net_tcpRxFrom6
+EndProcedure
+Procedure.i NetTcpRxTo6()
+ ProcedureReturn net_tcpRxTo6
+EndProcedure
+; Called by the IPv6 receive owner while the Ethernet receive span lives.
+; Recheck ownership here so no caller can inject another local address.
+Procedure.i NetTcp6Input(kind.i,frame.i,bytes.i)
+ Define view.IPv6TcpView,rc.i
+ If kind<1 Or kind>=#NET_IF_KINDS Or frame=0 Or bytes<74 Or bytes>1514 : ProcedureReturn #NET_E_ARG : EndIf
+ If net_GetBE16(frame+12)<>$86DD Or net_Same(frame,net_IfMacPtr(kind),6)=0 : ProcedureReturn #NET_IN_IGNORED : EndIf
+ rc=IPv6TcpParse(frame+14,bytes-14,@view) : If rc<>0 : ProcedureReturn rc : EndIf
+ If NetTcp6SourceValid(kind,view\destination)<>1 : ProcedureReturn #NET_IN_IGNORED : EndIf
+ net_rxKind=kind : net_rxTo=0
+ net_tcpRxFamily=6 : net_tcpRxFrom=0 : net_tcpRxTo=0
+ net_tcpRxFrom6=view\source : net_tcpRxTo6=view\destination
+ net_tcpRxSrcPort=view\sourcePort : net_tcpRxDstPort=view\destinationPort
+ net_tcpRxSeg=view\segment : net_tcpRxSegLen=view\segmentBytes
+ net_tcpRxHdrLen=view\headerBytes : net_tcpRxData=view\data : net_tcpRxDataLen=view\dataBytes
+ net_tcpRxMac=frame+6 : net_tcpRxCount=net_tcpRxCount+1
+ ProcedureReturn #NET_IN_TCP
+EndProcedure
+
 Procedure.i NetTcpSegBuf()
   ProcedureReturn @net_out[#NET_ETH_HDR + #NET_IP_HDR]
 EndProcedure
@@ -3557,6 +3618,7 @@ Procedure.i net_RecvTcp(kind.i, *p, n.i, srcIp.i, dstIp.i, *srcMac)
     ProcedureReturn #NET_E_TCP_CKSUM
   EndIf
 
+  net_tcpRxFamily=4 : net_tcpRxFrom6=0 : net_tcpRxTo6=0
   net_tcpRxFrom    = srcIp
   net_tcpRxTo      = dstIp
   net_tcpRxSrcPort = net_GetBE16(*p + 0)
@@ -3985,6 +4047,7 @@ Procedure.i NetInput(kind.i, *frame, length.i)
     net_ipv6InputBusy = 1
     r = net_ipv6InputHook(kind,*frame,length,@net_out[0],1514)
     net_ipv6InputBusy = 0
+    If r = #NET_IN_TCP And net_tcpRxFamily=6 : ProcedureReturn #NET_IN_TCP : EndIf
     If r = 0 : ProcedureReturn #NET_IN_IGNORED : EndIf
     If r > 0
       If r < 54 Or r > 1514
@@ -4123,6 +4186,7 @@ Procedure NetReset()
   net_udpRxPort = 0
   net_udpRxDstPort = 0
   net_udpRxLen = 0
+  net_tcpRxFamily=4 : net_tcpRxFrom6=0 : net_tcpRxTo6=0
   net_tcpRxFrom = 0
   net_tcpRxTo = 0
   net_tcpRxSrcPort = 0

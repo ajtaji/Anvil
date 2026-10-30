@@ -207,6 +207,47 @@ Procedure ipv6svc_NeighborInput(kind.i,now.i,frame.i,bytes.i)
 EndProcedure
 ; Explicit source avoids pretending the unfinished RFC6724 automatic source
 ; selection policy is complete. Caller selects a currently assigned source.
+; Shared TCP callbacks: no receive pumping, waiting or borrowed output.
+Procedure.i IPv6ServiceSourceValid(kind.i,source.i)
+ If kind<1 Or kind>=#NET_IF_KINDS Or source=0 : ProcedureReturn 0 : EndIf
+ If HwLinkReady(kind)=0 : ProcedureReturn 0 : EndIf
+ ProcedureReturn ipv6svc_Assigned(kind,ipv6svc_Now(),source)
+EndProcedure
+Procedure.i IPv6ServiceResolve(kind.i,source.i,destination.i,mac.i)
+ Define hop.IPv6AddressStorage
+ Define now.i,rc.i,i.i,j.i,slot.i,failed.i,index.i
+ Define *router.IPv6DefaultRouter
+ If IPv6ServiceSourceValid(kind,source)<>1 Or destination=0 Or mac=0 : ProcedureReturn -881 : EndIf
+ If PeekA(destination)=255 Or IPv6AddressUnspecified(destination)<>0 : ProcedureReturn -881 : EndIf
+ now=ipv6svc_Now()
+ For i=0 To 15 : PokeA(@hop+i,PeekA(destination+i)) : Next
+ rc=IPv6PrefixListMatch(@ipv6svcOnLink[kind],ipv6svcEpoch[kind],now,destination)
+ If PeekA(destination)=254 And (PeekA(destination+1)&192)=128 : rc=1 : EndIf
+ If rc<0 : ProcedureReturn rc : EndIf
+ If rc=0
+  If PeekA(source)=254 And (PeekA(source+1)&192)=128 : ProcedureReturn -883 : EndIf
+  failed=0
+  For j=0 To 3
+   *router=@ipv6svcRouterRows[kind*128+j*32]
+   slot=ipv6svc_NeighborFind(kind,@*router\address)
+   If slot>=0
+    If ipv6svcNeighbor[slot]\policy\state=#IPV6_NC_FAILED : failed=failed|(1<<j) : EndIf
+   EndIf
+  Next
+  index=IPv6DefaultRoutersSelect(@ipv6svcRouters[kind],ipv6svcEpoch[kind],now,failed)
+  If index<=0 : ProcedureReturn -883 : EndIf
+  *router=@ipv6svcRouterRows[kind*128+(index-1)*32]
+  For i=0 To 15 : PokeA(@hop+i,PeekA(@*router\address+i)) : Next
+ EndIf
+ slot=ipv6svc_NeighborGet(kind,now,@hop,source,0)
+ If slot<0 : ProcedureReturn slot : EndIf
+ rc=IPv6NeighborOwnerUse(@ipv6svcNeighbor[slot],ipv6svcNeighbor[slot]\generation,now)
+ If rc<0 : ProcedureReturn -888 : EndIf
+ If rc=0 : ProcedureReturn 0 : EndIf
+ For i=0 To 5 : PokeA(mac+i,PeekA(@ipv6svcNeighbor[slot]\policy\mac+i)) : Next
+ ProcedureReturn 1
+EndProcedure
+
 Procedure.i IPv6ServiceEchoStart(source.i,destination.i)
  Define kind.i,found.i,now.i,rc.i,i.i,slot.i,failed.i,j.i,index.i
  Define *router.IPv6DefaultRouter
@@ -496,6 +537,12 @@ Procedure.i IPv6ServiceInput(kind.i,frame.i,bytes.i,out.i,capacity.i)
   If NetReadBE16(frame+12)=$86DD And (PeekA(frame+6)&1)=0
    If IPv6EndpointBytesEqual(frame+6,HwLinkMacPtr(kind),6)=0
     rc=IPv6PacketParse(frame+14,bytes-14,@ip)
+    If rc=0 And ip\protocol=6
+     rc=NetTcp6Input(kind,frame,bytes)
+     If rc=#NET_IN_TCP : ProcedureReturn #NET_IN_TCP : EndIf
+     If rc<0 : ProcedureReturn rc : EndIf
+     ProcedureReturn 0
+    EndIf
     If rc=0 And ip\protocol=58 And ip\payloadBytes>=1
      If PeekA(ip\payload)=134
       local=ipv6svc_RaLocal(kind,now,ip\destination)
@@ -642,6 +689,7 @@ Procedure.i IPv6ServiceBind(generation.i,prepare.i)
  If generation=0 Or prepare=0 Or ipv6svcGeneration<>0 : ProcedureReturn -800 : EndIf
  ipv6svcGeneration=generation : ipv6svcPrepare=prepare
  NetSetIPv6InputHook(@IPv6ServiceInput)
+ NetSetTcp6Hooks(@IPv6ServiceSourceValid,@IPv6ServiceResolve)
  NetSetProtocolTickHook(@IPv6ServiceTick)
  ProcedureReturn 0
 EndProcedure
