@@ -1,0 +1,350 @@
+XIncludeFile "RaspberryPi4/Lib/mmu.pi4"
+#GEM_NCR       = $0000   ; MACB_NCR
+#GEM_TSR       = $0014   ; MACB_TSR
+#GEM_NCR_RE      = $004    ; bit 2  receive enable
+#GEM_NCR_TE      = $008    ; bit 3  transmit enable
+#GEM_NCR_MPE     = $010    ; bit 4  management (MDIO) port enable
+#GEM_NCR_CLRSTAT = $020    ; bit 5  clear the statistics
+#GEM_NCR_TSTART  = $200    ; bit 9  start transmission
+#GEM_TSR_UBR     = $01         ; used bit read
+#GEM_TSR_RLE     = $04         ; retry limit exceeded
+#GEM_TSR_BEX     = $10         ; AHB/AXI error mid frame
+#GEM_TSR_COMP    = $20         ; transmit complete
+#GEM_TSR_UND     = $40         ; underrun
+#GEM_TSR_FAULTS  = $54         ; RLE | BEX | UND
+#GEM_DESC_SIZE  = 16                 ; 64-bit form: addr, ctrl, addr hi, 0
+#GEM_DESC_ADDR  = 0
+#GEM_DESC_CTRL  = 4
+#GEM_DESC_ADDRH = 8
+#GEM_DESC_PAD   = 12
+#GEM_TX_LEN     = $00003FFF          ; TX control 13:0
+#GEM_TX_LAST    = $00008000          ; bit 15
+#GEM_TX_FAULTS  = $38000000          ; 27 exhausted | 28 underrun | 29 error
+#GEM_TX_WRAP    = $40000000          ; bit 30
+#GEM_TX_USED    = $80000000          ; bit 31
+#GEM_BUF_BYTES   = 1536
+#GEM_TX_DESCS    = 8
+#GEM_OFF_TXRING  = $00800            ;   8 x 16 = $80
+#GEM_OFF_TXTIE   = $00880            ; one USED|WRAP descriptor, queues 1..7
+#GEM_OFF_TXBUF   = $01000            ;   8 x 1536
+#GEM_REGION_MIN  = $34000
+#GEM_FRAME_MAX   = 1514
+#GEM_FRAME_MIN   = 60                ; padded here with zeros
+#GEM_LINE        = 64                ; Cortex-A76 data cache line
+#GEM_ERR_NONE        =   0
+#GEM_ERR_ARG         =  -1
+#GEM_ERR_RANGE       =  -2
+#GEM_ERR_RP1         =  -3
+#GEM_ERR_BUSMASTER   =  -4
+#GEM_ERR_VERSION     =  -5
+#GEM_ERR_NO_DMA64    =  -6
+#GEM_ERR_MDIO_BUSY   =  -7
+#GEM_ERR_PHY_NONE    =  -8
+#GEM_ERR_PHY_ID      =  -9
+#GEM_ERR_NO_LINK     = -10
+#GEM_ERR_ANEG        = -11
+#GEM_ERR_NO_MAC      = -12
+#GEM_ERR_NO_REGION   = -13
+#GEM_ERR_NOT_STARTED = -14
+#GEM_ERR_NOT_PROBED  = -15
+#GEM_ERR_TX_TIMEOUT  = -16
+#GEM_ERR_TX_FAULT    = -17
+#GEM_ERR_RX_LONG     = -18
+#GEM_ERR_RX_FRAG     = -19
+#GEM_ERR_AXI         = -20
+#GEM_ERR_TX_BUSY     = -21
+
+Global gem_err.i,gem_started.i,gem_txPending.i,gem_txCount.i,gem_txHead.i,gem_lastTsr.i,gem_region.i,gem_regionBytes.i
+Global Dim region.a[#GEM_REGION_MIN+64]
+Global Dim sourceFrame.a[1536]
+Global ncr.i,tsr.i,failRead.i=-1,failWrite.i,stopFail.i,linkUp.i=1,fakeTicks.i,writes.i,view.i
+Procedure.i gem_Rd(off.i)
+ If off=failRead : gem_err=-2 : ProcedureReturn -2 : EndIf
+ If off=#GEM_NCR : ProcedureReturn ncr : EndIf
+ ProcedureReturn tsr
+EndProcedure
+Procedure.i gem_Wr(off.i,value.i)
+ writes=writes+1
+ If failWrite<>0 : gem_err=-2 : ProcedureReturn 0 : EndIf
+ If off=#GEM_NCR
+  If stopFail=0 : ncr=value : EndIf
+ Else
+  tsr=0
+ EndIf
+ ProcedureReturn 1
+EndProcedure
+Procedure.i PcieLinkUp()
+ ProcedureReturn linkUp
+EndProcedure
+Procedure.i PcieDmaOk(base.i,bytes.i)
+ ProcedureReturn 1
+EndProcedure
+Procedure.i PcieDmaBus(addr.i)
+ ProcedureReturn addr+$1000000000
+EndProcedure
+Procedure gem_Barrier()
+EndProcedure
+Procedure gem_CacheRange(addr.i,n.i)
+EndProcedure
+Procedure.i Ticks()
+ fakeTicks=fakeTicks+1 : ProcedureReturn fakeTicks
+EndProcedure
+Procedure.i GemTimeoutTicks(ms.i)
+ ProcedureReturn ms
+EndProcedure
+Procedure.i gem_WrSync(off.i, v.i)
+  If gem_Wr(off, v) = 0
+    ProcedureReturn 0
+  EndIf
+  gem_Rd(off)
+  ProcedureReturn 1
+EndProcedure
+Procedure gem_DescAddr(d.i, bus.i, flags.i)
+  PokeL(d + #GEM_DESC_ADDRH, (bus >> 32) & $FFFFFFFF)
+  PokeL(d + #GEM_DESC_PAD, 0)
+  gem_Barrier()
+  PokeL(d + #GEM_DESC_ADDR, (bus & $FFFFFFFF) | flags)
+EndProcedure
+Procedure.i GemSetRegion(base.i, bytes.i)
+  If gem_started <> 0 Or gem_txPending <> 0
+    gem_err = #GEM_ERR_TX_BUSY
+    ProcedureReturn 0
+  EndIf
+  If base <= 0 Or (base % #GEM_LINE) <> 0 Or bytes < #GEM_REGION_MIN
+    gem_err = #GEM_ERR_ARG
+    ProcedureReturn 0
+  EndIf
+  If PcieDmaOk(base, bytes) = 0
+    gem_err = #GEM_ERR_ARG
+    ProcedureReturn 0
+  EndIf
+  gem_region = base
+  gem_regionBytes = bytes
+  ProcedureReturn 1
+EndProcedure
+Procedure.i GemStopChecked()
+  Define v.i
+  gem_started = 0
+  If PcieLinkUp() = 0
+    gem_txPending = 0
+    ProcedureReturn 1
+  EndIf
+  v = gem_Rd(#GEM_NCR)
+  If v < 0
+    ProcedureReturn 0
+  EndIf
+  gem_WrSync(#GEM_NCR, v & ~(#GEM_NCR_RE | #GEM_NCR_TE))
+  gem_Barrier()
+  v = gem_Rd(#GEM_NCR)
+  If v < 0 Or (v & (#GEM_NCR_RE | #GEM_NCR_TE)) <> 0
+    ProcedureReturn 0
+  EndIf
+  gem_txPending = 0
+  ProcedureReturn 1
+EndProcedure
+Procedure.i GemPollSend()
+  Define d.i, ctrl.i, tsr.i
+  If gem_txPending = 0
+    ProcedureReturn 1
+  EndIf
+  If gem_started = 0
+    gem_err = #GEM_ERR_NOT_STARTED
+    ProcedureReturn -1
+  EndIf
+  d = gem_region + #GEM_OFF_TXRING + gem_txHead * #GEM_DESC_SIZE
+  gem_CacheRange(d, #GEM_DESC_SIZE)
+  ctrl = PeekN(d + #GEM_DESC_CTRL)
+  If (ctrl & #GEM_TX_USED) = 0
+    ProcedureReturn 0
+  EndIf
+  tsr = gem_Rd(#GEM_TSR)
+  If tsr < 0
+    ProcedureReturn -1
+  EndIf
+  gem_lastTsr = tsr
+  If gem_Wr(#GEM_TSR, tsr) = 0
+    ProcedureReturn -1
+  EndIf
+  gem_txPending = 0
+  gem_txHead = (gem_txHead + 1) % #GEM_TX_DESCS
+  If (ctrl & #GEM_TX_FAULTS) <> 0 Or (tsr & #GEM_TSR_FAULTS) <> 0
+    gem_err = #GEM_ERR_TX_FAULT
+    ProcedureReturn -1
+  EndIf
+  gem_txCount = gem_txCount + 1
+  gem_err = #GEM_ERR_NONE
+  ProcedureReturn 1
+EndProcedure
+Procedure.i GemTrySend(*frame, length.i)
+  Define d.i, nd.i, nxt.i, buf.i, n.i, i.i, ctrl.i, v.i
+  If gem_started = 0
+    gem_err = #GEM_ERR_NOT_STARTED
+    ProcedureReturn 0
+  EndIf
+  If *frame = 0 Or length < 14 Or length > #GEM_FRAME_MAX
+    gem_err = #GEM_ERR_ARG
+    ProcedureReturn 0
+  EndIf
+  v = GemPollSend()
+  If v < 0
+    ProcedureReturn 0
+  EndIf
+  If v = 0
+    gem_err = #GEM_ERR_TX_BUSY
+    ProcedureReturn -1
+  EndIf
+  v = gem_Rd(#GEM_NCR)
+  If v < 0
+    ProcedureReturn 0
+  EndIf
+  buf = gem_region + #GEM_OFF_TXBUF + gem_txHead * #GEM_BUF_BYTES
+  i = 0
+  While i < length
+    PokeB(buf + i, PeekA(*frame + i))
+    i = i + 1
+  Wend
+  n = length
+  While n < #GEM_FRAME_MIN
+    PokeB(buf + n, 0)
+    n = n + 1
+  Wend
+  gem_CacheRange(buf, n)
+
+  d = gem_region + #GEM_OFF_TXRING + gem_txHead * #GEM_DESC_SIZE
+  nxt = (gem_txHead + 1) % #GEM_TX_DESCS
+  nd = gem_region + #GEM_OFF_TXRING + nxt * #GEM_DESC_SIZE
+  If nxt = #GEM_TX_DESCS - 1
+    PokeL(nd + #GEM_DESC_CTRL, #GEM_TX_USED | #GEM_TX_WRAP)
+  Else
+    PokeL(nd + #GEM_DESC_CTRL, #GEM_TX_USED)
+  EndIf
+  gem_DescAddr(d, PcieDmaBus(buf), 0)
+  gem_Barrier()
+  ctrl = (n & #GEM_TX_LEN) | #GEM_TX_LAST
+  If gem_txHead = #GEM_TX_DESCS - 1
+    ctrl = ctrl | #GEM_TX_WRAP
+  EndIf
+  PokeL(d + #GEM_DESC_CTRL, ctrl)
+  gem_CacheRange(d, #GEM_DESC_SIZE)
+  gem_CacheRange(nd, #GEM_DESC_SIZE)
+
+
+  ; Mark ownership before TSTART: a failed posted write may have reached RP1.
+  gem_txPending = 1
+  If gem_WrSync(#GEM_NCR, v | #GEM_NCR_TSTART) = 0
+    ProcedureReturn 0
+  EndIf
+  gem_err = #GEM_ERR_NONE
+  ProcedureReturn 1
+EndProcedure
+Procedure.i GemSend(*frame, length.i, timeoutMs.i)
+  Define t0.i, budget.i, rc.i
+  If timeoutMs <= 0
+    gem_err = #GEM_ERR_ARG
+    ProcedureReturn 0
+  EndIf
+  If GemTrySend(*frame, length) <> 1
+    ProcedureReturn 0
+  EndIf
+  t0 = Ticks()
+  budget = GemTimeoutTicks(timeoutMs)
+  Repeat
+    rc = GemPollSend()
+    If rc = 1
+      ProcedureReturn 1
+    EndIf
+    If rc < 0
+      ProcedureReturn 0
+    EndIf
+    If (Ticks() - t0) > budget
+      GemStopChecked()
+      gem_err = #GEM_ERR_TX_TIMEOUT
+      ProcedureReturn 0
+    EndIf
+  ForEver
+EndProcedure
+Procedure Save(index.i,rc.i)
+ Define p.i,addr.i,i.i,d.i
+ p=$E1C00100+index*2048 : addr=gem_region+#GEM_OFF_TXBUF+view*#GEM_BUF_BYTES
+ d=gem_region+#GEM_OFF_TXRING+view*#GEM_DESC_SIZE
+ PokeI(p,rc) : PokeI(p+8,gem_txPending) : PokeI(p+16,gem_txHead)
+ PokeI(p+24,gem_txCount) : PokeI(p+32,gem_started) : PokeI(p+40,gem_err)
+ PokeI(p+48,writes) : PokeI(p+56,PeekN(d+#GEM_DESC_CTRL))
+ PokeI(p+64,Bool(PeekN(d)=((addr+$1000000000)&$FFFFFFFF)))
+ PokeI(p+72,PeekN(d+#GEM_DESC_ADDRH))
+ For i=0 To 1535 : PokeA(p+80+i,PeekA(addr+i)) : Next
+EndProcedure
+Procedure Complete()
+ Define d.i
+ d=gem_region+#GEM_OFF_TXRING+gem_txHead*#GEM_DESC_SIZE
+ PokeL(d+#GEM_DESC_CTRL,PeekN(d+#GEM_DESC_CTRL)|#GEM_TX_USED)
+EndProcedure
+Procedure.i Main()
+ Define i.i,rc.i
+ For i=0 To 65535 : PokeA($E1C00000+i,0) : Next
+ PokeI($E1C00000,$474D5431)
+ MmuClearNc() : rc=MmuBuildTables($4F80000) : If rc<>0 : ProcedureReturn 2 : EndIf
+ MmuEnableCached()
+ gem_region=(@region[0]+63) & -64
+ For i=0 To 1535 : sourceFrame[i]=(i*7+3)&255 : Next
+rc=GemTrySend(@sourceFrame[0],60)
+ Save(0,rc)
+gem_started=1 : ncr=#GEM_NCR_RE|#GEM_NCR_TE : rc=GemTrySend(@sourceFrame[0],13)
+ Save(1,rc)
+rc=GemTrySend(@sourceFrame[0],14)
+ Save(2,rc)
+For i=0 To 1535 : sourceFrame[i]=$EE : Next
+ rc=GemPollSend()
+ Save(3,rc)
+rc=GemTrySend(@sourceFrame[0],64)
+ Save(4,rc)
+rc=GemSetRegion(gem_region+64,#GEM_REGION_MIN)
+ Save(5,rc)
+Complete() : rc=GemPollSend()
+ Save(6,rc)
+rc=GemPollSend()
+ Save(7,rc)
+For i=0 To 1535 : sourceFrame[i]=(i*7+3)&255 : Next
+ view=1 : rc=GemTrySend(@sourceFrame[0],1514)
+ Save(8,rc)
+Complete() : failRead=#GEM_TSR : rc=GemPollSend()
+ Save(9,rc)
+failRead=-1 : failWrite=1 : rc=GemPollSend()
+ Save(10,rc)
+failWrite=0 : rc=GemPollSend()
+ Save(11,rc)
+view=2 : failWrite=1 : rc=GemTrySend(@sourceFrame[0],64)
+ Save(12,rc)
+failWrite=0 : rc=GemTrySend(@sourceFrame[0],64)
+ Save(13,rc)
+Complete() : rc=GemPollSend()
+ Save(14,rc)
+view=3 : rc=GemTrySend(@sourceFrame[0],60) : Complete()
+ PokeL(gem_region+#GEM_OFF_TXRING+3*16+4,#GEM_TX_USED|#GEM_TX_LAST|60|$10000000) : rc=GemPollSend()
+ Save(15,rc)
+view=4 : rc=GemTrySend(@sourceFrame[0],60) : Complete() : tsr=#GEM_TSR_UND : rc=GemPollSend()
+ Save(16,rc)
+view=5 : stopFail=1 : rc=GemSend(@sourceFrame[0],60,1)
+ Save(17,rc)
+rc=GemSetRegion(gem_region+64,#GEM_REGION_MIN)
+ Save(18,rc)
+rc=GemPollSend()
+ Save(19,rc)
+stopFail=0 : rc=GemStopChecked()
+ Save(20,rc)
+rc=GemSetRegion(gem_region,#GEM_REGION_MIN)
+ Save(21,rc)
+gem_started=1 : ncr=#GEM_NCR_RE|#GEM_NCR_TE : gem_txHead=7 : view=7 : rc=GemTrySend(@sourceFrame[0],60)
+ Save(22,rc)
+Complete() : rc=GemPollSend()
+ Save(23,rc)
+rc=GemTrySend(@sourceFrame[0],1515)
+ Save(24,rc)
+rc=GemTrySend(0,60)
+ Save(25,rc)
+view=0 : rc=GemTrySend(@sourceFrame[0],60) : linkUp=0 : rc=GemStopChecked()
+ Save(26,rc)
+ PokeI($E1C00008,27)
+ MmuDisableCachedFlushed()
+ ProcedureReturn 0
+EndProcedure

@@ -951,3 +951,33 @@ these are observations, not worst-case bounds.
 Remaining work includes SDIO/device waits, other transmit backends, synchronous
 console/storage paths, actual IPv6 web traffic and HTTP/2-3. This removes Wi-Fi
 credit polling from the integrated protocol path, not all networking blocking.
+
+
+## GEM submit/completion ownership (Pi 5 compile 439)
+
+The RP1 GEM Ethernet driver now provides `GemTrySend` and `GemPollSend`.
+Submission copies and pads the packet into driver-owned DMA storage, then returns
+without waiting for wire completion. Only one descriptor is outstanding. Pending
+or ambiguously published work keeps ownership; another request cannot overwrite
+its buffer. Completion reads USED and status once, retires the descriptor once,
+and counts only successful sends. The old `GemSend` API remains a bounded wait.
+
+Replacing the DMA region is refused while started or while an unsuccessful stop
+leaves ownership outstanding. Successful checked stop releases it; start verifies
+that stop before rebuilding the rings. The timeout diagnostic now distinguishes
+requesting a stop from proving it. These are backend prerequisites: the Ethernet
+link adapter still calls the synchronous compatibility API.
+
+All 27 checks passed on the physical Pi 4 CPU using controlled GEM register and
+cache callbacks, including exact owned bytes, padding, maximum frame, caller reuse,
+busy refusal, status failures, ambiguous submission, ring wrap, transmit faults,
+and failed/successful stops. This does not qualify physical RP1 DMA or Ethernet
+wire behavior. Evidence is in `docs/evidence/anvil-tls-jobs-20261029/gem-send430`.
+
+Full Pi 5 build 439 passes after correcting two existing board-composition errors:
+a hard-coded Pi 4 chip identifier and a payload network ABI flag confined to the
+Pi 4 branch. The compiler target now supplies the chip and both branches declare
+the included network ABI. Full Pi 4 build 440 also passes. Neither new monitor
+was installed: the bench remains on verified Pi 4 build 438, healthy after the
+returning test. IPv6 web traffic and HTTP/2-3 remain open, as do the remaining
+synchronous device, console and storage paths.

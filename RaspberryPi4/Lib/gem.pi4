@@ -20,6 +20,8 @@
 ;      GemSetRegion(base, bytes)        >= #GEM_REGION_MIN, 64-byte aligned
 ;      GemStart(linkMs)                 1 up; 0 and GemError() otherwise
 ;      GemSend(@frame[0], n, ms)        1 sent, 0 not
+;      GemTrySend(@frame[0], n)         1 accepted, -1 busy, 0 error
+;      GemPollSend()                   1 idle/done, 0 pending, -1 error
 ;      GemRecv(@into[0], cap)           >0 bytes, 0 nothing now, <0 refused
 ;      GemRecvWait(@into[0], cap, ms)   the same, waiting up to ms
 ;      GemStop() / GemStopChecked()     RE and TE off, read back
@@ -106,7 +108,7 @@
 ;      line, only when all four have been consumed and therefore none of
 ;      them can be written by the GEM (it writes only descriptors it owns).
 ;      The ring keeps 124 of its 128 descriptors armed at all times.
-;    * TX is one frame at a time and waited for (as genet.pi4's is), so
+;    * TX is one frame at a time, with ownership retained until USED, so
 ;      no descriptor the CPU cleans can be one the GEM is still writing.
 ;
 ; ======================================================================
@@ -362,6 +364,7 @@ CompilerEndIf
 #GEM_ERR_RX_LONG     = -18
 #GEM_ERR_RX_FRAG     = -19
 #GEM_ERR_AXI         = -20
+#GEM_ERR_TX_BUSY     = -21
 
 Global gem_err.i
 Global gem_probed.i
@@ -380,6 +383,7 @@ Global gem_phyWasReset.i
 Global gem_speed.i
 Global gem_fullDuplex.i
 Global gem_txHead.i
+Global gem_txPending.i
 Global gem_rxTail.i
 Global gem_txCount.i
 Global gem_rxCount.i
@@ -990,6 +994,10 @@ EndProcedure
 ; The caller's region: 64-byte aligned, at least #GEM_REGION_MIN, and
 ; wholly inside pcie2's inbound window (PcieDmaOk) - memory RP1 can reach.
 Procedure.i GemSetRegion(base.i, bytes.i)
+  If gem_started <> 0 Or gem_txPending <> 0
+    gem_err = #GEM_ERR_TX_BUSY
+    ProcedureReturn 0
+  EndIf
   If base <= 0 Or (base % #GEM_LINE) <> 0 Or bytes < #GEM_REGION_MIN
     gem_err = #GEM_ERR_ARG
     ProcedureReturn 0
@@ -1074,6 +1082,7 @@ Procedure gem_RingsInit()
     i = i + 4
   Wend
   gem_txHead = 0
+  gem_txPending = 0
   gem_rxTail = 0
 EndProcedure
 
@@ -1119,6 +1128,7 @@ Procedure.i GemStopChecked()
   Define v.i
   gem_started = 0
   If PcieLinkUp() = 0
+    gem_txPending = 0
     ProcedureReturn 1
   EndIf
   v = gem_Rd(#GEM_NCR)
@@ -1131,6 +1141,7 @@ Procedure.i GemStopChecked()
   If v < 0 Or (v & (#GEM_NCR_RE | #GEM_NCR_TE)) <> 0
     ProcedureReturn 0
   EndIf
+  gem_txPending = 0
   ProcedureReturn 1
 EndProcedure
 
@@ -1197,8 +1208,9 @@ Procedure.i GemStart(linkMs.i)
   gem_CfgWr(#GEM_CFG_CLKGEN, v | #GEM_CLK_ENABLE)
 
   ; ---- 2: the MAC stopped, the management port on
-  v = gem_Rd(#GEM_NCR)
-  gem_WrSync(#GEM_NCR, v & ~(#GEM_NCR_RE | #GEM_NCR_TE))
+  If GemStopChecked() = 0
+    ProcedureReturn 0
+  EndIf
   gem_Wr(#GEM_NCFGR, (#GEM_MDC_DIV96 << #GEM_NCFGR_CLK_SHIFT) | gem_Dbw())
   gem_Wr(#GEM_USRIO, #GEM_USRIO_RGMII)
   gem_WrSync(#GEM_NCR, #GEM_NCR_MPE)
@@ -1276,37 +1288,68 @@ Procedure.i GemStart(linkMs.i)
 EndProcedure
 
 ; ======================================================================
-;  SEND - one frame, one descriptor, waited for
+;  SEND - one owned frame, separate submission and completion
 ; ======================================================================
-; The frame is COPIED into this driver's own TX buffer (padded to 60
-; bytes), so the caller's buffer may be anywhere and is free the moment
-; this returns. The descriptor after it is (re)marked USED first - the
-; end of the queue - then the frame's descriptor gets its address and,
-; last, its control word with USED clear. Both lines are cleaned, then
-; NCR.TSTART (read back: posted write). The GEM sets USED in the frame's
-; descriptor when it is done; that is what is waited for, the line
-; invalidated before every look.
-;
-; A TIMEOUT STOPS THE MAC. A descriptor the GEM never handed back is a
-; ring whose state nobody knows; the next command's bring-up rebuilds it
-; from nothing, which HwLinkReady and eth_HwUp notice by GemStarted().
-Procedure.i GemSend(*frame, length.i, timeoutMs.i)
-  Define d.i
-  Define nd.i
-  Define nxt.i
-  Define buf.i
-  Define n.i
-  Define i.i
-  Define ctrl.i
-  Define t0.i
-  Define budget.i
-  Define tsr.i
+; A successful submit copies the caller's frame; it may be reused at once.
+; One descriptor stays owned until USED returns or a checked stop succeeds.
+; No polling or descriptor/buffer writes while a prior send is pending.
+; Errors after publication retain ownership: never replay an ambiguous send.
+; Calls are serialized by the link service, not safe for concurrent callers.
+Procedure.i GemPollSend()
+  Define d.i, ctrl.i, tsr.i
+  If gem_txPending = 0
+    ProcedureReturn 1
+  EndIf
+  If gem_started = 0
+    gem_err = #GEM_ERR_NOT_STARTED
+    ProcedureReturn -1
+  EndIf
+  d = gem_region + #GEM_OFF_TXRING + gem_txHead * #GEM_DESC_SIZE
+  gem_CacheRange(d, #GEM_DESC_SIZE)
+  ctrl = PeekN(d + #GEM_DESC_CTRL)
+  If (ctrl & #GEM_TX_USED) = 0
+    ProcedureReturn 0
+  EndIf
+  tsr = gem_Rd(#GEM_TSR)
+  If tsr < 0
+    ProcedureReturn -1
+  EndIf
+  gem_lastTsr = tsr
+  If gem_Wr(#GEM_TSR, tsr) = 0
+    ProcedureReturn -1
+  EndIf
+  gem_txPending = 0
+  gem_txHead = (gem_txHead + 1) % #GEM_TX_DESCS
+  If (ctrl & #GEM_TX_FAULTS) <> 0 Or (tsr & #GEM_TSR_FAULTS) <> 0
+    gem_err = #GEM_ERR_TX_FAULT
+    ProcedureReturn -1
+  EndIf
+  gem_txCount = gem_txCount + 1
+  gem_err = #GEM_ERR_NONE
+  ProcedureReturn 1
+EndProcedure
+
+; 1 accepted, -1 busy, 0 error (GemError). Does not wait for the wire.
+Procedure.i GemTrySend(*frame, length.i)
+  Define d.i, nd.i, nxt.i, buf.i, n.i, i.i, ctrl.i, v.i
   If gem_started = 0
     gem_err = #GEM_ERR_NOT_STARTED
     ProcedureReturn 0
   EndIf
-  If *frame = 0 Or length < 14 Or length > #GEM_FRAME_MAX Or timeoutMs <= 0
+  If *frame = 0 Or length < 14 Or length > #GEM_FRAME_MAX
     gem_err = #GEM_ERR_ARG
+    ProcedureReturn 0
+  EndIf
+  v = GemPollSend()
+  If v < 0
+    ProcedureReturn 0
+  EndIf
+  If v = 0
+    gem_err = #GEM_ERR_TX_BUSY
+    ProcedureReturn -1
+  EndIf
+  v = gem_Rd(#GEM_NCR)
+  If v < 0
     ProcedureReturn 0
   EndIf
   buf = gem_region + #GEM_OFF_TXBUF + gem_txHead * #GEM_BUF_BYTES
@@ -1340,15 +1383,36 @@ Procedure.i GemSend(*frame, length.i, timeoutMs.i)
   gem_CacheRange(d, #GEM_DESC_SIZE)
   gem_CacheRange(nd, #GEM_DESC_SIZE)
 
-  gem_WrSync(#GEM_NCR, gem_Rd(#GEM_NCR) | #GEM_NCR_TSTART)
 
+  ; Mark ownership before TSTART: a failed posted write may have reached RP1.
+  gem_txPending = 1
+  If gem_WrSync(#GEM_NCR, v | #GEM_NCR_TSTART) = 0
+    ProcedureReturn 0
+  EndIf
+  gem_err = #GEM_ERR_NONE
+  ProcedureReturn 1
+EndProcedure
+
+; Compatibility waiting form. Timeout stops the MAC; failed stop keeps the
+; region pinned. Only checked stop/start may release or rebuild that ring.
+Procedure.i GemSend(*frame, length.i, timeoutMs.i)
+  Define t0.i, budget.i, rc.i
+  If timeoutMs <= 0
+    gem_err = #GEM_ERR_ARG
+    ProcedureReturn 0
+  EndIf
+  If GemTrySend(*frame, length) <> 1
+    ProcedureReturn 0
+  EndIf
   t0 = Ticks()
   budget = GemTimeoutTicks(timeoutMs)
   Repeat
-    gem_CacheRange(d, #GEM_DESC_SIZE)
-    ctrl = PeekN(d + #GEM_DESC_CTRL)
-    If (ctrl & #GEM_TX_USED) <> 0
-      Break
+    rc = GemPollSend()
+    If rc = 1
+      ProcedureReturn 1
+    EndIf
+    If rc < 0
+      ProcedureReturn 0
     EndIf
     If (Ticks() - t0) > budget
       GemStopChecked()
@@ -1356,17 +1420,6 @@ Procedure.i GemSend(*frame, length.i, timeoutMs.i)
       ProcedureReturn 0
     EndIf
   ForEver
-
-  tsr = gem_Rd(#GEM_TSR)
-  gem_lastTsr = tsr
-  gem_Wr(#GEM_TSR, tsr)
-  gem_txHead = nxt
-  If (ctrl & #GEM_TX_FAULTS) <> 0 Or (tsr & #GEM_TSR_FAULTS) <> 0
-    gem_err = #GEM_ERR_TX_FAULT
-    ProcedureReturn 0
-  EndIf
-  gem_txCount = gem_txCount + 1
-  ProcedureReturn 1
 EndProcedure
 
 ; ======================================================================
@@ -1558,7 +1611,7 @@ Procedure.i GemErrorText()
     Case #GEM_ERR_NOT_PROBED
       ProcedureReturn "gem error -15: the GEM has not been probed (GemProbe)"
     Case #GEM_ERR_TX_TIMEOUT
-      ProcedureReturn "gem error -16: a transmitted frame's descriptor was never handed back, so the MAC was stopped - check that RP1's 125 MHz Ethernet clock is running"
+      ProcedureReturn "gem error -16: transmit completion timed out; stop was requested and an unconfirmed stop keeps the DMA region pinned - check RP1's 125 MHz Ethernet clock"
     Case #GEM_ERR_TX_FAULT
       ProcedureReturn "gem error -17: the GEM reported the transmission failed (retry limit, bus error or underrun)"
     Case #GEM_ERR_RX_LONG
@@ -1567,6 +1620,8 @@ Procedure.i GemErrorText()
       ProcedureReturn "gem error -19: a received frame was not whole in one receive buffer, and was dropped"
     Case #GEM_ERR_AXI
       ProcedureReturn "gem error -20: RP1 flagged an illegal AXI burst from the Ethernet block (eth_cfg STATUS), which needs a block or system reset - power-cycle the board"
+    Case #GEM_ERR_TX_BUSY
+      ProcedureReturn "gem error -21: a transmit is pending or the DMA region is still in use; poll completion or obtain a checked stop before replacing it"
   EndSelect
   ProcedureReturn "gem: an error code this driver does not know"
 EndProcedure

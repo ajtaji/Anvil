@@ -1185,7 +1185,7 @@ StackAddress $8000000
 ;      #ANVIL_BUILD = 1        ; pmf:build off
 ;  The IDE's Compiler > Build Number... window writes that word for you.
 ; ======================================================================
-#ANVIL_BUILD = 438        ; pmf:build
+#ANVIL_BUILD = 440        ; pmf:build
 
 ;  The two optional siblings, written by the same successful build. They
 ;  are INTEGERS because `#NAME = <literal>` takes a number and nothing
@@ -1194,14 +1194,14 @@ StackAddress $8000000
 ;  for. YYYYMMDD and HHMMSS read correctly as decimal numbers anyway, and
 ;  CmdVersion() prints them with their separators put back.
 #ANVIL_BUILD_DATE = 20261029   ; pmf:builddate
-#ANVIL_BUILD_TIME = 210247     ; pmf:buildtime
+#ANVIL_BUILD_TIME = 212132     ; pmf:buildtime
 
 ; ======================================================================
 ;  THE LIBRARIES. A library never includes a library - the main file
 ;  lists what it needs, and the order matters where one calls another.
 ;  clocks.pi4 calls mailbox.pi4, so mailbox comes first.
 ; ======================================================================
-#PMF_CHIP = 2711
+; #PMF_CHIP comes from the compiler target, including -t pi5.
 XIncludeFile "RaspberryPi4/Lib/uart.pi4"
 XIncludeFile "RaspberryPi4/Lib/timer.pi4"
 ; ----------------------------------------------------------------------
@@ -1686,6 +1686,11 @@ XIncludeFile "RaspberryPi4/Lib/core_accept.pi4"
 ;  2712 in their own register accessors, so no BCM2711 address is in a
 ;  -t pi5 image. Flip a line to 1 when its driver lands, as #CAP_I2C was.
 ; ======================================================================
+#ANVIL_PAYLOAD_NET = 1  ; the payload ABI's net group (base 72) is built:
+                    ; Anvil/Core/payload_net.pbi over Lib/tcp, included
+                    ; after abi.pbi below. Not a #CAP_: #CAP_NET says the
+                    ; board has an interface, and a board can have one
+                    ; (the Pi 3) without the TCP stack this group rides on.
 CompilerIf #PMF_CHIP = 2712
   #CAP_STORAGE  = 1   ; the micro-SD card on the BCM2712 SDHCI, through the
                     ; one SDHCI driver Lib/emmc.pi4 (2712 branch), FAT32/exFAT
@@ -1719,11 +1724,6 @@ CompilerElse
                     ; load / save / mount work today.
 #CAP_NET      = 1   ; an IP-capable interface. Gigabit Ethernet via
                     ; Lib/genet under Lib/net + Lib/tftp - get / put / net.
-#ANVIL_PAYLOAD_NET = 1  ; the payload ABI's net group (base 72) is built:
-                    ; Anvil/Core/payload_net.pbi over Lib/tcp, included
-                    ; after abi.pbi below. Not a #CAP_: #CAP_NET says the
-                    ; board has an interface, and a board can have one
-                    ; (the Pi 3) without the TCP stack this group rides on.
 #CAP_GPIO     = 1   ; general-purpose I/O. Lib/gpio over the HwGpio* seam
                     ; (RaspberryPi4/Board/hw_gpio.pi4) - the `gpio` command.
 #CAP_I2C      = 1   ; the header I2C bus (BSC1 on GPIO 2/3), driven by
