@@ -14,6 +14,7 @@
 #WEB_RESPONSE_CHUNK_LF=7
 #WEB_RESPONSE_TRAILERS=8
 #WEB_RESPONSE_DONE=9
+#WEB_RESPONSE_STREAM=10
 #WEB_RESPONSE_ARGUMENT=-520
 #WEB_RESPONSE_SYNTAX=-521
 #WEB_RESPONSE_FRAMING=-522
@@ -27,6 +28,7 @@ Structure WebResponse
   state.i
   error.i
   status.i
+  versionMajor.i
   versionMinor.i
   headOnly.i
   allowUpgrade.i
@@ -150,6 +152,7 @@ Procedure.i WebResponseInit(*s.WebResponse,line.i,lineCapacity.i,headers.i,heade
   EndIf
   *s\line=line : *s\lineCapacity=lineCapacity
   *s\headers=headers : *s\headerCapacity=headerCapacity : *s\headOnly=headOnly
+  *s\versionMajor=1
   ProcedureReturn 0
 EndProcedure
 
@@ -399,6 +402,7 @@ Procedure.i WebResponseFeed(*s.WebResponse,source.i,bytes.i,destination.i,capaci
   If *s=0 : ProcedureReturn #WEB_RESPONSE_ARGUMENT : EndIf
   *s\written=0 : *s\consumed=0
   If *s\error<0 : ProcedureReturn *s\error : EndIf
+  If *s\versionMajor<>1 : ProcedureReturn wrFail(*s,#WEB_RESPONSE_ARGUMENT) : EndIf
   If bytes<0 Or capacity<0 Or (bytes>0 And source=0) Or (capacity>0 And destination=0)
     ProcedureReturn wrFail(*s,#WEB_RESPONSE_ARGUMENT)
   EndIf

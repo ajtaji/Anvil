@@ -1,0 +1,151 @@
+"""Compile live HTTPS qualification for automatic protocol dispatch and reuse."""
+from pathlib import Path
+import argparse,hashlib,json,os,re,subprocess
+from pmf_compiler import resolve_compiler
+
+def build(compiler,out,reference):
+ root=Path(__file__).resolve().parents[1];out.mkdir(parents=True,exist_ok=False)
+ rows=json.loads(Path(reference).read_text())
+ names=['RaspberryPi4/Lib/mmu.pi4', 'Anvil/Network/web_url.pbi', 'Anvil/Network/web_transport.pbi', 'Anvil/Network/h2_frame.pbi', 'Anvil/Network/hpack_decode.pbi', 'Anvil/Network/hpack_tables.pbi', 'Anvil/Network/h2_client.pbi', 'Anvil/Network/h2_request.pbi', 'Anvil/Network/web_request.pbi', 'Anvil/Network/web_response.pbi', 'Anvil/Network/web_client.pbi', 'Anvil/Network/tcp_dial.pbi', 'Anvil/Network/ipv6_address.pbi']
+ s=r'''#WEB_KERNEL_BINDING=0
+XIncludeFile "RaspberryPi4/Lib/mmu.pi4"
+XIncludeFile "Anvil/Network/web_url.pbi"
+XIncludeFile "Anvil/Network/web_transport.pbi"
+XIncludeFile "Anvil/Network/h2_frame.pbi"
+XIncludeFile "Anvil/Network/hpack_decode.pbi"
+XIncludeFile "Anvil/Network/hpack_tables.pbi"
+XIncludeFile "Anvil/Network/h2_client.pbi"
+XIncludeFile "Anvil/Network/h2_request.pbi"
+XIncludeFile "Anvil/Network/web_request.pbi"
+XIncludeFile "Anvil/Network/web_response.pbi"
+XIncludeFile "Anvil/Network/web_client.pbi"
+XIncludeFile "Anvil/Network/tcp_dial.pbi"
+XIncludeFile "Anvil/Network/ipv6_address.pbi"
+Global services.i
+Global *pet,*clock,*savedOpen,*savedClose
+Global opens.i,closes.i
+Global c.H2Client
+Global client.WebClient
+Global buffers.H2Buffers
+Global url.WebUrl
+Global request.WebRequest,request2.WebRequest
+Global response.WebResponse,response2.WebResponse
+Global Dim tx.a[16384]
+Global Dim rx.a[16384]
+Global Dim block.a[65536]
+Global Dim dynamic.a[4096]
+Global Dim field.a[8192]
+Global Dim streams.a[2048]
+Global Dim headers.a[2048]
+Global Dim headers2.a[2048]
+Global Dim metadata.a[32768]
+Global Dim metadata2.a[32768]
+Global Dim line.a[8192]
+Global Dim line2.a[8192]
+Global Dim upload.a[70000]
+Procedure CaptureTable()
+ ASM
+ adrp x1, global_services
+ add x1, x1, #:lo12:global_services
+ str x0, [x1]
+ EndASM
+EndProcedure
+Procedure.i CountOpen(host.i,port.i,protocols.i,bytes.i)
+ opens=opens+1 : ProcedureReturn savedOpen(host,port,protocols,bytes)
+EndProcedure
+Procedure.i CountClose(handle.i)
+ closes=closes+1 : ProcedureReturn savedClose(handle)
+EndProcedure
+Procedure.i Probe(index.i)
+ Define rc.i,i.i,started.i,now.i,before.i,cost.i,maxStep.i,maxService.i,position.i,received.i,goal.i,method.i,methodBytes.i,p.i,destination.i,*q.WebRequest,*a.WebResponse
+ p=$E1C00100+index*128 : destination=$E1C01000+index*200000
+ buffers\tx=@tx[0] : buffers\rx=@rx[0] : buffers\block=@block[0] : buffers\dynamic=@dynamic[0] : buffers\field=@field[0] : buffers\streams=@streams[0] : buffers\streamCount=4
+ url\secure=1 : url\port=443 : url\host="httpbin.org" : url\hostLength=11 : url\target="/post" : url\targetLength=5
+ If index=1 : url\target="/uuid" : url\targetLength=5 : EndIf
+ If index=2 : url\host="www.openbsd.org" : url\hostLength=15 : url\target="/" : url\targetLength=1 : EndIf
+ If index=3 : url\host="www.sqlite.org" : url\hostLength=14 : url\target="/" : url\targetLength=1 : EndIf
+ method="GET" : methodBytes=3 : goal=0
+ If index=0 : method="POST" : methodBytes=4 : goal=70000 : EndIf
+ *q=@request : *a=@response
+ If index=1 : *q=@request2 : *a=@response2 : EndIf
+ If index=1
+  rc=WebRequestInit(*q,@url,method,methodBytes,goal,1,@headers2[0],2048)
+ Else
+  rc=WebRequestInit(*q,@url,method,methodBytes,goal,1,@headers[0],2048)
+ EndIf
+ If rc<>0 : ProcedureReturn rc : EndIf
+ If index=0
+  For i=0 To 69999 : upload[i]=97 : Next
+  rc=WebRequestHeader(*q,"Content-Type",12,"text/plain",10) : If rc<>0 : ProcedureReturn rc : EndIf
+  rc=WebRequestHeader(*q,"X-Anvil-Probe",13,"automatic client",16) : If rc<>0 : ProcedureReturn rc : EndIf
+ EndIf
+ rc=WebRequestFinishHeaders(*q) : If rc<>0 : ProcedureReturn rc : EndIf
+ If index=1
+  rc=WebResponseInit(*a,@line2[0],8192,@metadata2[0],32768,0)
+ Else
+  rc=WebResponseInit(*a,@line[0],8192,@metadata[0],32768,0)
+ EndIf
+ If rc<>0 : ProcedureReturn rc : EndIf
+ started=clock()
+ If index=1
+  rc=WebClientNext(@client,*q,*a,started,45000000)
+ Else
+  opens=0 : closes=0
+  rc=WebClientStartAuto(@client,@url,*q,*a,@tx[0],16384,@rx[0],16384,@c,@buffers,started,45000000)
+ EndIf
+ If rc<>0 : ProcedureReturn rc : EndIf
+ While clock()-started<45000000
+  pet() : before=clock() : WebPayloadService(1) : cost=clock()-before
+  If cost>maxService : maxService=cost : EndIf
+  now=clock() : rc=WebClientStep(@client,@upload[0]+position,goal-position,1,destination+received,257,now) : cost=clock()-now
+  If cost>maxStep : maxStep=cost : EndIf
+  position=position+client\consumed : received=received+client\written
+  If rc<0 : ProcedureReturn rc : EndIf
+  If position>goal Or received>196351 : ProcedureReturn -9701 : EndIf
+  If rc=1 : Break : EndIf
+ Wend
+ If rc<>1 : ProcedureReturn -9702 : EndIf
+ PokeI(p+8,*a\status) : PokeI(p+16,client\protocol) : PokeI(p+24,*a\versionMajor)
+ PokeI(p+32,position) : PokeI(p+40,received) : PokeI(p+64,clock()-started)
+ PokeI(p+72,maxStep) : PokeI(p+80,maxService) : PokeI(p+88,client\h2Stream)
+ PokeI(p+96,c\connection\handle) : PokeI(p+104,client\sent) : PokeI(p+112,client\received)
+ If index<>0 : WebClientClose(@client) : EndIf
+ PokeI(p+48,opens) : PokeI(p+56,closes)
+ If opens<>1 : ProcedureReturn -9703 : EndIf
+ If index=0
+  If closes<>0 : ProcedureReturn -9704 : EndIf
+ Else
+  If closes<>1 : ProcedureReturn -9705 : EndIf
+ EndIf
+ ProcedureReturn 0
+EndProcedure
+Procedure.i Main()
+ CaptureTable()
+ Define i.i,index.i,rc.i
+ rc=WebPayloadBind(services) : If rc<>0 : ProcedureReturn 71 : EndIf
+ pet=PeekI(services+16+6*8) : clock=PeekI(services+16+11*8)
+ savedOpen=PeekI(services+16+90*8) : savedClose=PeekI(services+16+83*8)
+ webpTlsOpenAlpn=@CountOpen : webpTlsClose=@CountClose
+ MmuClearNc() : MmuAddNc($08A00000,$09200000) : MmuAddNc($08100000,$08180000)
+ rc=MmuBuildTables($4F80000) : If rc<>0 : ProcedureReturn 72 : EndIf
+ MmuEnableCached()
+ For i=0 To 1048575 : PokeA($E1C00000+i,0) : Next
+ PokeI($E1C00000,$4832414C) : PokeI($E1C00008,4)
+ For index=0 To 3
+  rc=Probe(index) : PokeI($E1C00100+index*128,rc)
+  If rc<>0 Or index<>0 : WebClientClose(@client) : EndIf
+ Next
+ MmuDisableCachedFlushed()
+ ProcedureReturn 0
+EndProcedure
+'''
+ source=out/'proof.pi4';source.write_text(s,encoding='utf8')
+ q=subprocess.run([str(resolve_compiler(compiler)),'--compile',str(source),'-t','pi4','--load-addr','0x1000000','--stack-addr','0x4f00000','--entry-returns','--wants-services','-o',str(out/'proof.img')],env=dict(os.environ,PMF_ROOT=str(root)),capture_output=True,text=True,encoding='utf8',timeout=180,creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
+ log=q.stdout+q.stderr;(out/'compile.txt').write_text(log,encoding='utf8');print(log[-2200:]);assert q.returncode==0
+ code=re.search(r'occupying \$([0-9A-Fa-f]+)\.\.\$([0-9A-Fa-f]+)',log);bss=re.search(r'bss \$([0-9A-Fa-f]+)\.\.\$([0-9A-Fa-f]+)',log)
+ payload=(out/'proof.img.pmf').read_bytes();ranges={'code':['0x'+x for x in code.groups()],'bss':['0x'+x for x in bss.groups()],'stack':['0x4e00000','0x4efffff'],'report':['0xe1c00000','0xe1cfffff'],'tables':['0x4f80000','0x4f82fff']}
+ (out/'identity.json').write_text(json.dumps(dict(bytes=len(payload),sha256=hashlib.sha256(payload).hexdigest(),checked_ranges=ranges,source_hashes={n:hashlib.sha256((root/n).read_bytes()).hexdigest() for n in names},cases=rows),indent=2),encoding='utf8')
+if __name__=='__main__':
+    ap=argparse.ArgumentParser(description=__doc__);ap.add_argument('--compiler',required=True);ap.add_argument('--out',type=Path,required=True)
+    ap.add_argument('--reference',type=Path,required=True)
+    a=ap.parse_args();build(a.compiler,a.out.resolve(),a.reference)

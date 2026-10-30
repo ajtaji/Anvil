@@ -49,6 +49,8 @@ Structure H2Buffers
 EndStructure
 Structure H2Client
  allowHttp1.i
+ sent.i
+ received.i
  connection.WebConnection
  buffers.H2Buffers
  frame.H2FrameHeader
@@ -624,6 +626,7 @@ Procedure.i H2ClientStep(*c.H2Client,now.i)
   If rc<0 And rc<>-110 : ProcedureReturn h2cFail(*c,rc) : EndIf
   If rc>0
    If rc>*c\txLength-*c\txOffset : ProcedureReturn h2cFail(*c,#H2_PROTOCOL) : EndIf
+   *c\sent=*c\sent+rc
    *c\txOffset=*c\txOffset+rc
    If *c\txOffset=*c\txLength : *c\txOffset=0 : *c\txLength=0 : EndIf
   EndIf
@@ -641,6 +644,7 @@ Procedure.i H2ClientStep(*c.H2Client,now.i)
    If st=2 : ProcedureReturn h2cFail(*c,#H2_CLOSED) : EndIf
    ProcedureReturn 0
   EndIf
+  *c\received=*c\received+rc
   rc=H2FrameFeed(@*c\frame,*c\buffers\rx,rc) : If rc<0 : ProcedureReturn h2cFail(*c,rc) : EndIf
   If *c\frame\used=9 And *c\frame\length=0 : ProcedureReturn h2cFrame(*c) : EndIf
   ProcedureReturn 0
@@ -654,6 +658,7 @@ Procedure.i H2ClientStep(*c.H2Client,now.i)
   ProcedureReturn 0
  EndIf
  *c\payloadUsed=*c\payloadUsed+rc
+ *c\received=*c\received+rc
  If *c\payloadUsed=*c\frame\length : ProcedureReturn h2cFrame(*c) : EndIf
  ProcedureReturn 0
 EndProcedure

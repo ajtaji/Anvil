@@ -7,6 +7,7 @@ def build(compiler,out,cancel_handshakes=False,cancel_preparation=False,profile_
     root=Path(__file__).resolve().parents[1];out.mkdir(parents=True,exist_ok=False)
     cases=['gzip','deflate']
     names=['Anvil/Core/crc_constants.pbi', 'Anvil/Core/crc.pbi', 'Anvil/Network/web_url.pbi', 'Anvil/Network/web_request.pbi', 'Anvil/Network/web_response.pbi', 'Anvil/Network/web_transport.pbi', 'Anvil/Network/web_client.pbi', 'Anvil/Network/web_inflate.pbi', 'Anvil/Network/web_content.pbi', 'Anvil/Network/web_content_response.pbi', 'RaspberryPi4/Lib/mmu.pi4']
+    names += ['Anvil/Network/h2_frame.pbi','Anvil/Network/hpack_decode.pbi','Anvil/Network/hpack_tables.pbi','Anvil/Network/h2_request.pbi','Anvil/Network/h2_client.pbi']
     s='#WEB_KERNEL_BINDING=0\n'+'\n'.join('XIncludeFile "'+n+'"' for n in names)+r'''
 Global u.WebUrl,q.WebRequest,a.WebResponse,client.WebClient,content.WebContent
 Global Dim host.a[256]

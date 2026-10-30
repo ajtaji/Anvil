@@ -2708,8 +2708,8 @@ lowercase field names, prohibited connection fields, pseudo-header order and
 uniqueness, status, field-value controls, content length, informational responses
 and trailers. `H2ClientCancel` cancels the entire connection, and `H2ClientClose`
 releases transport ownership. It does not yet provide per-stream deadlines,
-graceful local GOAWAY/error transmission, or automatic
-WebClient protocol dispatch. Per-stream cancellation and minimal processing of
+graceful local GOAWAY/error transmission. Opt-in automatic WebClient protocol
+dispatch is described below. Per-stream cancellation and minimal processing of
 late closed-stream frames are described below.
 Errors currently close the connection, including stream-local failures. The
 existing HTTP/1 WebClient remains the default; HTTP/2 is explicit opt-in.
@@ -2780,7 +2780,7 @@ was off and the temporary DNS override was removed. Shared Pi 3 compilation also
 passed, without a Pi 3 hardware claim. Evidence:
 `docs/evidence/anvil-ipv6-20261030/http2-cancel483`.
 
-WebClient dispatch, per-stream deadlines and graceful local connection
+Per-stream deadlines and graceful local connection
 shutdown remain unfinished, alongside the broader TLS, IPv6 and HTTP/3 work.
 
 
@@ -2824,8 +2824,8 @@ closed with RST_STREAM(NO_ERROR); the complete response is preserved.
 HEAD responses may describe a representation Content-Length without delivering
 that many body bytes. Nonempty response DATA for HEAD is rejected. Other stream
 events, cancellation, release and connection ownership retain their contracts.
-Automatic integration with WebClient is still pending; the HTTP/1 default has
-not been changed and HTTP/2 remains explicitly selected.
+WebClientStartAuto, described below, integrates this engine with WebClient.
+The original HTTP/1 default remains unchanged.
 
 On physical Anvil 483, all 46 existing engine regression cases and eight new
 upload cases passed. The new cases cover connection-credit exhaustion during a
@@ -2846,7 +2846,7 @@ watchdog was off, and the temporary DNS override was removed. The shared source
 also compiled for Pi 3, without claiming a physical Pi 3 run. No firmware update
 was required. Evidence: `docs/evidence/anvil-ipv6-20261030/http2-upload483`.
 
-Remaining work includes WebClient ALPN dispatch, per-stream deadlines, graceful
+Remaining work includes per-stream deadlines, graceful
 local connection shutdown and stream-local error isolation, as well as the
 broader remaining TLS, off-link IPv6/RDNSS qualification and HTTP/3 work.
 
@@ -2905,7 +2905,79 @@ connection used TLS 1.2, which this TLS 1.3 implementation does not support. Nei
 failed attempt is counted as fallback qualification or certificate validation.
 Evidence: `docs/evidence/anvil-ipv6-20261030/http-negotiation483`.
 
-These APIs supply negotiation and a tested ownership handoff. They do not yet
-provide a unified WebClient entry that maps HTTP/2 response events and bodies
-into WebResponse. That integration, HTTP/2 lifecycle work, remaining TLS work,
+These APIs supply negotiation and a tested ownership handoff used by the
+unified WebClient entry below. HTTP/2 lifecycle work, remaining TLS work,
 off-link IPv6/RDNSS qualification and HTTP/3 remain open.
+
+### Automatic WebClient protocol dispatch
+
+`WebClientStartAuto(client, url, request, response, tx, txCapacity, rx,
+rxCapacity, h2Context, h2Buffers, now, timeout)` explicitly opts into HTTPS ALPN
+negotiation through the existing WebClient Step/Next/Cancel/Close API. The original
+WebClientStart remains HTTP/1. Plain HTTP, an allowUpgrade response, or an older
+payload service table without ALPN uses HTTP/1 directly. HTTPS offers h2 then
+http/1.1. Explicit HTTP/1 selection or absent ALPN moves the same verified TLS
+connection into the HTTP/1 path without another open or handshake; unknown
+selections fail closed. The exchange deadline includes negotiation and fallback.
+
+Use fresh or closed contexts and finalized WebRequest/initialized WebResponse
+objects. All contexts, URL host and buffers must remain live and disjoint until
+Close. The caller supplies the H2Client and H2Buffers storage, including their
+existing bounded frame, header-block, HPACK and stream storage. WebClient owns
+that H2 context exclusively: do not independently pump it, submit another stream,
+or share it with another WebClient. This interface supports sequential reuse;
+advanced multiplexing still uses H2Client directly. HTTP/1 tx/rx storage remains
+required for fallback. Context layouts changed; recompile callers together.
+
+`client.protocol` is 0 during negotiation, 1 for HTTP/1 and 2 for HTTP/2.
+`response.versionMajor` is initialized to 1 and becomes 2 for HTTP/2. HTTP/2
+response events populate WebResponse directly, without fabricated HTTP/1 framing.
+Status and duplicate final fields use the existing header lookup API. Informational
+fields count against metadata limits but do not appear in final header lookup;
+trailers follow the stored final-header terminator and cannot override them.
+The eight-informational-response, line, header-storage and total-metadata limits
+are enforced. `WEB_RESPONSE_STREAM` identifies an ongoing HTTP/2 response body.
+WebResponseFeed remains an HTTP/1 framing parser and refuses versionMajor 2.
+
+Keep pumping the network separately and call WebClientStep with the usual body,
+output and time arguments. `client.consumed` is the upload byte count accepted
+by that call; retain/retry the remainder, repeating endBody for the final span.
+`client.written` is the response output count. Partial or zero-capacity output
+preserves pending DATA until consumed. Fixed and unknown-length uploads use H2
+flow control. HEAD representation lengths do not require body bytes. An early
+final response stops further upload submission; completion waits for any queued
+request-side reset/control bytes to drain. The existing Step return convention
+is unchanged: pending 0, completed 1, negative error.
+
+`WebClientNext` reuses the same origin, transport and HPACK state after a reusable
+response, and renews the exchange deadline. Keep the previous response available
+until Next returns; supply a fresh request and initialized next response. GOAWAY
+prevents reuse. `client.sent/received` count actual protocol bytes for the exchange;
+the first H2 exchange includes connection preface/control traffic. Peer reset
+returns WEB_CLIENT_STREAM_RESET (-555), with its code in `client.h2ResetCode`.
+Cancel, errors and Close release the owned connection; repeated Close is safe.
+Automatic redirects, managed cookies and content decoding are separate facilities.
+
+Physical Anvil 483 qualification passed 24 new automatic-client cases, the 46-case
+H2 regression, and existing HTTP/1 gzip/deflate/preparation-cancel checks. New cases
+cover metadata, tiny output buffers, upload windows, unknown binary lengths, HEAD,
+early rejection, limits, reset/GOAWAY, cancellation/deadlines, sequential reuse,
+explicit/absent ALPN fallback, legacy services, upgrades and plaintext. Independent
+host HPACK decoding checks exact outgoing fields and bodies.
+
+Actual verified HTTPS uploaded 70000 bytes to httpbin.org/post and checked the
+70316-byte echo and custom header. A second /uuid request reused the same H2/TLS
+connection. Observed elapsed times were 2299609 and 83729 microseconds; maximum
+Step calls 2626 and 92 microseconds. OpenBSD and SQLite then passed HTTP/1 fallback
+through the same API, with exact independent body hashes (3622 and 9008 bytes),
+one TLS open/close each, and maximum Step calls 4282 and 2438 microseconds.
+These are observations, not worst-case guarantees. Shared Pi 3 compilation passed;
+only Pi 4 was physically tested. Captures 163-166 returned zero with cores, fonts
+and Vulkan healthy, watchdog off and temporary DNS overrides removed. Monitor 483
+was unchanged. Evidence: `docs/evidence/anvil-ipv6-20261030/webclient-auto483`.
+
+This is not a complete HTTP/2 implementation. The engine still prioritizes pending
+transmission, which can delay incoming response/control processing during a stalled
+upload. Duplex progress, per-stream deadlines, graceful local GOAWAY and stream-local
+error isolation remain work, alongside remaining TLS compatibility/blocking work,
+off-link IPv6/RDNSS qualification and HTTP/3.
