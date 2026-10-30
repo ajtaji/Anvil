@@ -2219,3 +2219,35 @@ Evidence: docs/evidence/anvil-ipv6-20261030/tls-transcript475.
 
 Remaining atomic TLS and device work, IPv6 off-link/PMTU/DNS transport,
 HTTP/2-3 and managed cookies remain open.
+
+
+### Cooperative key-share setup (installed 476)
+
+The shared TLS key-share path now checks its cooperative budget between complete
+DRBG requests and before deriving the public key. Each DRBG request remains
+atomic; no mutable HMAC state is suspended. The requests, entropy refusal,
+private-key generation and eight-attempt derivation limit are unchanged.
+The optional Tls13SetupPauseHook is installed only while the worker runs, and
+cleared when it yields or is cancelled. Endpoint 10 identifies these checkpoints.
+A refused checkpoint terminates the handshake with the existing refusal 26.
+
+Physical capture 104 passed 25 control-flow tests: all 18 cancellation boundaries
+of the bounded retry path, each entropy request failing, retry exhaustion,
+successful setup, synchronous fallback and an already-failed connection.
+These tests use deterministic RNG/key-derivation doubles and make no cryptographic
+correctness claim. Real DRBG/X25519 are exercised by the live HTTPS tests.
+
+On the same cancellation and certificate-verified HTTPS workload, observed maximum
+whole service changed from 1993 us on 475 to 2237 us
+on 476; the longest unchecked interval changed from
+1579 us to 1518 us.
+Final interval endpoints: [9, 7].
+These are observed maxima, not hard timing guarantees.
+
+Four overlapping verified HTTPS connections also passed, including three complete
+replies and an event stream. Core/font/Vulkan/watchdog checks passed. Pi 3 build 90
+compiles the shared changes; only Pi 4 build 476 is physically validated.
+Evidence: docs/evidence/anvil-ipv6-20261030/tls-setup476.
+
+The 1 ms slice remains a soft scheduling policy. Remaining atomic device/TLS work,
+IPv6 off-link/PMTU/DNS transport, HTTP/2-3 and managed cookies remain open.

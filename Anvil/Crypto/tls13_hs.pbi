@@ -863,23 +863,38 @@ EndProcedure
 ;  short draw refuses with #TLS13_REFUSE_KEYGEN_FAILED and clears the
 ;  share, so Tls13BuildClientHello cannot send it either.
 ; ----------------------------------------------------------------------
+; Setup checkpoints occur between complete DRBG requests, never inside
+; its mutable HMAC state. Other consumers may draw randomness while paused.
+Global *Tls13SetupPauseHook
+Procedure.i Tls13SetupCheckpoint()
+  If Tls13State=#TLS13_ST_FAILED : ProcedureReturn 0 : EndIf
+  If Tls13SetupPauseHook<>0
+    If Tls13SetupPauseHook()=0 : ProcedureReturn TlsFail(#TLS13_REFUSE_COOPERATIVE_STOP,#TLS_ALERT_INTERNAL_ERROR) : EndIf
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
 Procedure.i Tls13NewKeyShare()
   Protected tries.i
   TlsKeyShareLen = 0
   TlsSessionIdLen = 0
+  If Tls13SetupCheckpoint()=0 : ProcedureReturn 0 : EndIf
   If DrbgGenerate(@TlsClientRandom[0], 32) <> 32
     ProcedureReturn TlsFail(#TLS13_REFUSE_KEYGEN_FAILED, #TLS_ALERT_INTERNAL_ERROR)
   EndIf
+  If Tls13SetupCheckpoint()=0 : ProcedureReturn 0 : EndIf
   If DrbgGenerate(@TlsSessionId[0], 32) <> 32
     ProcedureReturn TlsFail(#TLS13_REFUSE_KEYGEN_FAILED, #TLS_ALERT_INTERNAL_ERROR)
   EndIf
   TlsSessionIdLen = 32
   tries = 0
   While tries < 8
+    If Tls13SetupCheckpoint()=0 : ProcedureReturn 0 : EndIf
     If DrbgGenerate(@secTlsPriv[0], 32) <> 32
       TlsKeyShareLen = 0
       ProcedureReturn TlsFail(#TLS13_REFUSE_KEYGEN_FAILED, #TLS_ALERT_INTERNAL_ERROR)
     EndIf
+    If Tls13SetupCheckpoint()=0 : ProcedureReturn 0 : EndIf
     If Tls13DeriveKeySharePublic() <> 0
       ProcedureReturn 1
     EndIf

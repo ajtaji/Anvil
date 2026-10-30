@@ -1,0 +1,131 @@
+XIncludeFile "RaspberryPi4/Lib/mmu.pi4"
+#TLS13_OK                                = 0
+#TLS13_ST_FAILED        = 10   ; terminal; Tls13Err names why
+#TLS13_REFUSE_COOPERATIVE_STOP           = 26
+#TLS13_REFUSE_KEYGEN_FAILED              = 7
+
+#TLS_ALERT_INTERNAL_ERROR=80
+Global Tls13State.i,Tls13Err.i,Tls13Alert.i,TlsKeyShareLen.i,TlsSessionIdLen.i
+Global Dim TlsClientRandom.a[32]
+Global Dim TlsSessionId.a[32]
+Global Dim secTlsPriv.a[32]
+Global *Tls13SetupPauseHook
+Global table.i
+Global *pet
+Global stopAt.i,failAt.i,retryMode.i,draws.i,derives.i,checks.i
+Procedure CaptureTable()
+ ASM
+ adrp x1, global_table
+ add x1, x1, #:lo12:global_table
+ str x0, [x1]
+ EndASM
+EndProcedure
+Procedure.i DrbgGenerate(dst.i,n.i)
+ Define i.i
+ draws=draws+1
+ If draws=failAt : ProcedureReturn 0 : EndIf
+ For i=0 To n-1 : PokeA(dst+i,draws) : Next
+ ProcedureReturn n
+EndProcedure
+Procedure.i Tls13DeriveKeySharePublic()
+ derives=derives+1
+ If retryMode=1 : ProcedureReturn 0 : EndIf
+ TlsKeyShareLen=32 : ProcedureReturn 1
+EndProcedure
+Procedure.i PauseSetup()
+ checks=checks+1 : pet()
+ If checks=stopAt : ProcedureReturn 0 : EndIf
+ ProcedureReturn 1
+EndProcedure
+Procedure.i TlsFail(err.i, alert.i)
+  If Tls13Err = #TLS13_OK
+    Tls13Err = err
+    Tls13Alert = alert
+  EndIf
+  Tls13State = #TLS13_ST_FAILED
+  ProcedureReturn 0
+EndProcedure
+Procedure.i Tls13SetupCheckpoint()
+  If Tls13State=#TLS13_ST_FAILED : ProcedureReturn 0 : EndIf
+  If Tls13SetupPauseHook<>0
+    If Tls13SetupPauseHook()=0 : ProcedureReturn TlsFail(#TLS13_REFUSE_COOPERATIVE_STOP,#TLS_ALERT_INTERNAL_ERROR) : EndIf
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+Procedure.i Tls13NewKeyShare()
+  Protected tries.i
+  TlsKeyShareLen = 0
+  TlsSessionIdLen = 0
+  If Tls13SetupCheckpoint()=0 : ProcedureReturn 0 : EndIf
+  If DrbgGenerate(@TlsClientRandom[0], 32) <> 32
+    ProcedureReturn TlsFail(#TLS13_REFUSE_KEYGEN_FAILED, #TLS_ALERT_INTERNAL_ERROR)
+  EndIf
+  If Tls13SetupCheckpoint()=0 : ProcedureReturn 0 : EndIf
+  If DrbgGenerate(@TlsSessionId[0], 32) <> 32
+    ProcedureReturn TlsFail(#TLS13_REFUSE_KEYGEN_FAILED, #TLS_ALERT_INTERNAL_ERROR)
+  EndIf
+  TlsSessionIdLen = 32
+  tries = 0
+  While tries < 8
+    If Tls13SetupCheckpoint()=0 : ProcedureReturn 0 : EndIf
+    If DrbgGenerate(@secTlsPriv[0], 32) <> 32
+      TlsKeyShareLen = 0
+      ProcedureReturn TlsFail(#TLS13_REFUSE_KEYGEN_FAILED, #TLS_ALERT_INTERNAL_ERROR)
+    EndIf
+    If Tls13SetupCheckpoint()=0 : ProcedureReturn 0 : EndIf
+    If Tls13DeriveKeySharePublic() <> 0
+      ProcedureReturn 1
+    EndIf
+    tries = tries + 1
+  Wend
+  TlsKeyShareLen = 0
+  ProcedureReturn TlsFail(#TLS13_REFUSE_KEYGEN_FAILED, #TLS_ALERT_INTERNAL_ERROR)
+EndProcedure
+
+Procedure Run(index.i,stop.i,fail.i,retry.i,hook.i)
+ Define p.i,rc.i
+ stopAt=stop : failAt=fail : retryMode=retry : checks=0 : draws=0 : derives=0
+ Tls13Err=0 : Tls13Alert=0 : Tls13State=0 : TlsKeyShareLen=0 : TlsSessionIdLen=0
+ If retry=2 : Tls13State=#TLS13_ST_FAILED : Tls13Err=99 : EndIf
+ Tls13SetupPauseHook=0 : If hook<>0 : Tls13SetupPauseHook=@PauseSetup : EndIf
+ rc=Tls13NewKeyShare() : p=$E1C00100+index*128
+ PokeI(p,rc) : PokeI(p+8,Tls13Err) : PokeI(p+16,Tls13State)
+ PokeI(p+24,draws) : PokeI(p+32,derives) : PokeI(p+40,checks)
+ PokeI(p+48,TlsKeyShareLen) : PokeI(p+56,TlsSessionIdLen)
+EndProcedure
+Procedure.i Main()
+ Define i.i,rc.i
+ CaptureTable() : pet=PeekI(table+16+6*8)
+ For i=0 To 16383 : PokeA($E1C00000+i,0) : Next
+ PokeI($E1C00000,$54534B31)
+ MmuClearNc() : MmuAddNc($08A00000,$09200000) : MmuAddNc($08100000,$08180000)
+ rc=MmuBuildTables($4F80000) : If rc<>0 : ProcedureReturn 2 : EndIf
+ MmuEnableCached()
+ Run(0,0,0,0,1)
+ Run(1,1,0,1,1)
+ Run(2,2,0,1,1)
+ Run(3,3,0,1,1)
+ Run(4,4,0,1,1)
+ Run(5,5,0,1,1)
+ Run(6,6,0,1,1)
+ Run(7,7,0,1,1)
+ Run(8,8,0,1,1)
+ Run(9,9,0,1,1)
+ Run(10,10,0,1,1)
+ Run(11,11,0,1,1)
+ Run(12,12,0,1,1)
+ Run(13,13,0,1,1)
+ Run(14,14,0,1,1)
+ Run(15,15,0,1,1)
+ Run(16,16,0,1,1)
+ Run(17,17,0,1,1)
+ Run(18,18,0,1,1)
+ Run(19,0,1,0,1)
+ Run(20,0,2,0,1)
+ Run(21,0,3,0,1)
+ Run(22,0,0,1,1)
+ Run(23,0,0,0,0)
+ Run(24,0,0,2,1)
+ PokeI($E1C00008,25)
+ MmuDisableCachedFlushed() : ProcedureReturn 0
+EndProcedure
