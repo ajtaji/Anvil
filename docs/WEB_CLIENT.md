@@ -2981,3 +2981,15 @@ transmission, which can delay incoming response/control processing during a stal
 upload. Duplex progress, per-stream deadlines, graceful local GOAWAY and stream-local
 error isolation remain work, alongside remaining TLS compatibility/blocking work,
 off-link IPv6/RDNSS qualification and HTTP/3.
+
+
+The TX-priority limitation is now physically reproduced in forum topic 1538.
+A POST stalled after 88 bytes of its first DATA payload while the peer had its
+SETTINGS acknowledgment and final 413 response ready. The current engine timed
+out (-552), having read only the initial nine-byte SETTINGS frame; 37 incoming
+bytes stayed unread. The peer would resume writes after its response was read.
+Capture 167 returned zero and the Pi remained healthy. This is failed networking
+behavior, not a passing exchange. The original checker expected 18 received bytes;
+its corrected check confirms the defect from the same immutable report without
+another board run. Evidence: `docs/evidence/anvil-ipv6-20261030/http2-duplex-repro483`.
+The finding remains open; no timeout increase or protocol fix has been applied.

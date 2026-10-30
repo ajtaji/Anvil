@@ -1,0 +1,17 @@
+import struct
+def check(data,cases):
+ q=lambda at:struct.unpack_from('<q',data,at)[0]
+ p=256
+ assert q(0)==0x48324155 and q(8)==1
+ assert q(p)==-552 and q(p+8)==16375,(q(p),q(p+8))
+ assert q(p+200)==1 and q(p+168)==9,(q(p+200),q(p+168))
+ assert q(p+16)==0 and q(p+24)==0
+ assert q(p+72)==1 and q(p+192)==1
+ wire=data[q(p+96):q(p+96)+q(p+32)]
+ at=24
+ while at+9<=len(wire):
+  n=int.from_bytes(wire[at:at+3],'big')
+  if at+9+n>len(wire):break
+  at+=9+n
+ assert wire[at+3]==0 and 13<=len(wire)-at-9<16375
+ return dict(defect_reproduced=True,expected_http_status=413,actual_error=q(p),accepted_upload=q(p+8),received_wire=q(p+168),unread_response_bytes=len(bytes.fromhex(cases[0]['wire']))-q(p+168),partial_data_bytes=len(wire)-at-9)
