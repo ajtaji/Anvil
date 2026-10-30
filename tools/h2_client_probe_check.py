@@ -8,6 +8,9 @@ def check(data,cases):
  replies=[]
  for i in range(2):
   p=256+i*64
+  if i==0 and cases[0].endswith('/delay/5'):
+   assert q(64)==1 and q(p+24)==2 and q(p+16)==0
+   replies.append(dict(url=cases[i],cancelled=True));continue
   assert q(p)==200 and q(p+8)>=2 and q(p+24)==1
   n=q(p+16);assert 0<n<=131072
   body=data[4096+i*131072:4096+i*131072+n]

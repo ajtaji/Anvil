@@ -74,6 +74,7 @@ Structure H2Client
  blockStatus.i
  blockRegular.i
  blockTrailers.i
+ blockDiscard.i
  decoding.i
  event.i
  eventStream.i
@@ -241,6 +242,25 @@ Procedure.i H2ClientGet(*c.H2Client,target.i,bytes.i)
  H2FrameWrite(*c\buffers\tx,16384,*c\txLength-9,1,5,*s\id)
  ProcedureReturn *s\id
 EndProcedure
+ ; Cancellation queues RST_STREAM(CANCEL); consume the RESET event normally.
+; BUSY preserves all state: finish pending output/events, then retry.
+Procedure.i H2ClientCancelStream(*c.H2Client,id.i)
+ Define *s.H2Stream
+ If *c=0 : ProcedureReturn #H2_ARGUMENT : EndIf
+ If *c\state=-1 : ProcedureReturn *c\error : EndIf
+ If *c\state<>3 : ProcedureReturn #H2_STATE : EndIf
+ *s=h2cStream(*c,id) : If *s=0 : ProcedureReturn #H2_STATE : EndIf
+ If *s\state<>1 : ProcedureReturn #H2_STATE : EndIf
+ If *c\txLength<>0 Or *c\event<>0 Or *c\finishStream=*s : ProcedureReturn #H2_BUSY : EndIf
+ H2FrameWrite(*c\buffers\tx,16384,4,3,0,id)
+ NetWriteBE32(*c\buffers\tx+9,8) : *c\txLength=13 : *c\txOffset=0
+ *s\state=3 : *s\resetCode=8 : *c\activeStreams=*c\activeStreams-1
+ If *c\blockStream=*s And (*c\decoding<>0 Or *c\continuation<>0)
+  *c\blockDiscard=1 : *c\blockStream=0
+ EndIf
+ *c\event=#H2_RESET : *c\eventStream=id
+ ProcedureReturn 0
+EndProcedure
 Procedure.i H2ClientRelease(*c.H2Client,id.i)
  Define *s.H2Stream
  If *c=0 : ProcedureReturn #H2_ARGUMENT : EndIf
@@ -271,8 +291,12 @@ Procedure.i h2cDecode(*c.H2Client)
  rc=HpackNext(@*c\decoder)
  If rc<0 : ProcedureReturn h2cFail(*c,rc) : EndIf
  If rc=2 : ProcedureReturn 0 : EndIf
- If rc=1 : ProcedureReturn h2cField(*c) : EndIf
+ If rc=1
+  If *c\blockDiscard<>0 : ProcedureReturn 0 : EndIf
+  ProcedureReturn h2cField(*c)
+ EndIf
  *s=*c\blockStream : *c\decoding=0 : *c\blockUsed=0
+ If *c\blockDiscard<>0 : *c\blockStream=0 : ProcedureReturn 0 : EndIf
  If *c\blockTrailers=0
   If *c\blockStatus=0 : ProcedureReturn h2cFail(*c,#H2_PROTOCOL) : EndIf
   If *c\blockStatus<200
@@ -285,11 +309,25 @@ Procedure.i h2cDecode(*c.H2Client)
  ProcedureReturn 0
 EndProcedure
 Procedure.i h2cFrame(*c.H2Client)
- Define *h.H2FrameHeader,*s.H2Stream,p.i,i.i,n.i,v.i,offset.i,padding.i,rc.i,j.i,*other.H2Stream
+ Define *h.H2FrameHeader,*s.H2Stream,p.i,i.i,n.i,v.i,offset.i,padding.i,rc.i,j.i,*other.H2Stream,closed.i
  *h=@*c\frame : p=*c\buffers\rx
  If *c\settingsSeen=0 And (*h\kind<>4 Or (*h\flags & 1)<>0) : ProcedureReturn h2cFail(*c,#H2_PROTOCOL) : EndIf
  If *c\continuation<>0 And (*h\kind<>9 Or *h\stream<>*c\continuation) : ProcedureReturn h2cFail(*c,#H2_PROTOCOL) : EndIf
  *s=h2cStream(*c,*h\stream)
+ ; IDs are consecutive odd integers. Released older IDs remain closed without
+ ; retaining unbounded tombstones. RFC 9113 5.1 permits minimal processing.
+ closed=0
+ If *h\stream<>0
+  If *h\stream>=*c\nextStream Or (*h\stream & 1)=0
+   closed=-1
+  Else
+   If *s=0
+    closed=1
+   Else
+    If *s\state<>1 : closed=1 : EndIf
+   EndIf
+  EndIf
+ EndIf
  Select *h\kind
   Case 4
    If (*h\flags & 1)<>0
@@ -318,11 +356,13 @@ Procedure.i h2cFrame(*c.H2Client)
     H2FrameWrite(*c\buffers\tx,16384,0,4,1,0) : *c\txLength=9 : *c\txOffset=0
    EndIf
   Case 1
-   If *s=0 : ProcedureReturn h2cFail(*c,#H2_PROTOCOL) : EndIf
-   If *s\state<>1 : ProcedureReturn h2cFail(*c,#H2_PROTOCOL) : EndIf
-   *c\blockStream=*s : *c\blockEnd=*h\flags & 1 : *c\blockStatus=0 : *c\blockRegular=0
-   *c\blockTrailers=0 : If *s\status<>0 : *c\blockTrailers=1 : EndIf
-   If *c\blockTrailers<>0 And *c\blockEnd=0 : ProcedureReturn h2cFail(*c,#H2_PROTOCOL) : EndIf
+   If closed=-1 : ProcedureReturn h2cFail(*c,#H2_PROTOCOL) : EndIf
+   *c\blockDiscard=closed : *c\blockStream=0
+   *c\blockEnd=*h\flags & 1 : *c\blockStatus=0 : *c\blockRegular=0 : *c\blockTrailers=0
+   If closed=0
+    *c\blockStream=*s : If *s\status<>0 : *c\blockTrailers=1 : EndIf
+    If *c\blockTrailers<>0 And *c\blockEnd=0 : ProcedureReturn h2cFail(*c,#H2_PROTOCOL) : EndIf
+   EndIf
    offset=0 : padding=0
    If (*h\flags & 8)<>0 : padding=PeekA(p) : offset=1 : EndIf
    If (*h\flags & 32)<>0
@@ -340,19 +380,29 @@ Procedure.i h2cFrame(*c.H2Client)
    *c\blockUsed=*c\blockUsed+*h\length
    If (*h\flags & 4)<>0 : *c\continuation=0 : *c\decoding=1 : EndIf
   Case 0
-   If *s=0 : ProcedureReturn h2cFail(*c,#H2_PROTOCOL) : EndIf
-   If *s\state<>1 Or *s\status=0 : ProcedureReturn h2cFail(*c,#H2_PROTOCOL) : EndIf
-   If *h\length>*c\window Or *h\length>*s\window : ProcedureReturn h2cFail(*c,#H2_FLOW) : EndIf
+   If closed=-1 : ProcedureReturn h2cFail(*c,#H2_PROTOCOL) : EndIf
+   If *h\length>*c\window : ProcedureReturn h2cFail(*c,#H2_FLOW) : EndIf
    offset=0 : padding=0
    If (*h\flags & 8)<>0 : offset=1 : padding=PeekA(p) : EndIf
    n=*h\length-offset-padding : If n<0 : ProcedureReturn h2cFail(*c,#H2_PROTOCOL) : EndIf
-   If n>0 And (*s\status=204 Or *s\status=304) : ProcedureReturn h2cFail(*c,#H2_PROTOCOL) : EndIf
-   If *s\received>$7FFFFFFFFFFFFFFF-n : ProcedureReturn h2cFail(*c,#H2_LIMIT) : EndIf
-   *s\received=*s\received+n
-   If *s\contentLength>=0 And *s\status<>304 And *s\received>*s\contentLength : ProcedureReturn h2cFail(*c,#H2_PROTOCOL) : EndIf
-   *c\window=*c\window-*h\length : *s\window=*s\window-*h\length
-   *c\credit=*h\length : *c\data=p+offset : *c\dataBytes=n : *c\eventStream=*s\id : *c\event=#H2_DATA
-   If (*h\flags & 1)<>0 : *c\finishStream=*s : EndIf
+   If closed<>0
+    ; Discarded content still consumes connection credit, never stream credit.
+    ; Parsing resumes only after the queued WINDOW_UPDATE is fully sent.
+    If *h\length>0
+     H2FrameWrite(*c\buffers\tx,16384,4,8,0,0)
+     NetWriteBE32(*c\buffers\tx+9,*h\length) : *c\txLength=13 : *c\txOffset=0
+    EndIf
+   Else
+    If *s\status=0 : ProcedureReturn h2cFail(*c,#H2_PROTOCOL) : EndIf
+    If *h\length>*s\window : ProcedureReturn h2cFail(*c,#H2_FLOW) : EndIf
+    If n>0 And (*s\status=204 Or *s\status=304) : ProcedureReturn h2cFail(*c,#H2_PROTOCOL) : EndIf
+    If *s\received>$7FFFFFFFFFFFFFFF-n : ProcedureReturn h2cFail(*c,#H2_LIMIT) : EndIf
+    *s\received=*s\received+n
+    If *s\contentLength>=0 And *s\status<>304 And *s\received>*s\contentLength : ProcedureReturn h2cFail(*c,#H2_PROTOCOL) : EndIf
+    *c\window=*c\window-*h\length : *s\window=*s\window-*h\length
+    *c\credit=*h\length : *c\data=p+offset : *c\dataBytes=n : *c\eventStream=*s\id : *c\event=#H2_DATA
+    If (*h\flags & 1)<>0 : *c\finishStream=*s : EndIf
+   EndIf
   Case 2
    If (NetReadBE32(p) & $7FFFFFFF)=*h\stream : ProcedureReturn h2cFail(*c,#H2_PROTOCOL) : EndIf
   Case 3

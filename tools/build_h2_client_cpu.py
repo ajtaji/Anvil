@@ -46,7 +46,7 @@ Procedure.i FakeSend(handle.i,source.i,bytes.i)
  outBytes=outBytes+n : ProcedureReturn n
 EndProcedure
 Procedure.i FakeRecv(handle.i,destination.i,bytes.i)
- Define i.i,n.i,at.i,requests.i,length.i
+ Define i.i,n.i,at.i,requests.i,length.i,needed.i
  recvCalls=recvCalls+1 : If (recvCalls % 3)=0 And forceClosed=0 : ProcedureReturn 0 : EndIf
  at=24 : requests=0
  While at+9<=outBytes
@@ -55,7 +55,8 @@ Procedure.i FakeRecv(handle.i,destination.i,bytes.i)
   If outgoing[at+3]=1 : requests=requests+1 : EndIf
   at=at+9+length
  Wend
- If inAt>=9 And requests<wanted : ProcedureReturn 0 : EndIf
+ needed=wanted : If mode=7 : needed=2 : EndIf
+ If inAt>=9 And requests<needed : ProcedureReturn 0 : EndIf
  n=inBytes-inAt : If n>bytes : n=bytes : EndIf : If n>5 : n=5 : EndIf
  If inAt<9 And inAt+n>9 : n=9-inAt : EndIf
  For i=0 To n-1 : PokeA(destination+i,incoming[inAt+i]) : Next
@@ -71,7 +72,7 @@ EndProcedure
 
 
 Procedure.i RunOne(index.i)
- Define rc.i,tick.i,sent.i,ended.i,bodyBytes.i,bodySum.i,i.i,p.i,at.i,st.i,busy.i
+ Define rc.i,tick.i,sent.i,ended.i,bodyBytes.i,bodySum.i,i.i,p.i,at.i,st.i,busy.i,cancelled.i,shouldCancel.i,eventKind.i
  inAt=0 : outBytes=0 : sendCalls=0 : recvCalls=0 : closeCalls=0 : forceClosed=0
  url\secure=1 : url\host="example.org" : url\hostLength=11 : url\port=443
  buffers\tx=@tx[0] : buffers\rx=@rx[0] : buffers\block=@block[0] : buffers\dynamic=@dynamic[0] : buffers\field=@field[0] : buffers\streams=@streams[0] : buffers\streamCount=4
@@ -84,25 +85,51 @@ Procedure.i RunOne(index.i)
    If mode=2 : rc=H2ClientStep(@c,200001) : Break : EndIf
    If mode=3 : forceClosed=1 : EndIf
   EndIf
+  shouldCancel=0
+  If cancelled=0 And sent>=2 And c\txLength=0 And c\event=0
+   If mode=4 : shouldCancel=1 : EndIf
+   If (mode=5 Or mode=7) And c\continuation=1 : shouldCancel=1 : EndIf
+   If mode=6 And c\decoding<>0 And c\decoder\fields>0 : shouldCancel=1 : EndIf
+  EndIf
+  If shouldCancel<>0
+   rc=H2ClientCancelStream(@c,1) : If rc<>0 : Break : EndIf
+   cancelled=1
+  EndIf
   rc=H2ClientStep(@c,tick)
   If rc<0 : Break : EndIf
   If rc>0
-   at=inAt : st=rc
+   eventKind=rc : at=inAt : st=rc
    If H2ClientStep(@c,tick)<>st Or inAt<>at : rc=-9202 : Break : EndIf
    busy=H2ClientGet(@c,"/forbidden",10)
    If busy<>#H2_BUSY And c\goaway=0 : rc=-9203 : Break : EndIf
+   If rc=#H2_DATA Or rc=#H2_FIELD
+    If H2ClientCancelStream(@c,c\eventStream)<>#H2_BUSY : rc=-9206 : Break : EndIf
+   EndIf
    If rc=#H2_DATA
     bodyBytes=bodyBytes+c\dataBytes
     For i=0 To c\dataBytes-1 : bodySum=bodySum+PeekA(c\data+i) : Next
    EndIf
    If rc=#H2_END : ended=ended+1 : EndIf
-   If rc=#H2_RESET Or rc=#H2_GOAWAY : Break : EndIf
+   If rc=#H2_GOAWAY : Break : EndIf
+   If rc=#H2_RESET
+    If mode<4 : Break : EndIf
+    ended=ended+1
+   EndIf
+   at=c\eventStream
    rc=H2ClientConsume(@c) : If rc<>0 : Break : EndIf
+   If mode>=4 And (eventKind=#H2_RESET Or eventKind=#H2_END)
+    rc=H2ClientRelease(@c,at) : If rc<>0 : Break : EndIf
+   EndIf
   EndIf
   If ended=wanted And c\txLength=0 : rc=0 : Break : EndIf
-  If c\state=3 And c\txLength=0 And c\event=0 And sent<wanted
+  If c\state=3 And c\txLength=0 And c\event=0 And sent<wanted And (mode<>7 Or sent<2 Or cancelled<>0)
    rc=H2ClientGet(@c,"/test?x=1",9)
-   If rc>0 : sent=sent+1 : Else : If rc<>#H2_BUSY : Break : EndIf : EndIf
+   If rc>0
+    sent=sent+1
+    If H2ClientCancelStream(@c,rc)<>#H2_BUSY : rc=-9207 : Break : EndIf
+   Else
+    If rc<>#H2_BUSY : Break : EndIf
+   EndIf
   EndIf
  Next
  If tick>100000 : rc=-9204 : EndIf

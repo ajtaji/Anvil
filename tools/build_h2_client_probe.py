@@ -6,9 +6,9 @@ from pathlib import Path
 import argparse,hashlib,json,os,re,subprocess
 from pmf_compiler import resolve_compiler
 
-def build(compiler,out):
+def build(compiler,out,cancel_first=False):
  root=Path(__file__).resolve().parents[1];out.mkdir(parents=True,exist_ok=False)
- rows=['https://httpbin.org/uuid','https://httpbin.org/bytes/70000']
+ rows=['https://httpbin.org/delay/5' if cancel_first else 'https://httpbin.org/uuid','https://httpbin.org/bytes/70000']
  names=['RaspberryPi4/Lib/mmu.pi4','Anvil/Network/web_url.pbi','Anvil/Network/web_transport.pbi','Anvil/Network/h2_frame.pbi','Anvil/Network/hpack_decode.pbi','Anvil/Network/hpack_tables.pbi','Anvil/Network/h2_client.pbi']
  s='#WEB_KERNEL_BINDING=0\n'+'\n'.join('XIncludeFile "'+n+'"' for n in names)+r'''
 
@@ -90,6 +90,11 @@ Procedure.i Main()
  ProcedureReturn 0
 EndProcedure
 '''
+ if cancel_first:
+  s=s.replace('n.i,peak.i','n.i,peak.i,cancelled.i')
+  s=s.replace('now=clock() : rc=H2ClientStep(@c,now)','If sent=2 And cancelled=0 And c\\txLength=0 And c\\event=0\n   rc=H2ClientCancelStream(@c,1) : If rc<>0 : ProcedureReturn rc : EndIf\n   cancelled=1 : PokeI($E1C00040,1)\n  EndIf\n  now=clock() : rc=H2ClientStep(@c,now)')
+  s=s.replace('H2ClientGet(@c,"/uuid",5)','H2ClientGet(@c,"/delay/5",8)')
+  s=s.replace('If rc=#H2_RESET Or rc=#H2_GOAWAY : ProcedureReturn -9104 : EndIf','If rc=#H2_GOAWAY : ProcedureReturn -9104 : EndIf\n   If rc=#H2_RESET\n    If slot<>0 Or cancelled<>1 : ProcedureReturn -9104 : EndIf\n    ended=ended+1 : PokeI(p+24,2)\n   EndIf')
  source=out/'proof.pi4';source.write_text(s,encoding='utf8')
  q=subprocess.run([str(resolve_compiler(compiler)),'--compile',str(source),'-t','pi4','--load-addr','0x1000000','--stack-addr','0x4f00000','--entry-returns','--wants-services','-o',str(out/'proof.img')],env=dict(os.environ,PMF_ROOT=str(root)),capture_output=True,text=True,encoding='utf8',timeout=180,creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
  log=q.stdout+q.stderr;(out/'compile.txt').write_text(log,encoding='utf8');print(log[-2200:]);assert q.returncode==0
@@ -97,5 +102,5 @@ EndProcedure
  payload=(out/'proof.img.pmf').read_bytes();ranges={'code':['0x'+x for x in code.groups()],'bss':['0x'+x for x in bss.groups()],'stack':['0x4e00000','0x4efffff'],'report':['0xe1c00000','0xe1cfffff'],'tables':['0x4f80000','0x4f82fff']}
  (out/'identity.json').write_text(json.dumps(dict(bytes=len(payload),sha256=hashlib.sha256(payload).hexdigest(),checked_ranges=ranges,source_hashes={n:hashlib.sha256((root/n).read_bytes()).hexdigest() for n in names},cases=rows),indent=2),encoding='utf8')
 if __name__=='__main__':
-    ap=argparse.ArgumentParser(description=__doc__);ap.add_argument('--compiler',required=True);ap.add_argument('--out',type=Path,required=True)
-    a=ap.parse_args();build(a.compiler,a.out.resolve())
+    ap=argparse.ArgumentParser(description=__doc__);ap.add_argument('--compiler',required=True);ap.add_argument('--out',type=Path,required=True);ap.add_argument('--cancel-first',action='store_true')
+    a=ap.parse_args();build(a.compiler,a.out.resolve(),a.cancel_first)

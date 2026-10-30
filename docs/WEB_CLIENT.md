@@ -2707,9 +2707,10 @@ RST_STREAM and GOAWAY; and rejects unsolicited push. HTTP response checks includ
 lowercase field names, prohibited connection fields, pseudo-header order and
 uniqueness, status, field-value controls, content length, informational responses
 and trailers. `H2ClientCancel` cancels the entire connection, and `H2ClientClose`
-releases transport ownership. It does not yet provide per-stream cancellation,
-request DATA uploads, graceful local GOAWAY/error transmission, complete handling
-of late frames on closed/reset streams, or automatic WebClient protocol dispatch.
+releases transport ownership. It does not yet provide per-stream deadlines,
+request DATA uploads, graceful local GOAWAY/error transmission, or automatic
+WebClient protocol dispatch. Per-stream cancellation and minimal processing of
+late closed-stream frames are described below.
 Errors currently close the connection, including stream-local failures. The
 existing HTTP/1 WebClient remains the default; HTTP/2 is explicit opt-in.
 
@@ -2737,3 +2738,47 @@ that compile-only fixture was not run. No monitor update was needed. Evidence:
 Networking is not complete. Alongside the HTTP/2 limitations above, HTTP/3/QUIC,
 remaining atomic TLS/device work, automatic RDNSS-to-web qualification and public
 off-link IPv6 traffic remain open.
+
+
+### Cancel one stream while others continue
+
+`H2ClientCancelStream(context, streamId)` queues RST_STREAM with CANCEL (8),
+marks that request reset and exposes the normal RESET event. Consume the event
+and then release its slot as usual. Other streams and the TLS connection remain
+active. A zero return means cancellation was accepted, not that the wire frame
+has already been sent. Continue pumping `H2ClientStep` and network service.
+If an output frame, event, or final completion is pending, cancellation returns
+BUSY without changing state; finish that pending work before retrying. Unknown
+or already completed/reset IDs return STATE. Whole-connection Cancel is unchanged.
+
+Header assembly and HPACK decoding can continue after cancellation, even when
+its caller-owned slot is released and reused for a newer stream. The decoder
+is detached from the old slot and suppresses its application fields while still
+updating connection compression state. Late HEADERS/CONTINUATION on closed IDs
+receive the same bounded decoding; late DATA is discarded and credited only at
+connection level, including padding. Frame, compression, padding and connection
+window limits still apply. Older odd IDs are known closed because this client
+allocates consecutive odd IDs; no unbounded tombstone list is needed. Unknown
+idle/server-initiated response streams still fail. This uses the minimal closed
+stream processing permitted by RFC 9113 section 5.1, rather than emitting frames
+on an already closed stream. Unsolicited push remains disabled and refused.
+
+The physical CPU suite now passes 46 cases. Six additions cover cancellation
+before a response, during CONTINUATION and during HPACK decoding; reuse of the
+cancelled slot while a header block is unfinished; and late frames after normal
+completion or a peer reset. Subsequent live-stream headers reference dynamic
+entries introduced by discarded headers. Checks verify exact CANCEL wire output,
+connection credit for discarded padded data, no delivered cancelled content,
+BUSY behavior and successful completion of the other streams.
+
+A separate verified-TLS test kept two requests active to httpbin.org, cancelled
+`/delay/5`, and received all 70000 bytes from `/bytes/70000` on the same connection.
+Elapsed time was 991774 microseconds, maximum observed client step 2594 and
+separate network service call 2768 microseconds. These are observations only.
+Captures 151/152 returned zero; cores, fonts and Vulkan remained healthy, watchdog
+was off and the temporary DNS override was removed. Shared Pi 3 compilation also
+passed, without a Pi 3 hardware claim. Evidence:
+`docs/evidence/anvil-ipv6-20261030/http2-cancel483`.
+
+WebClient dispatch, uploads, per-stream deadlines and graceful local connection
+shutdown remain unfinished, alongside the broader TLS, IPv6 and HTTP/3 work.

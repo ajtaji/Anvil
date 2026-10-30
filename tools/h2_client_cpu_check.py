@@ -11,7 +11,7 @@ def check(data,cases):
   assert q(p+64)==1,(c['name'],'close ownership',q(p+64))
   out=data[p+256:p+256+q(p+32)]
   assert out[:24]==b'PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n'
-  at=24;requests=0;credit=0;ping=False;dec=Decoder()
+  at=24;requests=0;credit=0;ping=False;resets=[];dec=Decoder()
   while at+9<=len(out):
    n=int.from_bytes(out[at:at+3],'big');kind=out[at+3];flags=out[at+4];sid=int.from_bytes(out[at+5:at+9],'big')
    assert at+9+n<=len(out),(c['name'],'partial outbound frame')
@@ -21,9 +21,12 @@ def check(data,cases):
     assert dict(dec.decode(b))=={':method':'GET',':scheme':'https',':path':'/test?x=1',':authority':'example.org'}
     requests+=1
    if kind==8 and sid==0:credit+=int.from_bytes(b,'big')
+   if kind==3:resets.append((sid,int.from_bytes(b,'big')))
    if kind==6:assert flags==1 and b==b'12345678';ping=True
   assert at==len(out) and requests==c['requests'],c['name']
   if c['name']=='two streams with persistent HPACK':assert credit==9
   if c['name']=='PING acknowledged':assert ping
   if c['name']=='body exceeds initial receive window':assert credit==70000
+  if 'cancel_rst' in c:assert resets==([(1,8)] if c['cancel_rst'] else []),(c['name'],resets)
+  if 'credit' in c:assert credit==c['credit'],(c['name'],'credit',credit)
  return dict(cases=len(cases),refusals=sum(x['result']<0 for x in cases),fragmented_send_bytes=3,fragmented_receive_bytes=5,complete_http2_client=False)
