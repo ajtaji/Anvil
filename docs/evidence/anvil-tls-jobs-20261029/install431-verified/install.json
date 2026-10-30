@@ -1,0 +1,200 @@
+{
+  "steps": [
+    {
+      "command": "version",
+      "reply": "version\nbuild 430 date 20261029 time 190225\nPureMetal Forge - Anvil, the Raspberry Pi 4 monitor. Version 2.0,\n64-bit AArch64, running with no operating system underneath it.\n  This is build 430 of this board's monitor, made 2026-10-29 at 19:02:25.\n  The number is raised by one by every successful build, so two images\n  can be told apart from the prompt. It says WHICH build this is, not\n  WHAT is in it - a number can be reset, frozen, or carried by a source\n  somebody edited without rebuilding. The digest below is what is in it.\n  This monitor's own image is 6400884 bytes, 00200000 .. 0081AB73.\n  That extent is the RUNNING IMAGE's own: the compiler marks the end\n  of the image with a symbol and this program reads it, so the length\n  is of the code that is executing and not of a file on a disk that\n  may since have been replaced. It is also why this monitor has no\n  maximum size - type map.\n  That size and the build number above are enough to tell two images\n  apart. For the digest that says WHAT is in it, type:\n    version full        - or crc32 00200000 0061AB74\n  It is not done here unasked because it reads every byte of the\n  image, which is not instant on a board with its caches off.\n  Built by PureMetal Forge for target pi4.\n  This image is a kernel8.img. The firmware loads the whole file to\n  00200000 and enters it there, with no loader in between -\n  which is why its size is not capped by anything: there is nothing\n  above it in the boot path to make room for.\n  The compiler and linker versions are not stamped into the image, so -\n  unlike U-Boot's version - they are not printed here rather than\n  guessed at.\n  Type info for the board, revision and clocks, or help for the commands.\npmf> "
+    },
+    {
+      "command": "map",
+      "reply": "map\nTHE MEMORY MAP, AS THIS IMAGE MEASURES IT\n  this image      00200000 to 0081AB73   6400884 bytes, measured from the image itself\n  reserved        00200000 to 008FFFFF   this monitor's code, measured from the image\n  reserved        0D000000 to 0F6FFFFF   its variables, placed by --bss-addr\n  reserved        001FF000 to 001FFFFF   the autoboot record\n  reserved        08A00000 to 091FFFFF   the DSI framebuffer\n  reserved        001FC000 to 001FEFFF   the reserved raw-secondary stacks\n  reserved        09200000 to 099FFFFF   the driver-module arena and its staging window\n  reserved        001FB000 to 001FBFFF   the boot phase record\n  reserved        0B000000 to 0BBFFFFF   the screenshot capture area\n  reserved        10000000 to 13FFFFFF   the reserved Vulkan device-memory heap\n  its stack top   00100000               and it grows downwards from there\n  stage a file at 00900000               which is what the upload tools ask for\n\nWhere a payload may go:\n  the low window   00900000 to 07EFFFFF   (about 118 MB)\n  the high window  40000000 to FBFFFFFF   (about 3 GB)\n  Nothing in this map is a constant this program was told. The\n  monitor's extent is the size of the image the firmware loaded, and\n  the low window begins above it, so both move when this program\n  does. There is no maximum size.\nok\npmf> "
+    },
+    {
+      "command": "vkstat",
+      "reply": "vkstat\n  last Vulkan failure: stage 0, console 0, Chrome 0\n  DSI frame-boundary presents since boot 3271, restores 5, timeouts 0\n  completed private WSI source transactions since boot 3271\n  public surface targets checked since boot 12\nResident Neon End timings: frames 0, failed 0, tick Hz 54000000\nVulkan console frames over the last 35 seconds:\n  banner only: 133 frames; per frame, microseconds: build 1687, submit and GPU wait 3557, copy to the display 15447\n  whole frame: 9 frames; per frame, microseconds: build 51357, submit and GPU wait 2890, copy to the display 13862\n  of a banner frame's build, microseconds: starting the frame 18, the text 1550, the logo 9\n  text layouts reused 802, shaped afresh 50\n  their share of the time, the GPU waits included: 9.48%\npmf> "
+    },
+    {
+      "command": "deadman",
+      "reply": "deadman\nThe deadman watchdog is off. A payload that hangs will hang the board\nwith it, and getting out of that means a reset or the mains.\n  Type deadman <seconds> to arm it and deadman off to disarm it. The\n  seconds are decimal and whole.\n  The counter behind it is 20 bits wide and counts 65536 times a\n  second, so a fraction under 16 seconds is the longest it can be set\n  to. Anything larger is cut down to 15 rather than 16, because a\n  deadman that fires SOONER than it promised is a trap and one that\n  fires later is merely patient.\npmf> "
+    },
+    {
+      "command": "cache",
+      "reply": "cache\nThe D-cache and MMU are ON - DRAM is cacheable write-back.\n  SCTLR_EL3 = $0000000030C51835\n  cache on   - build the identity tables and enable M|C|I\n  cache off  - flush the whole D-cache to DRAM and disable\n  The framebuffer and GENET ring are mapped non-cacheable, so the\n  console, screenshot, wifi, USB, mailbox and payloads are all coherent\n  with the cache on. It is turned on automatically for the V3D console.\npmf> "
+    },
+    {
+      "command": "load 1:/B430V431.IMG 2000000",
+      "reply": "load 1:/B430V431.IMG 2000000\n!! the file 1:/B430V431.IMG could not be opened, so nothing was loaded\n   and memory is untouched. Paths are case-insensitive; quote one that\n   contains spaces, and start it with N: for partition N (2:/name) -\n   with no N: it is partition 1. Type f to see the partitions.\n   The medium said: fat: no file or folder has that name - check the spelling and that every folder in the path exists\npmf> "
+    },
+    {
+      "command": "load 1:/V431NEW.IMG 2000000",
+      "reply": "load 1:/V431NEW.IMG 2000000\n!! the file 1:/V431NEW.IMG could not be opened, so nothing was loaded\n   and memory is untouched. Paths are case-insensitive; quote one that\n   contains spaces, and start it with N: for partition N (2:/name) -\n   with no N: it is partition 1. Type f to see the partitions.\n   The medium said: fat: no file or folder has that name - check the spelling and that every folder in the path exists\npmf> "
+    },
+    {
+      "command": "cat 1:/config.txt",
+      "reply": "cat 1:/config.txt\n---- 1:/config.txt, 2346 bytes ----\n# Raspberry Pi 4 / BCM2711 - bare-metal boot via U-Boot\n# PureMetal Forge, 2026-08-24\n\narm_64bit=1\n\n# ANVIL IS THE BOOT IMAGE, 2026-08-26.\n#\n# U-Boot is STILL ON THIS STICK as kernel8.img and is untouched. To go\n# back to it, change the kernel= line below to kernel8.img and drop\n# the kernel_address line. That is the whole recovery: one text edit on\n# this file, not a re-image.\n#\n# kernel_address is NOT optional. Anvil is built to run at 0x200000 and\n# its BSS - which includes a 550 KB XHCI arena - runs well past the end\n# of the image. Loaded at the 64-bit default of 0x80000 that BSS would\n# reach down through 0x100000, which is where Anvil puts its own stack.\n# Loading it where it was linked keeps the memory map that is actually\n# tested.\nkernel=kernel8.img\nkernel_address=0x200000\n\n# THE CONSOLE ON GPIO14/15 (header pins 8 and 10).\n#\n# disable-bt is NOT optional. With Bluetooth enabled the Pi 4 gives those\n# header pins to the MINI-UART and routes the PL011 to the Bluetooth\n# module - so a program writing to the PL011 is talking to a device that\n# works perfectly and is not attached to the wire. That cost an evening:\n# reads came back healthy, writes vanished, nothing faulted.\n#\n# disable-bt puts the PL011 back on the header, where init_uart_clock\n# then genuinely matters. The mini-UART derives its baud from the VPU\n# core clock, which the firmware scales; a PL011 with a pinned reference\n# does not move.\ndtoverlay=disable-bt\nenable_uart=1\ninit_uart_clock=48000000\n\n# OVERSCAN OFF, 2026-08-26.\n#\n# Without this the firmware trims 48 px from every edge of a CEA/TV HDMI\n# mode, so a 1920x1080 panel comes up as 1824x984. That is not our doing:\n# display.pi4 already sends SET_OVERSCAN 0,0,0,0 in the same nine-tag\n# transaction U-Boot uses, and the firmware ignores it. The reduction is\n# baked into the boot mode before any program asks.\n#\n# It went unnoticed because DisplayInit asks GET_PHYSICAL_W_H first and\n# requests whatever that answers, so we were faithfully asking for the\n# already-shrunken size and getting exactly what we asked for.\ndisable_overscan=1\ndtoverlay=vc4-kms-dsi-waveshare-panel-v2,10_1_inch_a\nuart_2ndstage=1\ndtdebug=on\n\n\n# Anvil EL3 entry: the firmware loads our reviewed 512-byte stub at zero.\n# Remove this one setting to return to the firmware default EL2 handoff.\n[pi4]\narmstub=armstub8.bin\n\n---- 2346 of 2346 bytes printed.\npmf> "
+    },
+    {
+      "command": "load 1:/KERNEL8.IMG 2000000",
+      "reply": "load 1:/KERNEL8.IMG 2000000\nLoaded 6400884 bytes into memory, filling 02000000 through 0261AB73.\n  Its entry point is 02000000, which is where run will jump if you\n  type run with no address of your own.\npmf> "
+    },
+    {
+      "command": "save 1:/B430V431.IMG 2000000 61AB74",
+      "reply": "save 1:/B430V431.IMG 2000000 61AB74\nThe file 1:/B430V431.IMG is not on the medium yet, so it is being created.\nWriting 6400884 bytes out of memory, starting at 02000000. This\ntakes a moment and must not be interrupted.\nwritten.\n  Saved 1:/B430V431.IMG on the boot medium.\n  That file now holds what was in memory, and the\n  block writer has been disarmed again so nothing else in this monitor\n  can reach the medium. Saving does not change the boot-file selection;\n  reset still loads the configured boot image, not an arbitrary saved file.\npmf> "
+    },
+    {
+      "command": "load 1:/B430V431.IMG 2000000",
+      "reply": "load 1:/B430V431.IMG 2000000\nLoaded 6400884 bytes into memory, filling 02000000 through 0261AB73.\n  Its entry point is 02000000, which is where run will jump if you\n  type run with no address of your own.\npmf> "
+    },
+    {
+      "command": "save 1:/V431NEW.IMG 1000000 61C374",
+      "reply": "save 1:/V431NEW.IMG 1000000 61C374\nThe file 1:/V431NEW.IMG is not on the medium yet, so it is being created.\nWriting 6407028 bytes out of memory, starting at 01000000. This\ntakes a moment and must not be interrupted.\nwritten.\n  Saved 1:/V431NEW.IMG on the boot medium.\n  That file now holds what was in memory, and the\n  block writer has been disarmed again so nothing else in this monitor\n  can reach the medium. Saving does not change the boot-file selection;\n  reset still loads the configured boot image, not an arbitrary saved file.\npmf> "
+    },
+    {
+      "command": "load 1:/V431NEW.IMG 2000000",
+      "reply": "load 1:/V431NEW.IMG 2000000\nLoaded 6407028 bytes into memory, filling 02000000 through 0261C373.\n  Its entry point is 02000000, which is where run will jump if you\n  type run with no address of your own.\npmf> "
+    },
+    {
+      "command": "save 1:/KERNEL8.IMG 1000000 61C374",
+      "reply": "save 1:/KERNEL8.IMG 1000000 61C374\nThe file 1:/KERNEL8.IMG on the boot medium is 6400884 bytes long at the moment.\nIt is being resized from 6400884 bytes to 6407028 bytes to match what\nyou asked to write.\nWriting 6407028 bytes out of memory, starting at 01000000. This\ntakes a moment and must not be interrupted.\nwritten.\n  Saved 1:/KERNEL8.IMG on the boot medium.\n  That file now holds what was in memory, and the\n  block writer has been disarmed again so nothing else in this monitor\n  can reach the medium. Saving does not change the boot-file selection;\n  reset still loads the configured boot image, not an arbitrary saved file.\npmf> "
+    },
+    {
+      "command": "load 1:/KERNEL8.IMG 2000000",
+      "reply": "load 1:/KERNEL8.IMG 2000000\nLoaded 6407028 bytes into memory, filling 02000000 through 0261C373.\n  Its entry point is 02000000, which is where run will jump if you\n  type run with no address of your own.\npmf> "
+    }
+  ],
+  "reset_sent": true,
+  "intent": null,
+  "health_before": {
+    "line": "coretest started=0 stopped=0 runs=0 nonce=0 error=0 core=0",
+    "started": 0,
+    "stopped": 0,
+    "runs": 0,
+    "nonce": 0,
+    "error": 0
+  },
+  "backup_verified": true,
+  "upload": {
+    "bytes": 6407028,
+    "sha256": "906489aea3aa24b5d5f1284a56c7bf8e1c8b33675d195e98c682d2117982053e",
+    "board_ms": 4281,
+    "seconds": 17.303,
+    "sent_seconds": 4.301595100041595,
+    "chunks": [
+      {
+        "offset": 0,
+        "bytes": 1048576,
+        "board_ms": 654,
+        "sha256": "128f62dbf144d8d992e73f4d03f8126e4346d927e68247f16c0f7f065ed8f531",
+        "seconds": 1.869,
+        "sent_seconds": 0.6571195000142325,
+        "listener_observation": {
+          "boundary": "needle",
+          "echo_seen": true,
+          "reply_datagrams": 3,
+          "keepalives_sent": 0
+        }
+      },
+      {
+        "offset": 1048576,
+        "bytes": 1048576,
+        "board_ms": 667,
+        "sha256": "a64f8fa482de7eb268d6cb6a356039713815df517e52d15cff4a50c6003cc649",
+        "seconds": 1.876,
+        "sent_seconds": 0.6695290000061505,
+        "listener_observation": {
+          "boundary": "needle",
+          "echo_seen": true,
+          "reply_datagrams": 3,
+          "keepalives_sent": 0
+        }
+      },
+      {
+        "offset": 2097152,
+        "bytes": 1048576,
+        "board_ms": 669,
+        "sha256": "cb9d828dbb864cd0a5408b3f6a25c7135737f855f4b43524ac74ffba921f1ac3",
+        "seconds": 1.932,
+        "sent_seconds": 0.6721227000089129,
+        "listener_observation": {
+          "boundary": "needle",
+          "echo_seen": true,
+          "reply_datagrams": 3,
+          "keepalives_sent": 0
+        }
+      },
+      {
+        "offset": 3145728,
+        "bytes": 1048576,
+        "board_ms": 739,
+        "sha256": "c6ae926b54f57bc88e4976749e39423c3d91f59c87ce31f4b1b4594f9afe6bcb",
+        "seconds": 2.07,
+        "sent_seconds": 0.7421059999905992,
+        "listener_observation": {
+          "boundary": "needle",
+          "echo_seen": true,
+          "reply_datagrams": 3,
+          "keepalives_sent": 0
+        }
+      },
+      {
+        "offset": 4194304,
+        "bytes": 1048576,
+        "board_ms": 745,
+        "sha256": "7640456d51d384a0cd4213e423ea1e9218109b49a94faf5dbfe91d0e440257ae",
+        "seconds": 2.002,
+        "sent_seconds": 0.7477860000071814,
+        "listener_observation": {
+          "boundary": "needle",
+          "echo_seen": true,
+          "reply_datagrams": 3,
+          "keepalives_sent": 0
+        }
+      },
+      {
+        "offset": 5242880,
+        "bytes": 1048576,
+        "board_ms": 728,
+        "sha256": "c487d8b7689a108fc26abb02e9099e89ee245f8cc3d4726e9f10c02ddf8b1956",
+        "seconds": 1.93,
+        "sent_seconds": 0.7308768000075361,
+        "listener_observation": {
+          "boundary": "needle",
+          "echo_seen": true,
+          "reply_datagrams": 3,
+          "keepalives_sent": 0
+        }
+      },
+      {
+        "offset": 6291456,
+        "bytes": 115572,
+        "board_ms": 79,
+        "sha256": "847bd5f813b3aa514a73f94c0ff1d79365f227920a3143b9f05afba59dd33892",
+        "seconds": 0.758,
+        "sent_seconds": 0.08205510000698268,
+        "listener_observation": {
+          "boundary": "needle",
+          "echo_seen": true,
+          "reply_datagrams": 3,
+          "keepalives_sent": 0
+        }
+      }
+    ],
+    "verification": {
+      "verified_by": "destination_range_sha256",
+      "attempt": 1,
+      "bytes": 6407028,
+      "sha256": "906489aea3aa24b5d5f1284a56c7bf8e1c8b33675d195e98c682d2117982053e",
+      "earlier_attempts": []
+    }
+  },
+  "candidate_verified": true,
+  "boot_file_verified": true,
+  "health_after": {
+    "line": "coretest started=0 stopped=0 runs=0 nonce=0 error=0 core=0",
+    "started": 0,
+    "stopped": 0,
+    "runs": 0,
+    "nonce": 0,
+    "error": 0
+  },
+  "complete_before_reset": true
+}

@@ -1544,3 +1544,6 @@ text is unchanged; no new board execution or boot claim follows.
 | `Anvil/Network/ipv6_neighbor.pbi` | protocol-facts | ietf-rfc | IETF specification | RFC 4861 neighbor discovery validity and wire messages; RFC 6980 fragment refusal |
 
 | `Anvil/Network/ipv6_reachability.pbi` | protocol-facts | ietf-rfc | IETF specification | RFC 4861 sections 7.2 and 7.3; independently implemented reachability state and timers |
+
+| `Anvil/Crypto/gcm_job.pbi` | consulted | bearssl | MIT | Bounded orchestration of existing AES/GHASH primitives; existing BearSSL acknowledgment retained |
+| `Anvil/Crypto/gcm_job.pbi` | protocol-facts | vendor-spec | NIST specification | SP 800-38D section 7.2, 96-bit-IV authenticated decryption and tag verification before plaintext release; no specification prose copied |

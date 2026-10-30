@@ -9,7 +9,7 @@ Global tlsw_sliceStart.i
 Global tlsw_sliceTicks.i
 
 Procedure tlsw_ClearHooks()
- X509PauseHook=0 : TlsRootsPauseHook=0
+ X509PauseHook=0 : TlsRootsPauseHook=0 : TlsRecDecryptHook=0
  EcdsaVerifyHook=0 : RsaPublicHook=0 : X25519ComputeHook=0
 EndProcedure
 
@@ -68,8 +68,19 @@ Procedure.i tlsw_X25519(out.i,scalar.i,point.i)
  ProcedureReturn Bool(rc=1)
 EndProcedure
 
+Procedure.i tlsw_GcmDecrypt(key.i,nonce.i,aad.i,aadBytes.i,cipher.i,bytes.i,plain.i,tag.i)
+ Define rc.i
+ rc=GcmJobBeginDecrypt(key,16,nonce,aad,aadBytes,cipher,bytes,plain,tag)
+ While rc=0
+  If tlsw_YieldDue()=0 : GcmJobCancel() : ProcedureReturn 0 : EndIf
+  rc=GcmJobStep()
+ Wend
+ If rc<>1 Or GcmJobResult<>1 : ProcedureReturn 0 : EndIf
+ ProcedureReturn $FFFFFFFF
+EndProcedure
+
 Procedure tlsw_SetHooks()
- X509PauseHook=@tlsw_YieldDue : TlsRootsPauseHook=@tlsw_YieldDue
+ X509PauseHook=@tlsw_YieldDue : TlsRootsPauseHook=@tlsw_YieldDue : TlsRecDecryptHook=@tlsw_GcmDecrypt
  EcdsaVerifyHook=@tlsw_Ecdsa : RsaPublicHook=@tlsw_Rsa : X25519ComputeHook=@tlsw_X25519
 EndProcedure
 
@@ -89,7 +100,7 @@ Procedure tlsw_Cancel(h.i)
  rc=ScReap(tlsw_handle)
  If rc=0 : tlsw_fault=1 : ProcedureReturn : EndIf
  tlsw_handle=0 : tlsw_ClearHooks()
- TlsRootsCancelLoad()
+ TlsRootsCancelLoad() : GcmJobCancel()
  EcdsaJobCancel() : EcpJobCancel() : RsaJobCancel() : X25519JobCancel()
 EndProcedure
 

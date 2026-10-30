@@ -163,6 +163,8 @@ Global Dim TlsTag.a[16]              ; tag scratch                 (public)
 
 Global TlsRecInnerType.i             ; recovered content type of the last record
 Global Tls13RecErr.i                 ; named reason for the last refusal
+; Optional serialized decrypt driver; key/nonce spans are borrowed for the call.
+Global *TlsRecDecryptHook
 Global TlsCipherInstalled.i          ; 0 none, 1 write key loaded, 2 read key
 
 ; ----------------------------------------------------------------------
@@ -460,7 +462,12 @@ Procedure.i Tls13RecUnprotect(rec.i, reclen.i)
   TlsRecUseReadKey()
   TlsRecNonce(@secTlsRIv[0], TlsRSeqHi, TlsRSeqLo)
   ; in-place: gcm hashes the ciphertext before it writes the plaintext
+  If TlsRecDecryptHook<>0
+    ok=TlsRecDecryptHook(@secTlsRKey[0],@TlsNonce[0],@TlsAad[0],#TLS_REC_HDR,rec+#TLS_REC_HDR,innerlen,rec+#TLS_REC_HDR,rec+#TLS_REC_HDR+innerlen)
+    Tls13RecInvalidateCipher()
+  Else
   ok = GcmDecrypt(@TlsNonce[0], 12, @TlsAad[0], #TLS_REC_HDR, rec + #TLS_REC_HDR, innerlen, rec + #TLS_REC_HDR, rec + #TLS_REC_HDR + innerlen)
+  EndIf
   If ok <> #TLSREC_W32
     ; THE TAG DID NOT VERIFY - or the verdict is not the exact authentic
     ; mask, which is treated the same way (change 1 in the header). The

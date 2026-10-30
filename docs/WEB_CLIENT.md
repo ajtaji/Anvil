@@ -699,3 +699,42 @@ The earlier partial `net` reply was followed by a successful reconnect without
 reset: prompt 0.66 s and complete `net` 0.79 s. The host's read-only recovery
 prompt window is now 60 s instead of 5 s. Only allowlisted read-only queries
 may be replayed; uploads, boot, reset and writes remain excluded.
+
+
+## Bounded record decryption
+
+Build 431 adds `Crypto/gcm_job.pbi`, a shared AES-GCM decrypt job for 96-bit
+nonces and 128-bit tags. Begin copies its key/nonce/tag and derives H; Step
+processes at most 256 bytes. AAD and ciphertext are authenticated before any
+plaintext is written. Input/output may be identical or disjoint. The key can
+be 128, 192 or 256 bits; byte counts are limited to 32 bits. Input buffers
+remain alive and immutable through completion. One job is allowed; another
+Begin returns busy. Cancel wipes private secrets and pointers, not caller
+buffers. Each step reconstructs the AES state it needs, so other synchronous
+AES/GHASH calls between steps cannot corrupt its progress.
+
+The cooperative TLS driver installs a decrypt hook only while its worker runs.
+The record layer still requires the exact authentic verdict before accepting
+plaintext or advancing its sequence. Close cancels the job with the worker;
+the shared cipher cache is invalidated after the hook. Compositions without
+the hook retain the synchronous path. This does not yet split record encryption,
+file opening, or synchronous link waits. No fully nonblocking TLS claim is made.
+
+On the Pi, capture 292 passed 124 independent-vector cases: AES-128/192/256,
+empty and partial blocks, 256-byte boundaries, full TLS-sized records, forged
+tags with untouched output, in-place operation, busy refusal, cancellation,
+restart, output guards and private-key wiping. Shared crypto scratch was
+changed between every step. The maximum observed call was 559 us. An earlier
+93-case run measured a 16,640-byte AES-128 synchronous decrypt at about 29.7 ms
+versus about 0.41 ms per job step; total work is not claimed to improve by that
+ratio. Final citation-only edits produced byte-identical raw and PMF payloads.
+Pi 3 and Rock Pi compile the shared job; only Pi 4 has physical evidence here.
+
+Build 431 was installed with a verified 430 backup and complete live-image
+hash. Capture 294 passed HTTPS gzip/deflate and cancellation: the largest
+service call in these two responses was 3,222 us, versus 8,694 us on 430;
+HTTP Step peaked at 3,611 us. Network timing varies and these are observations,
+not worst-case guarantees. Capture 295 passed four overlapping verified HTTPS
+connections, including an event stream delivered before completion. Capture
+293 passed the cooperative worker's 31 context cases with the new hook scope.
+All runs returned with cores, fonts and Vulkan healthy, and watchdog off.

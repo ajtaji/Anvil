@@ -108,13 +108,13 @@ Procedure.i Main()
   for j in range(0,len(b),24):s+=' Data.a '+','.join(map(str,b[j:j+24]))+'\n'
  s+='EndDataSection\n'
  if context:
-  extra=['Anvil/Crypto/ec256.pbi','Anvil/Crypto/ecp.pbi','Anvil/Crypto/ecdsa.pbi','Anvil/Crypto/ecdsa_job.pbi','Anvil/Crypto/ecp_job.pbi','Anvil/Hal/aarch64_counter.pbi','Anvil/Kernel/Scheduler/scheduler.pbi','Anvil/Kernel/Scheduler/cooperative_a64.pbi']
+  extra=['Anvil/Crypto/aes.pbi','Anvil/Crypto/gcm.pbi','Anvil/Crypto/gcm_job.pbi','Anvil/Crypto/ec256.pbi','Anvil/Crypto/ecp.pbi','Anvil/Crypto/ecdsa.pbi','Anvil/Crypto/ecdsa_job.pbi','Anvil/Crypto/ecp_job.pbi','Anvil/Hal/aarch64_counter.pbi','Anvil/Kernel/Scheduler/scheduler.pbi','Anvil/Kernel/Scheduler/cooperative_a64.pbi']
   names+=extra+['Anvil/Core/tls_cooperative.pbi']
   pos=s.index('Procedure CaptureTable()')
   s=s[:pos]+'\n'.join('XIncludeFile "'+n+'"' for n in extra)+'\n'+r'''
 #TLSC_CONNECTIONS=4
 #TLSC_PREPARE=7
-Global *X509PauseHook,*TlsRootsPauseHook
+Global *X509PauseHook,*TlsRootsPauseHook,*TlsRecDecryptHook
 #TLSC_RESOLVING=1
 #TLSC_TCP=2
 #TLSC_HS=3
@@ -172,7 +172,7 @@ Procedure KeyContextRun(kind.i,v.i,an.i,bn.i,cn.i)
   t=timer() : tlsw_Advance() : elapsed=timer()-t
   If elapsed>ctxMaximum : ctxMaximum=elapsed : EndIf
   If tlsc_slot<>caller : ctxVerdict=-997 : Break : EndIf
-  If X509PauseHook<>0 Or TlsRootsPauseHook<>0 Or EcdsaVerifyHook<>0 Or RsaPublicHook<>0 Or X25519ComputeHook<>0
+  If TlsRecDecryptHook<>0 Or X509PauseHook<>0 Or TlsRootsPauseHook<>0 Or EcdsaVerifyHook<>0 Or RsaPublicHook<>0 Or X25519ComputeHook<>0
    ctxVerdict=-995 : Break
   EndIf
   ctxOther=ctxOther+1 : ctxSteps=ctxSteps+1 : pet()
