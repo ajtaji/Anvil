@@ -2300,3 +2300,33 @@ This proves LAN IPv6 DNS and hostname-based web traffic, not public off-link IPv
 IPv6 UDP DNS, automatic resolver discovery, scoped resolver selection, off-link
 and PMTU work, remaining atomic TLS/device work, HTTP/2-3 and managed cookies
 remain open. The networking implementation is not complete.
+
+
+### RDNSS advertisement decoder qualification
+
+The shared `Anvil/Network/ipv6_rdnss.pbi` provides
+`IPv6RdnssDecode(packet, bytes, local, rows, capacity)`. Each output row contains
+16 address bytes and the unmodified 32-bit lifetime in seconds. The result is
+the record count or a negative refusal. This is a codec, not a resolver list:
+interface scope, expiry, withdrawal and selection remain the caller's job.
+
+The decoder uses the existing Neighbor Discovery validation for checksums,
+link-local RA sources, hop limit 255, option framing and fragment refusal.
+It accepts the all-nodes destination or the caller's assigned local address.
+Invalid DNS options are discarded as whole options; unrelated valid options
+remain available. Capacity and span checks precede all output writes.
+Multiple options and duplicate addresses retain their wire order. Zero and
+infinite lifetimes are preserved for the future repository owner.
+Protocol facts: [RFC 8106 sections 5.1 and 5.3.1](https://www.rfc-editor.org/rfc/rfc8106.html#section-5.1).
+
+Thirty cases passed on the physical Pi running monitor 477, capture 112.
+Coverage includes malformed envelopes/options, multicast and unspecified
+resolver rejection, mixed valid/invalid options, unicast/multicast destinations,
+multiple lifetimes, duplicates, exact/insufficient capacity, overlapping storage,
+and the maximum 127-address option. Independent expected bytes and untouched
+output/report guards were checked. Board health checks passed.
+Evidence: docs/evidence/anvil-ipv6-20261030/rdnss-decoder477.
+
+The resident monitor is unchanged. Automatic RDNSS learning is **not enabled**;
+the per-interface lifetime repository, link-generation cleanup, scoped transport
+selection and live advertisement-to-DNS integration remain to be implemented.
