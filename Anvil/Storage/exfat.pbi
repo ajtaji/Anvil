@@ -1750,53 +1750,58 @@ Procedure.i exfat_ReadSystemEntries()
   ProcedureReturn 1
 EndProcedure
 
-Procedure.i exfat_FindSystemEntries()
-  Define started.i,rc.i,checksum.i
-  started=ExFatProfileBegin() : rc=exfat_ReadSystemEntries() : ExFatProfileEnd(2,started)
-  If rc=0 : ProcedureReturn 0 : EndIf
-  started=ExFatProfileBegin()
-  checksum = exfat_UpcaseTableChecksum()
-  ExFatProfileEnd(3,started)
-  If checksum < 0 Or checksum <> exfat_upcaseChecksum
-    ProcedureReturn exfat_Fail(#EXFAT_E_UPCASE_CHECKSUM)
-  EndIf
-  started=ExFatProfileBegin() : rc=exfat_ValidateUpcase() : ExFatProfileEnd(4,started)
-  If rc = 0
-    ProcedureReturn 0
-  EndIf
-  exfat_upcaseFastReady = 0
-  started=ExFatProfileBegin() : rc=exfat_BuildFastUpcase() : ExFatProfileEnd(5,started)
-  If rc = 0
-    ProcedureReturn 0
-  EndIf
-  ProcedureReturn 1
-EndProcedure
-
-Procedure.i ExFatMount(partition.i)
-  Define started.i,rc.i
+; Mount stages remain private: callers must serialize all driver state.
+; This does not expose an asynchronous API or permit yielding without ownership.
+Procedure exfat_MountReset()
   exfat_error = #EXFAT_OK
   exfat_DropCaches()
   exfat_mounted = 0
   exfat_upcaseFastReady = 0
   exfat_open = 0
   exfat_partBlocks = 0
-  started=ExFatProfileBegin() : rc=exfat_FindPartition(partition) : ExFatProfileEnd(0,started)
-  If rc = 0
-    ProcedureReturn 0
-  EndIf
-  started=ExFatProfileBegin() : rc=exfat_ReadBoot() : ExFatProfileEnd(1,started)
-  If rc = 0
-    ProcedureReturn 0
-  EndIf
-  If exfat_FindSystemEntries() = 0
-    ProcedureReturn 0
-  EndIf
+EndProcedure
+
+Procedure.i exfat_MountStage(partition.i, stage.i)
+  Define started.i,rc.i,checksum.i
+  If stage<0 Or stage>5 : ProcedureReturn exfat_Fail(#EXFAT_E_BOUNDS) : EndIf
+  started=ExFatProfileBegin()
+  Select stage
+    Case 0 : rc=exfat_FindPartition(partition)
+    Case 1 : rc=exfat_ReadBoot()
+    Case 2 : rc=exfat_ReadSystemEntries()
+    Case 3
+      checksum=exfat_UpcaseTableChecksum()
+      If checksum<0 Or checksum<>exfat_upcaseChecksum
+        rc=exfat_Fail(#EXFAT_E_UPCASE_CHECKSUM)
+      Else
+        rc=1
+      EndIf
+    Case 4 : rc=exfat_ValidateUpcase()
+    Case 5
+      exfat_upcaseFastReady=0
+      rc=exfat_BuildFastUpcase()
+  EndSelect
+  ExFatProfileEnd(stage,started)
+  ProcedureReturn rc
+EndProcedure
+
+Procedure exfat_MountFinish()
   exfat_mounted = 1
   exfat_dirty = 0
   exfat_ioFailed = 0
   exfat_allocChanged = 0
   exfat_freeClusters = -1
   exfat_error = #EXFAT_OK
+EndProcedure
+
+Procedure.i ExFatMount(partition.i)
+  Define stage.i
+  exfat_MountReset()
+  For stage=0 To 5
+    If exfat_MountStage(partition,stage)=0 : ProcedureReturn 0 : EndIf
+  Next
+  ; Publish the mounted volume only after all validation stages succeeded.
+  exfat_MountFinish()
   ProcedureReturn 1
 EndProcedure
 

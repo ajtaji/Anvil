@@ -2043,3 +2043,27 @@ shared source; physical Pi3 execution was not tested. Evidence:
 
 Remaining cooperative first-open, IPv6/off-link/PMTU and DNS transport,
 HTTP/2-3 and managed-cookie work remains open.
+
+
+### Mount stage preparation (compiled build468; installed build467)
+
+Shared exFAT mounting now separates reset, six validation stages and final
+publication of the mounted volume. The existing public ExFatMount entry point
+still drains all stages synchronously. These are private primitives, not an
+asynchronous API: there is no new yield, ownership lease or TLS latency claim.
+The stages retain the same partition, boot, system-directory, up-case checksum,
+decoding and ASCII-map checks and timing counters.
+
+The physical Pi fixture passed the full filesystem/checksum/cache/boot regression
+and checks that no intermediate stage publishes a mounted volume, invalid stages
+perform no reads, a later checksum failure leaves the volume unmounted, and the
+normal entry point can recover and complete. Capture91 returned zero with healthy
+cores, fonts, Vulkan and watchdog state. Pi4build468 and Pi3build82 compile; 468
+has not been installed. The Pi remains on verified build467. Evidence:
+`docs/evidence/anvil-ipv6-20261030/mount-stages468`.
+
+Before these stages may yield, the shared filesystem facade needs ownership and
+cancellation handling: another operation must not replace or reuse partial mount
+state. Wiring a pause into the current global-state mount without that protection
+would be unsafe. Cooperative cold open and the remaining networking protocols
+are still unfinished.

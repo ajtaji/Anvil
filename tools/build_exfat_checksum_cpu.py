@@ -256,12 +256,37 @@ Procedure.i ProofBootSnapshots()
  ProofPrepareBoot()
  ProcedureReturn 0
 EndProcedure
+Procedure.i ProofMountStages()
+ Define stage.i,reads.i
+ ProofPrepareBoot() : exfat_MountReset()
+ For stage=0 To 5
+  If exfat_mounted<>0 : ProcedureReturn 1 : EndIf
+  If exfat_MountStage(1,stage)=0 : ProcedureReturn 10+stage : EndIf
+  If exfat_mounted<>0 : ProcedureReturn 2 : EndIf
+ Next
+ exfat_MountFinish()
+ If exfat_mounted<>1 Or exfat_upcaseFastReady<>1 : ProcedureReturn 3 : EndIf
+ ProofPrepareBoot() : exfat_MountReset()
+ reads=gateReads
+ If exfat_MountStage(1,-1)<>0 Or exfat_error<>#EXFAT_E_BOUNDS : ProcedureReturn 4 : EndIf
+ If exfat_MountStage(1,6)<>0 Or exfat_error<>#EXFAT_E_BOUNDS : ProcedureReturn 5 : EndIf
+ If gateReads<>reads Or exfat_mounted<>0 : ProcedureReturn 6 : EndIf
+ ; A later validation failure cannot publish the partial volume.
+ For stage=0 To 2
+  If exfat_MountStage(1,stage)=0 : ProcedureReturn 20+stage : EndIf
+ Next
+ exfat_upcaseChecksum=exfat_upcaseChecksum ! 1
+ If exfat_MountStage(1,3)<>0 Or exfat_error<>#EXFAT_E_UPCASE_CHECKSUM Or exfat_mounted<>0 : ProcedureReturn 7 : EndIf
+ ; The ordinary entry point still resets and completes the same stages.
+ If ExFatMount(1)=0 Or exfat_mounted<>1 : ProcedureReturn 8 : EndIf
+ ProcedureReturn 0
+EndProcedure
 Procedure.i Main()
  Define rc.i,i.i,j.i,n.i,start.i,slow.i,fast.i,old.i,new.i,p.i,reads.i
  For i=0 To 65535 : PokeA($E1C00000+i,0) : Next
  MmuClearNc() : rc=MmuBuildTables($4F80000) : If rc<>0 : ProcedureReturn 9999 : EndIf
  MmuEnableCached()
- PokeI($E1C00000,$58464334)
+ PokeI($E1C00000,$58464335)
  PokeI($E1C00040,ExFatProfileBegin())
  ExFatProfileSetClock(@ProofProfileClock)
  start=ExFatProfileBegin() : ExFatProfileEnd(0,start)
@@ -276,6 +301,8 @@ Procedure.i Main()
  If rc<>0 : MmuDisableCachedFlushed() : ProcedureReturn rc : EndIf
  rc=ProofBootSnapshots() : PokeI($E1C00088,rc)
  If rc<>0 : MmuDisableCachedFlushed() : ProcedureReturn 9800+rc : EndIf
+ rc=ProofMountStages() : PokeI($E1C00098,rc)
+ If rc<>0 : MmuDisableCachedFlushed() : ProcedureReturn 9900+rc : EndIf
  rc=ProofDirectoryCache() : PokeI($E1C00080,rc)
  If rc<>0 : MmuDisableCachedFlushed() : ProcedureReturn 9500+rc : EndIf
  GateFormat() : ExFatSetRangeReader(@GateReader) : ExFatSetRangeWriter(0)
