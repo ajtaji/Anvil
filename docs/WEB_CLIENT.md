@@ -2502,3 +2502,50 @@ open.
 Protocol references: [RFC 7301 section 3](https://www.rfc-editor.org/rfc/rfc7301.html#section-3)
 and [RFC 8446 section 4.2](https://www.rfc-editor.org/rfc/rfc8446.html#section-4.2).
 These supply protocol facts; no implementation code was copied.
+
+
+### TLS ALPN service integration: ABI 1.13, build 483
+
+Reserved network slots 90 and 91 now expose `SvcTlsOpenAlpn(host, port,
+protocols, bytes)` and `SvcTlsAlpn(handle, destination, capacity)`. The table
+remains 200 entries; no old index or signature changes. The two-argument open
+at slot 80 retains no-offer behavior. Unsupported target capabilities retain
+the existing service-table refusal behavior.
+
+Open validates and copies the bounded offer before returning its handle. The
+copy belongs to the connection through asynchronous preparation, DNS and TCP;
+it is applied after TLS initialization and cleared on close. The selected-name
+getter performs no network progress. It returns EAGAIN until the client is open,
+zero for no negotiated protocol, or a byte count without a terminator. Invalid
+or too-small destination storage is refused without a partial write. ABI entry
+points check caller buffers against payload memory before dereferencing them.
+
+On the installed physical Pi 4, two overlapping verified connections to
+httpbin.org negotiated h2 and http/1.1 respectively after the shared caller
+input buffer had been overwritten. The legacy open negotiated no protocol.
+Pending getters, undersized destinations with unchanged sentinel bytes, stale
+handles and six invalid-input refusals passed. The longest observed service
+call in that probe was 2332 microseconds, not a worst-case
+bound. Existing verified HTTPS gzip/deflate and cancellation tests also passed.
+
+The first live probe had an incomplete memory-translation lifecycle: it enabled
+translation without constructing tables and the watchdog reset the board. A
+second probe completed the network checks but omitted cache/translation teardown,
+so Vulkan was inactive on return. These failures are retained separately from
+the final successful qualification. The probe now constructs the tables with the
+required device mappings and flushes/disables caching and translation before
+return. Its builder refuses missing setup/teardown or an intervening early return.
+After recovery and the final run, cores, fonts, Vulkan and watchdog checks passed.
+Forum topic 1532 records the probe defect; it was not a TLS or compiler failure.
+
+Build 483 and its full running image hash were verified; build 482 remains at
+`1:/B482V483.IMG` for rollback. Pi 3 build 97 compiles. The payload guide was
+rebuilt and its changed pages visually checked. Evidence:
+`docs/evidence/anvil-ipv6-20261030/alpn-service483`.
+
+This proves actual verified ALPN negotiation through the application service.
+It does not yet provide an HTTP/2 request engine. Existing WebClient calls remain
+HTTP/1-only and must not send HTTP/1 bytes after negotiating h2. Next are shared
+HTTP/2 framing, HPACK, stream state and flow control. HTTP/3, public off-link IPv6,
+automatic RDNSS-to-web qualification and remaining atomic TLS/device work remain
+open.

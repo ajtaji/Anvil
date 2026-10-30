@@ -714,6 +714,29 @@ with cooperative TLS yielding between arithmetic/parser units. Closing wipes the
 buffers and saved state; returning from a payload closes all its TLS handles.
 
 
+@SECTION TLS application protocol negotiation
+
+ABI 1.13 fills reserved network slots 90 and 91. The table still has 200
+entries, and every older slot keeps its signature. Check major 1, minor at
+least 13 and at least 92 entries before reading these pointers.
+
+Slot 90, SvcTlsOpenAlpn(host, port, protocols, bytes), opens a verified TLS
+connection with a copied protocol offer. The offer contains one-byte name
+lengths followed by nonempty opaque names, with at most 256 bytes in total.
+For h2 the three bytes are 2, 104, 50. The copy belongs to the connection,
+so the caller may reuse its buffer immediately. Empty input means no offer,
+as with the unchanged two-argument SvcTlsOpen at slot 80. Malformed lists
+and buffers outside payload memory are refused before a connection opens.
+
+Slot 91, SvcTlsAlpn(handle, destination, capacity), copies the selected name
+only after verified establishment. It returns EAGAIN while pending, zero
+if no protocol was selected, or the name's byte count. The output is not
+zero-terminated. Capacity is bounded to 256 bytes; too-small or invalid
+storage returns EARG without a partial copy. The getter does not perform
+network progress: continue calling the service and state slots.
+
+@TRAP A selected h2 protocol requires HTTP/2 frames. Do not send an HTTP/1 request on that connection. Existing web-client calls continue to advertise no ALPN; negotiation support alone does not implement HTTP/2 or HTTP/3.
+
 @SECTION API credentials and forms
 
 The shared web_credentials library formats Basic and Bearer Authorization

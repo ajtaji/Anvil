@@ -35,11 +35,11 @@ def check():
         assert f'tlsc_saved[base+{i}]={name}' in select,name
         assert f'{name}=tlsc_saved[base+{i}]' in select,name
     assert f'#TLSC_CONNECTIONS*{len(fields)}]' in client
-    for name,limit in [('name','NAME_MAX'),('hs','HS_BUF'),('recv','RECV_BUF'),('tx','TX_BUF'),('in','IN_BUF'),('ring','RING')]:
+    for name,limit in [('name','NAME_MAX'),('hs','HS_BUF'),('recv','RECV_BUF'),('tx','TX_BUF'),('in','IN_BUF'),('ring','RING'),('alpn','ALPN_MAX')]:
         assert f'Global Dim tlsc_{name}.a[#TLSC_CONNECTIONS*#TLSC_{limit}]' in client
         for expression in re.findall(r'\btlsc_'+name+r'\[([^]]+)\]',client):
             base=f'tlsc_slot*#TLSC_{limit}'
             assert expression==base or expression.startswith(base+'+'),(name,expression)
-    return {'state_fields':len(rows),'snapshot_bytes':size,'client_fields':len(fields),'isolated_large_buffers':6}
+    return {'state_fields':len(rows),'snapshot_bytes':size,'client_fields':len(fields),'isolated_large_buffers':7}
 
 if __name__=='__main__':print(check())

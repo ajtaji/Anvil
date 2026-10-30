@@ -2233,6 +2233,33 @@ Procedure.i SvcTlsState(h.i)
   ProcedureReturn TlsClientState(h)
 EndProcedure
 
+; ABI 1.13, reserved network slots 90/91. No existing slot moves.
+Procedure.i SvcTlsOpenAlpn(host.i,port.i,protocols.i,bytes.i)
+  Define i.i,terminated.i
+  If SvcRequireCap(#CAP_NET,"net","this board has no network interface Anvil can reach")=0 : ProcedureReturn #SVC_ENOCAP : EndIf
+  If bytes<0 Or bytes>256 : ProcedureReturn #SVC_EARG : EndIf
+  If bytes>0
+    If protocols=0 Or InPayload(protocols,protocols+bytes-1)=0 : ProcedureReturn #SVC_EARG : EndIf
+  EndIf
+  terminated=0
+  For i=0 To 255
+    If host=0 Or InPayload(host+i,host+i)=0 : ProcedureReturn #SVC_EARG : EndIf
+    If PeekA(host+i)=0 : terminated=1 : Break : EndIf
+  Next
+  If terminated=0 : ProcedureReturn #SVC_EARG : EndIf
+  ProcedureReturn TlsClientOpenAlpn(host,port,protocols,bytes)
+EndProcedure
+
+Procedure.i SvcTlsAlpn(h.i,destination.i,capacity.i)
+  If SvcRequireCap(#CAP_NET,"net","this board has no network interface Anvil can reach")=0 : ProcedureReturn #SVC_ENOCAP : EndIf
+  If capacity<0 Or capacity>256 : ProcedureReturn #SVC_EARG : EndIf
+  If capacity>0
+    If destination=0 Or InPayload(destination,destination+capacity-1)=0 : ProcedureReturn #SVC_EARG : EndIf
+  EndIf
+  ProcedureReturn TlsClientAlpn(h,destination,capacity)
+EndProcedure
+
+
 CompilerEndIf
 
 ; ======================================================================
@@ -2930,6 +2957,8 @@ Procedure BuildServiceTable()
   gSvcTab[#SVC_HDR_WORDS + #SVC_BASE_NET + 15] = @SvcTlsState
   gSvcTab[#SVC_HDR_WORDS + #SVC_BASE_NET + 16] = @SvcTcpOpen6
   gSvcTab[#SVC_HDR_WORDS + #SVC_BASE_NET + 17] = @SvcDnsResolve6
+  gSvcTab[#SVC_HDR_WORDS + #SVC_BASE_NET + 18] = @SvcTlsOpenAlpn
+  gSvcTab[#SVC_HDR_WORDS + #SVC_BASE_NET + 19] = @SvcTlsAlpn
   CompilerEndIf
 
   ; --- usb, base 96 ---------------------------------------------------

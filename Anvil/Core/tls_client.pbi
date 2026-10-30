@@ -71,6 +71,9 @@ XIncludeFile "Anvil/Core/tcp_dial.pbi"
 
 XIncludeFile "Anvil/Crypto/tls13_context.pbi"
 #TLSC_CONNECTIONS=4
+#TLSC_ALPN_MAX=256
+Global Dim tlsc_alpn.a[#TLSC_CONNECTIONS*#TLSC_ALPN_MAX]
+Global Dim tlsc_alpnLen.i[#TLSC_CONNECTIONS]
 Global Dim tlsc_dial.TcpDial[#TLSC_CONNECTIONS]
 Global tlsc_state.i
 Global tlsc_fail.i                 ; the latched #SVC_* code
@@ -250,6 +253,10 @@ Procedure tlsc_Begin()
   Tls13SetGroup(#TLS_GROUP_X25519)
   If Tls13Init(@tlsc_name[tlsc_slot*#TLSC_NAME_MAX+0], tlsc_nameLen, WallClockNow()) = 0
     tlsc_Refuse(#SVC_ESTATE, "TLS would not start (no trusted time, no root store, or a key-schedule fault)")
+    ProcedureReturn
+  EndIf
+  If Tls13SetAlpn(@tlsc_alpn[tlsc_slot*#TLSC_ALPN_MAX],tlsc_alpnLen[tlsc_slot])=0
+    tlsc_Refuse(#SVC_EARG,"TLS protocol list was refused")
     ProcedureReturn
   EndIf
   If Tls13NewKeyShare() = 0
@@ -442,10 +449,25 @@ EndProcedure
 ; ----------------------------------------------------------------------
 ;  TlsClientOpen(*host, port) - a fresh handle at once, or negative.
 ; ----------------------------------------------------------------------
-Procedure.i TlsClientOpen(*host, port.i)
+Procedure.i TlsClientOpenAlpn(*host, port.i, protocols.i, bytes.i)
   Define n.i
   Define r.i
-  Define slot.i
+  Define slot.i,p.i,length.i
+  Define Dim copied.a[#TLSC_ALPN_MAX]
+  If bytes<0 Or bytes>#TLSC_ALPN_MAX Or (bytes>0 And protocols=0)
+    gSvcDetail="TLS protocol list must fit 256 bytes"
+    ProcedureReturn #SVC_EARG
+  EndIf
+  For r=0 To bytes-1 : copied[r]=PeekA(protocols+r) : Next
+  p=0
+  While p<bytes
+    length=copied[p]&255 : p=p+1
+    If length=0 Or length>bytes-p
+      gSvcDetail="TLS protocol list contains an empty or truncated name"
+      ProcedureReturn #SVC_EARG
+    EndIf
+    p=p+length
+  Wend
   If *host = 0
     gSvcDetail = "the host name pointer was zero"
     ProcedureReturn #SVC_EARG
@@ -480,6 +502,12 @@ Procedure.i TlsClientOpen(*host, port.i)
     tlsc_name[tlsc_slot*#TLSC_NAME_MAX+r] = PeekA(*host + r)
   Next
   tlsc_name[tlsc_slot*#TLSC_NAME_MAX+n] = 0
+  ; This copy survives caller reuse and asynchronous preparation/lookup.
+  For r=0 To #TLSC_ALPN_MAX-1
+    If r<bytes : tlsc_alpn[tlsc_slot*#TLSC_ALPN_MAX+r]=copied[r]
+    Else : tlsc_alpn[tlsc_slot*#TLSC_ALPN_MAX+r]=0 : EndIf
+  Next
+  tlsc_alpnLen[tlsc_slot]=bytes
   tlsc_nameLen = n
   tlsc_port = port
   tlsc_ip = 0
@@ -501,6 +529,25 @@ Procedure.i TlsClientOpen(*host, port.i)
   ; Opening reserves a handle only. Preparation belongs to the bounded
   ; progress path, not to a call promising a fresh handle at once.
   ProcedureReturn tlsc_handles[tlsc_slot]
+EndProcedure
+
+Procedure.i TlsClientOpen(*host,port.i)
+  ProcedureReturn TlsClientOpenAlpn(*host,port,0,0)
+EndProcedure
+
+; No progress is hidden in the getter. Pending and absent are distinct.
+Procedure.i TlsClientAlpn(h.i,destination.i,capacity.i)
+  Define rc.i
+  If capacity<0 Or capacity>#TLSC_ALPN_MAX Or (capacity>0 And destination=0)
+    gSvcDetail="TLS protocol destination must fit 256 bytes"
+    ProcedureReturn #SVC_EARG
+  EndIf
+  rc=tlsc_Handle(h) : If rc<0 : ProcedureReturn rc : EndIf
+  If tlsc_state=#TLSC_FAILED : gSvcDetail=tlsc_why : ProcedureReturn tlsc_fail : EndIf
+  If tlsc_state<>#TLSC_OPEN : ProcedureReturn #SVC_EAGAIN : EndIf
+  rc=Tls13Alpn(destination,capacity)
+  If rc<0 : gSvcDetail="TLS protocol destination is too small" : ProcedureReturn #SVC_EARG : EndIf
+  ProcedureReturn rc
 EndProcedure
 
 Procedure.i TlsClientState(h.i)
@@ -617,6 +664,8 @@ Procedure.i TlsClientClose(h.i)
   r=Tls13ContextWipe(@tlsc_context[tlsc_slot*#TLS13_CONTEXT_SIZE],#TLS13_CONTEXT_SIZE)
   r=Tls13ContextRestore(@tlsc_context[tlsc_slot*#TLS13_CONTEXT_SIZE],#TLS13_CONTEXT_SIZE)
   GcmWipe() : AesWipe()
+  tlsc_alpnLen[tlsc_slot]=0
+  For i=0 To #TLSC_ALPN_MAX-1 : tlsc_alpn[tlsc_slot*#TLSC_ALPN_MAX+i]=0 : Next
   For i=0 To #TLSC_NAME_MAX-1 : tlsc_name[tlsc_slot*#TLSC_NAME_MAX+i]=0 : Next
   For i=0 To #TLSC_HS_BUF-1 : tlsc_hs[tlsc_slot*#TLSC_HS_BUF+i]=0 : Next
   For i=0 To #TLSC_RECV_BUF-1 : tlsc_recv[tlsc_slot*#TLSC_RECV_BUF+i]=0 : Next
