@@ -1308,3 +1308,32 @@ state, address bytes and untouched record guards. The payload returned normally
 with cores, font slots and Vulkan healthy. This shared policy is not yet wired
 to live router advertisements. PIO decoding, router/prefix tables and resident
 address ownership still precede routed IPv6 TCP and actual web requests.
+
+
+## Router Advertisement copy-out codec
+
+`Anvil/Network/ipv6_router.pbi` validates Router Advertisements through the
+shared Neighbor Discovery parser, checks all-nodes or assigned-unicast
+addressing, and copies router configuration and prefix records into caller-owned
+storage. No output retains a pointer into receive memory. Every refusal leaves
+both output spans unchanged, including insufficient prefix capacity.
+
+The 88-byte router record contains the source address, optional MAC, hop limit,
+flags, router lifetime, reachability/retransmit values, usable advertised MTU
+and prefix count. Zero configuration fields remain zero for the owner to treat
+as unspecified. Each 56-byte prefix record carries length, independent L/A
+flags, valid/preferred lifetimes and a normalized network prefix. Records keep
+wire order and repeated prefixes; non-/64 lengths remain available for routing.
+The owner applies SLAAC identifier-length and lifetime rules separately.
+
+Unknown options, unusable PIOs and out-of-range MTUs are ignored. Structural
+option errors, wrong hop limit, checksum failures and ND fragments refuse.
+Valid MTUs must be within 1280 and the caller's link ceiling. The last usable
+MTU wins without an invalid later value erasing it. Prefix host bits are masked,
+including non-octet and zero-length prefixes; link-local/multicast prefixes are
+not installed from PIOs. This codec does not install routes or assign addresses.
+
+All 45 physical Pi CPU cases passed on Anvil 444 with exact copy-out bytes and
+unchanged output/guard checks. The payload returned normally, and cores, fonts
+and Vulkan remained healthy. Resident router/prefix tables and solicitation
+scheduling are still required before routed IPv6 TCP and web requests.
