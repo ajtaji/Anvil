@@ -1403,6 +1403,7 @@ CompilerEndIf
                                ; caller's buffer
 #GENET_ERR_NARROW      = -17   ; a 64-bit address truncated - the canary
 #GENET_ERR_UNCITED     = -18   ; asked for something with no citation
+#GENET_ERR_TX_BUSY     = -19   ; a previous frame still owns the TX DMA buffer
 
 ; ======================================================================
 ;  STATE
@@ -1426,6 +1427,12 @@ Global genet_linkUp.i
 Global genet_speed.i             ; 10, 100 or 1000. Mbit/s.
 Global genet_fullDuplex.i        ; 1 full, 0 half
 
+; The driver owns one aligned TX copy until completion or successful DMA stop.
+; A timed-out caller may reuse its own input; another submit cannot overwrite
+; bytes the controller may still be reading.
+Global Dim genet_txOwned.a[#GENET_MAX_FRAME + 64]
+Global genet_txPending.i
+Global genet_txGoal.i
 Global genet_txIndex.i           ; our cursor into the TX descriptors
 Global genet_rxIndex.i           ; our cursor into the RX descriptors
 Global genet_cIndex.i            ; the RX consumer index we last wrote
@@ -2902,6 +2909,7 @@ Procedure.i GenetDisableDma()
   If genet_Poke(#GENET_UMAC_TX_FLUSH, 0) = 0
     ProcedureReturn 0
   EndIf
+  genet_txPending = 0
   ProcedureReturn 1
 EndProcedure
 
@@ -3379,127 +3387,84 @@ EndProcedure
 ; go out twice with the new one's length. The driver does it in this
 ; order at [U:294-296] and so does this.
 ;
-; THE FRAME IS NOT COPIED. The DMA engine reads the caller's buffer
-; directly, so THE BUFFER MUST STAY PUT AND UNMODIFIED UNTIL THIS
-; RETURNS. That is safe because this call is synchronous - it does not
-; return until the hardware's consumer index says the frame is gone -
-; but it is stated because the obvious "optimisation" of returning
-; early is a use-after-free waiting to happen.
-;
-; THE COMPLETION SPIN IS BOUNDED BY TIME, NOT BY 100 TRIES. U-Boot's
-; `tries = 100` at [U:278] is a bare loop count with no delay in it,
-; which means its real duration depends on the compiler and the CPU
-; clock; on an A72 at 1.5 GHz that could expire in well under a
-; microsecond, long before a 1518-byte frame has left a gigabit
-; interface. Substituting a real deadline is a DELIBERATE DEPARTURE
-; from the cited driver and it is called out here so nobody "restores"
-; it. The deadline is the caller's, for the same reason
-; GenetPhyWaitLink's is.
-;
-; ONE FRAME AT A TIME. The ring has 256 descriptors and this uses them
-; one at a time, synchronously, exactly as the driver does. Queueing
-; several and reaping them later is a real feature and it is not this;
-; nobody asked for it and it would need an interrupt or a reaper the
-; caller has to remember to call.
+ ; A private aligned copy survives timeout and caller-buffer reuse. One DMA
+; owner is allowed at a time. Polling observes completion without waiting;
+; the compatibility wrapper retains its bounded wait. Failure to publish the
+; producer is ambiguous, so ownership remains until completion or DMA stop.
 ; ----------------------------------------------------------------------
-Procedure.i GenetSend(*frame, length.i, timeoutMs.i)
-  Protected d.i
-  Protected prod.i
-  Protected cons.i
-  Protected lenStat.i
-  Protected t0.i
-  Protected budget.i
-  Protected addr.i
+Procedure.i GenetPollSend()
+  Define cons.i
+  If genet_txPending = 0 : ProcedureReturn 1 : EndIf
+  cons = genet_Peek(#GENET_TDMA_CONS_INDEX)
+  If cons < 0
+    genet_err = cons
+    ProcedureReturn -1
+  EndIf
+  ; Exactly one frame is outstanding. Equality is valid across FFFF -> 0000;
+  ; a plain >= falsely completed the frame while the old consumer was FFFF.
+  If (cons & $FFFF) <> genet_txGoal : ProcedureReturn 0 : EndIf
+  genet_txPending = 0
+  genet_txCount = genet_txCount + 1
+  ProcedureReturn 1
+EndProcedure
 
+; 1 accepted into owned DMA storage, -1 busy with no submission, 0 error.
+; Neither operation waits. The input may be reused as soon as this returns.
+Procedure.i GenetTrySend(*frame, length.i)
+  Define d.i,prod.i,cons.i,lenStat.i,addr.i,i.i,rc.i
   genet_err = #GENET_ERR_NONE
-
   If genet_started = 0
-    genet_err = #GENET_ERR_NOT_STARTED
-    ProcedureReturn 0
+    genet_err = #GENET_ERR_NOT_STARTED : ProcedureReturn 0
   EndIf
-  If *frame = 0
-    genet_err = #GENET_ERR_ARG
-    ProcedureReturn 0
+  If *frame = 0 Or length < #GENET_MIN_FRAME Or length > #GENET_MAX_FRAME
+    genet_err = #GENET_ERR_ARG : ProcedureReturn 0
   EndIf
-  ; Short frames are REFUSED, not padded. See #GENET_MIN_FRAME.
-  If length < #GENET_MIN_FRAME Or length > #GENET_MAX_FRAME
-    genet_err = #GENET_ERR_ARG
-    ProcedureReturn 0
+  rc = GenetPollSend()
+  If rc < 0 : ProcedureReturn 0 : EndIf
+  If rc = 0
+    genet_err = #GENET_ERR_TX_BUSY : ProcedureReturn -1
   EndIf
-  If timeoutMs <= 0
-    genet_err = #GENET_ERR_ARG
-    ProcedureReturn 0
+  prod = genet_Peek(#GENET_TDMA_PROD_INDEX)
+  If prod < 0 : genet_err = prod : ProcedureReturn 0 : EndIf
+  cons = genet_Peek(#GENET_TDMA_CONS_INDEX)
+  If cons < 0 : genet_err = cons : ProcedureReturn 0 : EndIf
+  If (prod & $FFFF) <> (cons & $FFFF)
+    genet_err = #GENET_ERR_TX_BUSY : ProcedureReturn -1
   EndIf
-
-  addr = *frame
+  addr = (@genet_txOwned[0] + 63) & -64
   If (addr >> 32) <> 0
     If GenetAddrIsWide() = 0
-      genet_err = #GENET_ERR_NARROW
-      ProcedureReturn 0
+      genet_err = #GENET_ERR_NARROW : ProcedureReturn 0
     EndIf
   EndIf
-
-  prod = genet_Peek(#GENET_TDMA_PROD_INDEX)
-  If prod < 0
-    genet_err = prod
-    ProcedureReturn 0
-  EndIf
-
-  ; Push the frame out of our cache before a bus master reads it.
+  For i = 0 To length - 1 : PokeA(addr + i, PeekA(*frame + i)) : Next
   genet_CacheRange(addr, length)
-
-  ; [U:275] and [U:290-291]
   lenStat = ((length & #GENET_DMA_BUFLENGTH_MASK) << #GENET_DMA_BUFLENGTH_SHIFT) | #GENET_TX_FLAGS
-
   d = #GENET_TX_OFF + (genet_txIndex * #GENET_DESC_SIZE)
-  If genet_Poke(d + #GENET_DESC_ADDRESS_LO, addr & $FFFFFFFF) = 0
-    ProcedureReturn 0
-  EndIf
-  If genet_Poke(d + #GENET_DESC_ADDRESS_HI, (addr >> 32) & $FFFFFFFF) = 0
-    ProcedureReturn 0
-  EndIf
-  If genet_Poke(d + #GENET_DESC_LENGTH_STATUS, lenStat) = 0
-    ProcedureReturn 0
-  EndIf
-
-  ; [U:299-300] advance the cursor, wrapping at TX_DESCS
-  genet_txIndex = genet_txIndex + 1
-  If genet_txIndex >= #GENET_TX_DESCS
-    genet_txIndex = 0
-  EndIf
-
-  ; The descriptor must be visible to the controller before the
-  ; producer index tells it to look. The controller reads descriptors
-  ; through MMIO, which is Device memory and not reordered against
-  ; itself on this core - but the barrier is one instruction and the
-  ; cost of being wrong about that is a frame sent from a
-  ; half-written descriptor.
+  If genet_Poke(d + #GENET_DESC_ADDRESS_LO, addr & $FFFFFFFF) = 0 : ProcedureReturn 0 : EndIf
+  If genet_Poke(d + #GENET_DESC_ADDRESS_HI, (addr >> 32) & $FFFFFFFF) = 0 : ProcedureReturn 0 : EndIf
+  If genet_Poke(d + #GENET_DESC_LENGTH_STATUS, lenStat) = 0 : ProcedureReturn 0 : EndIf
   a64_barrier()
+  genet_txGoal = (prod + 1) & $FFFF
+  genet_txPending = 1
+  genet_txIndex = (genet_txIndex + 1) % #GENET_TX_DESCS
+  If genet_Poke(#GENET_TDMA_PROD_INDEX, genet_txGoal) = 0 : ProcedureReturn 0 : EndIf
+  ProcedureReturn 1
+EndProcedure
 
-  ; [U:302-305] the write that starts the transmission
-  prod = (prod + 1) & $FFFF
-  If genet_Poke(#GENET_TDMA_PROD_INDEX, prod) = 0
-    ProcedureReturn 0
+Procedure.i GenetSend(*frame, length.i, timeoutMs.i)
+  Define t0.i,budget.i,rc.i
+  If timeoutMs <= 0
+    genet_err = #GENET_ERR_ARG : ProcedureReturn 0
   EndIf
-
-  ; [U:307-312] wait for the consumer index, but on a real clock.
-  t0 = genet_Ticks()
-  budget = GenetTimeoutTicks(timeoutMs)
+  If GenetTrySend(*frame,length) <> 1 : ProcedureReturn 0 : EndIf
+  t0 = genet_Ticks() : budget = GenetTimeoutTicks(timeoutMs)
   Repeat
-    cons = genet_Peek(#GENET_TDMA_CONS_INDEX)
-    If cons < 0
-      genet_err = cons
-      ProcedureReturn 0
-    EndIf
-    If (cons & $FFFF) >= prod
-      genet_txCount = genet_txCount + 1
-      ProcedureReturn 1
-    EndIf
-    If (genet_Ticks() - t0) > budget
-      Break
-    EndIf
+    rc = GenetPollSend()
+    If rc = 1 : ProcedureReturn 1 : EndIf
+    If rc < 0 : ProcedureReturn 0 : EndIf
+    If (genet_Ticks() - t0) > budget : Break : EndIf
   ForEver
-
   genet_err = #GENET_ERR_TX_TIMEOUT
   ProcedureReturn 0
 EndProcedure
@@ -4088,6 +4053,8 @@ Procedure.i GenetErrorText()
       ProcedureReturn "genet: REFUSED - no RX region, or it is under 524288 bytes or not 64-byte aligned"
     Case #GENET_ERR_NOT_STARTED
       ProcedureReturn "genet: GenetStart() has not succeeded"
+    Case #GENET_ERR_TX_BUSY
+      ProcedureReturn "genet: a previous frame still owns the TX DMA buffer"
     Case #GENET_ERR_TX_TIMEOUT
       ProcedureReturn "genet: the TX consumer index never advanced - the frame was queued and nothing collected it"
     Case #GENET_ERR_RX_LONG

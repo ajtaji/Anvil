@@ -883,3 +883,31 @@ retains the supplied pointer requires a separate hardware-completion owner.
 The existing GENET synchronous path retains the caller pointer and compares its
 wrapping consumer counter with a plain `>=`; both ownership and wrap-safe
 completion need addressing during integration. No wired hardware fix is claimed.
+
+
+## GENET transmit ownership and wrapping completion (build 436)
+
+GENET now copies each packet into a private 64-byte-aligned DMA buffer. A timed-out
+caller can reuse its original storage without changing bytes that hardware may
+still read. `GenetTrySend` submits without waiting; `GenetPollSend` checks the one
+outstanding descriptor. Another submit cannot overwrite the owned buffer until
+completion. A successful DMA disable/flush releases ownership; any failed stop
+retains it. A failed producer write is treated as ambiguous and retains ownership.
+
+Completion now requires the consumer index to equal the single outstanding
+producer goal. The previous plain `>=` comparison falsely completed a wrapped
+goal of zero while the old consumer remained 65,535. The synchronous compatibility
+API uses the same submit/poll implementation and still has its bounded wait.
+
+Twenty-one physical Pi CPU checks passed with controlled register outcomes,
+covering counter/descriptor wrap, caller-buffer mutation, busy refusal, one-time
+completion, ambiguous publication, register failure, timeout, failed/successful
+DMA stop, maximum frames and invalid inputs. Exact retained buffer bytes were
+checked. These are not Ethernet-wire or physical DMA fault-injection results;
+the bench currently carries traffic over Wi-Fi. The change belongs to GENET's
+hardware-specific backend, while the owned FIFO remains shared across targets.
+
+Build 436 was installed and verified by running-image hash after the full boot
+interval. Actual Wi-Fi HTTPS gzip/deflate and cancellation tests passed, along
+with core/font/Vulkan health checks. Queue-to-driver integration, other backends'
+completion ownership, SDIO waits, IPv6 web traffic and HTTP/2-3 remain unfinished.

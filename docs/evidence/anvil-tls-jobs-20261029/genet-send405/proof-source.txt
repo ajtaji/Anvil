@@ -1,0 +1,228 @@
+XIncludeFile "RaspberryPi4/Lib/mmu.pi4"
+#GENET_UMAC_TX_FLUSH      = $0B34    ; $0800 + $334  [U:68] [unimac.h:64]
+#GENET_TX_DESCS    = 256             ; = TOTAL_DESCS [U:98]
+#GENET_DESC_LENGTH_STATUS = $00      ; [U:135]
+#GENET_DESC_ADDRESS_LO    = $04      ; [U:136]
+#GENET_DESC_ADDRESS_HI    = $08      ; [U:137]
+#GENET_DESC_SIZE          = 12       ; [U:138]
+#GENET_TX_OFF = $4000                ; [U:143]
+#GENET_TDMA_CONS_INDEX       = $5008 ; $5000 + $08  [U:157]
+#GENET_TDMA_PROD_INDEX       = $500C ; $5000 + $0c  [U:158]
+#GENET_TDMA_CTRL           = $5044   ; $5040 + $04
+#GENET_RDMA_CTRL           = $3044   ; $3040 + $04
+#GENET_DMA_EN                = $00000001  ; BIT(0)  [U:112]
+#GENET_DMA_BUFLENGTH_MASK    = $0FFF      ;         [U:115]
+#GENET_DMA_BUFLENGTH_SHIFT   = 16         ;         [U:116]
+#GENET_TX_FLAGS = $7FC0
+#GENET_MIN_FRAME = 60
+#GENET_MAX_FRAME = 1536              ; = #GENET_MAX_MTU_SIZE
+#GENET_ERR_NONE        =   0
+#GENET_ERR_ARG         =  -1   ; a parameter was out of range
+#GENET_ERR_RANGE       =  -2   ; a register offset outside the block
+#GENET_ERR_ALIGN       =  -3   ; a register offset that was not 4-aligned
+#GENET_ERR_VERSION     =  -4   ; SYS_REV_CTRL does not say GENETv5
+#GENET_ERR_MDIO_BUSY   =  -5   ; START_BUSY never cleared - bus dead?
+#GENET_ERR_MDIO_FAIL   =  -6   ; MDIO_READ_FAIL - nothing answered
+#GENET_ERR_PHY_NONE    =  -7   ; no PHY ID at that address
+#GENET_ERR_NO_LINK     =  -8   ; the PHY reports no link
+#GENET_ERR_ANEG        =  -9   ; auto-negotiation did not complete
+#GENET_ERR_SPEED       = -10   ; a speed this MAC must not be set to
+#GENET_ERR_HALF_DUPLEX = -11   ; REFUSED - see the header, refusal 1
+#GENET_ERR_NO_MAC      = -12   ; GenetSetMac() was never called
+#GENET_ERR_NO_RXBUF    = -13   ; GenetSetRxRegion() was never called,
+#GENET_ERR_NOT_STARTED = -14   ; GenetStart() has not succeeded
+#GENET_ERR_TX_TIMEOUT  = -15   ; the consumer index never advanced
+#GENET_ERR_RX_LONG     = -16   ; a received frame will not fit the
+#GENET_ERR_NARROW      = -17   ; a 64-bit address truncated - the canary
+#GENET_ERR_UNCITED     = -18   ; asked for something with no citation
+#GENET_ERR_TX_BUSY     = -19   ; a previous frame still owns the TX DMA buffer
+
+Global genet_err.i,genet_started.i,genet_txPending.i,genet_txGoal.i,genet_txCount.i,genet_txIndex.i
+Global Dim genet_txOwned.a[#GENET_MAX_FRAME+64]
+Global Dim sourceFrame.a[1536]
+Global fakeProd.i,fakeCons.i,failOffset.i=-1,publishFail.i,modifyFail.i,ticks.i,writes.i,cacheBytes.i,descAddr.i
+Procedure.i genet_Peek(off.i)
+ If off=#GENET_TDMA_PROD_INDEX : ProcedureReturn fakeProd : EndIf
+ ProcedureReturn fakeCons
+EndProcedure
+Procedure.i genet_Poke(off.i,value.i)
+ writes=writes+1
+ If off=#GENET_TDMA_PROD_INDEX
+  If off<>failOffset Or publishFail<>0 : fakeProd=value : EndIf
+ ElseIf off>=#GENET_TX_OFF And off<#GENET_TX_OFF+3072
+  If (off-#GENET_TX_OFF) % 12 = 4 : descAddr=value : EndIf
+ EndIf
+ If off=failOffset : genet_err=-2 : ProcedureReturn 0 : EndIf
+ ProcedureReturn 1
+EndProcedure
+Procedure.i genet_Modify(off.i,clear.i,bits.i)
+ If modifyFail<>0 : genet_err=-2 : ProcedureReturn 0 : EndIf
+ ProcedureReturn 1
+EndProcedure
+Procedure genet_DelayUs(n.i)
+EndProcedure
+Procedure genet_CacheRange(addr.i,n.i)
+ cacheBytes=n
+EndProcedure
+Procedure.i GenetAddrIsWide()
+ ProcedureReturn 1
+EndProcedure
+Procedure.i genet_Ticks()
+ ticks=ticks+1 : ProcedureReturn ticks
+EndProcedure
+Procedure.i GenetTimeoutTicks(ms.i)
+ ProcedureReturn ms
+EndProcedure
+Procedure.i GenetDisableDma()
+  If genet_Modify(#GENET_TDMA_CTRL, #GENET_DMA_EN, 0) = 0
+    ProcedureReturn 0
+  EndIf
+  If genet_Modify(#GENET_RDMA_CTRL, #GENET_DMA_EN, 0) = 0
+    ProcedureReturn 0
+  EndIf
+  If genet_Poke(#GENET_UMAC_TX_FLUSH, 1) = 0
+    ProcedureReturn 0
+  EndIf
+  genet_DelayUs(10)
+  If genet_Poke(#GENET_UMAC_TX_FLUSH, 0) = 0
+    ProcedureReturn 0
+  EndIf
+  genet_txPending = 0
+  ProcedureReturn 1
+EndProcedure
+Procedure.i GenetPollSend()
+  Define cons.i
+  If genet_txPending = 0 : ProcedureReturn 1 : EndIf
+  cons = genet_Peek(#GENET_TDMA_CONS_INDEX)
+  If cons < 0
+    genet_err = cons
+    ProcedureReturn -1
+  EndIf
+  ; Exactly one frame is outstanding. Equality is valid across FFFF -> 0000;
+  ; a plain >= falsely completed the frame while the old consumer was FFFF.
+  If (cons & $FFFF) <> genet_txGoal : ProcedureReturn 0 : EndIf
+  genet_txPending = 0
+  genet_txCount = genet_txCount + 1
+  ProcedureReturn 1
+EndProcedure
+Procedure.i GenetTrySend(*frame, length.i)
+  Define d.i,prod.i,cons.i,lenStat.i,addr.i,i.i,rc.i
+  genet_err = #GENET_ERR_NONE
+  If genet_started = 0
+    genet_err = #GENET_ERR_NOT_STARTED : ProcedureReturn 0
+  EndIf
+  If *frame = 0 Or length < #GENET_MIN_FRAME Or length > #GENET_MAX_FRAME
+    genet_err = #GENET_ERR_ARG : ProcedureReturn 0
+  EndIf
+  rc = GenetPollSend()
+  If rc < 0 : ProcedureReturn 0 : EndIf
+  If rc = 0
+    genet_err = #GENET_ERR_TX_BUSY : ProcedureReturn -1
+  EndIf
+  prod = genet_Peek(#GENET_TDMA_PROD_INDEX)
+  If prod < 0 : genet_err = prod : ProcedureReturn 0 : EndIf
+  cons = genet_Peek(#GENET_TDMA_CONS_INDEX)
+  If cons < 0 : genet_err = cons : ProcedureReturn 0 : EndIf
+  If (prod & $FFFF) <> (cons & $FFFF)
+    genet_err = #GENET_ERR_TX_BUSY : ProcedureReturn -1
+  EndIf
+  addr = (@genet_txOwned[0] + 63) & -64
+  If (addr >> 32) <> 0
+    If GenetAddrIsWide() = 0
+      genet_err = #GENET_ERR_NARROW : ProcedureReturn 0
+    EndIf
+  EndIf
+  For i = 0 To length - 1 : PokeA(addr + i, PeekA(*frame + i)) : Next
+  genet_CacheRange(addr, length)
+  lenStat = ((length & #GENET_DMA_BUFLENGTH_MASK) << #GENET_DMA_BUFLENGTH_SHIFT) | #GENET_TX_FLAGS
+  d = #GENET_TX_OFF + (genet_txIndex * #GENET_DESC_SIZE)
+  If genet_Poke(d + #GENET_DESC_ADDRESS_LO, addr & $FFFFFFFF) = 0 : ProcedureReturn 0 : EndIf
+  If genet_Poke(d + #GENET_DESC_ADDRESS_HI, (addr >> 32) & $FFFFFFFF) = 0 : ProcedureReturn 0 : EndIf
+  If genet_Poke(d + #GENET_DESC_LENGTH_STATUS, lenStat) = 0 : ProcedureReturn 0 : EndIf
+  a64_barrier()
+  genet_txGoal = (prod + 1) & $FFFF
+  genet_txPending = 1
+  genet_txIndex = (genet_txIndex + 1) % #GENET_TX_DESCS
+  If genet_Poke(#GENET_TDMA_PROD_INDEX, genet_txGoal) = 0 : ProcedureReturn 0 : EndIf
+  ProcedureReturn 1
+EndProcedure
+Procedure.i GenetSend(*frame, length.i, timeoutMs.i)
+  Define t0.i,budget.i,rc.i
+  If timeoutMs <= 0
+    genet_err = #GENET_ERR_ARG : ProcedureReturn 0
+  EndIf
+  If GenetTrySend(*frame,length) <> 1 : ProcedureReturn 0 : EndIf
+  t0 = genet_Ticks() : budget = GenetTimeoutTicks(timeoutMs)
+  Repeat
+    rc = GenetPollSend()
+    If rc = 1 : ProcedureReturn 1 : EndIf
+    If rc < 0 : ProcedureReturn 0 : EndIf
+    If (genet_Ticks() - t0) > budget : Break : EndIf
+  ForEver
+  genet_err = #GENET_ERR_TX_TIMEOUT
+  ProcedureReturn 0
+EndProcedure
+Procedure Save(index.i,rc.i)
+ Define p.i,addr.i,i.i
+ p=$E1C00100+index*2048 : addr=(@genet_txOwned[0]+63) & -64
+ PokeI(p,rc) : PokeI(p+8,genet_txPending) : PokeI(p+16,genet_txGoal)
+ PokeI(p+24,genet_txCount) : PokeI(p+32,genet_txIndex) : PokeI(p+40,genet_err)
+ PokeI(p+48,writes) : PokeI(p+56,cacheBytes)
+ PokeI(p+64,Bool(descAddr=addr)) : PokeI(p+72,Bool(descAddr<>@sourceFrame[0]))
+ For i=0 To 1535 : PokeA(p+80+i,PeekA(addr+i)) : Next
+EndProcedure
+Procedure.i Main()
+ Define i.i,rc.i
+ For i=0 To 65535 : PokeA($E1C00000+i,0) : Next
+ PokeI($E1C00000,$474E5431)
+ MmuClearNc() : rc=MmuBuildTables($4F80000) : If rc<>0 : ProcedureReturn 2 : EndIf
+ MmuEnableCached()
+ For i=0 To 1535 : sourceFrame[i]=(i*7+3)&255 : Next
+rc=GenetTrySend(@sourceFrame[0],60)
+ Save(0,rc)
+genet_started=1 : rc=GenetTrySend(@sourceFrame[0],59)
+ Save(1,rc)
+fakeProd=65535 : fakeCons=65535 : genet_txIndex=255 : rc=GenetTrySend(@sourceFrame[0],60)
+ Save(2,rc)
+For i=0 To 1535 : sourceFrame[i]=$EE : Next
+ rc=GenetPollSend()
+ Save(3,rc)
+rc=GenetTrySend(@sourceFrame[0],64)
+ Save(4,rc)
+fakeCons=0 : rc=GenetPollSend()
+ Save(5,rc)
+rc=GenetPollSend()
+ Save(6,rc)
+For i=0 To 1535 : sourceFrame[i]=(i*7+3)&255 : Next
+ failOffset=#GENET_TDMA_PROD_INDEX : publishFail=1 : rc=GenetTrySend(@sourceFrame[0],64)
+ Save(7,rc)
+rc=GenetPollSend()
+ Save(8,rc)
+fakeCons=1 : rc=GenetPollSend()
+ Save(9,rc)
+failOffset=#GENET_TX_OFF+12+4 : rc=GenetTrySend(@sourceFrame[0],64)
+ Save(10,rc)
+failOffset=-1 : rc=GenetTrySend(@sourceFrame[0],64)
+ Save(11,rc)
+fakeCons=-2 : rc=GenetPollSend()
+ Save(12,rc)
+fakeCons=2 : rc=GenetPollSend()
+ Save(13,rc)
+rc=GenetSend(@sourceFrame[0],64,1)
+ Save(14,rc)
+modifyFail=1 : rc=GenetDisableDma()
+ Save(15,rc)
+modifyFail=0 : rc=GenetDisableDma()
+ Save(16,rc)
+fakeCons=3 : rc=GenetTrySend(@sourceFrame[0],1536)
+ Save(17,rc)
+fakeCons=4 : rc=GenetPollSend()
+ Save(18,rc)
+rc=GenetTrySend(@sourceFrame[0],1537)
+ Save(19,rc)
+rc=GenetTrySend(0,60)
+ Save(20,rc)
+ PokeI($E1C00008,21)
+ MmuDisableCachedFlushed()
+ ProcedureReturn 0
+EndProcedure
