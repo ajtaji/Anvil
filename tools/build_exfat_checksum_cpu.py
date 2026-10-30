@@ -209,12 +209,59 @@ Global profileTestClock.i
 Procedure.i ProofProfileClock()
  profileTestClock=profileTestClock+10 : ProcedureReturn profileTestClock
 EndProcedure
+Procedure ProofRepairBoot(base.i)
+ Define i.i,sum.i
+ sum=GateBootChecksum(base)
+ For i=0 To 508 Step 4 : exfat_Put32(@gateDisk[0]+(base+11)*512,i,sum) : Next
+EndProcedure
+Procedure.i ProofDriftingBootReader(lba.i,count.i,dst.i)
+ If lba=1 And count=12
+  exfat_Put32(@gateDisk[0]+512,96,3)
+  exfat_Put32(@gateDisk[0]+13*512,96,3)
+  ProofRepairBoot(1) : ProofRepairBoot(13)
+ EndIf
+ ProcedureReturn GateReader(lba,count,dst)
+EndProcedure
+Procedure ProofPrepareBoot()
+ GateFormat() : gateFailLba=-1
+ ExFatSetRangeReader(@GateReader) : ExFatSetRangeWriter(0)
+ exfat_partLba=1 : exfat_partBlocks=2048 : exfat_error=0 : exfat_ioFailed=0
+ gateReads=0
+EndProcedure
+Procedure.i ProofBootSnapshots()
+ Define i.i,rc.i
+ ProofPrepareBoot()
+ If exfat_ReadBoot()=0 Or gateReads<>4 : ProcedureReturn 1 : EndIf
+ PokeI($E1C00090,gateReads)
+ ; Every immutable byte must still match, even with a valid backup checksum.
+ For i=64 To 111
+  If i<>106 And i<>107
+   ProofPrepareBoot()
+   gateDisk[13*512+i]=gateDisk[13*512+i] ! 1 : ProofRepairBoot(13)
+   If exfat_ReadBoot()<>0 Or exfat_error<>#EXFAT_E_BOOT : ProcedureReturn 100+i : EndIf
+  EndIf
+ Next
+ ProofPrepareBoot()
+ gateDisk[13*512+106]=255 : gateDisk[13*512+107]=255 : gateDisk[13*512+112]=100
+ If exfat_ReadBoot()=0 : ProcedureReturn 2 : EndIf
+ For i=0 To 1
+  ProofPrepareBoot() : gateDisk[(1+i*12)*512+200]=1
+  If exfat_ReadBoot()<>0 Or exfat_error<>#EXFAT_E_BOOT_CHECKSUM : ProcedureReturn 3+i : EndIf
+  ProofPrepareBoot() : gateFailLba=5+i*12
+  rc=exfat_ReadBoot() : gateFailLba=-1
+  If rc<>0 Or exfat_error<>#EXFAT_E_READ : ProcedureReturn 5+i : EndIf
+ Next
+ ProofPrepareBoot() : ExFatSetRangeReader(@ProofDriftingBootReader)
+ If exfat_ReadBoot()<>0 Or exfat_error<>#EXFAT_E_BOOT : ProcedureReturn 7 : EndIf
+ ProofPrepareBoot()
+ ProcedureReturn 0
+EndProcedure
 Procedure.i Main()
  Define rc.i,i.i,j.i,n.i,start.i,slow.i,fast.i,old.i,new.i,p.i,reads.i
  For i=0 To 65535 : PokeA($E1C00000+i,0) : Next
  MmuClearNc() : rc=MmuBuildTables($4F80000) : If rc<>0 : ProcedureReturn 9999 : EndIf
  MmuEnableCached()
- PokeI($E1C00000,$58464333)
+ PokeI($E1C00000,$58464334)
  PokeI($E1C00040,ExFatProfileBegin())
  ExFatProfileSetClock(@ProofProfileClock)
  start=ExFatProfileBegin() : ExFatProfileEnd(0,start)
@@ -227,6 +274,8 @@ Procedure.i Main()
  PokeI($E1C00068,ExFatProfileValue(7,0))
  rc=GateMain() : PokeI($E1C00008,rc)
  If rc<>0 : MmuDisableCachedFlushed() : ProcedureReturn rc : EndIf
+ rc=ProofBootSnapshots() : PokeI($E1C00088,rc)
+ If rc<>0 : MmuDisableCachedFlushed() : ProcedureReturn 9800+rc : EndIf
  rc=ProofDirectoryCache() : PokeI($E1C00080,rc)
  If rc<>0 : MmuDisableCachedFlushed() : ProcedureReturn 9500+rc : EndIf
  GateFormat() : ExFatSetRangeReader(@GateReader) : ExFatSetRangeWriter(0)

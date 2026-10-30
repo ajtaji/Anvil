@@ -2,9 +2,10 @@
 import struct
 def check(raw,cases):
     magic,regression,hz,fault=struct.unpack_from('<4q',raw)
-    assert magic==0x58464333 and regression==0 and hz>0 and fault==-1,(magic,regression,hz,fault)
+    assert magic==0x58464334 and regression==0 and hz>0 and fault==-1,(magic,regression,hz,fault)
     assert struct.unpack_from('<6q',raw,64)==(-1,2,20,10,0,-1),'profile clock/guard accounting failed'
     assert struct.unpack_from('<q',raw,128)[0]==0,'directory cache regression failed'
+    assert struct.unpack_from('<2q',raw,136)==(0,4),'boot snapshot validation/read count failed'
     rows=[]
     for i,n in enumerate(cases):
         old,new,slow,fast,reads=struct.unpack_from('<5q',raw,256+i*64)

@@ -698,6 +698,7 @@ Procedure.i exfat_Ror16(value.i)
 EndProcedure
 
 Global Dim exfat_bootRegion.a[12*#EXFAT_MAX_SECTOR]
+Global Dim exfat_bootMain.a[113]
  ; Accumulate exactly the same unsigned 32-bit rotate/add checksum. Four
 ; byte steps share loop control; byte loads impose no alignment requirement.
 Procedure.i exfat_ChecksumBytes(data.i,bytes.i,sum.i)
@@ -778,24 +779,18 @@ EndProcedure
 
 ; Both boot regions describe the same geometry. VolumeFlags and PercentInUse
 ; are explicitly allowed to be stale in the backup and are not compared.
-Procedure.i exfat_CheckBackupGeometry()
+Procedure.i exfat_CheckBootGeometry(main.i, backup.i)
   Define i.i
-  If exfat_ReadSector(0, @exfat_sector[0]) = 0
-    ProcedureReturn 0
-  EndIf
-  If exfat_ReadSector(12, @exfat_aux[0]) = 0
-    ProcedureReturn 0
-  EndIf
   i = 64
   While i <= 105
-    If PeekA(@exfat_sector[0] + i) <> PeekA(@exfat_aux[0] + i)
+    If PeekA(main + i) <> PeekA(backup + i)
       ProcedureReturn exfat_Fail(#EXFAT_E_BOOT)
     EndIf
     i = i + 1
   Wend
   i = 108
   While i <= 111
-    If PeekA(@exfat_sector[0] + i) <> PeekA(@exfat_aux[0] + i)
+    If PeekA(main + i) <> PeekA(backup + i)
       ProcedureReturn exfat_Fail(#EXFAT_E_BOOT)
     EndIf
     i = i + 1
@@ -1108,9 +1103,14 @@ Procedure.i exfat_ReadBoot()
   If exfat_ClusterValid(exfat_rootCluster) = 0
     ProcedureReturn exfat_Fail(#EXFAT_E_ROOT)
   EndIf
-  If exfat_CheckBootRegion(0) = 0 Or exfat_CheckBootRegion(12) = 0 Or exfat_CheckBackupGeometry() = 0
-    ProcedureReturn 0
-  EndIf
+  If exfat_CheckBootRegion(0) = 0 : ProcedureReturn 0 : EndIf
+  ; The geometry parsed above must match the checksum-validated main region.
+  ; Preserve that validated header before the backup replaces the range buffer.
+  If exfat_CheckBootGeometry(@exfat_sector[0], @exfat_bootRegion[0]) = 0 : ProcedureReturn 0 : EndIf
+  exfat_Copy(@exfat_bootMain[0], @exfat_bootRegion[0], 113)
+  If exfat_CheckBootRegion(12) = 0 : ProcedureReturn 0 : EndIf
+  ; Compare the actual validated snapshots, without two further device reads.
+  If exfat_CheckBootGeometry(@exfat_bootMain[0], @exfat_bootRegion[0]) = 0 : ProcedureReturn 0 : EndIf
   ProcedureReturn 1
 EndProcedure
 

@@ -2006,3 +2006,40 @@ probe and successful synchronized rerun:
 
 Remaining IPv6/off-link/PMTU and DNS transport work, HTTP/2-3 and managed-cookie
 policy remain open alongside the synchronous first-open work.
+
+
+### Validated boot-header reuse (build467)
+
+Boot validation compares immutable main/backup geometry directly from the
+checksum-validated snapshots. It no longer rereads two sectors solely for that
+comparison. It also rejects a main header whose immutable geometry differs
+from the initial header used to configure the mount. VolumeFlags and PercentInUse
+remain allowed to differ in the backup. Checksums and signatures still cover
+both complete boot regions.
+
+The physical RAM fixture confirms four device reads instead of six for boot
+validation, all 46 compared bytes, the allowed mutable fields, both region
+checksum failures, required read failures and changed bootstrap geometry.
+The full filesystem/cache/checksum regression also passed. An initial fixture
+asserted a dirty-volume latch for a clean read failure; its failed result is
+retained. The corrected test checks the required read-error code. No product
+change was needed for that test correction.
+
+On the identical cold, certificate-verified public HTTPS gzip/deflate probe:
+
+| Measurement | Build466 | Build467 |
+| --- | ---: | ---: |
+| Boot validation | 1.373 ms | 1.050 ms |
+| Cold root open, maximum | 3.853 ms | 3.515 ms |
+| Whole network service, maximum | 4.023 ms | 3.674 ms |
+
+These are individual run observations. Before/after counter differences exclude
+startup activity. The initial open is still synchronous; this does not complete
+TLS blocking. Build467 is installed and verified by its full running-image hash,
+with build466 retained for rollback. Cores, fonts, Vulkan and watchdog checks
+passed, and the temporary DNS override was removed. Pi3build81 compiles the same
+shared source; physical Pi3 execution was not tested. Evidence:
+`docs/evidence/anvil-ipv6-20261030/boot467`.
+
+Remaining cooperative first-open, IPv6/off-link/PMTU and DNS transport,
+HTTP/2-3 and managed-cookie work remains open.
