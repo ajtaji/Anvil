@@ -605,7 +605,7 @@ Procedure.i h2cFrame(*c.H2Client)
    offset=0 : padding=0
    If (*h\flags & 8)<>0 : padding=PeekA(p) : offset=1 : EndIf
    If (*h\flags & 32)<>0
-    If (NetReadBE32(p+offset) & $7FFFFFFF)=*h\stream : ProcedureReturn h2cFail(*c,#H2_PROTOCOL) : EndIf
+    ; Legacy scheduling hints are unused; retain their mandatory wire layout.
     offset=offset+5
    EndIf
    n=*h\length-offset-padding
@@ -649,7 +649,11 @@ Procedure.i h2cFrame(*c.H2Client)
     EndIf
    EndIf
   Case 2
-   If (NetReadBE32(p) & $7FFFFFFF)=*h\stream : ProcedureReturn h2cFail(*c,#H2_PROTOCOL) : EndIf
+   ; Well-formed deprecated PRIORITY hints do not change stream state.
+   ; The header reader admits malformed lengths only for an active stream.
+   If *h\length<>5 And *s<>0
+    h2cStreamError(*c,*s,6,#H2_FRAME_SIZE)
+   EndIf
   Case 3
    If *s=0
     If *h\stream>=*c\nextStream Or (*h\stream & 1)=0 : ProcedureReturn h2cFail(*c,#H2_PROTOCOL) : EndIf
@@ -813,7 +817,18 @@ Procedure.i H2ClientStep(*c.H2Client,now.i)
    ProcedureReturn 0
   EndIf
   *c\received=*c\received+rc
-  rc=H2FrameFeed(@*c\frame,*c\buffers\rx,rc) : If rc<0 : ProcedureReturn h2cFail(*c,rc) : EndIf
+  rc=H2FrameFeed(@*c\frame,*c\buffers\rx,rc)
+  If rc=#H2_FRAME_SIZE And *c\frame\kind=2 And *c\frame\stream<>0 And *c\frame\length<=16384 And *c\settingsSeen<>0 And *c\continuation=0
+   *s=h2cStream(*c,*c\frame\stream)
+   If *s<>0
+    If *s\state=1
+     ; Consume the bounded payload before resetting its stream. Keep the
+     ; reusable frame decoder strict for callers without stream context.
+     *c\frame\error=0 : rc=0
+    EndIf
+   EndIf
+  EndIf
+  If rc<0 : ProcedureReturn h2cFail(*c,rc) : EndIf
   If *c\frame\used=9 And *c\frame\length=0 : ProcedureReturn h2cFrame(*c) : EndIf
   ProcedureReturn 0
  EndIf

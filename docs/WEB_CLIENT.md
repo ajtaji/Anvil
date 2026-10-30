@@ -3253,3 +3253,39 @@ failed transfer record is preserved alongside the recovered evidence. Evidence:
 Remaining work includes other stream/frame-error classifications and automatic
 connection-error GOAWAY transmission, plus the broader TLS, off-link IPv6/RDNSS
 web qualification and HTTP/3 work. This is not a complete networking claim.
+
+
+### Legacy priority hints and contextual PRIORITY frame errors
+
+The client does not schedule requests using deprecated dependency-tree hints.
+Well-formed PRIORITY payloads are therefore ignored, including self-references
+and hints for idle streams. HEADERS still accounts for the mandatory five-byte
+priority prefix, including padding and CONTINUATION handling, without interpreting
+the unused dependency. This adds no priority scheduler and allocates no stream
+state for a hint. RFC 9113 section 5.3.2 deprecates the older signaling scheme.
+
+A malformed PRIORITY length on an active stream is consumed within the fixed
+16384-byte receive limit, then produces wire FRAME_SIZE_ERROR (6) and local
+H2_FRAME_SIZE through RESET. The shared frame decoder itself remains strict:
+only the connection engine, with established settings, no pending continuation
+and a known active stream, handles that error as stream-local. Pending resets
+retain bounded queue behavior. Oversized frames, zero stream identifiers,
+malformed hints without an active stream, interrupted header sequences and
+short HEADERS priority prefixes remain connection failures. This conservative
+escalation policy does not enlarge receive buffers or bypass framing checks.
+
+Physical Pi 4 capture 202 reproduced connection closure from legacy priority
+self-references and a short active-stream PRIORITY. Capture 203 passed 16 cases:
+active/idle/even hints, ordinary hints, padded and continued priority HEADERS,
+malformed active lengths 0/4/6/16384, full control-queue congestion, and five
+fatal boundary/order cases. Exact reset/local codes, request completion,
+content, credit and close ownership were checked. Captures 204-205 passed all
+46 engine and eight shutdown regressions. These are fragmented deterministic
+transport fixtures on the physical CPU, not external-server malformed traffic.
+Shared Pi 3 compilation passed; no physical Pi 3 claim. All four captures
+returned zero with healthy cores/fonts/Vulkan and watchdog off. Installed Anvil
+483 was unchanged. Evidence:
+`docs/evidence/anvil-ipv6-20261030/http2-priority483`.
+
+Automatic connection-error GOAWAY transmission remains unfinished, as do broader
+TLS compatibility/blocking, off-link IPv6/RDNSS web qualification and HTTP/3.
