@@ -8,7 +8,7 @@ import argparse,hashlib,json,os,re,subprocess
 from pmf_compiler import resolve_compiler
 from build_quic_handshake_frames_cpu import vi
 
-def build(compiler,out,public,wrong_name=False,bad_signature=False):
+def build(compiler,out,public,wrong_name=False,bad_signature=False,drop_probe=False):
     assert not (wrong_name and bad_signature)
     root=Path(__file__).resolve().parents[1];out.mkdir(parents=True,exist_ok=False)
     trust=json.loads(public.read_text(encoding='utf8'))
@@ -24,7 +24,7 @@ def build(compiler,out,public,wrong_name=False,bad_signature=False):
     params+=b'\x0c\x00'
     dn=bytes.fromhex(trust['root_dn']);key=bytes.fromhex(trust['root_key'])
     assert len(key)==65 and trust['hostname']=='quic-test.local' and len(params)<=128
-    source='#X509_SIG_LINKED=1\n'+ '\n'.join('XIncludeFile "'+n+'"' for n in names)
+    source=f'#DROP_PROBE_TEST={int(drop_probe)}\n#X509_SIG_LINKED=1\n'+ '\n'.join('XIncludeFile "'+n+'"' for n in names)
     # Explicit fixture CA; file-backed root loading is outside this proof.
     source+='\nGlobal *TlsRootsPauseHook\nGlobal unexpectedProfile.i\nProcedure str_print_at(address.i)\n unexpectedProfile=unexpectedProfile+1\nEndProcedure\nProcedure PrintDec(value.i)\n unexpectedProfile=unexpectedProfile+1\nEndProcedure\nProcedure PrintNl()\n unexpectedProfile=unexpectedProfile+1\nEndProcedure\nProcedure.i HwMicros()\n ProcedureReturn A64CounterReadOrdered()/(A64CounterFrequency()/1000000)\nEndProcedure\nXIncludeFile "Anvil/Core/tls_worker.pbi"\nXIncludeFile "Anvil/Core/tls_context_worker.pbi"\nXIncludeFile "Anvil/Core/quic_tls_operation.pbi"\nXIncludeFile "Anvil/Core/quic_connection.pbi"\nXIncludeFile "Anvil/Core/quic_connection_send.pbi"\nXIncludeFile "Anvil/Core/quic_connection_ack.pbi"\nXIncludeFile "Anvil/Core/quic_connection_receive.pbi"\nXIncludeFile "Anvil/Core/quic_connection_tls.pbi"\nXIncludeFile "Anvil/Core/quic_connection_start.pbi"\nXIncludeFile "Anvil/Core/quic_connection_control.pbi"\n'
     names+=['Anvil/Core/tls_worker.pbi','Anvil/Core/tls_context_worker.pbi','Anvil/Core/quic_tls_operation.pbi','Anvil/Core/quic_connection.pbi','Anvil/Core/quic_connection_send.pbi','Anvil/Core/quic_connection_ack.pbi','Anvil/Core/quic_connection_receive.pbi','Anvil/Core/quic_connection_tls.pbi','Anvil/Core/quic_connection_start.pbi','Anvil/Core/quic_connection_control.pbi']
@@ -55,4 +55,5 @@ def build(compiler,out,public,wrong_name=False,bad_signature=False):
 if __name__=='__main__':
     ap=argparse.ArgumentParser(description=__doc__);ap.add_argument('--compiler',required=True);ap.add_argument('--out',type=Path,required=True);ap.add_argument('--public',type=Path,required=True)
     negative=ap.add_mutually_exclusive_group();negative.add_argument('--wrong-name',action='store_true');negative.add_argument('--bad-signature',action='store_true')
-    a=ap.parse_args();build(a.compiler,a.out.resolve(),a.public.resolve(),a.wrong_name,a.bad_signature)
+    ap.add_argument('--drop-probe',action='store_true')
+    a=ap.parse_args();build(a.compiler,a.out.resolve(),a.public.resolve(),a.wrong_name,a.bad_signature,a.drop_probe)

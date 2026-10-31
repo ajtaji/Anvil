@@ -34,6 +34,7 @@ Global peerIdsFault.i,peerIdsChecked.i,peerIdsFrames.i
 Global confirmFault.i,confirmChecked.i,confirmForeign.i,confirmSecretPresent.i
 Global applicationStateFault.i
 Global applicationFault.i,applicationBadTag.i,applicationCancelled.i,applicationPing.i
+Global lossPhase.i,lossAckCount.i,lossFault.i,lossEvents.i,lossChecked.i,lossJob.QuicHandshakeSentLoss
 Global probeFault.i,probeChecked.i,probeNumber.i,probeBytes.i
 Global deliveryProbes.i
 Global applicationDelivery.i,deliveryFault.i,deliveryEvents.i,deliverySteps.i,deliveryNumber.i
@@ -304,15 +305,15 @@ Procedure.i SendApplicationPing()
  controlChecked=1 : applicationPing=1 : ProcedureReturn 0
 EndProcedure
 
-Procedure.i SendApplicationProbe()
+Procedure.i SendApplicationProbe(expected.i)
  Define rc.i,n.i,i.i
  If connection\applicationState\ack\pending<>0 : probeFault=1 : ProcedureReturn -9491 : EndIf
  If QuicConnectionControlBegin(@connection,HwMicros(),3,0)<>#QUIC_CONTROL_STATE : probeFault=2 : EndIf
  If QuicConnectionControlBegin(@connection,-1,3,1)<>#QUIC_CONTROL_ARGUMENT : probeFault=3 : EndIf
- If connection\applicationState\nextNumber<>1 : probeFault=4 : EndIf
+ If connection\applicationState\nextNumber<>expected : probeFault=4 : EndIf
  rc=QuicConnectionControlBegin(@connection,HwMicros(),3,1) : If rc<>0 : ProcedureReturn rc : EndIf
  probeNumber=connection\controlNumber : probeBytes=connection\controlBytes
- If probeNumber<>1 Or connection\applicationState\nextNumber<>2 Or connection\controlHasAck<>0 Or connection\controlToken<>0 Or probeBytes<>22+peerBytes : probeFault=5 : EndIf
+ If probeNumber<>expected Or connection\applicationState\nextNumber<>expected+1 Or connection\controlHasAck<>0 Or connection\controlToken<>0 Or probeBytes<>22+peerBytes : probeFault=5 : EndIf
  Repeat
   rc=QuicConnectionControlStep(@connection)
   n=Service() : If n<0 : ProcedureReturn n : EndIf
@@ -332,7 +333,7 @@ Procedure.i SendApplicationProbe()
  Until status\txState=#UDP_TX_SENT
  For i=0 To probeBytes-1 : If controlSaved[i]<>output[i] : probeFault=6 : EndIf : Next
  rc=QuicConnectionControlCompleted(@connection,0) : If rc<>1 : ProcedureReturn rc : EndIf
- If connection\applicationState\ack\pending<>0 Or connection\applicationHistory\issued<>2 Or connection\applicationHistory\first<>1 Or connection\applicationHistory\inFlight<>probeBytes : probeFault=7 : EndIf
+ If connection\applicationState\ack\pending<>0 Or connection\applicationHistory\issued<>expected+1 Or connection\applicationHistory\first<>1 Or connection\applicationHistory\inFlight<>expected*probeBytes : probeFault=7 : EndIf
  probeChecked=1 : ProcedureReturn 0
 EndProcedure
 Procedure.i ConfirmHandshake()
@@ -511,9 +512,11 @@ EndProcedure
 ; Continue the actual exchange after TX; consume authenticated peer ACKs.
 Procedure.i ReceiveApplicationAck()
  Define rc.i,n.i,i.i,p.i,bytes.i,cursor.i,used.i,pn.i,seen.i,eliciting.i,receivedAt.i,untilTime.i
- rc=CheckDeliveryRefusals() : If rc<>0 : ProcedureReturn rc : EndIf
+ If lossPhase=0
+  rc=CheckDeliveryRefusals() : If rc<>0 : ProcedureReturn rc : EndIf
+ EndIf
  untilTime=HwMicros()+3000000
- While applicationDelivery=0
+ While (lossPhase=0 And applicationDelivery=0) Or (lossPhase=1 And lossAckCount<3)
   n=Service() : If n<0 : ProcedureReturn n : EndIf
   If HwMicros()>untilTime : ProcedureReturn -9481 : EndIf
   bytes=UdpPayloadReceive(handle,@info,@packet[0],1472)
@@ -544,13 +547,18 @@ Procedure.i ReceiveApplicationAck()
      Repeat
       rc=QuicHandshakeSentAckStep(@connection\applicationAck) : deliverySteps=deliverySteps+1
       If rc=1
+       If lossPhase=1
+        lossAckCount=lossAckCount+1
+        If connection\applicationAck\number<2 Or connection\applicationAck\number>4 Or connection\applicationAck\packetBytes<>probeBytes Or connection\applicationAck\inFlightBytes<>probeBytes : lossFault=1 : EndIf
+       Else
        deliveryEvents=deliveryEvents+1
        If connection\applicationAck\number<>0 Or connection\applicationAck\packetBytes<>connection\controlBytes Or connection\applicationAck\inFlightBytes<>connection\controlBytes : deliveryFault=1 : EndIf
+       EndIf
       EndIf
       n=Service() : If n<0 : ProcedureReturn n : EndIf
      Until rc=2 Or rc<0
      If rc<>2 : ProcedureReturn rc : EndIf
-     If connection\applicationHistory\acked=1
+     If lossPhase=0 And connection\applicationHistory\acked=1
       If connection\applicationHistory\inFlight<>0 Or connection\applicationHistory\largestAcked<>0 : deliveryFault=2 : EndIf
       applicationDelivery=1 : deliveryNumber=pn
       rc=QuicHandshakeSentPrune(@connection\applicationHistory,64)
@@ -569,6 +577,47 @@ Procedure.i ReceiveApplicationAck()
   If rc<>1 : ProcedureReturn rc : EndIf
  Wend
  ProcedureReturn 0
+EndProcedure
+
+; Real missing-datagram proof: PN1 is discarded by the peer before decryption.
+; Three later authenticated deliveries trigger the packet threshold, not a timer.
+Procedure.i CheckProbeLoss()
+ Define rc.i,n.i,i.i
+ For i=2 To 4
+  rc=SendApplicationProbe(i) : If rc<>0 : ProcedureReturn rc : EndIf
+ Next
+ rc=QuicHandshakeSentLossBegin(@lossJob,@connection\applicationHistory,HwMicros(),$7FFFFFFFFFFFFFFF,3)
+ If rc<>0 : ProcedureReturn rc : EndIf
+ rc=QuicHandshakeSentLossStep(@lossJob)
+ If rc<>2 Or connection\applicationHistory\inFlight<>4*probeBytes : lossFault=2 : EndIf
+ If lossJob\phase=1 : QuicHandshakeSentLossCancel(@lossJob) : ProcedureReturn -9492 : EndIf
+ lossPhase=1
+ rc=ReceiveApplicationAck() : If rc<>0 : ProcedureReturn rc : EndIf
+ If lossAckCount<>3 Or connection\applicationHistory\acked<>4 Or connection\applicationHistory\largestAcked<>4 Or connection\applicationHistory\inFlight<>probeBytes : lossFault=3 : EndIf
+ rc=QuicHandshakeSentLossBegin(@lossJob,@connection\applicationHistory,HwMicros(),$7FFFFFFFFFFFFFFF,3)
+ If rc<>0 : ProcedureReturn rc : EndIf
+ Repeat
+  rc=QuicHandshakeSentLossStep(@lossJob)
+  If rc=1
+   lossEvents=lossEvents+1
+   If lossJob\number<>1 Or lossJob\packetBytes<>probeBytes Or lossJob\inFlightBytes<>probeBytes Or lossJob\sentAt<=0 : lossFault=4 : EndIf
+  EndIf
+  n=Service()
+  If n<0
+   If lossJob\phase=1 : QuicHandshakeSentLossCancel(@lossJob) : EndIf
+   ProcedureReturn n
+  EndIf
+ Until rc=2 Or rc<0
+ If rc<>2 : ProcedureReturn rc : EndIf
+ If lossEvents<>1 Or connection\applicationHistory\inFlight<>0 Or connection\applicationHistory\busy<>0 : lossFault=5 : EndIf
+ rc=QuicHandshakeSentPrune(@connection\applicationHistory,64)
+ If rc<>0 Or connection\applicationHistory\first<>1 Or connection\applicationHistory\issued<>5 : lossFault=6 : EndIf
+ rc=QuicHandshakeSentLossBegin(@lossJob,@connection\applicationHistory,HwMicros(),$7FFFFFFFFFFFFFFF,3)
+ If rc<>0 : ProcedureReturn rc : EndIf
+ rc=QuicHandshakeSentLossStep(@lossJob)
+ If rc<>2 Or connection\applicationHistory\inFlight<>0 : lossFault=7 : EndIf
+ If lossJob\phase=1 : QuicHandshakeSentLossCancel(@lossJob) : ProcedureReturn -9493 : EndIf
+ lossChecked=1 : ProcedureReturn 0
 EndProcedure
 
 Procedure.i Run()
@@ -611,7 +660,9 @@ Procedure.i Run()
  Wend
  stage=5 : rc=SendApplicationPing() : If rc<>0 : ProcedureReturn rc : EndIf
  rc=ReceiveApplicationAck() : If rc<>0 : ProcedureReturn rc : EndIf
- ProcedureReturn SendApplicationProbe()
+ rc=SendApplicationProbe(1) : If rc<>0 : ProcedureReturn rc : EndIf
+ If #DROP_PROBE_TEST : ProcedureReturn CheckProbeLoss() : EndIf
+ ProcedureReturn 0
 EndProcedure
 Procedure.i LiveEntry()
  Define *s.QuicConnectionSpace
@@ -1110,6 +1161,8 @@ Procedure.i Main()
  PokeI($E1C00258,applicationWriteReady) : PokeI($E1C00260,applicationFault)
  PokeI($E1C00268,applicationSteps) : PokeI($E1C00270,maxApplicationStep)
  PokeI($E1C00278,applicationCancelled) : PokeI($E1C00280,applicationPing)
+ PokeI($E1C00370,lossFault) : PokeI($E1C00378,lossChecked)
+ PokeI($E1C00380,lossAckCount) : PokeI($E1C00388,lossEvents)
  PokeI($E1C00350,probeFault) : PokeI($E1C00358,probeChecked)
  PokeI($E1C00360,probeNumber) : PokeI($E1C00368,probeBytes)
  PokeI($E1C00348,deliveryProbes)
