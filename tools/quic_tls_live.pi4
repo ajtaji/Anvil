@@ -18,6 +18,8 @@ Global peerBytes.i,hsReady.i,paramsReady.i,initialDiscarded.i
 Global received.i,sent.i,ackEvents.i,appAuthenticated.i,stage.i
 Global lastPump.i,maxPumpGap.i,maxTlsStep.i,maxSendStep.i,sendSteps.i
 Global sendFault.i,sendProbes.i,packetCancelChecked.i
+Global feedFault.i,keyCancelled.i,feedSteps.i,maxFeedStep.i
+Global keyOp.QuicTlsOperation,probeKey.QuicKeyJob,probeKeys.QuicKeys
 Global ackFault.i,ackChecks.i,ackSteps.i,maxAckStep.i
 Global receiveFault.i,receiveCancelled.i,receiveSteps.i,maxReceiveStep.i,savedReceiveBytes.i
 Global Dim savedReceive.a[1472]
@@ -175,32 +177,26 @@ Procedure.i HandleAck(*s.QuicConnectionSpace)
  ProcedureReturn 0
 EndProcedure
 Procedure.i FeedTls(*s.QuicConnectionSpace)
- Define rc.i,p.i,stepStarted.i,stepCost.i
+ Define rc.i,n.i,t.i,cost.i,pending.i
+ n=Tls13ContextSave(@ownerSnapshot[0],#TLS13_CONTEXT_SIZE)
+ If operationProbes=2 : OperationProbe(3) : OperationProbe(4) : EndIf
+ otherJob\result=773 : refusedJob\snapshot=771 : refusedJob\capacity=772 : refusedJob\worker\result=773
+ rc=QuicConnectionTlsBegin(@connection,*s\level,peerBytes,20000000)
+ If rc<>0 : ProcedureReturn rc : EndIf
+ If QuicConnectionTlsBegin(@connection,*s\level,peerBytes,20000000)<>#QUIC_FEED_STATE : feedFault=1 : EndIf
  Repeat
-  p=Pump() : If p<0 : ProcedureReturn p : EndIf
-  stepStarted=clock() : rc=DoTls(3,*s) : stepCost=clock()-stepStarted
-  If stepCost>maxTlsStep : maxTlsStep=stepCost : EndIf
- Until rc<=0
- If rc<0 : ProcedureReturn rc : EndIf
- If hsReady=0 And Tls13State>=#TLS13_ST_WAIT_EE And Tls13State<=#TLS13_ST_CONNECTED
-  rc=KeyDone(QuicTrafficKeysBegin(@connection\keyjob,@connection\handshake\readKeys,@secTlsSHs[0],32)) : If rc<>0 : ProcedureReturn rc : EndIf
-  rc=KeyDone(QuicTrafficKeysBegin(@connection\keyjob,@connection\handshake\writeKeys,@secTlsCHs[0],32)) : If rc<>0 : ProcedureReturn rc : EndIf
-  hsReady=1
- EndIf
- If paramsReady=0 And PeekI(@tlsConfig[0]+40)<>0
-  rc=QuicParametersBegin(@connection\params,@peerParameters[0],PeekI(@tlsConfig[0]+32),1,@parameterEntries[0],64)
-  If rc<>0 : ProcedureReturn rc : EndIf
-  Repeat : rc=QuicParametersStep(@connection\params) : Until rc<>0
-  If rc<>1 : ProcedureReturn rc : EndIf
-  rc=QuicParametersCheckIds(@connection\params,@peerId[0],peerBytes,@originalId[0],8,0,0,0)
-  If rc<>1 : ProcedureReturn rc : EndIf
-  paramsReady=1
- EndIf
- If Tls13State=#TLS13_ST_SEND_FINISHED
-  If paramsReady<>1 : ProcedureReturn -9306 : EndIf
-  rc=KeyDone(QuicTrafficKeysBegin(@connection\keyjob,@connection\appRead,@secTlsSAp[0],32)) : If rc<>0 : ProcedureReturn rc : EndIf
-  rc=MakeOutput(@connection\handshake) : If rc<>0 : ProcedureReturn rc : EndIf
- EndIf
+  n=Pump() : If n<0 : ProcedureReturn n : EndIf
+  pending=Bool(connection\tlsOp\phase=1)
+  If pending : TlsSliceBefore() : EndIf
+  t=HwMicros() : rc=QuicConnectionTlsStep(@connection) : cost=HwMicros()-t
+  If pending : TlsSliceAfter(cost) : EndIf
+  feedSteps=feedSteps+1 : If cost>maxFeedStep : maxFeedStep=cost : EndIf
+ Until rc<>0
+ n=Tls13ContextRestore(@ownerSnapshot[0],#TLS13_CONTEXT_SIZE)
+ hsReady=Bool(connection\handshake\readKeys\ready=1 And connection\handshake\writeKeys\ready=1)
+ paramsReady=connection\feed\parametersReady
+ If rc<>1 : ProcedureReturn rc : EndIf
+ If QuicConnectionTlsStep(@connection)<>1 : feedFault=2 : EndIf
  ProcedureReturn 0
 EndProcedure
 Procedure.i PacketOne(p.i,bytes.i)
@@ -365,10 +361,39 @@ Procedure OperationProbe(kind.i)
    If rc<>1 : operationFault=10 : ProcedureReturn : EndIf
    rc=QuicTlsOperationCancel(@inputOp) : CheckContext() : extraContextChecks=extraContextChecks+1
    If rc<>#QUIC_OP_CANCELLED Or probeRx\phase<>3 Or probeRx\offered<>0 Or TlsWorkerBusy()<>0 : operationFault=11 : EndIf
+  Case 4
+   rc=QuicTlsOperationBegin(@keyOp,@probeSnapshot[0],#TLS13_CONTEXT_SIZE,4,@probeKey,@probeKeys,Tls13ContextTrafficSecret(@probeSnapshot[0],#TLS13_CONTEXT_SIZE,1,0),32,20000000)
+   If rc<>1 : operationFault=13 : ProcedureReturn : EndIf
+   ticks=tlsjob_sliceTicks : tlsjob_sliceTicks=1
+   rc=QuicTlsOperationStep(@keyOp) : tlsjob_sliceTicks=ticks
+   CheckContext() : extraContextChecks=extraContextChecks+1
+   If rc<>0 Or probeKey\phase=0 : operationFault=14 : EndIf
+   rc=QuicTlsOperationCancel(@keyOp) : CheckContext() : extraContextChecks=extraContextChecks+1
+   If rc<>#QUIC_OP_CANCELLED Or probeKey\phase<>0 Or TlsWorkerBusy()<>0 : operationFault=15 : EndIf
+   For i=0 To SizeOf(QuicKeys)-1 : If PeekA(@probeKeys+i)<>0 : operationFault=16 : EndIf : Next
+   keyCancelled=1
  EndSelect
  For i=0 To #TLS13_CONTEXT_SIZE-1 : If probeSnapshot[i]<>0 : operationFault=12 : EndIf : Next
  n=Tls13ContextRestore(@ownerSnapshot[0],#TLS13_CONTEXT_SIZE)
  operationProbes=operationProbes+1
+EndProcedure
+Procedure TlsSliceBefore()
+ Define n.i
+  If TlsWorkerBegin(@otherJob,@LiveEntry,0)<>#TLSWORK_BUSY : ownershipFault=1 : EndIf
+  If TlsWorkerStep(@otherJob)<>#TLSWORK_OWNER Or TlsWorkerCancel(@otherJob)<>#TLSWORK_OWNER : ownershipFault=2 : EndIf
+  If otherJob\task<>0 Or otherJob\phase<>0 Or otherJob\result<>773 : ownershipFault=3 : EndIf
+  If HooksClear()<>1 Or TlsWorkerBusy()<>1 : ownershipFault=4 : EndIf
+  If TlsContextWorkerBegin(@refusedJob,@ownerSnapshot[0],#TLS13_CONTEXT_SIZE,@LiveEntry,0)<>#TLSWORK_BUSY : contextFault=6 : EndIf
+  If TlsContextWorkerStep(@refusedJob)<>#TLSWORK_OWNER Or TlsContextWorkerCancel(@refusedJob)<>#TLSWORK_OWNER : contextFault=7 : EndIf
+  If refusedJob\snapshot<>771 Or refusedJob\capacity<>772 Or refusedJob\worker\result<>773 Or refusedJob\worker\task<>0 : contextFault=8 : EndIf
+  ownershipChecks=ownershipChecks+1
+  ForeignContext() : n=Tls13ContextSave(@beforeSnapshot[0],#TLS13_CONTEXT_SIZE)
+EndProcedure
+Procedure TlsSliceAfter(cost.i)
+  CheckContext()
+  If cost>maxWorkerStep : maxWorkerStep=cost : EndIf
+  workerSteps=workerSteps+1
+  If HooksClear()<>1 : ownershipFault=5 : EndIf
 EndProcedure
 Procedure.i DoTls(operation.i,space.i)
  Define rc.i,t.i,cost.i,n.i,i.i
@@ -399,20 +424,9 @@ Procedure.i DoTls(operation.i,space.i)
  rc=BeginOperation(operation,space)
  If rc<>1 : ProcedureReturn rc : EndIf
  Repeat
-  If TlsWorkerBegin(@otherJob,@LiveEntry,0)<>#TLSWORK_BUSY : ownershipFault=1 : EndIf
-  If TlsWorkerStep(@otherJob)<>#TLSWORK_OWNER Or TlsWorkerCancel(@otherJob)<>#TLSWORK_OWNER : ownershipFault=2 : EndIf
-  If otherJob\task<>0 Or otherJob\phase<>0 Or otherJob\result<>773 : ownershipFault=3 : EndIf
-  If HooksClear()<>1 Or TlsWorkerBusy()<>1 : ownershipFault=4 : EndIf
-  If TlsContextWorkerBegin(@refusedJob,@ownerSnapshot[0],#TLS13_CONTEXT_SIZE,@LiveEntry,0)<>#TLSWORK_BUSY : contextFault=6 : EndIf
-  If TlsContextWorkerStep(@refusedJob)<>#TLSWORK_OWNER Or TlsContextWorkerCancel(@refusedJob)<>#TLSWORK_OWNER : contextFault=7 : EndIf
-  If refusedJob\snapshot<>771 Or refusedJob\capacity<>772 Or refusedJob\worker\result<>773 Or refusedJob\worker\task<>0 : contextFault=8 : EndIf
-  ownershipChecks=ownershipChecks+1
-  ForeignContext() : n=Tls13ContextSave(@beforeSnapshot[0],#TLS13_CONTEXT_SIZE)
+  TlsSliceBefore()
   t=HwMicros() : rc=QuicTlsOperationStep(@connection\tlsOp) : cost=HwMicros()-t
-  CheckContext()
-  If cost>maxWorkerStep : maxWorkerStep=cost : EndIf
-  workerSteps=workerSteps+1
-  If HooksClear()<>1 : ownershipFault=5 : EndIf
+  TlsSliceAfter(cost)
   If rc<>0 : Break : EndIf
   ; Foreground network service executes after the context has actually yielded.
   rc=Service() : If rc<0 : Break : EndIf
@@ -669,6 +683,8 @@ Procedure.i Main()
  PokeI($E1C001B8,lifecycleFault) : PokeI($E1C001C0,lifecycleProbes)
  CheckPacketCancellation()
  CheckReceiveCancellation()
+ PokeI($E1C00200,feedFault) : PokeI($E1C00208,keyCancelled)
+ PokeI($E1C000F0,maxFeedStep) : PokeI($E1C000F8,feedSteps)
  PokeI($E1C001F0,receiveFault) : PokeI($E1C001F8,receiveCancelled)
  PokeI($E1C000E0,maxReceiveStep) : PokeI($E1C000E8,receiveSteps)
  PokeI($E1C001C8,sendFault) : PokeI($E1C001D0,Bool(sendProbes=sent And sent>=1)) : PokeI($E1C001D8,packetCancelChecked)

@@ -35,6 +35,7 @@ Procedure.i QuicConnectionReceiveBegin(*c.QuicConnection,level.i,packet.i,bytes.
  Define i.i,p.i,*s.QuicConnectionSpace
  If quiccr_Valid(*c)=0 : ProcedureReturn #QUIC_RECEIVE_ARGUMENT : EndIf
  If *c\phase<>1 Or (*c\incoming\phase<>0 And *c\incoming\phase<>4 And *c\incoming\phase<>6) : ProcedureReturn #QUIC_RECEIVE_STATE : EndIf
+ If *c\feed\phase>=1 And *c\feed\phase<=11 : ProcedureReturn #QUIC_RECEIVE_STATE : EndIf
  If *c\outgoing\phase<>0 And *c\outgoing\phase<>6 : ProcedureReturn #QUIC_SENT_BUSY : EndIf
  If *c\acknowledge\phase>=1 And *c\acknowledge\phase<=4 : ProcedureReturn #QUIC_SENT_BUSY : EndIf
  If TlsWorkerBusy()<>0 : ProcedureReturn #TLSWORK_BUSY : EndIf

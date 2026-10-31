@@ -5,6 +5,21 @@
 ; Restore invalidates the shared AES-GCM cache before another record uses it.
 ; Snapshot bytes contain secrets: wipe when the connection is released.
 #TLS13_CONTEXT_SIZE=2928
+; Read-only queries keep snapshot layout private to this owner. Returned
+; secret views are borrowed, valid only while this snapshot remains alive.
+Procedure.i Tls13ContextState(snapshot.i,capacity.i)
+ If snapshot<=0 Or capacity<#TLS13_CONTEXT_SIZE Or snapshot>$7FFFFFFFFFFFFFFF-#TLS13_CONTEXT_SIZE : ProcedureReturn -1 : EndIf
+ ProcedureReturn PeekI(snapshot+168)
+EndProcedure
+Procedure.i Tls13ContextTrafficSecret(snapshot.i,capacity.i,server.i,application.i)
+ If snapshot<=0 Or capacity<#TLS13_CONTEXT_SIZE Or snapshot>$7FFFFFFFFFFFFFFF-#TLS13_CONTEXT_SIZE : ProcedureReturn 0 : EndIf
+ If server<0 Or server>1 Or application<0 Or application>1 : ProcedureReturn 0 : EndIf
+ ProcedureReturn snapshot+400+server*32+application*64
+EndProcedure
+Procedure.i Tls13ContextMatchesBuffers(snapshot.i,capacity.i,handshake.i,receive.i,config.i)
+ If Tls13ContextState(snapshot,capacity)<0 : ProcedureReturn 0 : EndIf
+ ProcedureReturn Bool(PeekI(snapshot+1224)=handshake And PeekI(snapshot+1248)=receive And PeekI(snapshot+2920)=config)
+EndProcedure
 Procedure.i Tls13ContextSave(dst.i,capacity.i)
  If dst=0 Or capacity<#TLS13_CONTEXT_SIZE : ProcedureReturn 0 : EndIf
  TlsCopy(dst+0,@secTlsWKey[0],16)

@@ -4795,3 +4795,56 @@ policy and the initial protected 1-RTT check still live in the fixture.
 HANDSHAKE_DONE, application processing, recovery, congestion/flow control,
 streams/QPACK and real HTTP/3 remain open, as do the earlier IPv6 and TLS
 compatibility/device-blocking items.
+
+
+### Connection TLS feed and key-transition dispatch
+
+`Anvil/Core/quic_connection_tls.pbi` now drives CRYPTO input, handshake traffic
+keys, peer transport parameters, application read keys and client Finished
+output through explicit connection states. Each Step admits or advances one
+TLS/key operation, parses a parameter, checks a transition, or copies at most
+256 Finished bytes. It performs no network I/O or waiting. Sender and receive
+admission refuse an active feed job; close uses the existing operation/key
+ownership and resource erasure. Per-operation timeouts supplement the caller's
+overall connection deadline. CID selection and UDP remain external.
+
+The TLS context owner provides read-only state, traffic-secret view and buffer
+identity queries, keeping snapshot offsets out of connection scheduling code.
+The new feed driver reads the connection snapshot rather than whichever TLS
+context the foreground currently selects. Callers must initialize and save
+the connection's TLS context in its owned storage before admission. Traffic
+secret views borrow that storage until the operation completes.
+
+`QuicTlsOperation` kind4 derives QUIC traffic keys through the context worker.
+Compose `Anvil/Network/quic_crypto.pbi` before this operation module; the
+connection fixture already includes it through the handshake receive owner.
+Job, output keys and input secret ranges are checked for invalid overlap;
+secret input may be a view inside the retained TLS snapshot. Cancellation
+stops the coroutine first, then wipes the snapshot, derivation job and output
+keys. The fixture exercises cancellation after a forced one-counter-tick
+slice, restores the normal slice and checks complete key/snapshot erasure.
+The existing three operation probes remain, making four in total.
+
+The live fixture now polls the shared feed driver instead of implementing its
+own TLS/key/parameter/Finished transition loop. Its complete foreground-context
+and ownership checks are factored into common before/after-slice probes used
+by both the initialization path and the feed driver. The foreground deliberately
+selects unrelated TLS metadata between slices; all 271 complete context checks
+passed. Repeated feed admission is refused and completed Step is idempotent.
+
+Physical capture 298 under Anvil488 passed 34 checks. The independent peer
+verified client Finished and h3. Feed dispatch used 276 calls with a maximum
+1.786 ms; exchange plus first close took 1.413970 seconds. Maximum foreground
+gap was 1.908 ms, service call537 us, sender1.238 ms, receive1.269 ms and ACK39us.
+There were 263 TLS worker calls and six additional context checks from the
+operation probes. These are measured observations, not guarantees. The
+corrupted-certificate run retained all probes and refused TLS completion.
+
+Exact qualification is archived at
+`docs/evidence/anvil-ipv6-20261030/quic-connection-tls488`. The fixture also
+compiled for Pi3 with its real timer/RNG adapter; no Pi3 execution is claimed.
+Both physical runs returned with cores/fonts/Vulkan healthy and watchdog off.
+Installed Anvil488 is unchanged. Connection initialization, CID policy and
+the first protected1RTT check remain fixture-owned. Application frames and
+packet space, HANDSHAKE_DONE, recovery, congestion/flow, streams/QPACK and real
+HTTP/3 remain open, plus earlier IPv6 and TLS compatibility/device blocking.

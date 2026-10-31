@@ -55,6 +55,15 @@ Structure QuicConnectionReceive
  bytes.i
  worker.TlsWorkerJob
 EndStructure
+Structure QuicConnectionTls
+ phase.i ; 0 fresh,1..11 dispatch,12 complete,-1 failed
+ result.i
+ level.i
+ peerBytes.i
+ timeout.i
+ keyTarget.i
+ parametersReady.i
+EndStructure
 Structure QuicConnection
  phase.i ; 0 fresh,1 active,2 closing,3 closed
  result.i
@@ -82,6 +91,7 @@ Structure QuicConnection
  initialRetired.i
  acknowledge.QuicConnectionAck
  incoming.QuicConnectionReceive
+ feed.QuicConnectionTls
 EndStructure
 ; Span table order: RX data/bits,TX data/bits,ACK ranges,sent slots/metadata,
 ; TLS snapshot,handshake/receive/output/config,local/peer parameters/entries,

@@ -11,7 +11,7 @@
 Structure QuicTlsOperation
  context.TlsContextWorkerJob
  phase.i ; 0 fresh, 1 pending, 2 completed, -1 terminal abandonment
- kind.i ; 1 key share, 2 output Begin, 3 receive feed
+ kind.i ; 1 key share, 2 output Begin, 3 receive feed, 4 QUIC traffic keys
  result.i
  started.i
  timeout.i
@@ -32,7 +32,7 @@ Procedure.i quicop_Storage(op.i,snapshot.i,size.i,p.i,n.i)
  ProcedureReturn 1
 EndProcedure
 Procedure.i quicop_Entry()
- Define *op.QuicTlsOperation
+ Define *op.QuicTlsOperation,rc.i
  *op=ScArgument()
  Select *op\kind
   Case 1
@@ -40,6 +40,13 @@ Procedure.i quicop_Entry()
    If *op\result<>1 : *op\result=#QUIC_OP_TLS : EndIf
   Case 2 : *op\result=QuicTlsOutputBegin(*op\outputJob,*op\stream,*op\output,*op\capacity)
   Case 3 : *op\result=QuicCryptoTlsStep(*op\stream)
+  Case 4
+   rc=QuicTrafficKeysBegin(*op\stream,*op\outputJob,*op\output,*op\capacity)
+   While rc=0
+    rc=QuicKeyJobStep(*op\stream)
+    If rc=0 : TlsWorkerCheckpoint() : EndIf
+   Wend
+   *op\result=rc
   Default : *op\result=#QUIC_OP_STATE
  EndSelect
  ProcedureReturn 1
@@ -62,6 +69,10 @@ Procedure.i QuicTlsOperationBegin(*op.QuicTlsOperation,snapshot.i,size.i,kind.i,
    If quicop_Storage(*op,snapshot,size,stream,SizeOf(QuicCryptoRx))=0 : ProcedureReturn #QUIC_OP_STATE : EndIf
    *rx=stream
    If quicop_Storage(*op,snapshot,size,*rx\data,*rx\capacity)=0 Or quicop_Storage(*op,snapshot,size,*rx\bits,*rx\capacity/8)=0 : ProcedureReturn #QUIC_OP_STATE : EndIf
+  Case 4
+   If capacity<>32 Or quicop_Span(output,32)=0 : ProcedureReturn #QUIC_OP_STATE : EndIf
+   If quicop_Storage(*op,snapshot,size,stream,SizeOf(QuicKeyJob))=0 Or quicop_Storage(*op,snapshot,size,outputJob,SizeOf(QuicKeys))=0 : ProcedureReturn #QUIC_OP_STATE : EndIf
+   If quicop_Overlap(stream,SizeOf(QuicKeyJob),outputJob,SizeOf(QuicKeys)) Or quicop_Overlap(output,32,stream,SizeOf(QuicKeyJob)) Or quicop_Overlap(output,32,outputJob,SizeOf(QuicKeys)) Or quicop_Overlap(output,32,*op,SizeOf(QuicTlsOperation)) : ProcedureReturn #QUIC_OP_STATE : EndIf
   Default : ProcedureReturn #QUIC_OP_STATE
  EndSelect
  rc=TlsContextWorkerBegin(@*op\context,snapshot,size,@quicop_Entry,*op)
@@ -87,6 +98,8 @@ Procedure.i quicop_Abandon(*op.QuicTlsOperation,reason.i)
   rc=QuicCryptoTxAbandon(*tx)
  ElseIf *op\kind=3
   rc=QuicCryptoTlsAbandon(*op\stream)
+ ElseIf *op\kind=4
+  QuicKeyJobCancel(*op\stream) : QuicKeysWipe(*op\outputJob)
  EndIf
  *op\phase=-1 : *op\result=reason
  ProcedureReturn reason
