@@ -20,6 +20,17 @@ Global Dim gcmj_tag.a[16]
 Global Dim gcmj_h.a[16]
 Global Dim gcmj_y.a[16]
 
+; Admission check for composed protocols sharing this single job owner.
+Procedure.i GcmJobBusy()
+ ProcedureReturn Bool(gcmj_phase<>0)
+EndProcedure
+
+; True only in a pending decrypt job after tag verification. A caller can
+; reject authenticated protocol metadata before the next Step writes plaintext.
+Procedure.i GcmJobAuthenticated()
+ ProcedureReturn Bool(gcmj_phase=4)
+EndProcedure
+
 Procedure GcmJobCancel()
  Define i.i
  For i=0 To 31 : gcmj_key[i]=0 : Next

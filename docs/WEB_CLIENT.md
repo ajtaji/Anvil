@@ -3456,3 +3456,65 @@ public off-link IPv6 or automatically learned RDNSS web traffic.
 
 Evidence: `docs/evidence/anvil-ipv6-20261030/quic-wire485`. TLS/device blocking
 and compatibility, public IPv6 qualification and full HTTP/3 remain open.
+
+### QUIC packet protection, shared crypto ownership (2026-10-30)
+
+`Anvil/Network/quic_crypto.pbi` adds QUIC v1 Initial client/server key derivation,
+traffic-secret key derivation, AES-128-GCM packet protection, header protection
+and authenticated reserved-bit rejection, using existing shared SHA/HMAC/HKDF,
+AES and bounded GCM jobs. It implements protocol facts from
+[RFC 9001 sections 5.1-5.4](https://www.rfc-editor.org/rfc/rfc9001.html#section-5).
+Callers include those crypto modules before this module. Key derivation runs one
+small HKDF operation per step; packet work uses the existing 256-byte GCM steps.
+There is no socket, allocation, driver state or network wait in this layer.
+
+`QuicInitialKeysBegin` and `QuicTrafficKeysBegin` use a zero-initialized
+`QuicKeyJob` and `QuicKeys`; `QuicKeyJobStep` returns pending (0), ready (1), or
+a negative error. Cancel wipes an unfinished key job and its partial keys;
+completed keys remain caller-owned until `QuicKeysWipe`. The 32-byte supplied
+traffic secret must not alias its destination. Only AES-128-GCM/SHA-256 and
+QUIC v1 are implemented; no cipher negotiation or key update is implied.
+
+`QuicPacketJobBegin` takes the last authenticated packet number for decrypt,
+or the full unique packet number for encrypt. Its caller owns the packet buffer
+and job until completion; pending output must not be sent or consumed. One
+explicit packet owner shares the existing GCM job. A busy job is refused before
+packet mutation, and cancellation cannot cancel another owner. Decrypt verifies
+the tag before writing plaintext. Bad authentication restores the original wire
+packet; authenticated invalid reserved bits are rejected before plaintext too.
+Cancellation instead requires discarding the partially processed packet. Keys,
+nonces and header-mask scratch copied into jobs are wiped at termination. The
+connection owner must enforce packet-number uniqueness, authenticated receive
+state, cipher usage limits and key-phase transitions.
+
+When TLS record code shares this address space, bind
+`QuicCipherInvalidateHook` to `Tls13RecInvalidateCipher` before use. This clears
+the TLS installed-key cache before QUIC touches shared AES/GCM scratch. The two
+new GCM queries expose busy state and the verified-before-plaintext phase without
+changing existing GCM Begin/Step behavior.
+
+Physical Pi 4 capture 224 under Anvil 485 passed 49 independent cases: published
+client/server Initial packets, all packet-number widths, a high full packet
+number, all 16 tag-byte corruptions, header/cipher corruption, wrong key,
+authenticated reserved bits, busy owners, cancellation and secret clearing.
+Two cases interleave real TLS record protect/unprotect operations between QUIC
+steps and after completion, checking the full RFC packet outputs and TLS
+plaintext. A Python oracle using `cryptography` AESGCM/AES-ECB also reproduces
+the RFC 9001 Appendix A packets byte for byte. Its first text extraction missed
+the server payload's final three bytes; this was corrected before board testing.
+
+The final run measured 164 us maximum key step, 225 us maximum packet Begin,
+and 527 us maximum packet Step. These are fixture observations, not universal
+latency bounds. Capture 223 retains the initial 47-case proof. Pi 3 shared-module
+compilation passed; its compile-only harness omits the Pi 4 cache transitions
+after the first attempt exposed a platform-helper difference. No physical Pi 3
+claim is made. Both Pi 4 runs returned normally; cores, fonts and Vulkan remained
+healthy, with watchdog off. No monitor or boot image update was required.
+
+Evidence: `docs/evidence/anvil-ipv6-20261030/quic-crypto485`.
+This provides packet cryptography, not a live QUIC connection or verified HTTP/3
+request. Retry integrity, TLS-over-CRYPTO transport parameters, frames/streams,
+recovery/congestion/flow control, UDP ownership, QPACK and interoperable live
+qualification remain. Initial keys are public protocol keys, not peer identity
+verification. Remaining TLS/device blocking and compatibility and public off-link
+IPv6/RDNSS web qualification also remain open.
