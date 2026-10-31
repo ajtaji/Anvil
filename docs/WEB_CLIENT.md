@@ -4985,3 +4985,53 @@ still configures TLS, entropy, IDs and parameters and orchestrates key share
 and ClientHello output. Application frame processing/HANDSHAKE_DONE, recovery,
 streams/QPACK, real HTTP/3, off-link IPv6 and remaining TLS/device work are
 also unfinished. These results are not a full networking or latency claim.
+
+### Shared client handshake startup — 2026-10-31
+
+Compose `Anvil/Core/quic_connection_start.pbi` after the connection owner and
+its TLS operation dependencies. `QuicConnectionStartBegin(connection,timeout)`
+returns 0 on admission or a negative refusal without mutation. The caller first
+configures trusted time, anchors, hostname, buffers, ALPN and QUIC parameters,
+generates the two eight-byte IDs with the entropy-backed generator, and saves
+that initialized TLS context into the owner's snapshot. Immutable TLS inputs
+remain borrowed. The driver does not collect entropy or make policy choices.
+
+Admission requires fresh connection work, empty Initial output, no Initial
+keys, an unknown peer, an initialized saved TLS context with matching owned
+buffers/configuration, and an available common worker. Startup cannot restart
+after admission or completion. While it is pending, send, receive, ACK and
+TLS-feed admission refuse overlapping work.
+
+`QuicConnectionStartStep` returns 0 pending, 1 complete or a negative failure.
+It orchestrates key-share generation, server/client Initial-key preparation
+and cooperative derivation, ClientHello construction, and retained CRYPTO
+output. One call performs one admission, worker slice, storage preparation or
+at most 256 bytes of output copy. A busy worker leaves its current admission
+stage pending. Failure starts connection close; existing close processing
+stops the owned worker before wiping keys, snapshot and retained output.
+The caller still checks the overall connection deadline, services transport
+between steps, and drives close to completion. There are no UDP calls or
+foreground wait loops in the shared driver. After completion, use the shared
+Initial sender to produce and submit the datagram.
+
+The live fixture now configures the connection and drives this shared startup
+API. Its former local key-share/Initial-key/ClientHello orchestration is gone.
+The existing key-share cancellation, output cancellation and other operation
+probes remain; the fixture runs them at the corresponding driver boundaries.
+It also checks duplicate admission refusal, send/receive exclusion, stable
+completion, both Initial keys ready and nonempty retained ClientHello output.
+
+Evidence is in `docs/evidence/anvil-ipv6-20261030/quic-startup488/`. The same
+positive binary passed 36 existing checks and the additional startup checks
+with both zero- and eight-byte peer IDs on Anvil 488. Independent peers verified
+Finished/h3, and the bad-signature run still refused the certificate. Core,
+font and Vulkan health checks passed after every RAM return; watchdog off.
+Pi 3 compiled with its actual hardware adapter, but was not executed. The
+installed monitor image was unchanged. These are interoperability and
+ownership proofs, not a universal latency or HTTP/3 completion claim.
+
+The first application packet is still authenticated without frame processing.
+Application packet-space handling/HANDSHAKE_DONE, recovery, streams/QPACK and
+actual HTTP/3 requests remain open, along with off-link IPv6 and other remaining
+TLS/device work. Connection policy, entropy initialization and transport I/O
+remain explicit caller responsibilities.

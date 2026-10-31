@@ -1,0 +1,86 @@
+; Cooperative client handshake startup using the connection's owned storage.
+; Caller supplies entropy-generated eight-byte IDs, trust/clock/hostname and
+; ALPN/QUIC parameters, then saves the initialized TLS context. Immutable TLS
+; inputs remain borrowed. No network calls, entropy collection or waits here.
+#QUIC_START_STATE=-3571
+#QUIC_START_ARGUMENT=-3572
+Procedure.i quicst_Valid(*c.QuicConnection)
+ ProcedureReturn Bool(*c>0 And *c<=$7FFFFFFFFFFFFFFF-SizeOf(QuicConnection))
+EndProcedure
+Procedure.i quicst_Fail(*c.QuicConnection,rc.i)
+ Define n.i
+ *c\startup\phase=-1 : *c\startup\result=rc
+ n=QuicConnectionClose(*c,rc)
+ ProcedureReturn rc
+EndProcedure
+; 0 admitted,negative refusal without changing the owner or snapshot.
+Procedure.i QuicConnectionStartBegin(*c.QuicConnection,timeoutUs.i)
+ Define snapshot.i
+ If quicst_Valid(*c)=0 Or timeoutUs<=0 : ProcedureReturn #QUIC_START_ARGUMENT : EndIf
+ If *c\phase<>1 Or *c\startup\phase<>0 Or *c\peerIdKnown<>0 Or *c\initialRetired<>0 : ProcedureReturn #QUIC_START_STATE : EndIf
+ If *c\incoming\phase<>0 Or *c\outgoing\phase<>0 Or *c\acknowledge\phase<>0 Or *c\feed\phase<>0 : ProcedureReturn #QUIC_START_STATE : EndIf
+ If *c\tlsOp\phase<>0 Or *c\tlsOutput\phase<>0 Or *c\keyjob\phase<>0 : ProcedureReturn #QUIC_START_STATE : EndIf
+ If *c\initial\readKeys\ready<>0 Or *c\initial\writeKeys\ready<>0 Or *c\initial\tx\tail<>0 : ProcedureReturn #QUIC_START_STATE : EndIf
+ If TlsWorkerBusy()<>0 : ProcedureReturn #TLSWORK_BUSY : EndIf
+ snapshot=QuicConnectionBuffer(*c,7)
+ If Tls13ContextState(snapshot,#TLS13_CONTEXT_SIZE)<>#TLS13_ST_START : ProcedureReturn #QUIC_START_STATE : EndIf
+ If Tls13ContextMatchesBuffers(snapshot,#TLS13_CONTEXT_SIZE,QuicConnectionBuffer(*c,8),QuicConnectionBuffer(*c,9),QuicConnectionBuffer(*c,11))<>1 : ProcedureReturn #QUIC_START_STATE : EndIf
+ *c\startup\phase=1 : *c\startup\result=0 : *c\startup\timeout=timeoutUs : *c\startup\keyTarget=0
+ ProcedureReturn 0
+EndProcedure
+; 0 pending,1 complete,negative failure. One admission, crypto worker slice,
+; storage preparation or <=256-byte output copy per call. Caller checks the
+; connection deadline and services transport between dispatches. Close cancels
+; the owned operation before releasing keys, snapshot or output storage.
+Procedure.i QuicConnectionStartStep(*c.QuicConnection)
+ Define rc.i,snapshot.i,*keys.QuicKeys
+ If quicst_Valid(*c)=0 : ProcedureReturn #QUIC_START_ARGUMENT : EndIf
+ If *c\phase<>1 : ProcedureReturn #QUIC_START_STATE : EndIf
+ If *c\startup\phase=9 : ProcedureReturn 1 : EndIf
+ snapshot=QuicConnectionBuffer(*c,7)
+ *keys=@*c\initial\readKeys
+ If *c\startup\keyTarget=1 : *keys=@*c\initial\writeKeys : EndIf
+ Select *c\startup\phase
+  Case 1
+   rc=QuicTlsOperationBegin(@*c\tlsOp,snapshot,#TLS13_CONTEXT_SIZE,1,0,0,0,0,*c\startup\timeout)
+   If rc=#TLSWORK_BUSY : ProcedureReturn 0 : EndIf
+   If rc<>1 : ProcedureReturn quicst_Fail(*c,rc) : EndIf
+   *c\startup\phase=2
+  Case 2,5,7
+   rc=QuicTlsOperationStep(@*c\tlsOp)
+   If rc=0 : ProcedureReturn 0 : EndIf
+   If rc<>1 : ProcedureReturn quicst_Fail(*c,rc) : EndIf
+   If *c\tlsOp\result<>1 : ProcedureReturn quicst_Fail(*c,#QUIC_START_STATE) : EndIf
+   If *c\startup\phase=2
+    *c\startup\phase=3
+   ElseIf *c\startup\phase=5
+    If *c\startup\keyTarget=0
+     *c\startup\keyTarget=1 : *c\startup\phase=3
+    Else
+     *c\startup\phase=6
+    EndIf
+   Else
+    *c\startup\phase=8
+   EndIf
+  Case 3
+   rc=QuicInitialKeysBegin(@*c\keyjob,*keys,QuicConnectionBuffer(*c,17),8,Bool(*c\startup\keyTarget=0))
+   If rc<>0 : ProcedureReturn quicst_Fail(*c,rc) : EndIf
+   *c\startup\phase=4
+  Case 4
+   rc=QuicTlsOperationBegin(@*c\tlsOp,snapshot,#TLS13_CONTEXT_SIZE,5,@*c\keyjob,*keys,0,0,*c\startup\timeout)
+   If rc=#TLSWORK_BUSY : ProcedureReturn 0 : EndIf
+   If rc<>1 : ProcedureReturn quicst_Fail(*c,rc) : EndIf
+   *c\startup\phase=5
+  Case 6
+   rc=QuicTlsOperationBegin(@*c\tlsOp,snapshot,#TLS13_CONTEXT_SIZE,2,@*c\initial\tx,@*c\tlsOutput,QuicConnectionBuffer(*c,10),2048,*c\startup\timeout)
+   If rc=#TLSWORK_BUSY : ProcedureReturn 0 : EndIf
+   If rc<>1 : ProcedureReturn quicst_Fail(*c,rc) : EndIf
+   *c\startup\phase=7
+  Case 8
+   rc=QuicTlsOutputStep(@*c\tlsOutput)
+   If rc<0 : ProcedureReturn quicst_Fail(*c,rc) : EndIf
+   If rc=0 : *c\startup\phase=9 : ProcedureReturn 1 : EndIf
+  Default : ProcedureReturn #QUIC_START_STATE
+ EndSelect
+ ProcedureReturn 0
+EndProcedure

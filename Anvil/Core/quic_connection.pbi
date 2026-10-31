@@ -66,6 +66,12 @@ Structure QuicConnectionTls
  keyTarget.i
  parametersReady.i
 EndStructure
+Structure QuicConnectionStart
+ phase.i ; 0 fresh,1..8 dispatch,9 complete,-1 failed
+ result.i
+ timeout.i
+ keyTarget.i
+EndStructure
 Structure QuicConnection
  phase.i ; 0 fresh,1 active,2 closing,3 closed
  result.i
@@ -96,6 +102,7 @@ Structure QuicConnection
  feed.QuicConnectionTls
  peerIdKnown.i
  peerIdBytes.i
+ startup.QuicConnectionStart
 EndStructure
 ; Span table order: RX data/bits,TX data/bits,ACK ranges,sent slots/metadata,
 ; TLS snapshot,handshake/receive/output/config,local/peer parameters/entries,

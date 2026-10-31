@@ -23,6 +23,7 @@ Global Dim savedClient.a[8]
 Global feedFault.i,keyCancelled.i,feedSteps.i,maxFeedStep.i
 Global keyOp.QuicTlsOperation,probeKey.QuicKeyJob,probeKeys.QuicKeys
 Global preparedKeyOp.QuicTlsOperation
+Global startupFault.i,startupChecks.i,startupSteps.i,maxStartupStep.i
 Global ackFault.i,ackChecks.i,ackSteps.i,maxAckStep.i
 Global receiveFault.i,receiveCancelled.i,receiveSteps.i,maxReceiveStep.i,savedReceiveBytes.i
 Global Dim savedReceive.a[1472]
@@ -112,15 +113,32 @@ Procedure.i KeyDone(rc.i)
  If connection\tlsOp\phase=1 : QuicTlsOperationCancel(@connection\tlsOp) : EndIf
  ProcedureReturn rc
 EndProcedure
-Procedure.i MakeOutput(*s.QuicConnectionSpace)
- Define rc.i,p.i
- rc=DoTls(2,*s)
- If rc<>1 : ProcedureReturn -9302 : EndIf
+Procedure.i StartHandshake()
+ Define rc.i,n.i,t.i,cost.i,pending.i
+ rc=PrepareTlsProbe(1,0) : If rc<>1 : ProcedureReturn rc : EndIf
+ rc=QuicConnectionStartBegin(@connection,20000000) : If rc<>0 : ProcedureReturn rc : EndIf
+ If QuicConnectionStartBegin(@connection,20000000)<>#QUIC_START_STATE : startupFault=1 : EndIf
+ If QuicConnectionSendBegin(@connection,0,0)<>#QUIC_SEND_STATE : startupFault=2 : EndIf
+ If QuicConnectionReceiveBegin(@connection,0,@packet[0],1)<>#QUIC_RECEIVE_STATE : startupFault=3 : EndIf
  Repeat
-  p=Pump() : If p<0 : ProcedureReturn p : EndIf
-  rc=QuicTlsOutputStep(@connection\tlsOutput)
- Until rc<=0
- ProcedureReturn rc
+  If connection\startup\phase=6 And operationProbes=1
+   n=Tls13ContextRestore(@ownerSnapshot[0],#TLS13_CONTEXT_SIZE)
+   rc=PrepareTlsProbe(2,@connection\initial) : If rc<>1 : ProcedureReturn rc : EndIf
+  EndIf
+  pending=Bool(connection\startup\phase=2 Or connection\startup\phase=5 Or connection\startup\phase=7)
+  If pending : TlsSliceBefore() : EndIf
+  t=HwMicros() : rc=QuicConnectionStartStep(@connection) : cost=HwMicros()-t
+  If pending : TlsSliceAfter(cost) : EndIf
+  startupSteps=startupSteps+1 : If cost>maxStartupStep : maxStartupStep=cost : EndIf
+  n=Service() : If n<0 : ProcedureReturn n : EndIf
+  If rc<>0 : Break : EndIf
+ ForEver
+ If rc<>1 : ProcedureReturn rc : EndIf
+ If QuicConnectionStartStep(@connection)<>1 Or QuicConnectionStartBegin(@connection,20000000)<>#QUIC_START_STATE : startupFault=4 : EndIf
+ If connection\initial\readKeys\ready<>1 Or connection\initial\writeKeys\ready<>1 Or connection\initial\tx\tail<=0 : startupFault=5 : EndIf
+ startupChecks=1
+ n=Tls13ContextRestore(@ownerSnapshot[0],#TLS13_CONTEXT_SIZE)
+ ProcedureReturn 0
 EndProcedure
 Procedure.i SendSpace(*s.QuicConnectionSpace)
  Define rc.i,n.i,t.i,cost.i,held.i,i.i,number.i,inFlight.i
@@ -284,16 +302,13 @@ Procedure.i Run()
  rc=DrbgAutoSeed() : If rc<>1 : ProcedureReturn rc : EndIf
  rc=DrbgGenerate(@originalId[0],8) : If rc<>8 : ProcedureReturn -9317 : EndIf
  rc=DrbgGenerate(@clientId[0],8) : If rc<>8 : ProcedureReturn -9318 : EndIf
- rc=DoTls(1,0) : If rc<>1 : ProcedureReturn -9319 : EndIf
  rc=Tls13SetAlpn(?Alpn,3) : If rc<>1 : ProcedureReturn -9320 : EndIf
  For i=0 To #LOCAL_PARAMETER_BYTES-1 : localParameters[i]=PeekA(?LocalTemplate+i) : Next
  For i=0 To 7 : localParameters[i+2]=clientId[i] : Next
  rc=Tls13SetQuicParameters(@tlsConfig[0],@localParameters[0],#LOCAL_PARAMETER_BYTES,@peerParameters[0],4096)
  If rc<>1 : ProcedureReturn -9321 : EndIf
- rc=KeyDone(QuicInitialKeysBegin(@connection\keyjob,@connection\initial\readKeys,@originalId[0],8,1)) : If rc<>0 : ProcedureReturn rc : EndIf
- rc=KeyDone(QuicInitialKeysBegin(@connection\keyjob,@connection\initial\writeKeys,@originalId[0],8,0)) : If rc<>0 : ProcedureReturn rc : EndIf
  stage=3
- rc=MakeOutput(@connection\initial) : If rc<>0 : ProcedureReturn rc : EndIf
+ rc=StartHandshake() : If rc<>0 : ProcedureReturn rc : EndIf
  rc=SendSpace(@connection\initial) : If rc<>0 : ProcedureReturn rc : EndIf
  stage=4
  While appAuthenticated=0
@@ -342,13 +357,6 @@ Procedure CheckContext()
   If PeekA(@tlsctxw_caller[0]+i)<>0 : contextFault=2 : EndIf
  Next
  contextChecks=contextChecks+1
-EndProcedure
-Procedure.i BeginOperation(operation.i,space.i)
- Define *s.QuicConnectionSpace
- *s=space
- If operation=1 : ProcedureReturn QuicTlsOperationBegin(@connection\tlsOp,@ownerSnapshot[0],#TLS13_CONTEXT_SIZE,1,0,0,0,0,20000000) : EndIf
- If operation=2 : ProcedureReturn QuicTlsOperationBegin(@connection\tlsOp,@ownerSnapshot[0],#TLS13_CONTEXT_SIZE,2,@*s\tx,@connection\tlsOutput,@tlsBytes[0],2048,20000000) : EndIf
- ProcedureReturn QuicTlsOperationBegin(@connection\tlsOp,@ownerSnapshot[0],#TLS13_CONTEXT_SIZE,3,@*s\rx,0,0,0,20000000)
 EndProcedure
 Procedure OperationProbe(kind.i)
  Define i.i,rc.i,n.i,ticks.i,t.i
@@ -432,7 +440,7 @@ Procedure TlsSliceAfter(cost.i)
   workerSteps=workerSteps+1
   If HooksClear()<>1 : ownershipFault=5 : EndIf
 EndProcedure
-Procedure.i DoTls(operation.i,space.i)
+Procedure.i PrepareTlsProbe(operation.i,space.i)
  Define rc.i,t.i,cost.i,n.i,i.i
  liveOperation=operation : liveSpace=space
  otherJob\result=773
@@ -458,22 +466,7 @@ Procedure.i DoTls(operation.i,space.i)
  EndIf
  If operationProbes=operation-1 : OperationProbe(operation) : EndIf
  If operationFault<>0 : ProcedureReturn -9327 : EndIf
- rc=BeginOperation(operation,space)
- If rc<>1 : ProcedureReturn rc : EndIf
- Repeat
-  TlsSliceBefore()
-  t=HwMicros() : rc=QuicTlsOperationStep(@connection\tlsOp) : cost=HwMicros()-t
-  TlsSliceAfter(cost)
-  If rc<>0 : Break : EndIf
-  ; Foreground network service executes after the context has actually yielded.
-  rc=Service() : If rc<0 : Break : EndIf
- ForEver
- If rc=1
-  n=Tls13ContextRestore(@ownerSnapshot[0],#TLS13_CONTEXT_SIZE)
-  ProcedureReturn connection\tlsOp\result
- EndIf
- If connection\tlsOp\phase=1 : QuicTlsOperationCancel(@connection\tlsOp) : EndIf
- ProcedureReturn rc
+ ProcedureReturn 1
 EndProcedure
 Procedure SetupSpans()
  PokeI(@connectionSpans[0]+0,@rxData[0]) : PokeI(@connectionSpans[0]+8,QuicConnectionBufferBytes(0))
@@ -710,6 +703,8 @@ Procedure.i Main()
  EndIf
  PokeI($E1C00100,rc) : PokeI($E1C00108,tlsState) : PokeI($E1C00110,tlsError)
  PokeI($E1C00220,peerBytes)
+ PokeI($E1C00228,startupFault) : PokeI($E1C00230,startupChecks)
+ PokeI($E1C00238,maxStartupStep) : PokeI($E1C00240,startupSteps)
  PokeI($E1C00118,x509Error) : PokeI($E1C00120,paramsReady) : PokeI($E1C00128,appAuthenticated)
  PokeI($E1C00130,initialDiscarded) : PokeI($E1C00138,Bool(certCount>=1)) : PokeI($E1C00140,Bool(ackEvents>0))
  PokeI($E1C00148,closed) : PokeI($E1C00150,GcmJobBusy()) : PokeI($E1C00158,Bool(sent>=2 And received>=1))
