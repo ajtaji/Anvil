@@ -4565,3 +4565,67 @@ image changed. Installed Anvil remains 488 and the previous uninstalled full
 candidate remains 491. Production connection lifecycle, application packets,
 recovery/congestion/flow control, streams/QPACK and real HTTP/3 traffic remain,
 as do the earlier IPv6 and TLS compatibility/device-blocking gaps.
+
+
+### QUIC connection resource ownership and bounded closure
+
+`Anvil/Core/quic_connection.pbi` composes Initial/Handshake packet spaces,
+keys, packet/ACK/TLS jobs and mutable connection storage. Begin validates all
+20 caller-supplied spans before mutation, rejecting insufficient capacity,
+overflow and overlap with each other, the descriptor or the span table. It
+adopts the open UDP handle only after successful initialization. Required
+span sizes are explicit; additional supplied capacity is not owned or wiped.
+Storage and child jobs remain exclusive until CloseStep returns 1. No child
+work may start once closure begins, and all crypto users must honor the shared
+worker's exclusion across suspension.
+
+The owner also tracks an overall handshake deadline, separate from individual
+TLS operation budgets. The serialized dispatcher supplies its monotonic time
+and checks the deadline while waiting for packets or crypto. Deadline expiry
+begins closure; it does not roll back transcripts or permit reuse. Clearing
+that deadline requires the protocol owner to verify handshake confirmation:
+TLS Finished alone is not QUIC HANDSHAKE_DONE.
+
+CloseStep defers while another TLS worker owns arithmetic scratch. It stops
+its own suspended TLS operation, cancels packet/ACK/key jobs, invalidates both
+CRYPTO streams, retires sent histories and wipes connection keys. Stop refusal
+retains ownership rather than freeing live storage. Selected TLS working state
+is cleared only when both working-buffer pointers identify this connection;
+a different selected TLS context remains intact.
+
+Transport closure is explicit: Step returns 2 until the dispatcher closes the
+owned socket and acknowledges that exact handle with a successful result.
+Wrong-handle and failed-close acknowledgements retain ownership. Storage is
+then erased in chunks of at most 4096 bytes per call, plus fixed-size metadata
+cleanup. Completion is idempotent and preserves the terminal reason. No hidden
+network call, wait loop, or transport-specific binding is introduced.
+
+The live fixture now uses this shared owner rather than scattered resource
+initialization and cleanup. On installed Anvil 488, capture 285 passed 25
+checks and the independent peer verified client Finished and h3 negotiation.
+Tests covered aliased/undersized storage refusal without mutation, deferral
+for another suspended worker, exact socket-close acknowledgement, complete
+buffer erasure, and repeated close. A separate probe advanced the supplied
+clock to the overall deadline while key-share crypto was suspended, confirmed
+that execution stopped before erasure, and verified a separate TLS context's
+complete snapshot and working-buffer markers survived. Only that probe used
+a one-counter-tick slice to force suspension; it restored the normal setting.
+
+The live exchange and first close measured 1.408773 seconds, with 257 worker
+calls and 263 full context checks. Maximum operation Step was 1.762 ms,
+maximum foreground service gap 1.911 ms, and maximum service call 239 us.
+Closure took 43 bounded calls; the slowest was 54 us. These are observations,
+not hard deadlines. The subsequent injected lifecycle probe is not included
+in those exchange timings. Capture 286 rejected the corrupted certificate
+signature; the peer did not complete TLS and the same lifecycle checks passed.
+
+The shared connection fixture also compiled for BCM2837 using shared crypto
+owners and the actual Pi 3 timer/RNG adapter. It was not executed on Pi 3.
+Exact sources, identities, payloads, reports and peer results are retained in
+`docs/evidence/anvil-ipv6-20261030/quic-connection488`. Both physical runs
+returned with healthy cores, fonts and Vulkan and watchdog off. No resident
+image or API changed: installed Anvil remains 488; full candidate 491 remains
+uninstalled. This resource owner does not yet replace the fixture's handshake
+event loop with a reusable connection client. Application packet/frame state,
+HANDSHAKE_DONE, recovery, congestion/flow control, streams/QPACK and real HTTP/3
+traffic remain, as do the previously recorded IPv6 and TLS gaps.
