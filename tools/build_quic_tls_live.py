@@ -17,7 +17,7 @@ def build(compiler,out,public,wrong_name=False,bad_signature=False):
             'Anvil/Crypto/x25519_job.pbi','Anvil/Crypto/ecp_job.pbi','Anvil/Crypto/rsa_job.pbi',
             'Anvil/Crypto/tls13_context.pbi','Anvil/Hal/aarch64_counter.pbi','Anvil/Kernel/Scheduler/scheduler.pbi','Anvil/Kernel/Scheduler/cooperative_a64.pbi','RaspberryPi4/Lib/mmu.pi4','Anvil/Network/udp_payload.pbi',
             'Anvil/Network/quic_handshake_receive.pbi','Anvil/Network/quic_handshake_sent.pbi',
-            'Anvil/Network/quic_tls_receive.pbi','Anvil/Network/quic_tls_send.pbi','Anvil/Network/quic_parameters.pbi']
+            'Anvil/Network/quic_tls_receive.pbi','Anvil/Network/quic_tls_send.pbi','Anvil/Network/quic_parameters.pbi','Anvil/Network/quic_application_frames.pbi']
     params=b'\x0f\x08'+bytes(8)
     for key,value in [(1,15000),(3,1200),(4,65536),(5,16384),(6,16384),(7,16384),(8,1),(9,3),(14,2)]:
         data=vi(value);params+=vi(key)+vi(len(data))+data

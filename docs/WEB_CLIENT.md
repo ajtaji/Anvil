@@ -5035,3 +5035,57 @@ Application packet-space handling/HANDSHAKE_DONE, recovery, streams/QPACK and
 actual HTTP/3 requests remain open, along with off-link IPv6 and other remaining
 TLS/device work. Connection policy, entropy initialization and transport I/O
 remain explicit caller responsibilities.
+
+### Application frame syntax — 2026-10-31
+
+`Anvil/Network/quic_application_frames.pbi` adds
+`QuicApplicationFrameRead(source,bytes,view)` for authenticated QUIC v1 1-RTT
+plaintext. It returns one frame's consumed byte count or a negative refusal,
+leaving the entire output view unchanged on refusal. The view borrows the
+packet; keep that storage immutable and alive while consuming it.
+
+`QuicApplicationFrame.base` holds the common handshake-frame fields. Additional
+fields are `stream`, `finalSize`, `value`, `sequence`, `retire`, `idBytes`,
+`resetToken` and `fin`. Stream payloads use base.data/bytes/offset; FIN records
+finalSize. RESET_STREAM uses finalSize and base.error; STOP_SENDING uses
+base.error. Flow limits use value, with stream populated when present.
+NEW_CONNECTION_ID exposes the CID in base.data/bytes, its sequence/retire
+values, idBytes and the borrowed 16-byte resetToken. NEW_TOKEN and path data
+use base.data/bytes. Application close uses base.error and its reason view.
+HANDSHAKE_DONE has only its type and ACK-eliciting flag.
+
+All base v1 frame types are decoded. Common ACK/CRYPTO/transport-close layouts
+reuse the existing decoder, including its local 64-range ACK work bound.
+STREAM without LEN consumes the complete remaining packet. Checks cover
+integer truncation, minimal frame types, stream offset/end overflow, stream
+count limits, nonempty tokens, CID lengths and retirement ordering. Unknown
+extension types are refused. Nonminimal field integers remain legal.
+Wire facts are independently implemented from
+[RFC 9000 sections 12.4 and 19](https://www.rfc-editor.org/rfc/rfc9000.html#section-19).
+
+This layer performs syntax validation only. It does not authenticate packets,
+enforce sender roles or stream/CID state, apply flow control or ACK effects,
+confirm the handshake or retire keys. In particular, merely decoding
+HANDSHAKE_DONE does not apply the connection transition described in
+[RFC 9001 section 4.1.2](https://www.rfc-editor.org/rfc/rfc9001.html#section-4.1.2).
+It is not a 0-RTT policy API or an HTTP/3 implementation.
+
+Evidence: `docs/evidence/anvil-ipv6-20261030/quic-application-frames488/`.
+The physical decoder proof passed 2,309 checks, covering every base frame type,
+all STREAM flag combinations, prefixes, following-frame boundaries, limits,
+invalid encodings and unchanged output on refusal. Refusal checks inspect
+every output byte; this aggregates the verdict without reducing coverage.
+The live fixture also decoded the first authenticated application packet:
+HANDSHAKE_DONE with a zero-length peer ID, and HANDSHAKE_DONE plus
+NEW_CONNECTION_ID with an eight-byte peer ID. Both live runs passed the 36
+existing checks and all extra lifecycle/startup assertions. Independent peer
+records confirm Finished/h3 and compatible sent frame counts. No packet-number
+correlation claim is made for that frame-count comparison.
+
+Pi 3 compilation used its actual hardware adapter; no Pi 3 execution claim.
+All three Pi 4 RAM runs returned with healthy cores, fonts and Vulkan and the
+watchdog off. Installed Anvil 488 was unchanged. Certificate rejection code did
+not change; the prior negative certificate proof was not rerun or counted as
+a new result. Application packet ownership, frame effects/ACKs, handshake
+confirmation and key retirement, recovery, streams/QPACK and real HTTP/3
+remain open, together with remaining IPv6/TLS/device work.

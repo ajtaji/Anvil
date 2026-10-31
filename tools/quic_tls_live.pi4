@@ -3,8 +3,9 @@
 ; Runs TLS arithmetic through the shared cooperative worker; UDP stays in
 ; the foreground dispatcher, outside the worker context.
 ; No Retry, migration, recovery timer, application frames or HTTP/3 requests.
-; The final protected 1-RTT packet is authenticated, but its frames are NOT
-; interpreted. TLS completion is also checked independently by the server.
+; The first protected 1-RTT packet is authenticated and its frame syntax is
+; decoded. Frame effects/ACKs and handshake confirmation are NOT applied.
+; TLS completion is also checked independently by the server.
 Global connection.QuicConnection
 Global Dim connectionSpans.i[40]
 Global bufferWiped.i,closeFault.i,storageRefused.i,closeCalls.i,maxCloseStep.i
@@ -23,6 +24,7 @@ Global Dim savedClient.a[8]
 Global feedFault.i,keyCancelled.i,feedSteps.i,maxFeedStep.i
 Global keyOp.QuicTlsOperation,probeKey.QuicKeyJob,probeKeys.QuicKeys
 Global preparedKeyOp.QuicTlsOperation
+Global applicationFrame.QuicApplicationFrame,applicationFrames.i,doneSeen.i
 Global startupFault.i,startupChecks.i,startupSteps.i,maxStartupStep.i
 Global ackFault.i,ackChecks.i,ackSteps.i,maxAckStep.i
 Global receiveFault.i,receiveCancelled.i,receiveSteps.i,maxReceiveStep.i,savedReceiveBytes.i
@@ -233,7 +235,7 @@ Procedure.i FeedTls(*s.QuicConnectionSpace)
  ProcedureReturn 0
 EndProcedure
 Procedure.i PacketOne(p.i,bytes.i)
- Define rc.i,i.i,t.i,cost.i,old.i,known.i,count.i,*s.QuicConnectionSpace
+ Define rc.i,i.i,t.i,cost.i,old.i,known.i,count.i,cursor.i,n.i,*s.QuicConnectionSpace
  rc=QuicPacketRead(@connection\header,p,bytes,8) : If rc<>1 : ProcedureReturn -9307 : EndIf
  If connection\header\kind=4
   If connection\header\destinationBytes<>8 : ProcedureReturn -9308 : EndIf
@@ -245,6 +247,15 @@ Procedure.i PacketOne(p.i,bytes.i)
    rc=QuicPacketJobStep(@connection\sendJob)
   Until rc<>0
   If rc<>1 : ProcedureReturn rc : EndIf
+  cursor=0
+  While cursor<connection\sendJob\plainBytes
+   n=QuicApplicationFrameRead(p+connection\sendJob\plainOffset+cursor,connection\sendJob\plainBytes-cursor,@applicationFrame)
+   If n<1 : ProcedureReturn n : EndIf
+   cursor=cursor+n
+   If applicationFrame\base\kind<>0 : applicationFrames=applicationFrames+1 : EndIf
+   If applicationFrame\base\kind=30 : doneSeen=1 : EndIf
+   rc=Pump() : If rc<0 : ProcedureReturn rc : EndIf
+  Wend
   appAuthenticated=1 : ProcedureReturn 0
  EndIf
  If connection\header\kind=0 : *s=@connection\initial
@@ -703,6 +714,7 @@ Procedure.i Main()
  EndIf
  PokeI($E1C00100,rc) : PokeI($E1C00108,tlsState) : PokeI($E1C00110,tlsError)
  PokeI($E1C00220,peerBytes)
+ PokeI($E1C00248,applicationFrames) : PokeI($E1C00250,doneSeen)
  PokeI($E1C00228,startupFault) : PokeI($E1C00230,startupChecks)
  PokeI($E1C00238,maxStartupStep) : PokeI($E1C00240,startupSteps)
  PokeI($E1C00118,x509Error) : PokeI($E1C00120,paramsReady) : PokeI($E1C00128,appAuthenticated)

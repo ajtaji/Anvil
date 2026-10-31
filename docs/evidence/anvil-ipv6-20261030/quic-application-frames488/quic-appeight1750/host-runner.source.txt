@@ -1,0 +1,18 @@
+from pathlib import Path
+import sys
+w=Path(__file__).parent
+sys.path.insert(0,str(w/'quic-peer1531'))
+sys.path.insert(0,r'C:/Users/ajtaj/Desktop/Anvil/tools')
+from quic_tls_live_peer import Peer
+d=w/'anvil-ipv6-20261030/quic-appeight1750'
+with Peer(w/'quic-private1532',d/'peer.json') as peer:
+ source=(w/'run_quic_output1525.py').read_text().replace('quic-output1524','quic-appeight1750').replace('QUIC TLS output admission CPU','QUIC zero/eight ID dispatch').replace("out=d/'board488'","out=d/'board488'").replace('chunk_bytes=4096','chunk_bytes=1024')
+ needle="assert rec.get('x0') is not None,'No confirmed return; stop board access and inspect journal'"
+ assert source.count(needle)==1
+ source=source.replace(needle,needle+"\n peer.check();peer.stop.set();peer.thread.join(3);assert not peer.thread.is_alive()")
+ exec(compile(source,str(w/'run_appeight1750.py'),'exec'))
+ peer.check()
+ print('Independent peer verified Finished/h3 at return, before diagnostic downloads.',flush=True)
+
+import struct
+assert struct.unpack_from("<q",(d/'board488'/"report.bin").read_bytes(),0x220)[0]==8

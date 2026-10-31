@@ -1,0 +1,13 @@
+from pathlib import Path
+import subprocess,sys
+w=Path(__file__).parent;r=Path('C:/Users/ajtaj/Desktop/Anvil')
+for name,trust,extra in [('quic-appzero1749','quic-private1532',[]),('quic-appeight1750','quic-private1532',[])]:
+ q=subprocess.run([sys.executable,str(r/'tools/build_quic_tls_live.py'),'--compiler','C:/Users/ajtaj/Desktop/Github/PureBasicCode/OpenGl Work/ArduinoBasic/PureMetalForge.exe','--out',str(w/'anvil-ipv6-20261030'/name),'--public',str(w/trust/'public.json'),*extra],capture_output=True,text=True)
+ print(name,q.returncode,q.stdout[-220:]+q.stderr);assert q.returncode==0
+for old,new,oldbuild,newbuild,cid in [('run_quic_cid1700.py','run_appzero1749.py','quic-cid1697','quic-appzero1749',0),('run_quic_cid1700.py','run_appeight1750.py','quic-cid1697','quic-appeight1750',8),('run_quic_cid1701.py','run_appbad_unused1751.py','quic-cid1698','quic-appbad-unused1751',0)]:
+ s=(w/old).read_text().replace(oldbuild,newbuild).replace(old,new).replace('handshake CID dispatch','zero/eight ID dispatch').replace('CID signature refusal','zero-ID signature refusal')
+ if cid==0:s=s.replace("d/'peer-replay.json')", "d/'peer-replay.json',connection_id_length=0)").replace("d/'peer.json')", "d/'peer.json',connection_id_length=0)")
+ if cid==8:s=s.replace('board488-replay','board488').replace('peer-replay.json','peer.json')
+ s+='\nimport struct\nassert struct.unpack_from("<q",(d/'+repr('board488-replay' if newbuild=='quic-appzero1749' else 'board488')+'/"report.bin").read_bytes(),0x220)[0]=='+str(cid)+'\n'
+ (w/new).write_text(s)
+s=(w/'compile_quic_cid1702.py').read_text().replace('quic-cid1697','quic-appzero1749').replace('quic-cid-pi3-1702','quic-app-pi3-1752');(w/'compile_app1752.py').write_text(s)

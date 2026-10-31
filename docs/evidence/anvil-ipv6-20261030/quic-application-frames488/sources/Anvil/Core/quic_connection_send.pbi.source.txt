@@ -1,0 +1,171 @@
+; Step-driven Initial/Handshake output for the shared connection owner.
+; Include quic_connection and cooperative TLS worker first. No hidden I/O.
+; Serialized dispatcher: no other sender or direct output/job mutation while
+; active. Transport receives an immutable datagram at Step=2. It must copy or
+; retain it until completion; caller closes the connection after any failure.
+#QUIC_SEND_STATE=-3521
+#QUIC_SEND_ARGUMENT=-3522
+#QUIC_SEND_OUTPUT=-3523
+Procedure.i quiccs_Valid(*c.QuicConnection)
+ ProcedureReturn Bool(*c>0 And *c<=$7FFFFFFFFFFFFFFF-SizeOf(QuicConnection))
+EndProcedure
+Procedure.i quiccs_Space(*c.QuicConnection)
+ If *c\outgoing\level=0 : ProcedureReturn @*c\initial : EndIf
+ ProcedureReturn @*c\handshake
+EndProcedure
+Procedure.i quiccs_Fail(*c.QuicConnection,reason.i)
+ Define rc.i
+ *c\outgoing\phase=-1 : *c\outgoing\result=reason
+ rc=QuicConnectionClose(*c,reason)
+ ProcedureReturn reason
+EndProcedure
+; The common worker owns packet crypto across suspension as it does TLS.
+; A raw packet owner may still be finishing: BUSY is retryable before mutation.
+Procedure.i quiccs_Encrypt()
+ Define *c.QuicConnection,*s.QuicConnectionSpace,rc.i
+ *c=ScArgument() : *s=quiccs_Space(*c)
+ rc=QuicPacketJobBegin(@*c\sendJob,@*s\writeKeys,QuicConnectionBuffer(*c,16),*c\outgoing\bytes,0,*c\outgoing\number,1)
+ If rc=0
+  Repeat
+   rc=QuicPacketJobStep(@*c\sendJob)
+   If rc<>0 : Break : EndIf
+   TlsWorkerCheckpoint()
+  ForEver
+ EndIf
+ *c\outgoing\cryptoResult=rc
+ ProcedureReturn 1
+EndProcedure
+; Begin returns0 admitted, negative refusal without changing pending output.
+; An unknown peer selects original DCID for the first Initial. Handshake needs a
+; previously authenticated peer CID. Both IDs use the owner's fixed buffers.
+Procedure.i QuicConnectionSendBegin(*c.QuicConnection,level.i,peerBytes.i)
+ Define i.i,*s.QuicConnectionSpace
+ If quiccs_Valid(*c)=0 : ProcedureReturn #QUIC_SEND_ARGUMENT : EndIf
+ If *c\phase<>1 Or (*c\outgoing\phase<>0 And *c\outgoing\phase<>6) : ProcedureReturn #QUIC_SEND_STATE : EndIf
+ If *c\startup\phase>=1 And *c\startup\phase<=8 : ProcedureReturn #QUIC_SEND_STATE : EndIf
+ If *c\acknowledge\phase>=1 And *c\acknowledge\phase<=4 : ProcedureReturn #QUIC_SENT_BUSY : EndIf
+ If *c\incoming\phase>=1 And *c\incoming\phase<=3 : ProcedureReturn #QUIC_SEND_STATE : EndIf
+ If *c\feed\phase>=1 And *c\feed\phase<=11 : ProcedureReturn #QUIC_SEND_STATE : EndIf
+ If (level<>0 And level<>2) Or peerBytes<0 Or peerBytes>20 : ProcedureReturn #QUIC_SEND_ARGUMENT : EndIf
+ If *c\peerIdKnown=0
+  If peerBytes<>0 Or level=2 : ProcedureReturn #QUIC_SEND_ARGUMENT : EndIf
+ ElseIf peerBytes<>*c\peerIdBytes
+  ProcedureReturn #QUIC_SEND_ARGUMENT
+ EndIf
+ If TlsWorkerBusy()<>0 : ProcedureReturn #TLSWORK_BUSY : EndIf
+ If level=0
+  If *c\initialRetired<>0 : ProcedureReturn #QUIC_SEND_STATE : EndIf
+  *s=@*c\initial
+ Else
+  *s=@*c\handshake
+ EndIf
+ If *s\writeKeys\ready<>1 : ProcedureReturn #QUIC_SEND_STATE : EndIf
+ For i=0 To SizeOf(QuicConnectionSend)-1 : PokeA(@*c\outgoing+i,0) : Next
+ *c\outgoing\phase=1 : *c\outgoing\level=level : *c\outgoing\peerBytes=peerBytes : *c\outgoing\cursor=*s\tx\base
+ ProcedureReturn 0
+EndProcedure
+; 0 pending,1 finished/no work,2 immutable datagram ready for submission,
+; 3 awaiting transport completion,negative terminal failure/refusal.
+; One bounded scan/frame/copy phase or cooperative crypto slice per call.
+Procedure.i QuicConnectionSendStep(*c.QuicConnection)
+ Define rc.i,i.i,n.i,head.i,room.i,output.i,*s.QuicConnectionSpace
+ If quiccs_Valid(*c)=0 : ProcedureReturn #QUIC_SEND_ARGUMENT : EndIf
+ If *c\phase<>1 : ProcedureReturn #QUIC_SEND_STATE : EndIf
+ If *c\outgoing\phase=6 : ProcedureReturn 1 : EndIf
+ If *c\outgoing\phase=4 : ProcedureReturn 2 : EndIf
+ If *c\outgoing\phase=5 : ProcedureReturn 3 : EndIf
+ *s=quiccs_Space(*c) : output=QuicConnectionBuffer(*c,16)
+ If *c\outgoing\phase=1
+  rc=QuicCryptoTxFind(@*s\tx,*c\outgoing\cursor,1024,@*c\outgoing\view)
+  If rc<0 : ProcedureReturn quiccs_Fail(*c,rc) : EndIf
+  *c\outgoing\found=rc : *c\outgoing\cursor=*c\outgoing\view\offset
+  If rc=0 And *c\outgoing\cursor<*s\tx\tail : ProcedureReturn 0 : EndIf
+  If rc=0 And *s\ack\pending=0 : *c\outgoing\phase=6 : ProcedureReturn 1 : EndIf
+  *c\outgoing\phase=2 : ProcedureReturn 0
+ EndIf
+ If *c\outgoing\phase=2
+  rc=QuicHandshakeSentReserve(@*s\history)
+  If rc<0 : ProcedureReturn quiccs_Fail(*c,rc) : EndIf
+  *c\outgoing\number=rc
+  *c\spec\kind=*s\level : *c\spec\source=QuicConnectionBuffer(*c,18) : *c\spec\sourceBytes=8
+  If *c\peerIdKnown=0
+   *c\spec\destination=QuicConnectionBuffer(*c,17) : *c\spec\destinationBytes=8
+  Else
+   *c\spec\destination=QuicConnectionBuffer(*c,19) : *c\spec\destinationBytes=*c\outgoing\peerBytes
+  EndIf
+  *c\spec\number=*c\outgoing\number : *c\spec\numberBytes=4
+  head=21+*c\spec\destinationBytes+Bool(*s\level=0)
+  *c\spec\cipherBytes=1200-head
+  n=QuicLongPacketWrite(@*c\spec,output,1472)
+  If n<>head : ProcedureReturn quiccs_Fail(*c,#QUIC_SEND_OUTPUT) : EndIf
+  For i=head To 1199 : PokeA(output+i,0) : Next
+  room=1200-head-16
+  If *s\ack\pending<>0
+   rc=QuicHandshakeAckWrite(@*s\ack,output+n,room,@*c\outgoing\token)
+   If rc<0 : ProcedureReturn quiccs_Fail(*c,rc) : EndIf
+   n=n+rc : room=room-rc
+  EndIf
+  If *c\outgoing\found=1
+   *c\outgoing\copied=*c\outgoing\view\bytes
+   If *c\outgoing\copied>room-24 : *c\outgoing\copied=room-24 : EndIf
+   If *c\outgoing\copied<=0 : ProcedureReturn quiccs_Fail(*c,#QUIC_SEND_OUTPUT) : EndIf
+   rc=QuicCryptoTxFrame(@*s\tx,*c\outgoing\view\offset,*c\outgoing\copied,output+n,room)
+   If rc<0 : ProcedureReturn quiccs_Fail(*c,rc) : EndIf
+  EndIf
+  *c\outgoing\bytes=1200 : *c\outgoing\phase=3 : ProcedureReturn 0
+ EndIf
+ If *c\outgoing\phase=3
+  If *c\outgoing\encryptStarted=0
+   rc=TlsWorkerBegin(@*c\outgoing\worker,@quiccs_Encrypt,*c)
+   If rc=#TLSWORK_BUSY : ProcedureReturn 0 : EndIf
+   If rc<>1 : ProcedureReturn quiccs_Fail(*c,rc) : EndIf
+   *c\outgoing\encryptStarted=1 : ProcedureReturn 0
+  EndIf
+  rc=TlsWorkerStep(@*c\outgoing\worker)
+  If rc=0 : ProcedureReturn 0 : EndIf
+  If rc<>1 : ProcedureReturn quiccs_Fail(*c,rc) : EndIf
+  rc=*c\outgoing\cryptoResult
+  If rc=#QUIC_CRYPTO_BUSY : *c\outgoing\encryptStarted=0 : ProcedureReturn 0 : EndIf
+  If rc<>1 : ProcedureReturn quiccs_Fail(*c,rc) : EndIf
+  *c\outgoing\phase=4 : ProcedureReturn 2
+ EndIf
+ ProcedureReturn #QUIC_SEND_STATE
+EndProcedure
+; Acknowledge only an actual whole-datagram transport acceptance. An EAGAIN
+; attempt leaves Step=2 and the same protected bytes/PN available to retry.
+Procedure.i QuicConnectionSendAccepted(*c.QuicConnection,bytes.i,now.i)
+ Define rc.i,meta.i,*s.QuicConnectionSpace
+ If quiccs_Valid(*c)=0 Or now<0 : ProcedureReturn #QUIC_SEND_ARGUMENT : EndIf
+ If *c\phase<>1 Or *c\outgoing\phase<>4 : ProcedureReturn #QUIC_SEND_STATE : EndIf
+ If bytes<>*c\outgoing\bytes : ProcedureReturn #QUIC_SEND_ARGUMENT : EndIf
+ *s=quiccs_Space(*c) : meta=*s\metadata+*c\outgoing\number*16
+ PokeI(meta,*c\outgoing\view\offset) : PokeI(meta+8,*c\outgoing\copied)
+ rc=QuicHandshakeSentCommit(@*s\history,*c\outgoing\number,bytes,now,Bool(*c\outgoing\copied>0),1,meta)
+ If rc<>0 : ProcedureReturn quiccs_Fail(*c,rc) : EndIf
+ If *c\outgoing\copied>0
+  rc=QuicCryptoTxSent(@*s\tx,*c\outgoing\view\offset,*c\outgoing\copied)
+  If rc<>0 : ProcedureReturn quiccs_Fail(*c,rc) : EndIf
+ EndIf
+ *c\outgoing\phase=5 : ProcedureReturn 0
+EndProcedure
+; result0 means the accepted datagram actually completed transmission. A
+; negative transport failure starts terminal connection closure, never retry.
+Procedure.i QuicConnectionSendCompleted(*c.QuicConnection,result.i)
+ Define rc.i,*s.QuicConnectionSpace
+ If quiccs_Valid(*c)=0 : ProcedureReturn #QUIC_SEND_ARGUMENT : EndIf
+ If *c\phase<>1 Or *c\outgoing\phase<>5 : ProcedureReturn #QUIC_SEND_STATE : EndIf
+ If result>0 : ProcedureReturn #QUIC_SEND_ARGUMENT : EndIf
+ If result<0 : ProcedureReturn quiccs_Fail(*c,result) : EndIf
+ *s=quiccs_Space(*c)
+ If *c\outgoing\token<>0
+  rc=QuicHandshakeAckSent(@*s\ack,*c\outgoing\token)
+  If rc<>1 : ProcedureReturn quiccs_Fail(*c,#QUIC_SEND_OUTPUT) : EndIf
+ EndIf
+ If *s\level=2 And *c\initialRetired=0
+  QuicKeysWipe(@*c\initial\readKeys) : QuicKeysWipe(@*c\initial\writeKeys)
+  rc=QuicHandshakeSentDiscard(@*c\initial\history)
+  If rc<>0 : ProcedureReturn quiccs_Fail(*c,rc) : EndIf
+  *c\initialRetired=1
+ EndIf
+ *c\outgoing\phase=6 : ProcedureReturn 1
+EndProcedure

@@ -1,0 +1,96 @@
+"""Physical QUIC 1-RTT frame decoding against independently encoded vectors."""
+from pathlib import Path
+import argparse,hashlib,json,os,re,subprocess
+from pmf_compiler import resolve_compiler
+from build_quic_handshake_frames_cpu import vi
+
+def build(compiler,out):
+ root=Path(__file__).resolve().parents[1];out.mkdir(parents=True,exist_ok=False)
+ names=['Anvil/Network/quic_application_frames.pbi','Anvil/Network/quic_handshake_frames.pbi','Anvil/Network/quic_crypto_stream.pbi','Anvil/Network/quic_wire.pbi','Anvil/Network/byte_order.pbi','RaspberryPi4/Lib/mmu.pi4','tools/build_quic_application_frames_cpu.py']
+ cases=[];steps=[];vectors=[];valid=[]
+ fields=['base.'+x for x in ['kind','eliciting','data','bytes','offset','largest','delay','count','ranges','rangeBytes','ect0','ect1','ce','error','trigger']]+['stream','finalSize','value','sequence','retire','idBytes','resetToken','fin']
+ def check(name,expr,want):
+  steps.append(f'PokeI($E1C00100+{len(cases)*8},{expr})');cases.append(dict(name=name,expected=want))
+ def add(name,b,expected=None,error=None,consumed=None):
+  index=len(vectors);vectors.append(b or b'\0');p=f'?V{index}'
+  steps.append(f'For j=0 To SizeOf(QuicApplicationFrame)-1 : PokeA(@v+j,$5A) : Next\nrc=QuicApplicationFrameRead({p},{len(b)},@v)')
+  check(name+' result','rc',error if error is not None else consumed if consumed is not None else len(b))
+  if error is not None:
+   steps.append('bad=0 : For j=0 To SizeOf(QuicApplicationFrame)-1 : If PeekA(@v+j)<>$5A : bad=bad+1 : EndIf : Next')
+   check(name+' unchanged view','bad',0);return
+  for field in fields:
+   expr='v'+chr(92)+field.replace('.',chr(92))
+   want=0x5a5a5a5a5a5a5a5a if error is not None else (expected or {}).get(field,0)
+   if error is None and field in ('base.data','base.ranges','resetToken') and want:expr+=f'-{p}'
+   check(name+' '+field,expr,want)
+ def good(name,b,f,header=None):
+  valid.append((name,b,f,header));add(name,b,f)
+ def common(k,b,**kw):good('common '+str(k),b,{'base.kind':k,**{'base.'+a:v for a,v in kw.items()}})
+ common(0,b'\0');common(1,b'\1',eliciting=1)
+ common(2,b'\2\x05\0\0\x02',largest=5,count=1,ranges=4,rangeBytes=1)
+ common(3,b'\3\x05\0\0\x02\1\2\3',largest=5,count=1,ranges=4,rangeBytes=1,ect0=1,ect1=2,ce=3)
+ common(6,b'\6\1\3abc',eliciting=1,offset=1,data=3,bytes=3)
+ common(28,b'\x1c\1\6\3bye',error=1,trigger=6,data=4,bytes=3)
+ good('reset',b'\4'+vi(65)+vi(1000)+vi(1<<40),{'base.kind':4,'base.eliciting':1,'stream':65,'base.error':1000,'finalSize':1<<40})
+ good('stop',b'\5'+vi(65,4)+vi(5,2),{'base.kind':5,'base.eliciting':1,'stream':65,'base.error':5})
+ good('token',b'\7\3abc',{'base.kind':7,'base.eliciting':1,'base.data':2,'base.bytes':3})
+ for k in range(8,16):
+  b=bytes([k])+vi(65,4);offset=70 if k&4 else 0
+  if k&4:b+=vi(offset,2)
+  if k&2:b+=vi(3,2)
+  h=len(b);f={'base.kind':k,'base.eliciting':1,'stream':65,'base.offset':offset,'base.data':h,'base.bytes':3,'fin':k&1,'finalSize':offset+3 if k&1 else 0}
+  good('stream '+str(k),b+b'abc',f,None if k&2 else h)
+ good('empty final stream',b'\x0f\0'+vi((1<<62)-1)+b'\0',{'base.kind':15,'base.eliciting':1,'base.offset':(1<<62)-1,'base.data':11,'fin':1,'finalSize':(1<<62)-1})
+ for k in range(16,24):
+  f={'base.kind':k,'base.eliciting':1,'value':1<<60};b=bytes([k])
+  if k in (17,21):b+=vi(65,4);f['stream']=65
+  b+=vi(1<<60);good('limit '+str(k),b,f)
+ for size in [1,20]:
+  b=b'\x18'+vi(65)+vi(1,2)+bytes([size]);p=len(b)
+  good('new cid '+str(size),b+bytes(range(size))+bytes(range(16)),{'base.kind':24,'base.eliciting':1,'sequence':65,'retire':1,'idBytes':size,'base.data':p,'base.bytes':size,'resetToken':p+size})
+ good('retire',b'\x19'+vi((1<<62)-1),{'base.kind':25,'base.eliciting':1,'sequence':(1<<62)-1})
+ for k in (26,27):good('path '+str(k),bytes([k])+b'abcdefgh',{'base.kind':k,'base.eliciting':1,'base.data':1,'base.bytes':8})
+ good('application close',b'\x1d'+vi(65,4)+b'\3bye',{'base.kind':29,'base.error':65,'base.data':6,'base.bytes':3})
+ good('handshake done',b'\x1e',{'base.kind':30,'base.eliciting':1})
+ for name,b,f,header in valid:
+  # A no-LEN stream has valid shorter payloads, not truncated frames.
+  for n in range(len(b) if header is None else header):add(name+' prefix '+str(n),b[:n],error=-3422)
+  if header is None:add(name+' next frame',b+b'\1',f,consumed=len(b))
+  else:
+   more=dict(f);more['base.bytes']+=1
+   if more['fin']:more['finalSize']+=1
+   add(name+' remainder includes ping',b+b'\1',more)
+ for k in range(31):add('nonminimal type '+str(k),vi(k,2),error=-3424)
+ for k in [31,63,64,(1<<62)-1]:add('unknown '+str(k),vi(k),error=-3424)
+ add('empty token',b'\7\0',error=-3424)
+ for size in [0,21,255]:add('bad CID length '+str(size),b'\x18\0\0'+bytes([size])+bytes(40),error=-3424)
+ add('retire beyond sequence',b'\x18\1\2',error=-3424)
+ for k in (18,19,22,23):add('stream limit overflow '+str(k),bytes([k])+vi((1<<60)+1),error=-3423)
+ add('stream offset overflow',b'\x0e\0'+vi((1<<62)-1)+b'\1x',error=-3423)
+ add('ack underflow',b'\2\0\0\0\1',error=-3424)
+ for expr in ['QuicApplicationFrameRead(0,1,@v)','QuicApplicationFrameRead(?V0,-1,@v)','QuicApplicationFrameRead(?V0,1,0)','QuicApplicationFrameRead(@v,1,@v)','QuicApplicationFrameRead($7FFFFFFFFFFFFFFF,2,@v)']:
+  check('argument '+expr,expr,-3421)
+ assert 256+8*len(cases)<=65536,len(cases)
+ s=r'''XIncludeFile "RaspberryPi4/Lib/mmu.pi4"
+XIncludeFile "Anvil/Network/quic_application_frames.pbi"
+Global v.QuicApplicationFrame
+Procedure.i Main()
+ Define rc.i,j.i,bad.i
+ For j=0 To 65535 : PokeA($E1C00000+j,$A5) : Next
+ PokeI($E1C00000,$55445331)
+ MmuClearNc() : MmuAddNc($08A00000,$09200000) : MmuAddNc($08100000,$08180000)
+ rc=MmuBuildTables($4F80000) : If rc<>0 : ProcedureReturn 2 : EndIf
+ MmuEnableCached()
+'''+ '\n'.join(steps)+f'\nPokeI($E1C00008,{len(cases)})\nMmuDisableCachedFlushed()\nProcedureReturn 0\nEndProcedure\nDataSection\n'
+ for k,b in enumerate(vectors):
+  s+=f'V{k}:\n'
+  for i in range(0,len(b),24):s+=' Data.a '+','.join(map(str,b[i:i+24]))+'\n'
+ s+='EndDataSection\n';source=out/'proof.pi4';source.write_text(s)
+ q=subprocess.run([str(resolve_compiler(compiler)),'--compile',str(source),'-t','pi4','--load-addr','0x1000000','--stack-addr','0x4f00000','--entry-returns','--wants-services','-o',str(out/'proof.img')],env=dict(os.environ,PMF_ROOT=str(root)),capture_output=True,text=True,timeout=180,creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
+ log=q.stdout+q.stderr;(out/'compile.txt').write_text(log);print(log[-1200:]);assert q.returncode==0
+ code=re.search(r'occupying \$([0-9A-Fa-f]+)\.\.\$([0-9A-Fa-f]+)',log);bss=re.search(r'bss \$([0-9A-Fa-f]+)\.\.\$([0-9A-Fa-f]+)',log)
+ payload=(out/'proof.img.pmf').read_bytes();ranges={'code':['0x'+x for x in code.groups()],'bss':['0x'+x for x in bss.groups()],'stack':['0x4e00000','0x4efffff'],'report':['0xe1c00000','0xe1c0ffff'],'tables':['0x4f80000','0x4f82fff']}
+ (out/'identity.json').write_text(json.dumps(dict(bytes=len(payload),sha256=hashlib.sha256(payload).hexdigest(),checked_ranges=ranges,source_hashes={n:hashlib.sha256((root/n).read_bytes()).hexdigest() for n in names},cases=cases),indent=2))
+if __name__=='__main__':
+ ap=argparse.ArgumentParser(description=__doc__);ap.add_argument('--compiler',required=True);ap.add_argument('--out',type=Path,required=True)
+ a=ap.parse_args();build(a.compiler,a.out.resolve())
