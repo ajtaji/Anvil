@@ -4,7 +4,7 @@
 ; DRBG and trust anchors are shared owners, never rolled back by Restore.
 ; Restore invalidates the shared AES-GCM cache before another record uses it.
 ; Snapshot bytes contain secrets: wipe when the connection is released.
-#TLS13_CONTEXT_SIZE=2920
+#TLS13_CONTEXT_SIZE=2928
 Procedure.i Tls13ContextSave(dst.i,capacity.i)
  If dst=0 Or capacity<#TLS13_CONTEXT_SIZE : ProcedureReturn 0 : EndIf
  TlsCopy(dst+0,@secTlsWKey[0],16)
@@ -94,6 +94,7 @@ Procedure.i Tls13ContextSave(dst.i,capacity.i)
  PokeI(dst+2384,X509EeQAddr)
  PokeI(dst+2392,X509EeQLen)
  TlsCopy(dst+2400,@xEePkey[0],520)
+ PokeI(dst+2920,TlsQuicConfig)
  ProcedureReturn #TLS13_CONTEXT_SIZE
 EndProcedure
 
@@ -186,6 +187,7 @@ Procedure.i Tls13ContextRestore(src.i,capacity.i)
  X509EeQAddr=PeekI(src+2384)
  X509EeQLen=PeekI(src+2392)
  TlsCopy(@xEePkey[0],src+2400,520)
+ TlsQuicConfig=PeekI(src+2920)
  Tls13RecInvalidateCipher()
  ProcedureReturn #TLS13_CONTEXT_SIZE
 EndProcedure

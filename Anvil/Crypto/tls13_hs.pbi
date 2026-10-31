@@ -345,6 +345,11 @@
 #TLS13_REFUSE_ALPN_FORMAT                = 54
 #TLS13_REFUSE_ALPN_SELECTION             = 55
 #TLS13_REFUSE_ALPN_DUPLICATE             = 56
+#TLS13_REFUSE_QUIC_CONFIG                = 57
+#TLS13_REFUSE_QUIC_PARAMETERS            = 58
+#TLS13_REFUSE_QUIC_LEVEL                 = 59
+#TLS13_QUIC_CONFIG_SIZE                  = 48
+#TLS_EXT_QUIC_PARAMETERS                 = 57
 ; --- Certificate ---
 #TLS13_REFUSE_CERT_CONTEXT_NOT_EMPTY     = 60
 #TLS13_REFUSE_EMPTY_CERT_LIST            = 61
@@ -455,6 +460,9 @@ Global TlsLabelsReady.i
 Global TlsKdfFault.i                 ; 1 once an hkdf call came back short
 Global TlsAlpnOfferLen.i
 Global TlsAlpnSelectedLen.i
+; Caller-owned configuration: offer ptr/bytes, receive ptr/capacity, received
+; bytes, received flag (six native integers). Lifetime spans the connection.
+Global TlsQuicConfig.i
 Global Dim TlsAlpnOffer.a[256]
 Global Dim TlsAlpnSelected.a[256]
 ; label offsets inside TlsLbl
@@ -1004,6 +1012,7 @@ EndProcedure
 ; ----------------------------------------------------------------------
 Procedure.i Tls13Init(nameAddr.i, nameLen.i, unixTime.i)
   Define i.i
+  TlsQuicConfig=0
   TlsAlpnOfferLen=0 : TlsAlpnSelectedLen=0
   For i=0 To 255 : TlsAlpnOffer[i]=0 : TlsAlpnSelected[i]=0 : Next
   Tls13State = #TLS13_ST_IDLE
@@ -1164,6 +1173,19 @@ Procedure.i TlsAlpnReadSelection(body.i,bytes.i)
  ProcedureReturn TlsFail(#TLS13_REFUSE_ALPN_SELECTION,#TLS_ALERT_ILLEGAL_PARAMETER)
 EndProcedure
 
+; Configure after Init, before ClientHello. Buffers remain separate, immutable
+; where applicable, and alive through the connection. Parameters are opaque to
+; TLS: the QUIC owner validates their semantics and connection-ID binding.
+Procedure.i Tls13SetQuicParameters(config.i,offer.i,bytes.i,peer.i,capacity.i)
+ Define i.i
+ If Tls13State<>#TLS13_ST_START : ProcedureReturn TlsFail(#TLS13_REFUSE_WRONG_STATE,#TLS_ALERT_INTERNAL_ERROR) : EndIf
+ If config<=0 Or offer<=0 Or peer<=0 Or bytes<0 Or bytes>16384 Or capacity<1 Or capacity>16384 : ProcedureReturn TlsFail(#TLS13_REFUSE_QUIC_CONFIG,#TLS_ALERT_INTERNAL_ERROR) : EndIf
+ If config>$7FFFFFFFFFFFFFFF-48 Or offer>$7FFFFFFFFFFFFFFF-bytes Or peer>$7FFFFFFFFFFFFFFF-capacity : ProcedureReturn TlsFail(#TLS13_REFUSE_QUIC_CONFIG,#TLS_ALERT_INTERNAL_ERROR) : EndIf
+ If (config<offer+bytes And offer<config+48) Or (config<peer+capacity And peer<config+48) Or (offer<peer+capacity And peer<offer+bytes) : ProcedureReturn TlsFail(#TLS13_REFUSE_QUIC_CONFIG,#TLS_ALERT_INTERNAL_ERROR) : EndIf
+ PokeI(config,offer) : PokeI(config+8,bytes) : PokeI(config+16,peer) : PokeI(config+24,capacity) : PokeI(config+32,0) : PokeI(config+40,0)
+ TlsQuicConfig=config : ProcedureReturn 1
+EndProcedure
+
 Procedure.i Tls13BuildClientHello(dst.i, dstmax.i)
   Protected p.i
   Protected extStart.i
@@ -1173,6 +1195,7 @@ Procedure.i Tls13BuildClientHello(dst.i, dstmax.i)
   Protected i.i
   Protected g2.i
   Protected nlen.i
+  Protected start.i,extra.i
 
   If Tls13State <> #TLS13_ST_START
     ProcedureReturn TlsFail(#TLS13_REFUSE_WRONG_STATE, #TLS_ALERT_INTERNAL_ERROR)
@@ -1190,12 +1213,17 @@ Procedure.i Tls13BuildClientHello(dst.i, dstmax.i)
   ; Without ALPN the largest ClientHello is 197 bytes plus the
   ; server name; reserve the optional ALPN bytes too before any write -
   ; a bound checked afterwards is a bound that already overflowed.
-  If dstmax < 256 + nlen + TlsAlpnOfferLen + Bool(TlsAlpnOfferLen>0)*6
+  start=dst+5 : extra=0
+  If TlsQuicConfig<>0
+    If TlsAlpnOfferLen=0 : ProcedureReturn TlsFail(#TLS13_REFUSE_QUIC_CONFIG,#TLS_ALERT_INTERNAL_ERROR) : EndIf
+    start=dst : extra=4+PeekI(TlsQuicConfig+8) : TlsSessionIdLen=0
+  EndIf
+  If dstmax < 256 + nlen + TlsAlpnOfferLen + Bool(TlsAlpnOfferLen>0)*6 + extra
     ProcedureReturn TlsFail(#TLS13_REFUSE_BUF_TOO_SMALL, #TLS_ALERT_INTERNAL_ERROR)
   EndIf
 
   TlsOfferedCount = 0
-  bodyStart = dst + 5 + 4
+  bodyStart = start + 4
   p = bodyStart
 
   TlsWr16(p, #TLS13_LEGACY_VERSION) : p = p + 2
@@ -1212,6 +1240,11 @@ Procedure.i Tls13BuildClientHello(dst.i, dstmax.i)
 
   extStart = p
   p = p + 2                            ; extensions length, filled at the end
+  If TlsQuicConfig<>0
+    TlsWr16(p,#TLS_EXT_QUIC_PARAMETERS) : TlsWr16(p+2,PeekI(TlsQuicConfig+8))
+    TlsCopy(p+4,PeekI(TlsQuicConfig),PeekI(TlsQuicConfig+8)) : p=p+extra
+    TlsNoteOffered(#TLS_EXT_QUIC_PARAMETERS)
+  EndIf
 
   ; ---- server_name (RFC 6066), only when we know the name ----
   If nlen > 0
@@ -1292,15 +1325,15 @@ Procedure.i Tls13BuildClientHello(dst.i, dstmax.i)
   If 5 + 4 + msgLen > dstmax
     ProcedureReturn TlsFail(#TLS13_REFUSE_BUF_TOO_SMALL, #TLS_ALERT_INTERNAL_ERROR)
   EndIf
-  TlsWr8(dst + 5, #TLS_HS_CLIENT_HELLO)
-  TlsWr24(dst + 6, msgLen)
+  TlsWr8(start, #TLS_HS_CLIENT_HELLO)
+  TlsWr24(start+1, msgLen)
   ; RFC 8446 5.1: the initial ClientHello carries legacy_record_version
   ; 0x0301 for middlebox compatibility
-  Tls13RecBuildPlainHeader(dst, #TLS_CT_HANDSHAKE, 4 + msgLen, $01)
+  If TlsQuicConfig=0 : Tls13RecBuildPlainHeader(dst, #TLS_CT_HANDSHAKE, 4 + msgLen, $01) : EndIf
 
-  If Tls13TranscriptAppend(dst + 5, 4 + msgLen)=0 : ProcedureReturn 0 : EndIf
+  If Tls13TranscriptAppend(start, 4 + msgLen)=0 : ProcedureReturn 0 : EndIf
   Tls13State = #TLS13_ST_WAIT_SH
-  ProcedureReturn 5 + 4 + msgLen
+  ProcedureReturn start-dst + 4 + msgLen
 EndProcedure
 
 ; ======================================================================
@@ -1497,6 +1530,7 @@ Procedure.i TlsHandleEncryptedExtensions(msg.i, mlen.i)
   Protected et.i
   Protected el.i
   Protected sawAlpn.i
+  Protected sawQuic.i,dest.i
   sawAlpn=0
 
   If mlen < 6
@@ -1547,11 +1581,18 @@ Procedure.i TlsHandleEncryptedExtensions(msg.i, mlen.i)
       sawAlpn=1
       If TlsAlpnReadSelection(p,el)=0 : ProcedureReturn 0 : EndIf
     EndIf
+    If et=#TLS_EXT_QUIC_PARAMETERS
+      If TlsQuicConfig=0 Or sawQuic<>0 : ProcedureReturn TlsFail(#TLS13_REFUSE_QUIC_PARAMETERS,#TLS_ALERT_ILLEGAL_PARAMETER) : EndIf
+      sawQuic=1 : dest=PeekI(TlsQuicConfig+16)
+      If el>PeekI(TlsQuicConfig+24) Or (dest<endp And msg<dest+el) : ProcedureReturn TlsFail(#TLS13_REFUSE_QUIC_CONFIG,#TLS_ALERT_INTERNAL_ERROR) : EndIf
+      TlsCopy(dest,p,el) : PokeI(TlsQuicConfig+32,el) : PokeI(TlsQuicConfig+40,1)
+    EndIf
     ; The remaining offered server_name and supported_groups values
     ; do not change client behavior. ALPN was checked and retained above.
     p = p + el
   Wend
 
+  If TlsQuicConfig<>0 And (sawQuic=0 Or sawAlpn=0) : ProcedureReturn TlsFail(#TLS13_REFUSE_QUIC_PARAMETERS,#TLS_ALERT_MISSING_EXTENSION) : EndIf
   Tls13State = #TLS13_ST_WAIT_CERT
   ProcedureReturn 1
 EndProcedure
@@ -1819,7 +1860,7 @@ Procedure.i Tls13BuildClientFinished(dst.i, dstmax.i)
   If Tls13State <> #TLS13_ST_SEND_FINISHED
     ProcedureReturn TlsFail(#TLS13_REFUSE_WRONG_STATE, #TLS_ALERT_INTERNAL_ERROR)
   EndIf
-  If dstmax < 5 + 36 + 1 + 16
+  If (TlsQuicConfig=0 And dstmax<5+36+1+16) Or (TlsQuicConfig<>0 And dstmax<36)
     ProcedureReturn TlsFail(#TLS13_REFUSE_BUF_TOO_SMALL, #TLS_ALERT_INTERNAL_ERROR)
   EndIf
 
@@ -1837,7 +1878,11 @@ Procedure.i Tls13BuildClientFinished(dst.i, dstmax.i)
 
   ; protected under the CLIENT HANDSHAKE traffic key, which is still the
   ; installed write key
-  n = Tls13RecProtect(#TLS_CT_HANDSHAKE, @TlsScratch[0], 36, 0, dst, dstmax)
+  If TlsQuicConfig<>0
+    TlsCopy(dst,@TlsScratch[0],36) : n=36
+  Else
+    n = Tls13RecProtect(#TLS_CT_HANDSHAKE, @TlsScratch[0], 36, 0, dst, dstmax)
+  EndIf
   If n = 0
     ProcedureReturn TlsFail(#TLS13_REFUSE_BUF_TOO_SMALL, #TLS_ALERT_INTERNAL_ERROR)
   EndIf
@@ -1890,6 +1935,7 @@ EndProcedure
 ;  installed AFTERWARDS, which is the order RFC 8446 4.6.3 requires.
 ; ----------------------------------------------------------------------
 Procedure.i Tls13BuildKeyUpdate(dst.i, dstmax.i, requestPeerUpdate.i)
+  If TlsQuicConfig<>0 : ProcedureReturn TlsFail(#TLS13_REFUSE_QUIC_LEVEL,#TLS_ALERT_UNEXPECTED_MESSAGE) : EndIf
   Protected n.i
   Protected m.i
   If Tls13State <> #TLS13_ST_CONNECTED
@@ -1918,6 +1964,7 @@ EndProcedure
 ;  APPLICATION DATA AND ALERTS
 ; ======================================================================
 Procedure.i Tls13BuildAppRecord(dst.i, dstmax.i, payload.i, len.i)
+  If TlsQuicConfig<>0 : ProcedureReturn TlsFail(#TLS13_REFUSE_QUIC_LEVEL,#TLS_ALERT_UNEXPECTED_MESSAGE) : EndIf
   Protected n.i
   If Tls13State <> #TLS13_ST_CONNECTED
     ProcedureReturn TlsFail(#TLS13_REFUSE_WRONG_STATE, #TLS_ALERT_INTERNAL_ERROR)
@@ -1947,6 +1994,7 @@ EndProcedure
 ;  refusal in this file sets it.
 ; ----------------------------------------------------------------------
 Procedure.i Tls13BuildAlert(dst.i, dstmax.i, level.i, desc.i)
+  If TlsQuicConfig<>0 : ProcedureReturn TlsFail(#TLS13_REFUSE_QUIC_LEVEL,#TLS_ALERT_UNEXPECTED_MESSAGE) : EndIf
   Protected m.i
   m = @TlsScratch[0]
   TlsWr8(m, level)
@@ -2051,6 +2099,7 @@ Procedure.i TlsHandleMessage(msg.i, mlen.i)
       ProcedureReturn 1
     EndIf
     If t = #TLS_HS_KEY_UPDATE
+      If TlsQuicConfig<>0 : ProcedureReturn TlsFail(#TLS13_REFUSE_QUIC_LEVEL,#TLS_ALERT_UNEXPECTED_MESSAGE) : EndIf
       If mlen <> 5
         ProcedureReturn TlsFail(#TLS13_REFUSE_KEY_UPDATE_LENGTH, #TLS_ALERT_DECODE_ERROR)
       EndIf
@@ -2120,6 +2169,49 @@ Procedure.i TlsHsFeed(p.i, n.i)
 EndProcedure
 
 ; ----------------------------------------------------------------------
+; QUIC owner supplies authenticated, ordered CRYPTO bytes. Encryption levels:
+; 0 Initial, 2 Handshake, 3 application. Consume at most 256 bytes and never
+; cross a handshake-message boundary, so the next call rechecks the level.
+; Returns bytes consumed, 0 for empty input, -1 on terminal TLS failure.
+Procedure.i Tls13FeedQuic(level.i,src.i,bytes.i)
+ Define expected.i,want.i,total.i
+ If TlsQuicConfig=0 Or bytes<0 Or (bytes>0 And src<=0)
+  TlsFail(#TLS13_REFUSE_QUIC_CONFIG,#TLS_ALERT_INTERNAL_ERROR) : ProcedureReturn -1
+ EndIf
+ expected=-1
+ Select Tls13State
+  Case #TLS13_ST_WAIT_SH : expected=0
+  Case #TLS13_ST_WAIT_EE : expected=2
+  Case #TLS13_ST_WAIT_CERT : expected=2
+  Case #TLS13_ST_WAIT_CV : expected=2
+  Case #TLS13_ST_WAIT_FINISHED : expected=2
+  Case #TLS13_ST_CONNECTED : expected=3
+ EndSelect
+ If expected<0 Or level<>expected
+  TlsFail(#TLS13_REFUSE_QUIC_LEVEL,#TLS_ALERT_UNEXPECTED_MESSAGE) : ProcedureReturn -1
+ EndIf
+ If bytes=0 : ProcedureReturn 0 : EndIf
+ If TlsHsAddr=0 Or TlsHsSize<4 Or TlsHsLen<0 Or TlsHsLen>TlsHsSize
+  TlsFail(#TLS13_REFUSE_NO_HS_BUFFER,#TLS_ALERT_INTERNAL_ERROR) : ProcedureReturn -1
+ EndIf
+ If TlsHsLen<4
+  want=4-TlsHsLen
+ Else
+  total=4+TlsRd24(TlsHsAddr+1)
+  If total>TlsHsSize Or total<=TlsHsLen
+   TlsFail(#TLS13_REFUSE_HS_MSG_TOO_LONG,#TLS_ALERT_RECORD_OVERFLOW) : ProcedureReturn -1
+  EndIf
+  want=total-TlsHsLen
+ EndIf
+ If want>bytes : want=bytes : EndIf
+ If want>256 : want=256 : EndIf
+ If src>$7FFFFFFFFFFFFFFF-want
+  TlsFail(#TLS13_REFUSE_QUIC_CONFIG,#TLS_ALERT_INTERNAL_ERROR) : ProcedureReturn -1
+ EndIf
+ If TlsHsFeed(src,want)=0 : ProcedureReturn -1 : EndIf
+ ProcedureReturn want
+EndProcedure
+
 ;  TlsHandleAlert(p, n) - RFC 8446 6. close_notify closes; everything
 ;  else is fatal here. The level byte is deliberately not trusted: 1.3
 ;  says all alerts other than close_notify and user_canceled are fatal
@@ -2148,6 +2240,7 @@ EndProcedure
 ;  buffer: a protected record is opened in place.
 ; ----------------------------------------------------------------------
 Procedure.i Tls13FeedRecord(rec.i, reclen.i)
+  If TlsQuicConfig<>0 : ProcedureReturn TlsFail(#TLS13_REFUSE_QUIC_LEVEL,#TLS_ALERT_UNEXPECTED_MESSAGE) : EndIf
   Protected t.i
   Protected flen.i
   Protected n.i
@@ -2262,6 +2355,9 @@ EndProcedure
 ;  record completed and the caller should look at Tls13AppLen first).
 ; ----------------------------------------------------------------------
 Procedure.i Tls13FeedBytesLimited(src.i, len.i, records.i)
+  If TlsQuicConfig<>0
+    TlsFail(#TLS13_REFUSE_QUIC_LEVEL,#TLS_ALERT_UNEXPECTED_MESSAGE) : ProcedureReturn -1
+  EndIf
   Protected took.i
   Protected want.i
   Protected flen.i

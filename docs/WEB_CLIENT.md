@@ -3613,3 +3613,78 @@ TLS extension/CRYPTO integration, frame/stream handling, recovery/congestion/flo
 control, UDP ownership, QPACK and live verified HTTP/3 remain. Remaining TLS
 blocking/compatibility and public off-link IPv6/RDNSS web qualification remain
 open; these parameter tests do not establish any live web-traffic result.
+
+### TLS handshake interface for QUIC (2026-10-30)
+
+The existing shared TLS handshake now has an explicit QUIC mode, following
+[RFC 9001 sections 4 and 8](https://www.rfc-editor.org/rfc/rfc9001.html#section-4).
+It reuses the existing key schedule, certificate/CertificateVerify processing,
+transcript and Finished verification. No alternate verification path was added.
+The normal TLS record mode remains the default after `Tls13Init`.
+
+After Init and before ClientHello, call `Tls13SetQuicParameters` with a separate
+48-byte configuration block, local parameter bytes and peer-parameter storage.
+Each connection owns its own configuration and buffers for its full lifetime.
+The six native integers in the block hold local pointer/length, peer
+pointer/capacity, received length and received flag. Input and output buffers
+must remain disjoint and alive. Local/peer parameter storage is limited to
+16384 bytes. TLS treats the bytes as opaque; the QUIC owner validates local
+parameters before sending, and uses `QuicParameters` plus connection-ID checks
+on the received parameters before applying them after authentication.
+
+In this mode ClientHello includes extension 57, requires an ALPN offer, has an
+empty legacy session ID and returns raw handshake bytes. EncryptedExtensions
+must contain a selected offered ALPN and exactly one transport-parameter
+extension; peer bytes are copied into the supplied buffer. A received flag alone
+is not proof of a completed valid handshake. Client Finished also returns raw
+handshake bytes; normal TLS still emits the encrypted record. TLS record input,
+record application output, record alerts and TLS KeyUpdate are refused in QUIC
+mode. The owner maps TLS alerts to QUIC connection errors and supplies QUIC's
+own packet protection/key-update machinery.
+
+`Tls13FeedQuic(level, input, bytes)` accepts already authenticated, ordered
+CRYPTO data: level 0 Initial, 2 Handshake or 3 application. Each call consumes
+at most 256 bytes and stops at a handshake-header/message boundary so the next
+call rechecks the encryption level after a state transition. It returns consumed
+bytes, zero for empty input or -1 for terminal failure. The existing TLS message
+handlers still run on completion; this input bound is not a new worst-case
+latency guarantee for certificate processing. The owner must handle CRYPTO
+offsets/reordering/retransmission, packet-key availability/discard, application
+data ordering and QUIC handshake confirmation. TLS's connected state alone does
+not mean QUIC's handshake-confirmed state.
+
+Connection snapshots are now 2928 bytes: the extra native integer saves the
+configuration pointer. Referenced buffers are not deep-copied. The existing
+connection pool allocates and indexes snapshots using `TLS13_CONTEXT_SIZE`;
+ordinary Init resets the pointer to zero.
+
+Physical Pi 4 evidence under Anvil 485:
+
+- Capture 227 passed 29 codec/ALPN cases, including the legacy cases and QUIC
+  offer/selection, missing/duplicate extension, buffer refusal and received-byte
+  validation through the shared parameter decoder. This fixture stubs transcript
+  append and is not a certificate-handshake proof.
+- Capture 228 passed connection switching with four real AES-GCM records and
+  independent ciphertext expectations, including configuration-pointer isolation,
+  existing certificate/ALPN state, cache invalidation and snapshot wiping.
+- Capture 229 passed 15 tests using the full shared TLS source and real
+  X25519/HKDF/HMAC/AES-GCM. They cover fragmented ServerHello/EncryptedExtensions,
+  level changes at and within message boundaries, 256-byte input slices, forbidden
+  TLS KeyUpdate/record APIs, correct and corrupted server Finished, application
+  secrets, raw client Finished and unchanged legacy Finished ciphertext.
+  Deterministic keys and selected starting states isolate these checks: this is
+  not certificate-chain verification or a live authenticated QUIC peer.
+
+All runs returned normally with healthy cores/fonts/Vulkan and watchdog off.
+Pi 3 codec compilation passed without a physical Pi 3 claim. Full Pi 4 crypto
+compilation passed after replacing an unsupported multi-value Case in the new
+receive wrapper; the earlier codec/context fixtures did not include that wrapper.
+Their exact pre-fix source and unchanged relevant procedure comparison are
+retained. No monitor/boot image update was made.
+
+Evidence: `docs/evidence/anvil-ipv6-20261030/tls-quic485`.
+Next remains the QUIC connection owner: frames/streams, CRYPTO reassembly,
+recovery/congestion/flow control, UDP integration and QPACK, followed by live
+certificate-verified HTTP/3. The new interface does not yet provide that request
+path. Existing TLS compatibility/device-blocking and public IPv6/RDNSS web
+qualification remain open.

@@ -30,6 +30,7 @@ Procedure Start(seed.i)
  TlsAlpnOfferLen=seed : TlsAlpnSelectedLen=seed+2
  For i=0 To 255 : TlsAlpnOffer[i]=(seed+i)&255 : TlsAlpnSelected[i]=(seed+2*i)&255 : Next
  Tls13State=seed : TlsHsLen=seed+123 : TlsTrSnap[0]=seed+1
+ TlsQuicConfig=seed+4096
 EndProcedure
 Procedure Emit(index.i)
  Define n.i,i.i,p.i
@@ -43,6 +44,7 @@ Procedure Emit(index.i)
  PokeI(p,TlsAlpnOfferLen) : PokeI(p+8,TlsAlpnSelectedLen)
  PokeI(p+16,TlsAlpnOffer[0]) : PokeI(p+24,TlsAlpnOffer[255])
  PokeI(p+32,TlsAlpnSelected[0]) : PokeI(p+40,TlsAlpnSelected[255])
+ PokeI(p+48,TlsQuicConfig)
 EndProcedure
 Procedure.i Main(services.i)
  Define i.i,n.i,ok.i
