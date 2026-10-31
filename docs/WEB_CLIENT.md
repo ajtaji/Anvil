@@ -3403,3 +3403,56 @@ The same shared fixture compiled for Pi 3; it was not run on a physical Pi 3.
 Evidence: `docs/evidence/anvil-ipv6-20261030/websocket-drain485`.
 Remaining TLS blocking/compatibility, public off-link IPv6/RDNSS qualification,
 and HTTP/3 are still open.
+
+### QUIC wire layer and current timing evidence (2026-10-30)
+
+`Anvil/Network/quic_wire.pbi` starts the shared QUIC v1 transport work for HTTP/3.
+It supplies checked 62-bit integer encoding/decoding, untrusted packet boundary
+parsing, packet-number reconstruction, and outgoing Initial/0-RTT/Handshake
+headers. The implementation was written from the protocol definitions in
+[RFC 9000](https://www.rfc-editor.org/rfc/rfc9000.html) sections 16-17 and the
+[RFC 9001](https://www.rfc-editor.org/rfc/rfc9001.html#section-5.4.2) header
+protection sample requirement. No implementation was copied.
+
+Integer decoding accepts legal nonminimal widths; frame-type canonical encoding
+must be enforced by the future frame decoder. Header parsing preserves protected
+bits without interpreting them, bounds connection IDs and token/packet lengths,
+and identifies coalesced packet boundaries. Version Negotiation permits the
+version-independent longer connection IDs; unknown versions return an explicit
+unsupported result after exposing only invariant fields. Retry tokens and tags
+are only located, not authenticated. Packet-number reconstruction takes the
+largest previously authenticated number; its result still needs authentication.
+Writers validate arguments and capacity before changing output. These routines
+allocate nothing and contain no network waits or private driver state.
+
+Physical Pi 4 capture 222 under Anvil 485 passed 463 cases: 261 integer cases,
+81 packet cases, 79 packet-number cases, 31 outgoing header cases and 11 null or
+negative argument refusals. Independent Python expectations check complete output,
+guard bytes, truncation, all integer widths, overflow limits, reserved/protected
+bits, short/long/Retry/Version Negotiation formats and coalescing. Pi 3 compilation
+passed without a physical Pi 3 claim. Capture 221 initially failed one Python
+expectation at the maximum packet-number boundary: it omitted the guarded upper
+bound in RFC 9000 A.3. The corrected oracle passes all 452 retained first-run
+cases; original failed and corrected reports are both kept. Runtime code did not
+change to satisfy that correction. Cores, fonts and Vulkan remained healthy;
+watchdog off. No monitor update or storage mutation was needed.
+
+This is not yet a QUIC connection or an HTTP/3 request path. Required remaining
+work includes packet protection and Retry integrity, TLS handshake over CRYPTO
+frames with transport parameters, frame parsing and stream reassembly, ACK/loss
+recovery and congestion/flow control, UDP ownership and timers, QPACK and HTTP/3
+control/request streams, and live interoperable verified requests. Reuse shared
+crypto and network owners; do not create a second TLS or IP implementation.
+
+The retained live service counters were also read without restarting the Pi.
+The longest call was 2948 us: HTTP server/TCP contributed 1719 us and TLS 1221 us.
+The largest individual TLS phase was 1698 us. Root open peaked at 1054 us, root
+read at 506 us, and exFAT boot validation at 1065 us. These cumulative observations
+are not worst-case guarantees. `PayNetService` explicitly runs maintenance once
+before draining receive within the remaining slice; no service was skipped merely
+to make a strict timing limit appear to pass. The current advertised IPv6 prefix
+is private ULA, with a link-local router and DHCPv4 DNS; it still does not prove
+public off-link IPv6 or automatically learned RDNSS web traffic.
+
+Evidence: `docs/evidence/anvil-ipv6-20261030/quic-wire485`. TLS/device blocking
+and compatibility, public IPv6 qualification and full HTTP/3 remain open.
