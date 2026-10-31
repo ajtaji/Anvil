@@ -1186,6 +1186,21 @@ Procedure.i Tls13SetQuicParameters(config.i,offer.i,bytes.i,peer.i,capacity.i)
  TlsQuicConfig=config : ProcedureReturn 1
 EndProcedure
 
+; Read-only conservative destination bound, shared by admission and builder.
+Procedure.i Tls13ClientHelloCapacity()
+ Define nlen.i,extra.i
+ nlen=TlsNameLen : If nlen<0 : nlen=0 : EndIf
+ extra=0 : If TlsQuicConfig<>0 : extra=4+PeekI(TlsQuicConfig+8) : EndIf
+ ProcedureReturn 256+nlen+TlsAlpnOfferLen+Bool(TlsAlpnOfferLen>0)*6+extra
+EndProcedure
+; Zero when QUIC has no ready output. Does not advance TLS or set an error.
+Procedure.i Tls13QuicOutputCapacity()
+ If TlsQuicConfig=0 : ProcedureReturn 0 : EndIf
+ If Tls13State=#TLS13_ST_START And TlsKeyShareLen>0 : ProcedureReturn Tls13ClientHelloCapacity() : EndIf
+ If Tls13State=#TLS13_ST_SEND_FINISHED : ProcedureReturn 36 : EndIf
+ ProcedureReturn 0
+EndProcedure
+
 Procedure.i Tls13BuildClientHello(dst.i, dstmax.i)
   Protected p.i
   Protected extStart.i
@@ -1218,7 +1233,7 @@ Procedure.i Tls13BuildClientHello(dst.i, dstmax.i)
     If TlsAlpnOfferLen=0 : ProcedureReturn TlsFail(#TLS13_REFUSE_QUIC_CONFIG,#TLS_ALERT_INTERNAL_ERROR) : EndIf
     start=dst : extra=4+PeekI(TlsQuicConfig+8) : TlsSessionIdLen=0
   EndIf
-  If dstmax < 256 + nlen + TlsAlpnOfferLen + Bool(TlsAlpnOfferLen>0)*6 + extra
+  If dstmax < Tls13ClientHelloCapacity()
     ProcedureReturn TlsFail(#TLS13_REFUSE_BUF_TOO_SMALL, #TLS_ALERT_INTERNAL_ERROR)
   EndIf
 

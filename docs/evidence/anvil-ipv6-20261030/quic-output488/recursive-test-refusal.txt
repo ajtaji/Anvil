@@ -1,0 +1,29 @@
+pmfc: BCM2711 image linked for $1000000 (default is $80000, the firmware's)
+pmfc: BCM2711 initial stack top $4F00000 (default is $8000000); the stack grows down from here
+pmfc: BCM2711 --entry-returns; Main()'s value comes back in x0, the loader's stack and DAIF are left as they were
+pmfc: --wants-services; the container asks Anvil to enter this payload with the service table in x0 (payload ABI 1.0)
+pmfc: C:\Users\ajtaj\Documents\Codex\2026-10-19\c-users-ajtaj-documents-codex-2026\work\anvil-ipv6-20261030\quic-output1523\proof.pi4  ->  BCM2711
+> Intrinsics for BCM2711: bcm2711_hardware.def
+[DEBUG] Attempting to load intrinsics from: C:\Users\ajtaj\Desktop\Anvil\RaspberryPi4\Intrinsics\bcm2711_hardware.def
+> Loaded Hardware Intrinsics from bcm2711_hardware.def
+pmfc: pin aliases from Boards/Raspberry_Pi_4.board
+> F_CPU = 1500000000 Hz, from the board's ClockSpeed. Nothing in the Pi 4 backend derives from it:
+>       delay()/millis() run on CNTPCT_EL0 (54 MHz, fixed) and the
+>       UART takes its reference clock explicitly. The part BOOTS at
+>       600 MHz - call ClockInit() (RaspberryPi4/Lib/clocks.pi4 in the
+>       Anvil repository) to reach this.
+--------------------------------------------------
+FRONTEND FATAL ERROR: Recursion is refused on every target, and these procedures call each other in a loop: Tls13TranscriptAppend -> (through the variable 'Tls13PauseHook') OutputYield -> QuicTlsOutputBegin -> Tls13BuildClientFinished -> Tls13TranscriptAppend.
+  Tls13TranscriptAppend calls OutputYield through the variable 'Tls13PauseHook' at tls13_hs.pbi line 677 (included)
+  OutputYield calls QuicTlsOutputBegin at proof.pi4 line 66
+  QuicTlsOutputBegin calls Tls13BuildClientFinished at quic_tls_send.pbi line 53 (included)
+  Tls13BuildClientFinished calls Tls13TranscriptAppend at tls13_hs.pbi line 1907 (included)
+A step written 'Tls13PauseHook(...)' is a call through a variable, and a call through a variable is treated as a call to every procedure whose address can reach it - followed through the assignments this program writes. Assign the pointer a procedure that does not lead back here, or call by name, to break the loop.
+A program on these boards runs for as long as the board has power, and recursion makes how deep the stack goes depend on the data it is given - so no build can prove the stack is big enough, and one input deeper than any before it runs off the end of the stack. Without a loop in the calls, the deepest call chain is fixed when the program is built. Rewrite it iteratively: a While or Repeat loop, with an explicit stack array where the algorithm needs one. See Help/Guide/10_when_it_says_no.txt.
+At tls13_hs.pbi line 1907 (included)
+(in a procedure call, 'Tls13TranscriptAppend')
+COMPILATION HALTED. Check your syntax or variable scopes.
+--------------------------------------------------
+NOTE: 154 further frontend messages were withheld - each came after an error above had already halted the code it was in, and anything the walk met after that is read out of a half-built expression, so it names lines that are not at fault. Fix the errors above and build again.
+pmfc: IR generation failed
+pmfc: BUILD FAILED - no output produced.

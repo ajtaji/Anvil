@@ -1,0 +1,251 @@
+#X509_SIG_LINKED=1
+XIncludeFile "Anvil/Core/sha256.pbi"
+XIncludeFile "Anvil/Crypto/sha512.pbi"
+XIncludeFile "RaspberryPi4/Lib/hmac.pi4"
+XIncludeFile "RaspberryPi4/Lib/hkdf.pi4"
+XIncludeFile "RaspberryPi4/Lib/entropy.pi4"
+XIncludeFile "RaspberryPi4/Lib/drbg.pi4"
+XIncludeFile "Anvil/Crypto/aes.pbi"
+XIncludeFile "RaspberryPi4/Lib/gcm.pi4"
+XIncludeFile "RaspberryPi4/Lib/bignum.pi4"
+XIncludeFile "RaspberryPi4/Lib/ec256.pi4"
+XIncludeFile "RaspberryPi4/Lib/x25519.pi4"
+XIncludeFile "RaspberryPi4/Lib/ecp.pi4"
+XIncludeFile "RaspberryPi4/Lib/ecdsa.pi4"
+XIncludeFile "RaspberryPi4/Lib/rsa.pi4"
+XIncludeFile "RaspberryPi4/Lib/t0vm.pi4"
+XIncludeFile "RaspberryPi4/Lib/x509_blob.pi4"
+XIncludeFile "RaspberryPi4/Lib/x509.pi4"
+XIncludeFile "RaspberryPi4/Lib/tls13_record.pi4"
+XIncludeFile "RaspberryPi4/Lib/tls13_hs.pi4"
+XIncludeFile "RaspberryPi4/Lib/mmu.pi4"
+XIncludeFile "Anvil/Network/quic_tls_receive.pbi"
+Global rx0.QuicCryptoRx,rx2.QuicCryptoRx,rx3.QuicCryptoRx
+Global Dim rxData.a[12288]
+Global Dim rxBits.a[1536]
+Procedure Queue(stream.i,level.i,p.i,bytes.i)
+ Define rc.i,half.i
+ half=bytes/2
+ rc=QuicCryptoRxPut(stream,level,half,p+half,bytes-half)
+ rc=QuicCryptoRxPut(stream,level,0,p,half)
+ rc=QuicCryptoRxPut(stream,level,0,p,bytes)
+EndProcedure
+Global Dim config.a[48]
+Global Dim localParams.a[2]
+Global Dim peer.a[64]
+Global Dim incoming.a[2048]
+Global Dim handshakes.a[2048]
+Global Dim output.a[1024]
+Global Dim zero.a[16]
+Global table.i,*pet
+Procedure CaptureTable()
+ ASM
+ adrp x1, global_table
+ add x1, x1, #:lo12:global_table
+ str x0, [x1]
+ EndASM
+EndProcedure
+Procedure.i Yield()
+ pet() : ProcedureReturn 1
+EndProcedure
+Procedure Prepare()
+ Define i.i,n.i
+ Tls13State=#TLS13_ST_START : Tls13Err=0 : Tls13Alert=0 : TlsKdfFault=0 : TlsQuicConfig=0
+ Tls13TicketsDiscarded=0 : TlsHsAddr=@handshakes[0] : TlsHsSize=2048 : TlsHsLen=0
+ TlsNameLen=0 : TlsGroup=#TLS_GROUP_X25519 : TlsSessionIdLen=32
+ Tls13RecReset() : Tls13TranscriptReset()
+ For i=0 To 31 : secTlsPriv[i]=i+1 : Next
+ n=Tls13DeriveKeySharePublic()
+ localParams[0]=15 : localParams[1]=0
+ n=Tls13SetAlpn(?quic_alpn,3)
+ n=Tls13SetQuicParameters(@config[0],@localParams[0],2,@peer[0],64)
+ Sha256Of("",0,@TlsEmptyHash[0]) : TlsScheduleEarly()
+ n=Tls13BuildClientHello(@output[0],1024)
+EndProcedure
+Procedure Run(index.i,mode.i,bytes.i)
+ Define i.i,p.i,n.i,pos.i,level.i,offered.i,maxTaken.i,rc.i,first.i,stream.i,offset.i,again.i
+ p=$E1C00100+index*2048
+ Prepare()
+ For i=0 To bytes-1 : Read.a incoming[i] : Next
+ For i=0 To 1023 : output[i]=$A5 : Next
+ If mode=5 Or mode=6 : Tls13State=#TLS13_ST_CONNECTED : EndIf
+ If mode=7 Or mode=8 Or mode=9 Or mode=10 Or mode=17
+  Tls13TranscriptReset() : rc=Tls13TranscriptAppend("quic fixture",12)
+  Sha256Of("quic fixture",12,@TlsThSf[0])
+  For i=0 To 31
+   secTlsCHs[i]=i : secTlsCAp[i]=32+i : secTlsSHs[i]=64+i : secTlsMaster[i]=96+i
+  Next
+  Tls13State=#TLS13_ST_WAIT_FINISHED
+ EndIf
+ If mode=13 : TlsQuicConfig=0 : EndIf
+
+ rc=QuicCryptoRxInit(@rx0,0,@rxData[0],4096,@rxBits[0],512)
+ rc=QuicCryptoRxInit(@rx2,2,@rxData[4096],4096,@rxBits[512],512)
+ rc=QuicCryptoRxInit(@rx3,3,@rxData[8192],4096,@rxBits[1024],512)
+ first=bytes
+ If mode=0 Or mode=1 Or mode=2
+  first=4+(PeekA(@incoming[0]+1)<<16)+(PeekA(@incoming[0]+2)<<8)+PeekA(@incoming[0]+3)
+ EndIf
+ If mode=15
+  rc=QuicCryptoRxPut(@rx0,0,1,@incoming[0]+1,bytes-1)
+ ElseIf mode=16
+  Queue(@rx0,0,@incoming[0],bytes)
+  rc=QuicCryptoRxPut(@rx0,0,bytes+5,@incoming[0],1)
+ ElseIf mode=17
+  Queue(@rx2,2,@incoming[0],bytes)
+ ElseIf mode=0
+  Queue(@rx2,2,@incoming[0]+first,bytes-first)
+  Queue(@rx0,0,@incoming[0],first)
+ ElseIf mode=2
+  Queue(@rx0,0,@incoming[0],bytes)
+ ElseIf mode=3
+  Queue(@rx2,2,@incoming[0],bytes)
+ ElseIf mode=4
+  Queue(@rx0,0,@incoming[0],2)
+  Queue(@rx2,2,@incoming[0]+2,bytes-2)
+ ElseIf mode=5 Or mode=6
+  Queue(@rx3,3,@incoming[0],bytes)
+ ElseIf mode=7
+  Queue(@rx2,2,@incoming[0],bytes)
+ ElseIf mode=13
+  Queue(@rx0,0,@incoming[0],bytes)
+ EndIf
+ If mode<8 Or mode=13 Or mode>=15
+  While pos<bytes
+   pet() : level=2
+   If Tls13State=#TLS13_ST_WAIT_SH : level=0 : EndIf
+   If Tls13State=#TLS13_ST_CONNECTED : level=3 : EndIf
+   If mode=2 : level=0 : EndIf
+   If mode=3 : level=2 : EndIf
+   If mode=4 And pos>0 : level=2 : EndIf
+   offered=bytes-pos : If mode=1 : offered=1 : EndIf
+   If mode=4 And pos=0 : offered=2 : EndIf
+
+   stream=@rx2 : If level=0 : stream=@rx0 : EndIf
+   If level=3 : stream=@rx3 : EndIf
+   If mode=1
+    offset=pos : If level=2 : offset=pos-first : EndIf
+    rc=QuicCryptoRxPut(stream,level,offset,@incoming[pos],1)
+   EndIf
+   n=QuicCryptoTlsStep(stream)
+   If n<0
+    again=QuicCryptoTlsStep(stream)
+    PokeI(p+56,again)
+    again=QuicCryptoRxPut(stream,level,0,@incoming[0],1)
+    PokeI(p+112,again)
+   EndIf
+
+   If n>maxTaken : maxTaken=n : EndIf
+   If n<=0 : Break : EndIf
+   pos=pos+n
+  Wend
+ ElseIf mode=8 Or mode=9 Or mode=10 Or mode=17
+  Tls13State=#TLS13_ST_SEND_FINISHED
+  If mode=9
+   TlsQuicConfig=0 : Tls13RecReset() : Tls13RecSetWriteKey(@zero[0],@zero[0])
+  EndIf
+  offered=1024 : If mode=10 : offered=35 : EndIf
+  n=Tls13BuildClientFinished(@output[0],offered)
+ ElseIf mode=11
+  n=Tls13FeedRecord(0,0)
+ ElseIf mode=12
+  n=Tls13FeedBytesLimited(0,0,1)
+ EndIf
+
+ PokeI(p+64,rx0\phase) : PokeI(p+72,rx2\phase) : PokeI(p+80,rx3\phase)
+ PokeI(p+88,rx0\base) : PokeI(p+96,rx2\base) : PokeI(p+104,rx3\base)
+ If mode=0 Or mode=1 : PokeI(p+120,QuicCryptoTlsStep(@rx0)) : EndIf
+ PokeI(p,Tls13Err) : PokeI(p+8,Tls13State) : PokeI(p+16,pos) : PokeI(p+24,maxTaken) : PokeI(p+32,n)
+ PokeI(p+40,Tls13TicketsDiscarded) : PokeI(p+48,TlsHsLen)
+ TlsCopy(p+128,@output[0],128) : TlsCopy(p+256,@secTlsCAp[0],32) : TlsCopy(p+288,@secTlsSAp[0],32)
+EndProcedure
+Procedure.i Main()
+ Define i.i,rc.i
+ CaptureTable() : *pet=PeekI(table+16+6*8)
+ For i=0 To 65535 : PokeA($E1C00000+i,0) : Next
+ PokeI($E1C00000,$51544331)
+ MmuClearNc() : MmuAddNc($08A00000,$09200000) : MmuAddNc($08100000,$08180000)
+ rc=MmuBuildTables($4F80000) : If rc<>0 : ProcedureReturn 2 : EndIf
+ MmuEnableCached()
+ Tls13PauseHook=@Yield : Tls13SetupPauseHook=@Yield
+ TlsInitTables() : X25519Init()
+ PokeI($E1C00008,18)
+ Restore QuicTlsCase0
+ Run(0,0,128)
+ Restore QuicTlsCase1
+ Run(1,1,128)
+ Restore QuicTlsCase2
+ Run(2,2,128)
+ Restore QuicTlsCase3
+ Run(3,3,90)
+ Restore QuicTlsCase4
+ Run(4,4,90)
+ Restore QuicTlsCase5
+ Run(5,5,604)
+ Restore QuicTlsCase6
+ Run(6,6,5)
+ Restore QuicTlsCase7
+ Run(7,7,36)
+ Restore QuicTlsCase8
+ Run(8,7,36)
+ Restore QuicTlsCase9
+ Run(9,8,0)
+ Restore QuicTlsCase10
+ Run(10,9,0)
+ Restore QuicTlsCase11
+ Run(11,10,0)
+ Restore QuicTlsCase12
+ Run(12,11,0)
+ Restore QuicTlsCase13
+ Run(13,12,0)
+ Restore QuicTlsCase14
+ Run(14,13,1)
+ Restore QuicTlsCase15
+ Run(15,15,90)
+ Restore QuicTlsCase16
+ Run(16,16,90)
+ Restore QuicTlsCase17
+ Run(17,17,37)
+ MmuDisableCachedFlushed()
+ ProcedureReturn 0
+EndProcedure
+DataSection
+quic_alpn:
+ Data.a 2,104,51
+QuicTlsCase0:
+ Data.a 2,0,0,86,3,3,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,0,19,1,0,0,46,0,43,0,2,3,4,0,51,0,36,0,29,0,32,9,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,8,0,0,34,0,32,0,16,0,5,0,3,2,104,51,0,57,0,19,0,8,111,114,105,103,105,110,97,108,15,7,105,110,105,116,105,97,108
+QuicTlsCase1:
+ Data.a 2,0,0,86,3,3,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,0,19,1,0,0,46,0,43,0,2,3,4,0,51,0,36,0,29,0,32,9,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,8,0,0,34,0,32,0,16,0,5,0,3,2,104,51,0,57,0,19,0,8,111,114,105,103,105,110,97,108,15,7,105,110,105,116,105,97,108
+QuicTlsCase2:
+ Data.a 2,0,0,86,3,3,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,0,19,1,0,0,46,0,43,0,2,3,4,0,51,0,36,0,29,0,32,9,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,8,0,0,34,0,32,0,16,0,5,0,3,2,104,51,0,57,0,19,0,8,111,114,105,103,105,110,97,108,15,7,105,110,105,116,105,97,108
+QuicTlsCase3:
+ Data.a 2,0,0,86,3,3,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,0,19,1,0,0,46,0,43,0,2,3,4,0,51,0,36,0,29,0,32,9,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+QuicTlsCase4:
+ Data.a 2,0,0,86,3,3,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,0,19,1,0,0,46,0,43,0,2,3,4,0,51,0,36,0,29,0,32,9,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+QuicTlsCase5:
+ Data.a 4,0,2,88,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120
+QuicTlsCase6:
+ Data.a 24,0,0,1,0
+QuicTlsCase7:
+ Data.a 20,0,0,32,113,183,34,110,20,213,221,81,35,248,108,76,111,165,186,85,99,75,190,225,170,155,139,174,143,25,247,236,49,224,246,168
+QuicTlsCase8:
+ Data.a 20,0,0,32,113,183,34,110,20,213,221,81,35,248,108,76,111,165,186,85,99,75,190,225,170,155,139,174,143,25,247,236,49,224,246,169
+QuicTlsCase9:
+ Data.a 0
+QuicTlsCase10:
+ Data.a 0
+QuicTlsCase11:
+ Data.a 0
+QuicTlsCase12:
+ Data.a 0
+QuicTlsCase13:
+ Data.a 0
+QuicTlsCase14:
+ Data.a 0
+QuicTlsCase15:
+ Data.a 2,0,0,86,3,3,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,0,19,1,0,0,46,0,43,0,2,3,4,0,51,0,36,0,29,0,32,9,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+QuicTlsCase16:
+ Data.a 2,0,0,86,3,3,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,0,19,1,0,0,46,0,43,0,2,3,4,0,51,0,36,0,29,0,32,9,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+QuicTlsCase17:
+ Data.a 20,0,0,32,113,183,34,110,20,213,221,81,35,248,108,76,111,165,186,85,99,75,190,225,170,155,139,174,143,25,247,236,49,224,246,168,0
+EndDataSection

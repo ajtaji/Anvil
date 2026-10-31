@@ -4208,3 +4208,60 @@ retention image remained byte-identical; the combined live fixture changed.
 Final source snapshots are under `sources-final` in the same evidence directory;
 original runs and snapshots remain available. Health checks still passed and
 Anvil 488 remains installed.
+
+
+### TLS output admission into retained CRYPTO
+
+`Tls13ClientHelloCapacity()` is a read-only conservative output bound used by
+both the existing ClientHello builder and its callers. `Tls13QuicOutputCapacity()`
+returns that bound for a ready QUIC ClientHello, 36 for client Finished, or zero
+when no QUIC output is ready. It does not advance TLS or create an error; key
+share preparation can still be pending.
+
+`quic_tls_send.pbi` connects those builders to retained CRYPTO storage. Begin
+selects the correct Initial/Handshake stream and checks output capacity, retained
+free space, offset range and ownership before invoking a TLS builder. Admission
+refusals leave TLS, transcript, job and stream unchanged. The conservative bound
+may exceed the actual message size. The caller must select the matching TLS
+context, supply independent storage and serialize access through TLS hooks.
+
+The job is explicitly in a building phase during synchronous TLS work. A yield
+callback cannot start copying its unfinished output, and a second Begin on the
+same job is refused. Once the builder returns, Step retains at most 256 bytes
+per call from the immutable owned output buffer. This supports messages larger
+than one retained-buffer Append. After Begin returns, copying does not use TLS
+globals, so other TLS contexts may run. The job exclusively owns appending to
+its CRYPTO stream until completion. An unexpected intervening append is detected.
+
+TLS has already advanced by the time copying begins. Build failure, copy-state
+failure or cancellation poisons the stream and requires connection close; it
+must not rebuild the message or roll back the transcript. Output generation is
+not transport submission, handshake confirmation or permission to discard keys.
+Begin retains existing cooperative TLS hooks; the byte-copy limit is not a
+wall-time bound on TLS cryptographic work.
+
+Capture 265 on Anvil 488 passed 79 assertions with full shared TLS crypto and
+independently constructed ClientHello bytes, X25519 public key and Finished
+HMAC/transcript hashes. Checks include capacity/queue refusals without TLS
+mutation, wrong level and aliases, ring wrap, a maximum-length opaque parameter
+extension producing a message larger than 16 KiB, partial-copy cancellation,
+interleaved append detection, builder failure, legacy-mode exclusion and a real
+TLS yield-hook attempt to copy during building. Parameters/keys/states are
+controlled fixtures, not a certificate-chain or live peer qualification.
+
+Capture 263 separately passed all 18 existing TLS receive/crypto scenarios,
+including ordinary record-protected Finished, after sharing the capacity check.
+The final output fixture compiled for Pi 3. Its initial Pi 3 attempt refused
+historical Pi 4 compatibility includes; the deterministic fixture now resolves
+shared crypto owners and does not include or exercise hardware entropy adapters.
+A proposed recursive Begin test was refused by the compiler; building-state
+Begin refusal is tested directly and Step is tested through the real callback.
+No recursion restriction was bypassed. Earlier drafts passed on captures 262/264;
+the final implementation and assertions are qualified by capture 265.
+
+Evidence is `docs/evidence/anvil-ipv6-20261030/quic-output488`, including the two
+compile refusals. Final physical checks left cores/fonts/Vulkan healthy and
+watchdog off; installed Anvil remains 488. This is TLS-to-buffer integration,
+not a live QUIC handshake. Actual connection/TLS packet scheduling, production
+recovery, RTT/ECN/congestion/flow handling, streams/QPACK and certificate-verified
+HTTP/3 remain open, alongside earlier TLS and public off-link IPv6 qualification.

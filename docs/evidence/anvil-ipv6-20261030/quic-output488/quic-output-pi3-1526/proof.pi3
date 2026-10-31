@@ -1,0 +1,224 @@
+#X509_SIG_LINKED=1
+XIncludeFile "Anvil/Core/sha256.pbi"
+XIncludeFile "Anvil/Crypto/sha512.pbi"
+XIncludeFile "Anvil/Crypto/hmac.pbi"
+XIncludeFile "Anvil/Crypto/hkdf.pbi"
+XIncludeFile "Anvil/Crypto/drbg.pbi"
+XIncludeFile "Anvil/Crypto/aes.pbi"
+XIncludeFile "Anvil/Crypto/gcm.pbi"
+XIncludeFile "Anvil/Crypto/bignum.pbi"
+XIncludeFile "Anvil/Crypto/ec256.pbi"
+XIncludeFile "Anvil/Crypto/x25519.pbi"
+XIncludeFile "Anvil/Crypto/ecp.pbi"
+XIncludeFile "Anvil/Crypto/ecdsa.pbi"
+XIncludeFile "Anvil/Crypto/rsa.pbi"
+XIncludeFile "Anvil/Crypto/t0vm.pbi"
+XIncludeFile "Anvil/Crypto/x509_blob.pbi"
+XIncludeFile "Anvil/Crypto/x509.pbi"
+XIncludeFile "Anvil/Crypto/tls13_record.pbi"
+XIncludeFile "Anvil/Crypto/tls13_hs.pbi"
+XIncludeFile "Anvil/Network/quic_tls_send.pbi"
+Global Dim config.a[48]
+Global Dim localParams.a[16384]
+Global Dim peer.a[64]
+Global Dim incoming.a[2048]
+Global Dim handshakes.a[2048]
+Global Dim output.a[20000]
+Global Dim zero.a[16]
+Global table.i,*pet
+Procedure CaptureTable()
+ ASM
+ adrp x1, global_table
+ add x1, x1, #:lo12:global_table
+ str x0, [x1]
+ EndASM
+EndProcedure
+Procedure.i Yield()
+ pet() : ProcedureReturn 1
+EndProcedure
+Procedure Prepare()
+ Define i.i,n.i
+ Tls13State=#TLS13_ST_START : Tls13Err=0 : Tls13Alert=0 : TlsKdfFault=0 : TlsQuicConfig=0
+ Tls13TicketsDiscarded=0 : TlsHsAddr=@handshakes[0] : TlsHsSize=2048 : TlsHsLen=0
+ TlsNameLen=0 : TlsGroup=#TLS_GROUP_X25519 : TlsSessionIdLen=32
+ Tls13RecReset() : Tls13TranscriptReset()
+ For i=0 To 31 : secTlsPriv[i]=i+1 : Next
+ n=Tls13DeriveKeySharePublic()
+ localParams[0]=15 : localParams[1]=0
+ n=Tls13SetAlpn(?quic_alpn,3)
+ n=Tls13SetQuicParameters(@config[0],@localParams[0],2,@peer[0],64)
+ Sha256Of("",0,@TlsEmptyHash[0]) : TlsScheduleEarly()
+EndProcedure
+
+Global tx.QuicCryptoTx,job.QuicTlsOutput
+Global Dim txData.a[32768]
+Global Dim txStates.a[8192]
+Global Dim filler.a[4090]
+Global Dim frame.a[20032]
+Global Dim digest.a[32]
+Global probeActive.i,probeSeen.i,probeStep.i
+Procedure.i OutputYield()
+ pet()
+ If probeActive<>0
+  probeSeen=probeSeen+1
+  probeStep=QuicTlsOutputStep(@job)
+ EndIf
+ ProcedureReturn 1
+EndProcedure
+Procedure.i Hash(p.i,n.i)
+ Define i.i,h.i
+ h=2166136261
+ For i=0 To n-1 : h=((h ! PeekA(p+i))*16777619)&$FFFFFFFF : Next
+ ProcedureReturn h
+EndProcedure
+Procedure.i Main()
+ Define rc.i,i.i,total.i,high.i,saved.i
+ CaptureTable() : *pet=PeekI(table+16+6*8)
+ For i=0 To 65535 : PokeA($04000000+i,0) : Next
+ PokeI($04000000,$55445331)
+ Tls13PauseHook=@Yield : Tls13SetupPauseHook=@Yield
+ TlsInitTables() : X25519Init()
+Prepare()
+For i=0 To 19999 : output[i]=$A5 : Next
+For i=0 To SizeOf(QuicTlsOutput)-1 : PokeA(@job+i,0) : Next
+PokeI($04000100+0,QuicCryptoTxInit(@tx,0,@txData[0],4096,@txStates[0],8192))
+PokeI($04000100+8,Tls13ClientHelloCapacity())
+PokeI($04000100+16,Tls13QuicOutputCapacity())
+saved=Hash(@TlsTrSnap[0],104)
+PokeI($04000100+24,QuicTlsOutputBegin(@job,@tx,@output[0],270))
+PokeI($04000100+32,Tls13State)
+PokeI($04000100+40,TlsSessionIdLen)
+PokeI($04000100+48,Tls13Err)
+PokeI($04000100+56,job\phase)
+PokeI($04000100+64,tx\tail)
+PokeI($04000100+72,Bool(saved=Hash(@TlsTrSnap[0],104)))
+PokeI($04000100+80,Hash(@output[0],20000))
+tx\level=2
+PokeI($04000100+88,QuicTlsOutputBegin(@job,@tx,@output[0],20000))
+tx\level=0
+PokeI($04000100+96,QuicTlsOutputBegin(@job,@tx,@txData[0],4096))
+TlsKeyShareLen=0
+PokeI($04000100+104,QuicTlsOutputBegin(@job,@tx,@output[0],20000))
+PokeI($04000100+112,Tls13Err)
+TlsKeyShareLen=32
+PokeI($04000100+120,QuicCryptoTxAppend(@tx,@filler[0],4090))
+PokeI($04000100+128,QuicTlsOutputBegin(@job,@tx,@output[0],20000))
+PokeI($04000100+136,Tls13State)
+PokeI($04000100+144,Bool(saved=Hash(@TlsTrSnap[0],104)))
+rc=QuicCryptoTxSent(@tx,0,4090) : rc=QuicCryptoTxAck(@tx,0,4090) : rc=QuicCryptoTxReclaim(@tx,4096)
+job\phase=3
+PokeI($04000100+152,QuicTlsOutputBegin(@job,@tx,@output[0],20000))
+job\phase=0
+probeActive=1 : Tls13PauseHook=@OutputYield
+PokeI($04000100+160,QuicTlsOutputBegin(@job,@tx,@output[0],20000))
+probeActive=0 : Tls13PauseHook=@Yield
+PokeI($04000100+168,Bool(probeSeen>0))
+PokeI($04000100+176,probeStep)
+PokeI($04000100+184,Tls13State)
+PokeI($04000100+192,job\offset)
+PokeI($04000100+200,tx\tail)
+PokeI($04000100+208,QuicTlsOutputBegin(@job,@tx,@output[0],20000))
+total=0 : high=0
+For i=0 To 199
+ rc=QuicTlsOutputStep(@job)
+ If rc<=0 : Break : EndIf
+ total=total+rc : If rc>high : high=rc : EndIf
+Next
+PokeI($04000100+216,rc)
+PokeI($04000100+224,job\phase)
+PokeI($04000100+232,total)
+PokeI($04000100+240,high)
+PokeI($04000100+248,tx\tail)
+PokeI($04000100+256,job\copied)
+PokeI($04000100+264,Hash(@output[0],20000))
+PokeI($04000100+272,QuicCryptoTxFrame(@tx,4090,141,@frame[0],20032))
+PokeI($04000100+280,Hash(@frame[0],146))
+Tls13TranscriptHash(@digest[0])
+PokeI($04000100+288,Hash(@digest[0],32))
+PokeI($04000100+296,QuicTlsOutputBegin(@job,@tx,@output[0],20000))
+Prepare()
+For i=0 To 19999 : output[i]=$A5 : Next
+For i=0 To SizeOf(QuicTlsOutput)-1 : PokeA(@job+i,0) : Next
+PokeI($04000100+304,QuicCryptoTxInit(@tx,0,@txData[0],32768,@txStates[0],8192))
+For i=0 To 16383 : localParams[i]=0 : Next
+rc=Tls13SetQuicParameters(@config[0],@localParams[0],16384,@peer[0],64)
+PokeI($04000100+312,QuicTlsOutputBegin(@job,@tx,@output[0],20000))
+total=0 : high=0
+For i=0 To 199
+ rc=QuicTlsOutputStep(@job)
+ If rc<=0 : Break : EndIf
+ total=total+rc : If rc>high : high=rc : EndIf
+Next
+PokeI($04000100+320,rc)
+PokeI($04000100+328,job\phase)
+PokeI($04000100+336,total)
+PokeI($04000100+344,high)
+PokeI($04000100+352,tx\tail)
+PokeI($04000100+360,job\copied)
+PokeI($04000100+368,Hash(@output[0],20000))
+PokeI($04000100+376,Hash(@txData[0],16523))
+Tls13TranscriptHash(@digest[0])
+PokeI($04000100+384,Hash(@digest[0],32))
+Prepare()
+For i=0 To 19999 : output[i]=$A5 : Next
+For i=0 To SizeOf(QuicTlsOutput)-1 : PokeA(@job+i,0) : Next
+PokeI($04000100+392,QuicCryptoTxInit(@tx,0,@txData[0],32768,@txStates[0],8192))
+For i=0 To 599 : localParams[i]=0 : Next
+rc=Tls13SetQuicParameters(@config[0],@localParams[0],600,@peer[0],64)
+PokeI($04000100+400,QuicTlsOutputBegin(@job,@tx,@output[0],20000))
+PokeI($04000100+408,QuicTlsOutputStep(@job))
+PokeI($04000100+416,QuicTlsOutputCancel(@job))
+PokeI($04000100+424,tx\phase)
+PokeI($04000100+432,tx\tail)
+PokeI($04000100+440,QuicTlsOutputStep(@job))
+PokeI($04000100+448,QuicCryptoTxAppend(@tx,@filler[0],1))
+Prepare()
+For i=0 To 19999 : output[i]=$A5 : Next
+For i=0 To SizeOf(QuicTlsOutput)-1 : PokeA(@job+i,0) : Next
+PokeI($04000100+456,QuicCryptoTxInit(@tx,0,@txData[0],32768,@txStates[0],8192))
+PokeI($04000100+464,QuicTlsOutputBegin(@job,@tx,@output[0],20000))
+rc=QuicCryptoTxAppend(@tx,@filler[0],1)
+PokeI($04000100+472,QuicTlsOutputStep(@job))
+PokeI($04000100+480,tx\phase)
+Prepare()
+For i=0 To 19999 : output[i]=$A5 : Next
+For i=0 To SizeOf(QuicTlsOutput)-1 : PokeA(@job+i,0) : Next
+PokeI($04000100+488,QuicCryptoTxInit(@tx,2,@txData[0],32768,@txStates[0],8192))
+Tls13TranscriptReset() : rc=Tls13TranscriptAppend("quic fixture",12)
+Sha256Of("quic fixture",12,@TlsThSf[0])
+For i=0 To 31 : secTlsCHs[i]=i : secTlsCAp[i]=32+i : Next
+Tls13State=#TLS13_ST_SEND_FINISHED
+PokeI($04000100+496,Tls13QuicOutputCapacity())
+PokeI($04000100+504,QuicTlsOutputBegin(@job,@tx,@output[0],35))
+PokeI($04000100+512,Tls13State)
+PokeI($04000100+520,QuicTlsOutputBegin(@job,@tx,@output[0],20000))
+rc=QuicTlsOutputStep(@job)
+PokeI($04000100+528,rc)
+PokeI($04000100+536,Tls13State)
+PokeI($04000100+544,Hash(@txData[0],36))
+PokeI($04000100+552,Hash(@output[0],20000))
+Tls13TranscriptHash(@digest[0])
+PokeI($04000100+560,Hash(@digest[0],32))
+Prepare()
+For i=0 To 19999 : output[i]=$A5 : Next
+For i=0 To SizeOf(QuicTlsOutput)-1 : PokeA(@job+i,0) : Next
+PokeI($04000100+568,QuicCryptoTxInit(@tx,0,@txData[0],32768,@txStates[0],8192))
+TlsAlpnOfferLen=0
+PokeI($04000100+576,QuicTlsOutputBegin(@job,@tx,@output[0],20000))
+PokeI($04000100+584,tx\phase)
+PokeI($04000100+592,QuicTlsOutputStep(@job))
+Prepare()
+For i=0 To 19999 : output[i]=$A5 : Next
+For i=0 To SizeOf(QuicTlsOutput)-1 : PokeA(@job+i,0) : Next
+PokeI($04000100+600,QuicCryptoTxInit(@tx,0,@txData[0],32768,@txStates[0],8192))
+TlsQuicConfig=0
+PokeI($04000100+608,Tls13ClientHelloCapacity())
+PokeI($04000100+616,QuicTlsOutputBegin(@job,@tx,@output[0],20000))
+PokeI($04000100+624,Tls13State)
+PokeI($04000008,79)
+ProcedureReturn 0
+EndProcedure
+DataSection
+quic_alpn:
+Data.a 2,104,51
+EndDataSection
