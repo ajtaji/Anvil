@@ -1,0 +1,11 @@
+import struct
+from check_repeat1933 import check as previous
+
+def check(raw,peer):
+ out=previous(raw,peer)
+ read=lambda off:struct.unpack_from('<q',raw,off)[0]
+ assert read(0x580)==0
+ assert read(0x588)>=6 and read(0x590)>=3
+ assert read(0x598)&4
+ out.update(poll_ack_checks=read(0x588),poll_loss_checks=read(0x590),poll_space_mask=read(0x598))
+ return out

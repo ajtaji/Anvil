@@ -239,6 +239,9 @@ EndProcedure
 Procedure.i QuicConnectionRecoveryPoll(*c.QuicConnection,now.i)
  If qconn_Span(*c,SizeOf(QuicConnection))=0 : ProcedureReturn #QUIC_CONNECTION_ARGUMENT : EndIf
  If *c\phase<>1 : ProcedureReturn #QUIC_CONNECTION_STATE : EndIf
+ ; A bounded ACK/loss job can have applied only part of its event stream.
+ ; Preserve deadline/backoff until the dispatcher finishes or cancels it.
+ If *c\initial\history\busy<>0 Or *c\handshake\history\busy<>0 Or *c\applicationHistory\busy<>0 : ProcedureReturn #QUIC_SENT_BUSY : EndIf
  ProcedureReturn QuicProbeTimerPoll(@*c\recoveryTimer,now)
 EndProcedure
 Procedure.i qconn_LossOwned(*c.QuicConnection)

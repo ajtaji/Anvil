@@ -1,0 +1,49 @@
+import struct
+
+def check(raw,peer):
+    read=lambda off:struct.unpack_from('<q',raw,off)[0]
+    assert read(0x390)==0
+    count=read(0x398);assert 2<=count<=4
+    samples=[struct.unpack_from('<8q',raw,0x400+64*i) for i in range(count)]
+    assert samples[0][0]==0 and samples[-1][0]==3
+    assert [x[0] for x in samples]==sorted({x[0] for x in samples})
+    frames=[f for t in peer['qlog']['traces'] for e in t['events']
+            if e['name']=='transport:packet_sent' and e['data']['header']['packet_type']=='1RTT'
+            for f in e['data']['frames'] if f['frame_type']=='ack']
+    minimum=smoothed=variation=None
+    for pn,received,sent,delay,exponent,cap,level,confirmed in samples:
+        assert pn in (0,2,3,4) and received>sent>=0
+        assert (exponent,cap,level,confirmed)==(3,25000,4,1)
+        assert any(max(hi for lo,hi in f['acked_ranges'])==pn
+                   and -0.000001<=f['ack_delay']*1000-delay*(1<<exponent)<(1<<exponent)+0.000001
+                   for f in frames),(pn,delay)
+        latest=received-sent
+        if minimum is None:
+            minimum=smoothed=latest;variation=latest//2
+        else:
+            minimum=min(minimum,latest)
+            adjusted=latest-min(delay*(1<<exponent),cap)
+            if adjusted<minimum:adjusted=latest
+            variation=(3*variation+abs(smoothed-adjusted))//4
+            smoothed=(7*smoothed+adjusted)//8
+    values=[latest,minimum,smoothed,variation,max(1000,(9*max(latest,smoothed)+7)//8),smoothed+max(4*variation,1000)+25000]
+    assert [read(0x3a0+8*i) for i in range(6)]==values
+    assert count==2
+    assert read(0x500)==0 and read(0x508)==2 and read(0x528)==0
+    base,due,fired=[read(x) for x in (0x510,0x518,0x520)]
+    first=samples[0][1]-samples[0][2]
+    assert due-base==first+4*(first//2)+25000
+    assert fired>=due and samples[1][2]>=fired
+    base2,due2,fired2=[read(x) for x in (0x560,0x568,0x570)]
+    duration=due-base
+    assert base2>=fired and due2==base2+2*duration and fired2>=due2
+    assert samples[1][2]>=fired2
+    assert read(0x540)==0 and read(0x548)==3
+    assert read(0x550)==due2
+    assert read(0x578)==samples[1][2]+4*duration
+    assert read(0x558)==samples[1][2]+values[5]
+    dropped=peer['dropped_probes']
+    assert [p['ordinal'] for p in dropped]==[2,3]
+    assert len({p['sha256'] for p in dropped})==2
+    assert all(p['bytes']==22+peer['connection_id_length'] for p in dropped)
+    return dict(timer_base=base,timer_due=due,timer_fired=fired,deadline_lateness=fired-due,repeat_base=base2,repeat_due=due2,repeat_fired=fired2,third_probe_due=read(0x578),ack_rearm_due=read(0x558),samples=samples,latest=latest,minimum=minimum,smoothed=smoothed,variation=variation,loss_delay=values[4],pto=values[5])

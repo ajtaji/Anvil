@@ -9,6 +9,7 @@
 ; Other frame kinds are refused without committing an application receipt.
 ; TLS completion is also checked independently by the server.
 Global recoveryCloseFault.i,recoveryCloseChecked.i
+Global pollGuardFault.i,pollAckChecks.i,pollLossChecks.i,pollSpaceMask.i
 Global rearmFault.i,rearmChecked.i,probeRearmDue.i,ackRearmDue.i
 Global repeatBase.i,repeatDue.i,repeatFired.i,thirdProbeDue.i
 Global timerFault.i,timerBase.i,timerDue.i,timerFired.i,timerCount.i
@@ -209,6 +210,24 @@ Procedure.i SendSpace(*s.QuicConnectionSpace)
  Until rc=1
  ProcedureReturn 0
 EndProcedure
+; Force an otherwise-due poll while a real ledger job holds its lock.
+; This is a lifecycle refusal test, not a simulated wire timeout.
+Procedure CheckRecoveryLocked(kind.i)
+ Define before.QuicProbeTimer,i.i,rc.i,a.i,h.i,p.i
+ a=connection\initial\history\busy : h=connection\handshake\history\busy : p=connection\applicationHistory\busy
+ If a=0 And h=0 And p=0 : pollGuardFault=1 : ProcedureReturn : EndIf
+ If a : pollSpaceMask=pollSpaceMask|1 : EndIf
+ If h : pollSpaceMask=pollSpaceMask|2 : EndIf
+ If p : pollSpaceMask=pollSpaceMask|4 : EndIf
+ For i=0 To SizeOf(QuicProbeTimer)-1 : PokeA(@before+i,PeekA(@connection\recoveryTimer+i)) : Next
+ rc=QuicConnectionRecoveryPoll(@connection,$7FFFFFFFFFFFFFFF)
+ If rc<>#QUIC_SENT_BUSY : pollGuardFault=2 : EndIf
+ For i=0 To SizeOf(QuicProbeTimer)-1
+  If PeekA(@before+i)<>PeekA(@connection\recoveryTimer+i) : pollGuardFault=3 : EndIf
+ Next
+ If a<>connection\initial\history\busy Or h<>connection\handshake\history\busy Or p<>connection\applicationHistory\busy : pollGuardFault=4 : EndIf
+ If kind=1 : pollAckChecks=pollAckChecks+1 : Else : pollLossChecks=pollLossChecks+1 : EndIf
+EndProcedure
 Procedure.i HandleAck(*s.QuicConnectionSpace)
  Define rc.i,n.i,phase.i,t.i,cost.i,authenticated.i
  phase=connection\acknowledge\phase
@@ -223,6 +242,7 @@ Procedure.i HandleAck(*s.QuicConnectionSpace)
  If QuicConnectionSendBegin(@connection,*s\level,peerBytes)<>#QUIC_SENT_BUSY : ackFault=3 : EndIf
  Repeat
   n=Pump() : If n<0 : ProcedureReturn n : EndIf
+  If *s\history\busy<>0 : CheckRecoveryLocked(1) : EndIf
   t=clock() : rc=QuicConnectionAckStep(@connection) : cost=clock()-t
   ackSteps=ackSteps+1 : If cost>maxAckStep : maxAckStep=cost : EndIf
   If rc=0 And connection\receive\process\phase<>2 : ackFault=4 : EndIf
@@ -507,13 +527,16 @@ Procedure.i CheckDeliveryRefusals()
  deliveryProbes=deliveryProbes+1
  rc=QuicHandshakeSentAckBegin(@connection\applicationAck,@connection\applicationHistory,4,@f)
  If rc<>0 : ProcedureReturn rc : EndIf
+ CheckRecoveryLocked(1)
  rc=QuicHandshakeSentAckStep(@connection\applicationAck)
  If rc<>#QUIC_SENT_UNSENT Or connection\applicationHistory\acked<>0 Or connection\applicationHistory\busy<>0 Or connection\applicationHistory\inFlight<>connection\controlBytes : deliveryFault=4 : ProcedureReturn -9488 : EndIf
  deliveryProbes=deliveryProbes+1 : f\largest=0
  rc=QuicHandshakeSentAckBegin(@connection\applicationAck,@connection\applicationHistory,4,@f)
  If rc<>0 : ProcedureReturn rc : EndIf
+ CheckRecoveryLocked(1)
  rc=QuicHandshakeSentAckStep(@connection\applicationAck)
  If rc<>0 Or connection\applicationAck\phase<>2 Or connection\applicationHistory\acked<>0 : deliveryFault=5 : ProcedureReturn -9489 : EndIf
+ CheckRecoveryLocked(1)
  rc=QuicHandshakeSentAckCancel(@connection\applicationAck)
  If rc<>#QUIC_SENT_CANCELLED Or connection\applicationHistory\busy<>0 Or connection\applicationHistory\acked<>0 Or connection\applicationHistory\inFlight<>connection\controlBytes : deliveryFault=6 : ProcedureReturn -9490 : EndIf
  deliveryProbes=deliveryProbes+1 : ProcedureReturn 0
@@ -562,7 +585,8 @@ Procedure.i ReceiveApplicationAck()
      rc=QuicHandshakeSentAckBegin(@connection\applicationAck,@connection\applicationHistory,4,@applicationFrame\base)
      If rc<>0 : ProcedureReturn rc : EndIf
      Repeat
-      rc=QuicHandshakeSentAckStep(@connection\applicationAck) : deliverySteps=deliverySteps+1
+      CheckRecoveryLocked(1)
+ rc=QuicHandshakeSentAckStep(@connection\applicationAck) : deliverySteps=deliverySteps+1
       If rc=1
        If lossPhase=1
         lossAckCount=lossAckCount+1
@@ -651,6 +675,7 @@ Procedure.i CheckProbeLoss()
  Next
  rc=QuicConnectionLossBegin(@connection,4,HwMicros(),$7FFFFFFFFFFFFFFF,3)
  If rc<>0 : ProcedureReturn rc : EndIf
+ If connection\applicationHistory\busy<>0 : CheckRecoveryLocked(2) : EndIf
  rc=QuicConnectionLossStep(@connection)
  If rc<>2 Or connection\applicationHistory\inFlight<>highest*probeBytes : lossFault=2 : EndIf
  If connection\recoveryLoss\phase=1 : QuicHandshakeSentLossCancel(@connection\recoveryLoss) : ProcedureReturn -9492 : EndIf
@@ -665,7 +690,8 @@ Procedure.i CheckProbeLoss()
  rc=QuicConnectionLossBegin(@connection,4,HwMicros(),delay,3)
  If rc<>0 : ProcedureReturn rc : EndIf
  Repeat
-  rc=QuicConnectionLossStep(@connection)
+  If connection\applicationHistory\busy<>0 : CheckRecoveryLocked(2) : EndIf
+ rc=QuicConnectionLossStep(@connection)
   If rc=1
    lossEvents=lossEvents+1
    If connection\recoveryLoss\number<>lossEvents Or connection\recoveryLoss\packetBytes<>probeBytes Or connection\recoveryLoss\inFlightBytes<>probeBytes Or connection\recoveryLoss\sentAt<=0 : lossFault=4 : EndIf
@@ -685,6 +711,7 @@ Procedure.i CheckProbeLoss()
  If rc<>0 Or connection\applicationHistory\first<>1 Or connection\applicationHistory\issued<>highest+1 : lossFault=6 : EndIf
  rc=QuicConnectionLossBegin(@connection,4,HwMicros(),$7FFFFFFFFFFFFFFF,3)
  If rc<>0 : ProcedureReturn rc : EndIf
+ If connection\applicationHistory\busy<>0 : CheckRecoveryLocked(2) : EndIf
  rc=QuicConnectionLossStep(@connection)
  If rc<>2 Or connection\applicationHistory\inFlight<>0 : lossFault=7 : EndIf
  If connection\recoveryLoss\phase=1 : QuicHandshakeSentLossCancel(@connection\recoveryLoss) : ProcedureReturn -9493 : EndIf
@@ -1251,6 +1278,8 @@ Procedure.i Main()
  PokeI($E1C00258,applicationWriteReady) : PokeI($E1C00260,applicationFault)
  PokeI($E1C00268,applicationSteps) : PokeI($E1C00270,maxApplicationStep)
  PokeI($E1C00278,applicationCancelled) : PokeI($E1C00280,applicationPing)
+ PokeI($E1C00580,pollGuardFault) : PokeI($E1C00588,pollAckChecks)
+ PokeI($E1C00590,pollLossChecks) : PokeI($E1C00598,pollSpaceMask)
  PokeI($E1C00560,repeatBase) : PokeI($E1C00568,repeatDue)
  PokeI($E1C00570,repeatFired) : PokeI($E1C00578,thirdProbeDue)
  PokeI($E1C00540,rearmFault) : PokeI($E1C00548,rearmChecked)
