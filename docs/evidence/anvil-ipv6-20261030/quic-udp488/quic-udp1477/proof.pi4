@@ -1,0 +1,149 @@
+XIncludeFile "RaspberryPi4/Lib/mmu.pi4"
+XIncludeFile "Anvil/Network/udp_payload.pbi"
+XIncludeFile "Anvil/Core/sha256.pbi"
+XIncludeFile "Anvil/Crypto/hmac.pbi"
+XIncludeFile "Anvil/Crypto/hkdf.pbi"
+XIncludeFile "Anvil/Crypto/aes.pbi"
+XIncludeFile "Anvil/Crypto/gcm.pbi"
+XIncludeFile "Anvil/Crypto/gcm_job.pbi"
+XIncludeFile "Anvil/Network/quic_handshake_receive.pbi"
+Global services.i,*pet,*clock
+Global ep.UdpEndpoint,info.UdpDatagramInfo,status.UdpSocketStatus
+Global readKeys.QuicKeys,writeKeys.QuicKeys,keyjob.QuicKeyJob
+Global receive.QuicHandshakeReceive,sendJob.QuicPacketJob,spec.QuicLongPacketSpec
+Global rx.QuicCryptoRx,ack.QuicHandshakeAck
+Global Dim packet.a[1472]
+Global Dim output.a[1472]
+Global Dim data.a[4096]
+Global Dim bits.a[512]
+Global Dim ranges.a[1024]
+Global received.i,badTags.i,duplicates.i,completed.i,sent.i,largest.i,maxService.i
+Procedure CaptureTable()
+ ASM
+ adrp x1, global_services
+ add x1, x1, #:lo12:global_services
+ str x0, [x1]
+ EndASM
+EndProcedure
+Procedure.i Pump()
+ Define t.i,rc.i,cost.i
+ pet() : t=clock() : rc=UdpPayloadService() : cost=clock()-t
+ If cost>maxService : maxService=cost : EndIf
+ ProcedureReturn rc
+EndProcedure
+Procedure.i WaitTx(h.i)
+ Define started.i,rc.i
+ started=clock()
+ While clock()-started<3000000
+  rc=Pump() : If rc<0 : ProcedureReturn rc : EndIf
+  rc=UdpPayloadStatus(h,@status) : If rc<>0 : ProcedureReturn rc : EndIf
+  If status\txState=#UDP_TX_SENT : ProcedureReturn 0 : EndIf
+  If status\txState=#UDP_TX_FAILED : ProcedureReturn status\txError : EndIf
+ Wend
+ ProcedureReturn -9201
+EndProcedure
+Procedure.i SendAck(h.i)
+ Define i.i,n.i,rc.i,token.i,started.i
+ spec\kind=0 : spec\destination=?ServerId : spec\destinationBytes=4
+ spec\source=?ClientId : spec\sourceBytes=8 : spec\number=0 : spec\numberBytes=4
+ spec\cipherBytes=1174
+ n=QuicLongPacketWrite(@spec,@output[0],1472) : If n<>26 : ProcedureReturn -9202 : EndIf
+ For i=n To 1199 : output[i]=0 : Next
+ rc=QuicHandshakeAckWrite(@ack,@output[n],1158,@token) : If rc<>5 : ProcedureReturn -9203 : EndIf
+ rc=QuicPacketJobBegin(@sendJob,@writeKeys,@output[0],1200,0,0,1)
+ If rc<>0 : ProcedureReturn rc : EndIf
+ started=clock()
+ Repeat
+  rc=Pump() : If rc<0 : ProcedureReturn rc : EndIf
+  rc=QuicPacketJobStep(@sendJob)
+  If clock()-started>3000000 : QuicPacketJobCancel(@sendJob) : ProcedureReturn -9204 : EndIf
+ Until rc<>0
+ If rc<>1 : ProcedureReturn rc : EndIf
+ rc=UdpPayloadSendTo(h,@ep,@output[0],1200) : If rc<1 : ProcedureReturn rc : EndIf
+ rc=WaitTx(h) : If rc<>0 : ProcedureReturn rc : EndIf
+ rc=QuicHandshakeAckSent(@ack,token) : If rc<>1 : ProcedureReturn -9205 : EndIf
+ sent=sent+1 : ProcedureReturn 0
+EndProcedure
+Procedure.i Run(h.i)
+ Define i.i,n.i,rc.i,started.i,part.i,header.QuicPacketHeader
+ largest=-1
+ rc=QuicCryptoRxInit(@rx,0,@data[0],4096,@bits[0],512) : If rc<>0 : ProcedureReturn rc : EndIf
+ rc=QuicHandshakeAckInit(@ack,0,@ranges[0],64) : If rc<>0 : ProcedureReturn rc : EndIf
+ rc=QuicInitialKeysBegin(@keyjob,@readKeys,?OriginalId,8,1)
+ While rc=0 : pet() : rc=QuicKeyJobStep(@keyjob) : Wend
+ If rc<>1 : ProcedureReturn rc : EndIf
+ rc=QuicInitialKeysBegin(@keyjob,@writeKeys,?OriginalId,8,0)
+ While rc=0 : pet() : rc=QuicKeyJobStep(@keyjob) : Wend
+ If rc<>1 : ProcedureReturn rc : EndIf
+ rc=UdpPayloadSendTo(h,@ep,?Hello,4) : If rc<1 : ProcedureReturn rc : EndIf
+ rc=WaitTx(h) : If rc<>0 : ProcedureReturn rc : EndIf
+ started=clock()
+ While received<3 And clock()-started<8000000
+  rc=Pump() : If rc<0 : ProcedureReturn rc : EndIf
+  n=UdpPayloadReceive(h,@info,@packet[0],1472)
+  If n<>#SVC_EAGAIN
+   If n<>1200 Or info\family<>4 Or info\peerPort<>55442 : ProcedureReturn -9206 : EndIf
+   For i=0 To 15 : If PeekA(@info\peerAddress+i)<>PeekA(@ep\address+i) : ProcedureReturn -9207 : EndIf : Next
+   received=received+1
+   rc=QuicPacketRead(@header,@packet[0],n,0)
+   If rc<>1 Or header\kind<>0 Or header\destinationBytes<>8 Or header\sourceBytes<>4 Or header\tokenBytes<>0 : ProcedureReturn -9208 : EndIf
+   For i=0 To 7 : If PeekA(@packet[0]+header\destinationOffset+i)<>PeekA(?ClientId+i) : ProcedureReturn -9209 : EndIf : Next
+   For i=0 To 3 : If PeekA(@packet[0]+header\sourceOffset+i)<>PeekA(?ServerId+i) : ProcedureReturn -9210 : EndIf : Next
+   rc=QuicHandshakeReceiveBegin(@receive,@readKeys,@packet[0],n,0,largest,@rx,@ack)
+   If rc=0
+    Repeat
+     rc=Pump() : If rc<0 : ProcedureReturn rc : EndIf
+     rc=QuicHandshakeReceiveStep(@receive)
+     If clock()-started>=8000000 : QuicHandshakeReceiveCancel(@receive) : ProcedureReturn -9211 : EndIf
+    Until rc<>1
+   EndIf
+   If receive\authenticated<>0 And receive\crypto\number>largest : largest=receive\crypto\number : EndIf
+   If rc=6
+    If receive\authenticated<>0 : duplicates=duplicates+1 : Else : badTags=badTags+1 : EndIf
+   ElseIf rc=4
+    completed=completed+1 : rc=SendAck(h) : If rc<>0 : ProcedureReturn rc : EndIf
+   Else
+    ProcedureReturn rc
+   EndIf
+  EndIf
+ Wend
+ If received<>3 : ProcedureReturn -9212 : EndIf
+ ProcedureReturn 0
+EndProcedure
+Procedure.i Main()
+ CaptureTable()
+ Define i.i,rc.i,h.i,closed.i,cleanup.i
+ rc=UdpPayloadBind(services) : If rc<>0 : ProcedureReturn 71 : EndIf
+ pet=PeekI(services+16+6*8) : clock=PeekI(services+16+11*8)
+ MmuClearNc() : MmuAddNc($08A00000,$09200000) : MmuAddNc($08100000,$08180000)
+ rc=MmuBuildTables($4F80000) : If rc<>0 : ProcedureReturn 72 : EndIf
+ MmuEnableCached()
+ For i=0 To 65535 : PokeA($E1C00000+i,0) : Next
+ PokeI($E1C00000,$55445331) : PokeI($E1C00008,15)
+ ep\family=4 : ep\kind=0 : ep\port=55442
+ For i=0 To 15 : PokeA(@ep\address+i,PeekA(?Peer+i)) : Next
+ h=UdpPayloadOpen(4,0,55013)
+ If h>0 : rc=Run(h) : closed=UdpPayloadClose(h) : Else : rc=h : closed=-1 : EndIf
+ If receive\phase=1 Or receive\phase=2 : cleanup=QuicHandshakeReceiveCancel(@receive) : EndIf
+ If sendJob\phase<>0 : cleanup=QuicPacketJobCancel(@sendJob) : EndIf
+ PokeI($E1C00100,rc) : PokeI($E1C00108,received) : PokeI($E1C00110,badTags)
+ PokeI($E1C00118,duplicates) : PokeI($E1C00120,completed) : PokeI($E1C00128,sent)
+ PokeI($E1C00130,rx\buffered) : PokeI($E1C00138,ack\count) : PokeI($E1C00140,ack\pending)
+ PokeI($E1C00148,largest) : PokeI($E1C00150,data[0]) : PokeI($E1C00158,data[1]) : PokeI($E1C00160,data[2])
+ PokeI($E1C00168,closed) : PokeI($E1C00170,GcmJobBusy())
+ PokeI($E1C00040,maxService)
+ QuicKeysWipe(@readKeys) : QuicKeysWipe(@writeKeys)
+ MmuDisableCachedFlushed() : ProcedureReturn 0
+EndProcedure
+DataSection
+OriginalId:
+ Data.a $83,$94,$C8,$F0,$3E,$51,$57,$08
+ClientId:
+ Data.a 97,98,99,100,101,102,103,104
+ServerId:
+ Data.a 87,88,89,90
+Hello:
+ Data.a 81,72,48,49
+Peer:
+ Data.a 192,168,1,104,0,0,0,0,0,0,0,0,0,0,0,0
+EndDataSection

@@ -4058,3 +4058,34 @@ with healthy cores/fonts/Vulkan and watchdog off. Evidence is under
 Actual UDP connection/send ownership, sent-packet history, ACK scheduling/retry,
 loss/congestion/flow handling, streams, QPACK and live authenticated HTTP/3 remain
 unfinished, as do the earlier TLS and public off-link IPv6 qualification items.
+
+
+### Live UDP protected-handshake integration
+
+Captures 254 and 255 on Anvil 488 connected the resident UDP ABI to the shared
+protected handshake receiver, CRYPTO storage, receipt history, ACK encoder and
+packet protection. A temporary independent desktop peer sent three 1200-byte
+Initial packets: a damaged tag, a valid CRYPTO/PING packet and its duplicate.
+The Pi validated the source endpoint and fixture CIDs, discarded the bad tag,
+queued exactly three CRYPTO bytes, discarded the duplicate, and sent exactly
+one protected 1200-byte ACK. The desktop independently removed header protection,
+decrypted that response and checked its entire header and ACK/padding plaintext.
+No extra replies were observed. Fifteen board report assertions passed per run.
+
+The final fixture additionally refuses a second protected send so its fixed
+outgoing packet number cannot be reused. It services UDP and the watchdog during
+bounded crypto/packet steps, waits for link send completion before retiring ACK
+demand, closes the socket and wipes its keys. Both runs returned with healthy
+cores/fonts/Vulkan, no held crypto job and watchdog off. Build 488 is unchanged.
+The reproducible builder and independent peer are `tools/build_quic_udp_live.py`
+and `tools/quic_udp_live_peer.py`; the fixture uses the recorded desktop/Pi test
+endpoints, ports 55442/55013 and public deterministic Initial keys. Evidence,
+wire transcripts, reports and exact images are archived under
+`docs/evidence/anvil-ipv6-20261030/quic-udp488`.
+
+This is a live IPv4 UDP boundary qualification with a controlled protocol peer,
+not a TLS handshake, a certificate-verified peer, or an HTTP/3 request. Its four
+byte setup datagram is test coordination, not QUIC. It supplies no reusable
+connection owner or general packet-number allocator; outgoing CRYPTO, sent-packet
+history, retransmission, loss/congestion/flow handling, streams and QPACK remain
+open. Earlier TLS and public off-link IPv6 qualification items are also open.
