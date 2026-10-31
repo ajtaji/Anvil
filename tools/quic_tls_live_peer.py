@@ -12,6 +12,7 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import NameOID, ExtendedKeyUsageOID
 from aioquic.buffer import Buffer
 from aioquic.quic.configuration import QuicConfiguration
+from aioquic.quic.crypto import CryptoPair
 from aioquic.quic.connection import QuicConnection
 from aioquic.quic.events import HandshakeCompleted, ConnectionTerminated, ProtocolNegotiated
 from aioquic.quic.logger import QuicLogger
@@ -76,7 +77,7 @@ class FixtureConnection(QuicConnection):
             super()._replenish_connection_ids()
 
 class Peer:
-    def __init__(self, directory, report, host='192.168.1.104', port=55442, allowed='192.168.1.114', connection_id_length=8, drop_probe=False, repeat_probe=False):
+    def __init__(self, directory, report, host='192.168.1.104', port=55442, allowed='192.168.1.114', connection_id_length=8, drop_probe=False, repeat_probe=False, initial_probe=False):
         assert 0 <= connection_id_length <= 20
         self.directory, self.report, self.allowed = directory, report, allowed
         self.sock=socket.socket(socket.AF_INET,socket.SOCK_DGRAM)
@@ -86,6 +87,7 @@ class Peer:
                   cipher_suites=[CipherSuite.AES_128_GCM_SHA256],quic_logger=self.logger,idle_timeout=30)
         self.config.load_cert_chain(str(directory/'chain.pem'),str(directory/'key.pem'))
         self.drop_probe=drop_probe or repeat_probe;self.drop_count=2 if repeat_probe else 1;self.short_packets=0
+        self.initial_probe=initial_probe
         self.connection=None;self.stop=threading.Event();self.thread=None
         self.result=dict(implementation='aioquic 1.7.0',connection_id_length=connection_id_length,received=[],sent=[],events=[],complete=False,error=None)
 
@@ -102,8 +104,19 @@ class Peer:
                     if addr[0]!=self.allowed: continue
                     self.result['received'].append(dict(bytes=len(data),sha256=hashlib.sha256(data).hexdigest()))
                     if self.connection is None:
-                        header=pull_quic_header(Buffer(data=data),host_cid_length=8)
+                        buf=Buffer(data=data);header=pull_quic_header(buf,host_cid_length=8)
                         assert header.packet_type==QuicPacketType.INITIAL and header.version==1 and len(data)>=1200
+                        if self.initial_probe:
+                            crypto=CryptoPair();crypto.setup_initial(header.destination_cid,is_client=False,version=1)
+                            plain_header,plain,number=crypto.decrypt_packet(data[:header.packet_length],buf.tell(),0)
+                            packets=self.result.setdefault('initial_probe_packets',[])
+                            packets.append(dict(number=number,bytes=len(data),sha256=hashlib.sha256(data).hexdigest(),payload_sha256=hashlib.sha256(plain).hexdigest(),payload_bytes=len(plain)))
+                            if len(packets)==1:
+                                assert number==0
+                                continue
+                            assert len(packets)==2 and number==1
+                            assert packets[0]['payload_sha256']==packets[1]['payload_sha256']
+                            assert packets[0]['sha256']!=packets[1]['sha256']
                         self.connection=FixtureConnection(configuration=self.config,original_destination_connection_id=header.destination_cid)
                     if data and not (data[0]&0x80):
                         self.short_packets+=1
