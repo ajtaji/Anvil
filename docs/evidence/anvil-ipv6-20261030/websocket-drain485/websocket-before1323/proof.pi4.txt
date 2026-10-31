@@ -1,0 +1,204 @@
+#WEB_KERNEL_BINDING=0
+XIncludeFile "Anvil/Network/web_url.pbi"
+XIncludeFile "Anvil/Network/web_request.pbi"
+XIncludeFile "Anvil/Network/web_response.pbi"
+XIncludeFile "Anvil/Network/websocket_frame.pbi"
+XIncludeFile "Anvil/Network/websocket_handshake.pbi"
+XIncludeFile "Anvil/Crypto/sha1.pbi"
+XIncludeFile "Anvil/Network/web_client.pbi"
+XIncludeFile "Anvil/Network/websocket_client.pbi"
+Global u.WebUrl,q.WebRequest,a.WebResponse,h.WebClient,f.WebSocketFrame,ws.WebSocketClient
+Global Dim host.a[256]
+Global Dim target.a[3072]
+Global Dim headers.a[1024]
+Global Dim response.a[2048]
+Global Dim line.a[512]
+Global Dim key.a[25]
+Global Dim accept.a[29]
+Global Dim scratch.i[64]
+Global Dim ctrl.a[125]
+Global Dim tx.a[512]
+Global Dim rx.a[512]
+Global Dim output.a[4]
+
+Global mode.i,closed.i,sent.i,wireLen.i,wireOff.i,requestLen.i,rngCalls.i
+Global pending.i,drains.i,dropped.i,nowTick.i,afterDrainRecv.i
+Global Dim incoming.a[2048]
+Global Dim outgoing.a[4096]
+Procedure.i FakeOpen(host.i,port.i)
+ ProcedureReturn 1
+EndProcedure
+Procedure.i FakeDns(host.i)
+ ProcedureReturn $04030201
+EndProcedure
+Procedure.i FakeTime()
+ ProcedureReturn nowTick*1000
+EndProcedure
+Procedure.i FakeState(handle.i)
+ If mode=4 And wireOff=wireLen : ProcedureReturn 3 : EndIf
+ If mode=13 And ws\closeReceived : ProcedureReturn 3 : EndIf
+ ProcedureReturn 2
+EndProcedure
+Procedure.i FakeTlsState(handle.i)
+ If mode=14 And ws\closeReceived : ProcedureReturn 5 : EndIf
+ ProcedureReturn 4
+EndProcedure
+Procedure.i FakeSend(handle.i,p.i,n.i)
+ Define i.i,take.i
+ If mode=5 And sent>=requestLen : ProcedureReturn n+1 : EndIf
+ If mode=14 And ws\closeReceived : ProcedureReturn 0 : EndIf
+ take=n : If take>3 : take=3 : EndIf
+ If mode=1 : take=1 : EndIf
+ For i=0 To take-1 : outgoing[sent+i]=PeekA(p+i) : Next
+ sent=sent+take
+ If mode>=8 And mode<>13 And ws\state=2 : pending=pending+take : EndIf
+ ProcedureReturn take
+EndProcedure
+Procedure.i FakeRecv(handle.i,p.i,n.i)
+ Define i.i,take.i
+ If drains>0 : afterDrainRecv=afterDrainRecv+1 : EndIf
+ If sent<requestLen : ProcedureReturn 0 : EndIf
+ take=wireLen-wireOff : If take>n : take=n : EndIf
+ If mode=1 And take>1 : take=1 : EndIf
+ For i=0 To take-1 : PokeA(p+i,incoming[wireOff+i]) : Next
+ wireOff=wireOff+take : ProcedureReturn take
+EndProcedure
+Procedure.i FakeDrain(handle.i)
+ drains=drains+1
+ If mode=10 : ProcedureReturn -105 : EndIf
+ If mode=9 Or mode=12 : ProcedureReturn 0 : EndIf
+ If drains<6 : ProcedureReturn 0 : EndIf
+ pending=0 : ProcedureReturn 1
+EndProcedure
+Procedure.i FakeClose(handle.i)
+ closed=closed+1 : dropped=dropped+pending : pending=0
+ ProcedureReturn 0
+EndProcedure
+Procedure BindFake()
+ webpBound=1 : webpDns=@FakeDns : webpTime=@FakeTime
+ webpOpen=@FakeOpen : webpState=@FakeState : webpSend=@FakeSend
+ webpRecv=@FakeRecv : webpClose=@FakeClose
+ webpTlsOpen=@FakeOpen : webpTlsState=@FakeTlsState : webpTlsSend=@FakeSend
+ webpTlsRecv=@FakeRecv : webpTlsClose=@FakeClose : webpTlsDrain=@FakeDrain
+ If mode=11 : webpTlsDrain=0 : EndIf
+EndProcedure
+Procedure.i FixtureRandom(p.i,n.i)
+ Define i.i
+ rngCalls=rngCalls+1
+ If mode=2 : ProcedureReturn -1 : EndIf
+ For i=0 To n-1 : PokeA(p+i,17*rngCalls+i) : Next
+ ProcedureReturn n
+EndProcedure
+Procedure Run(which.i,n.i)
+ Define i.i,rc.i,p.i,started.i,tick.i,plain.i,frames.i,queued.i,k.i
+ mode=which : pending=0 : drains=0 : dropped=0 : nowTick=0 : afterDrainRecv=0
+ BindFake()
+ closed=0 : sent=0 : wireLen=n : wireOff=0 : requestLen=0 : rngCalls=0
+ For i=0 To n-1 : Read.a incoming[i] : Next
+ u\host=@host[0] : u\hostCapacity=256 : u\target=@target[0] : u\targetCapacity=3072
+ rc=WebSocketUrlParse("ws://example.com/chat",21,1,@u,@scratch[0],512)
+ If mode>=8 And mode<>13 : u\secure=1 : u\port=443 : EndIf
+ If rc=0 : rc=WebSocketRequestInit(@q,@u,@headers[0],1024,"the sample nonce",@key[0],@accept[0],@scratch[0]) : EndIf
+ If rc=0 : rc=WebRequestFinishHeaders(@q) : EndIf
+ requestLen=q\length
+ If rc=0 : rc=WebResponseInit(@a,@line[0],512,@response[0],2048,0) : EndIf
+ If rc=0 : rc=WebResponseAllowUpgrade(@a) : EndIf
+ If rc=0 : rc=WebSocketFrameInit(@f,@ctrl[0],1024) : EndIf
+ If rc=0 : rc=WebClientStart(@h,@u,@q,@a,@tx[0],512,@rx[0],512,0,4000) : EndIf
+ If rc=0 : rc=WebSocketClientBind(@ws,@h,@f,@accept[0],0,0,@FixtureRandom,@scratch[0]) : EndIf
+ p=$E1C00100+which*1024
+ While rc>=0 And rc<>2 And tick<5000
+  nowTick=tick
+  rc=WebSocketClientStep(@ws,@output[0],2,tick)
+  For k=0 To ws\written-1 : PokeA(p+64+plain,output[k]) : plain=plain+1 : Next
+  If rc=1 : frames=frames+1 : EndIf
+  If ws\state=1 And queued=0
+   If mode=6
+    WebSocketClientAbort(@ws) : rc=ws\error
+   ElseIf mode=7 Or mode=15
+    rc=WebSocketClientSend(@ws,8,0,0,tick)
+   Else
+    rc=WebSocketClientSend(@ws,1,"Hello",5,tick)
+   EndIf
+   queued=1
+  EndIf
+  If mode=12 And drains=2 : WebSocketClientAbort(@ws) : rc=ws\error : EndIf
+  tick=tick+1
+ Wend
+ PokeI(p,rc) : PokeI(p+8,ws\state) : PokeI(p+16,closed) : PokeI(p+24,plain)
+ PokeI(p+32,frames) : PokeI(p+40,sent-requestLen) : PokeI(p+48,rngCalls) : PokeI(p+56,tick)
+ PokeI(p+80,drains) : PokeI(p+88,dropped) : PokeI(p+96,afterDrainRecv)
+ For i=requestLen To sent-1 : PokeA(p+256+i-requestLen,outgoing[i]) : Next
+EndProcedure
+Procedure.i Main(services.i)
+ Define i.i
+ For i=0 To 32767 : PokeA($E1C00000+i,0) : Next
+ PokeI($E1C00000,$57534331) : PokeI($E1C00008,16)
+ Restore Case0
+ Run(0,142)
+ Restore Case1
+ Run(1,142)
+ Restore Case2
+ Run(2,129)
+ Restore Case3
+ Run(3,129)
+ Restore Case4
+ Run(4,138)
+ Restore Case5
+ Run(5,129)
+ Restore Case6
+ Run(6,129)
+ Restore Case7
+ Run(7,129)
+ Restore Case8
+ Run(8,142)
+ Restore Case9
+ Run(9,142)
+ Restore Case10
+ Run(10,142)
+ Restore Case11
+ Run(11,142)
+ Restore Case12
+ Run(12,142)
+ Restore Case13
+ Run(13,142)
+ Restore Case14
+ Run(14,142)
+ Restore Case15
+ Run(15,133)
+ ProcedureReturn 0
+EndProcedure
+DataSection
+Case0:
+ Data.a 72,84,84,80,47,49,46,49,32,49,48,49,32,83,119,105,116,99,104,105,110,103,32,80,114,111,116,111,99,111,108,115,13,10,85,112,103,114,97,100,101,58,32,119,101,98,115,111,99,107,101,116,13,10,67,111,110,110,101,99,116,105,111,110,58,32,85,112,103,114,97,100,101,13,10,83,101,99,45,87,101,98,83,111,99,107,101,116,45,65,99,99,101,112,116,58,32,115,51,112,80,76,77,66,105,84,120,97,81,57,107,89,71,122,122,104,90,82,98,75,43,120,79,111,61,13,10,13,10,137,1,33,1,1,72,128,1,105,136,2,3,232
+Case1:
+ Data.a 72,84,84,80,47,49,46,49,32,49,48,49,32,83,119,105,116,99,104,105,110,103,32,80,114,111,116,111,99,111,108,115,13,10,85,112,103,114,97,100,101,58,32,119,101,98,115,111,99,107,101,116,13,10,67,111,110,110,101,99,116,105,111,110,58,32,85,112,103,114,97,100,101,13,10,83,101,99,45,87,101,98,83,111,99,107,101,116,45,65,99,99,101,112,116,58,32,115,51,112,80,76,77,66,105,84,120,97,81,57,107,89,71,122,122,104,90,82,98,75,43,120,79,111,61,13,10,13,10,137,1,33,1,1,72,128,1,105,136,2,3,232
+Case2:
+ Data.a 72,84,84,80,47,49,46,49,32,49,48,49,32,83,119,105,116,99,104,105,110,103,32,80,114,111,116,111,99,111,108,115,13,10,85,112,103,114,97,100,101,58,32,119,101,98,115,111,99,107,101,116,13,10,67,111,110,110,101,99,116,105,111,110,58,32,85,112,103,114,97,100,101,13,10,83,101,99,45,87,101,98,83,111,99,107,101,116,45,65,99,99,101,112,116,58,32,115,51,112,80,76,77,66,105,84,120,97,81,57,107,89,71,122,122,104,90,82,98,75,43,120,79,111,61,13,10,13,10
+Case3:
+ Data.a 72,84,84,80,47,49,46,49,32,49,48,49,32,83,119,105,116,99,104,105,110,103,32,80,114,111,116,111,99,111,108,115,13,10,85,112,103,114,97,100,101,58,32,119,101,98,115,111,99,107,101,116,13,10,67,111,110,110,101,99,116,105,111,110,58,32,85,112,103,114,97,100,101,13,10,83,101,99,45,87,101,98,83,111,99,107,101,116,45,65,99,99,101,112,116,58,32,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,13,10,13,10
+Case4:
+ Data.a 72,84,84,80,47,49,46,49,32,49,48,49,32,83,119,105,116,99,104,105,110,103,32,80,114,111,116,111,99,111,108,115,13,10,85,112,103,114,97,100,101,58,32,119,101,98,115,111,99,107,101,116,13,10,67,111,110,110,101,99,116,105,111,110,58,32,85,112,103,114,97,100,101,13,10,83,101,99,45,87,101,98,83,111,99,107,101,116,45,65,99,99,101,112,116,58,32,115,51,112,80,76,77,66,105,84,120,97,81,57,107,89,71,122,122,104,90,82,98,75,43,120,79,111,61,13,10,13,10,137,1,33,1,1,72,128,1,105
+Case5:
+ Data.a 72,84,84,80,47,49,46,49,32,49,48,49,32,83,119,105,116,99,104,105,110,103,32,80,114,111,116,111,99,111,108,115,13,10,85,112,103,114,97,100,101,58,32,119,101,98,115,111,99,107,101,116,13,10,67,111,110,110,101,99,116,105,111,110,58,32,85,112,103,114,97,100,101,13,10,83,101,99,45,87,101,98,83,111,99,107,101,116,45,65,99,99,101,112,116,58,32,115,51,112,80,76,77,66,105,84,120,97,81,57,107,89,71,122,122,104,90,82,98,75,43,120,79,111,61,13,10,13,10
+Case6:
+ Data.a 72,84,84,80,47,49,46,49,32,49,48,49,32,83,119,105,116,99,104,105,110,103,32,80,114,111,116,111,99,111,108,115,13,10,85,112,103,114,97,100,101,58,32,119,101,98,115,111,99,107,101,116,13,10,67,111,110,110,101,99,116,105,111,110,58,32,85,112,103,114,97,100,101,13,10,83,101,99,45,87,101,98,83,111,99,107,101,116,45,65,99,99,101,112,116,58,32,115,51,112,80,76,77,66,105,84,120,97,81,57,107,89,71,122,122,104,90,82,98,75,43,120,79,111,61,13,10,13,10
+Case7:
+ Data.a 72,84,84,80,47,49,46,49,32,49,48,49,32,83,119,105,116,99,104,105,110,103,32,80,114,111,116,111,99,111,108,115,13,10,85,112,103,114,97,100,101,58,32,119,101,98,115,111,99,107,101,116,13,10,67,111,110,110,101,99,116,105,111,110,58,32,85,112,103,114,97,100,101,13,10,83,101,99,45,87,101,98,83,111,99,107,101,116,45,65,99,99,101,112,116,58,32,115,51,112,80,76,77,66,105,84,120,97,81,57,107,89,71,122,122,104,90,82,98,75,43,120,79,111,61,13,10,13,10
+Case8:
+ Data.a 72,84,84,80,47,49,46,49,32,49,48,49,32,83,119,105,116,99,104,105,110,103,32,80,114,111,116,111,99,111,108,115,13,10,85,112,103,114,97,100,101,58,32,119,101,98,115,111,99,107,101,116,13,10,67,111,110,110,101,99,116,105,111,110,58,32,85,112,103,114,97,100,101,13,10,83,101,99,45,87,101,98,83,111,99,107,101,116,45,65,99,99,101,112,116,58,32,115,51,112,80,76,77,66,105,84,120,97,81,57,107,89,71,122,122,104,90,82,98,75,43,120,79,111,61,13,10,13,10,137,1,33,1,1,72,128,1,105,136,2,3,232
+Case9:
+ Data.a 72,84,84,80,47,49,46,49,32,49,48,49,32,83,119,105,116,99,104,105,110,103,32,80,114,111,116,111,99,111,108,115,13,10,85,112,103,114,97,100,101,58,32,119,101,98,115,111,99,107,101,116,13,10,67,111,110,110,101,99,116,105,111,110,58,32,85,112,103,114,97,100,101,13,10,83,101,99,45,87,101,98,83,111,99,107,101,116,45,65,99,99,101,112,116,58,32,115,51,112,80,76,77,66,105,84,120,97,81,57,107,89,71,122,122,104,90,82,98,75,43,120,79,111,61,13,10,13,10,137,1,33,1,1,72,128,1,105,136,2,3,232
+Case10:
+ Data.a 72,84,84,80,47,49,46,49,32,49,48,49,32,83,119,105,116,99,104,105,110,103,32,80,114,111,116,111,99,111,108,115,13,10,85,112,103,114,97,100,101,58,32,119,101,98,115,111,99,107,101,116,13,10,67,111,110,110,101,99,116,105,111,110,58,32,85,112,103,114,97,100,101,13,10,83,101,99,45,87,101,98,83,111,99,107,101,116,45,65,99,99,101,112,116,58,32,115,51,112,80,76,77,66,105,84,120,97,81,57,107,89,71,122,122,104,90,82,98,75,43,120,79,111,61,13,10,13,10,137,1,33,1,1,72,128,1,105,136,2,3,232
+Case11:
+ Data.a 72,84,84,80,47,49,46,49,32,49,48,49,32,83,119,105,116,99,104,105,110,103,32,80,114,111,116,111,99,111,108,115,13,10,85,112,103,114,97,100,101,58,32,119,101,98,115,111,99,107,101,116,13,10,67,111,110,110,101,99,116,105,111,110,58,32,85,112,103,114,97,100,101,13,10,83,101,99,45,87,101,98,83,111,99,107,101,116,45,65,99,99,101,112,116,58,32,115,51,112,80,76,77,66,105,84,120,97,81,57,107,89,71,122,122,104,90,82,98,75,43,120,79,111,61,13,10,13,10,137,1,33,1,1,72,128,1,105,136,2,3,232
+Case12:
+ Data.a 72,84,84,80,47,49,46,49,32,49,48,49,32,83,119,105,116,99,104,105,110,103,32,80,114,111,116,111,99,111,108,115,13,10,85,112,103,114,97,100,101,58,32,119,101,98,115,111,99,107,101,116,13,10,67,111,110,110,101,99,116,105,111,110,58,32,85,112,103,114,97,100,101,13,10,83,101,99,45,87,101,98,83,111,99,107,101,116,45,65,99,99,101,112,116,58,32,115,51,112,80,76,77,66,105,84,120,97,81,57,107,89,71,122,122,104,90,82,98,75,43,120,79,111,61,13,10,13,10,137,1,33,1,1,72,128,1,105,136,2,3,232
+Case13:
+ Data.a 72,84,84,80,47,49,46,49,32,49,48,49,32,83,119,105,116,99,104,105,110,103,32,80,114,111,116,111,99,111,108,115,13,10,85,112,103,114,97,100,101,58,32,119,101,98,115,111,99,107,101,116,13,10,67,111,110,110,101,99,116,105,111,110,58,32,85,112,103,114,97,100,101,13,10,83,101,99,45,87,101,98,83,111,99,107,101,116,45,65,99,99,101,112,116,58,32,115,51,112,80,76,77,66,105,84,120,97,81,57,107,89,71,122,122,104,90,82,98,75,43,120,79,111,61,13,10,13,10,137,1,33,1,1,72,128,1,105,136,2,3,232
+Case14:
+ Data.a 72,84,84,80,47,49,46,49,32,49,48,49,32,83,119,105,116,99,104,105,110,103,32,80,114,111,116,111,99,111,108,115,13,10,85,112,103,114,97,100,101,58,32,119,101,98,115,111,99,107,101,116,13,10,67,111,110,110,101,99,116,105,111,110,58,32,85,112,103,114,97,100,101,13,10,83,101,99,45,87,101,98,83,111,99,107,101,116,45,65,99,99,101,112,116,58,32,115,51,112,80,76,77,66,105,84,120,97,81,57,107,89,71,122,122,104,90,82,98,75,43,120,79,111,61,13,10,13,10,137,1,33,1,1,72,128,1,105,136,2,3,232
+Case15:
+ Data.a 72,84,84,80,47,49,46,49,32,49,48,49,32,83,119,105,116,99,104,105,110,103,32,80,114,111,116,111,99,111,108,115,13,10,85,112,103,114,97,100,101,58,32,119,101,98,115,111,99,107,101,116,13,10,67,111,110,110,101,99,116,105,111,110,58,32,85,112,103,114,97,100,101,13,10,83,101,99,45,87,101,98,83,111,99,107,101,116,45,65,99,99,101,112,116,58,32,115,51,112,80,76,77,66,105,84,120,97,81,57,107,89,71,122,122,104,90,82,98,75,43,120,79,111,61,13,10,13,10,136,2,3,232
+EndDataSection

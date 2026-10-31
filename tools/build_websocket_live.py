@@ -10,7 +10,7 @@ def build(compiler,out):
     root=Path(__file__).resolve().parents[1];out.mkdir(parents=True,exist_ok=False)
     names=['Anvil/Network/web_url.pbi','Anvil/Network/web_request.pbi','Anvil/Network/web_response.pbi','Anvil/Network/websocket_frame.pbi','Anvil/Network/websocket_handshake.pbi','Anvil/Crypto/sha1.pbi','Anvil/Network/web_transport.pbi','Anvil/Network/web_client.pbi','Anvil/Network/websocket_client.pbi','RaspberryPi4/Lib/mmu.pi4','Anvil/Network/web_random.pbi']
     cases=['secure-resident-echo']
-    s='#WEB_KERNEL_BINDING=0\n'+'\n'.join(x for n in names for x in (root/n).read_text(encoding='utf8').splitlines() if not x.startswith(('XIncludeFile','#WEB_KERNEL_BINDING=')))+r'''
+    s='#WEB_KERNEL_BINDING=0\n'+'\n'.join('XIncludeFile "'+n+'"' for n in names)+r'''
 Global u.WebUrl,q.WebRequest,a.WebResponse,h.WebClient,f.WebSocketFrame,ws.WebSocketClient
 Global Dim host.a[256]
 Global Dim target.a[3072]
@@ -27,7 +27,15 @@ Global Dim output.a[4]
 Global Dim nonce.a[16]
 Global Dim closeCode.a[2]
 Global randomBytesUsed.i,wtable.i
-Global *wirePet,*wireTime
+Global *wirePet,*wireTime,*residentDrain
+Global drainCalls.i,drainPending.i,drainMax.i,serviceMax.i
+Procedure.i MeasuredDrain(handle.i)
+ Define began.i,rc.i,cost.i
+ began=wireTime() : rc=residentDrain(handle) : cost=wireTime()-began
+ drainCalls=drainCalls+1 : If rc=0 : drainPending=drainPending+1 : EndIf
+ If cost>drainMax : drainMax=cost : EndIf
+ ProcedureReturn rc
+EndProcedure
 Procedure CaptureTable()
  ASM
  adrp x1, global_wtable
@@ -43,6 +51,7 @@ Procedure.i Main()
  rc=WebPayloadBind(wtable) : PokeI($E1C00008,rc)
  If rc<>0 : ProcedureReturn 1 : EndIf
  *wirePet=PeekI(wtable+16+6*8) : *wireTime=PeekI(wtable+16+11*8)
+ *residentDrain=PeekI(wtable+16+92*8) : *webpTlsDrain=@MeasuredDrain
  MmuClearNc() : MmuAddNc($08A00000,$09200000) : MmuAddNc($08100000,$08180000)
  rc=MmuBuildTables($4F80000) : If rc<>0 : ProcedureReturn 2 : EndIf
  MmuEnableCached()
@@ -67,7 +76,9 @@ Procedure.i Main()
  If rc=0 : rc=WebClientStart(@h,@u,@q,@a,@tx[0],512,@rx[0],512,start,10000) : EndIf
  If rc=0 : rc=WebSocketClientBind(@ws,@h,@f,@accept[0],0,0,webRandomBytesFn,@scratch[0]) : EndIf
  While rc>=0 And rc<>2
-  wirePet() : WebPayloadService(1) : now=wireTime()/1000
+  wirePet() : began=wireTime() : WebPayloadService(1) : cost=wireTime()-began
+  If cost>serviceMax : serviceMax=cost : EndIf
+  now=wireTime()/1000
   began=wireTime() : rc=WebSocketClientStep(@ws,@output[0],3,now)
   cost=wireTime()-began : If cost>maxCost : maxCost=cost : EndIf
   For i=0 To ws\written-1
@@ -87,6 +98,8 @@ Procedure.i Main()
  PokeI($E1C00040,maxCost) : PokeI($E1C00048,randomBytesUsed) : PokeI($E1C00050,u\secure)
  PokeI($E1C00058,f\controlLength)
  For i=0 To f\controlLength-1 : PokeA($E1C00600+i,ctrl[i]) : Next
+ PokeI($E1C00078,drainCalls) : PokeI($E1C00080,drainPending)
+ PokeI($E1C00088,drainMax) : PokeI($E1C00090,serviceMax)
  If rc<>2 : WebSocketClientAbort(@ws) : EndIf
  MmuDisableCachedFlushed() : ProcedureReturn 0
 EndProcedure
@@ -95,6 +108,12 @@ EndProcedure
     q=subprocess.run([str(resolve_compiler(compiler)),'--compile',str(source),'-t','pi4','--load-addr','0x1000000','--stack-addr','0x4f00000','--entry-returns','--wants-services','-o',str(out/'proof.img')],env=dict(os.environ,PMF_ROOT=str(root)),capture_output=True,text=True,encoding='utf8',timeout=180,creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
     log=q.stdout+q.stderr;(out/'compile.txt').write_text(log,encoding='utf8');print(log[-1800:]);assert q.returncode==0
     code=re.search(r'occupying \$([0-9A-Fa-f]+)\.\.\$([0-9A-Fa-f]+)',log);bss=re.search(r'bss \$([0-9A-Fa-f]+)\.\.\$([0-9A-Fa-f]+)',log)
+    pending_names=list(names)
+    while pending_names:
+        name=pending_names.pop()
+        for dep in re.findall(r'^\s*XIncludeFile\s+"([^"]+)"',(root/name).read_text(encoding='utf8'),re.M):
+            if dep not in names:
+                names.append(dep);pending_names.append(dep)
     payload=(out/'proof.img.pmf').read_bytes();ranges={'code':['0x'+x for x in code.groups()],'bss':['0x'+x for x in bss.groups()],'stack':['0x4e00000','0x4efffff'],'report':['0xe1c00000','0xe1c03fff'],'tables':['0x4f80000','0x4f82fff']}
     (out/'identity.json').write_text(json.dumps(dict(bytes=len(payload),sha256=hashlib.sha256(payload).hexdigest(),checked_ranges=ranges,source_hashes={n:hashlib.sha256((root/n).read_bytes()).hexdigest() for n in names},cases=cases),indent=2),encoding='utf8')
 if __name__=='__main__':

@@ -33,8 +33,13 @@ Procedure.i wscFail(*s.WebSocketClient,code.i)
 EndProcedure
 
 Procedure.i wscClosed(*s.WebSocketClient)
-  Define *h.WebClient
-  *h=*s\http : WebClientClose(*h) : *s\state=3 : ProcedureReturn 2
+  Define *h.WebClient,rc.i
+  *h=*s\http
+  ; Send acceptance can leave plaintext or protected records queued in TLS.
+  rc=WebTransportDrain(@*h\connection)
+  If rc<0 : ProcedureReturn wscFail(*s,rc) : EndIf
+  If rc=0 : ProcedureReturn 0 : EndIf
+  WebClientClose(*h) : *s\state=3 : ProcedureReturn 2
 EndProcedure
 
 ; Bind AFTER WebClientStart with a finalized WebSocket request and a response
@@ -127,11 +132,14 @@ Procedure.i WebSocketClientStep(*s.WebSocketClient,output.i,capacity.i,now.i)
     *s\state=1 : ProcedureReturn 0
   EndIf
   If *s\state=2 And ((now-*s\closeStarted) & $FFFFFFFF)>=2000 : ProcedureReturn wscFail(*s,#WEB_CLIENT_TIMEOUT) : EndIf
+  ; Once both Close frames are accepted, only drain: no more reads or echoes.
+  If *s\closeSent And *s\closeReceived And *s\txOffset=*s\txLength : ProcedureReturn wscClosed(*s) : EndIf
   st=WebTransportState(@*h\connection)
   If st<0 : ProcedureReturn wscFail(*s,st) : EndIf
   If st=0 : ProcedureReturn 0 : EndIf
   If st<>1 And st<>2 : ProcedureReturn wscFail(*s,#WEB_CLIENT_TRANSPORT) : EndIf
-  If st=2 And *s\closeReceived : ProcedureReturn wscClosed(*s) : EndIf
+  ; Peer EOF does not prove our reply was sent. TCP half-close permits sending;
+  ; a closed TLS transport must fail or reach the existing close deadline.
   If *s\txOffset<*s\txLength
     rc=WebTransportSend(@*h\connection,*h\tx+*s\txOffset,*s\txLength-*s\txOffset)
     If rc<0 : ProcedureReturn wscFail(*s,rc) : EndIf
@@ -144,6 +152,7 @@ Procedure.i WebSocketClientStep(*s.WebSocketClient,output.i,capacity.i,now.i)
   If *f\state=3 Or *f\state=4
     rc=wscFrameEvent(*s,now)
     If rc<>0 Or *s\txOffset<*s\txLength : ProcedureReturn rc : EndIf
+    If *s\closeSent And *s\closeReceived : ProcedureReturn rc : EndIf
   EndIf
   If *h\rxOffset=*h\rxLength
     *h\rxOffset=0 : *h\rxLength=0

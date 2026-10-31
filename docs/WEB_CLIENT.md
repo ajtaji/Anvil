@@ -3371,3 +3371,35 @@ Evidence: `docs/evidence/anvil-ipv6-20261030/http2-error-drain485`.
 Broader TLS compatibility/blocking, public off-link IPv6 and automatically learned
 RDNSS web qualification, and HTTP/3 remain open. This is not a complete networking
 or HTTP/2 conformance claim.
+
+### WebSocket close output ownership (2026-10-30)
+
+WebSocket clean close now requires both Close frames and transport output drain.
+TLS send acceptance alone does not prove that queued plaintext reached TCP.
+`WebSocketClientStep` returns progress while draining, stops receiving or echoing
+more frames in that state, and keeps the existing two-second close deadline.
+Transport drain errors, including unavailable ABI support, are returned instead
+of a false clean close. Explicit Abort remains immediate. A peer TCP half-close
+does not skip sending the local Close reply.
+
+The shared implementation uses the ABI 1.14 drain service already installed in
+Anvil 485. No monitor replacement was required. The CPU fixture now composes the
+current HTTP and transport owners instead of an obsolete transport replacement.
+Physical Pi 4 capture 218 reproduced discarded TLS output and the missing reply;
+capture 219 passed all 16 final cases. These cover delayed and failing drain,
+partial writes, missing service, timeout, cancellation, local and peer close,
+TCP half-close, TLS closure before reply, and repeated terminal calls. Independent
+frame decoding checks masked client output. Delayed-output tests use controlled
+transport callbacks, not an external server or independent cryptography test.
+
+Live capture 220 used resident randomness and certificate-verified TLS to
+`wss://httpbingo.org/websocket/echo`, echoed all 15 bytes and completed normal
+close. Elapsed time was 690 ms; maximum observed Step was 2038 us, network
+service 1860 us and drain 33 us. The live queue was ready on its first drain
+check; controlled tests establish pending behavior. These timings are observations,
+not worst-case guarantees. Cores, fonts and Vulkan remained healthy, watchdog off.
+The same shared fixture compiled for Pi 3; it was not run on a physical Pi 3.
+
+Evidence: `docs/evidence/anvil-ipv6-20261030/websocket-drain485`.
+Remaining TLS blocking/compatibility, public off-link IPv6/RDNSS qualification,
+and HTTP/3 are still open.
