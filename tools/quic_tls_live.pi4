@@ -18,6 +18,7 @@ Global peerBytes.i,hsReady.i,paramsReady.i,initialDiscarded.i
 Global received.i,sent.i,ackEvents.i,appAuthenticated.i,stage.i
 Global lastPump.i,maxPumpGap.i,maxTlsStep.i,maxSendStep.i,sendSteps.i
 Global sendFault.i,sendProbes.i,packetCancelChecked.i
+Global ackFault.i,ackChecks.i,ackSteps.i,maxAckStep.i
 Global deadlineOp.QuicTlsOperation,outputOp.QuicTlsOperation,inputOp.QuicTlsOperation
 Global probeTx.QuicCryptoTx,probeRx.QuicCryptoRx,probeOut.QuicTlsOutput
 Global operationFault.i,operationProbes.i,extraContextChecks.i
@@ -147,22 +148,28 @@ Procedure.i SendSpace(*s.QuicConnectionSpace)
  ProcedureReturn 0
 EndProcedure
 Procedure.i HandleAck(*s.QuicConnectionSpace)
- Define rc.i,p.i,n.i
- rc=QuicHandshakeSentAckBegin(@connection\ackJob,@*s\history,*s\level,@connection\receive\process\frame)
+ Define rc.i,n.i,phase.i,t.i,cost.i,authenticated.i
+ phase=connection\acknowledge\phase
+ authenticated=connection\receive\authenticated : connection\receive\authenticated=0
+ rc=QuicConnectionAckBegin(@connection)
+ If rc<>#QUIC_CONNECTION_ACK_STATE Or connection\acknowledge\phase<>phase Or *s\history\busy<>0 : ackFault=1 : EndIf
+ connection\receive\authenticated=authenticated
+ If authenticated<>1 : ackFault=7 : EndIf
+ rc=QuicConnectionAckBegin(@connection)
  If rc<>0 : ProcedureReturn rc : EndIf
+ If QuicConnectionAckBegin(@connection)<>#QUIC_CONNECTION_ACK_STATE : ackFault=2 : EndIf
+ If QuicConnectionSendBegin(@connection,*s\level,peerBytes)<>#QUIC_SENT_BUSY : ackFault=3 : EndIf
  Repeat
-  rc=Pump() : If rc<0 : ProcedureReturn rc : EndIf
-  rc=QuicHandshakeSentAckStep(@connection\ackJob)
-  If rc=1
-   ackEvents=ackEvents+1 : n=PeekI(connection\ackJob\cookie+8)
-   If n>0
-    p=QuicCryptoTxAck(@*s\tx,PeekI(connection\ackJob\cookie),n) : If p<>0 : ProcedureReturn p : EndIf
-    p=QuicCryptoTxReclaim(@*s\tx,4096) : If p<0 : ProcedureReturn p : EndIf
-   EndIf
-  EndIf
- Until rc<>0 And rc<>1
- If rc<>2 : ProcedureReturn rc : EndIf
- ProcedureReturn QuicHandshakeReceiveAccept(@connection\receive)
+  n=Pump() : If n<0 : ProcedureReturn n : EndIf
+  t=clock() : rc=QuicConnectionAckStep(@connection) : cost=clock()-t
+  ackSteps=ackSteps+1 : If cost>maxAckStep : maxAckStep=cost : EndIf
+  If rc=0 And connection\receive\process\phase<>2 : ackFault=4 : EndIf
+ Until rc<>0
+ If rc<>1 : ProcedureReturn rc : EndIf
+ If connection\receive\process\phase<>1 Or *s\history\busy<>0 : ackFault=5 : EndIf
+ If QuicConnectionAckStep(@connection)<>1 Or QuicConnectionAckBegin(@connection)<>#QUIC_CONNECTION_ACK_STATE : ackFault=6 : EndIf
+ ackEvents=ackEvents+connection\acknowledge\events : ackChecks=ackChecks+1
+ ProcedureReturn 0
 EndProcedure
 Procedure.i FeedTls(*s.QuicConnectionSpace)
  Define rc.i,p.i,stepStarted.i,stepCost.i
@@ -609,6 +616,8 @@ Procedure.i Main()
  PokeI($E1C00198,connection\phase) : PokeI($E1C001A0,bufferWiped) : PokeI($E1C001A8,closeFault) : PokeI($E1C001B0,storageRefused)
  PokeI($E1C000B0,maxCloseStep) : PokeI($E1C000B8,closeCalls)
  PokeI($E1C000C0,maxSendStep) : PokeI($E1C000C8,sendSteps)
+ PokeI($E1C000D0,maxAckStep) : PokeI($E1C000D8,ackSteps)
+ PokeI($E1C001E0,ackFault) : PokeI($E1C001E8,Bool(ackChecks>0))
  CheckConnectionLifecycle()
  PokeI($E1C001B8,lifecycleFault) : PokeI($E1C001C0,lifecycleProbes)
  CheckPacketCancellation()

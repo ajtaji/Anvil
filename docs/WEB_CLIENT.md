@@ -4694,3 +4694,54 @@ watchdog off. This is the outgoing half of a reusable handshake client;
 receive/ACK/TLS dispatch still lives in the fixture. Application frames and
 HANDSHAKE_DONE, recovery, congestion/flow control, streams/QPACK and actual
 HTTP/3 requests remain, along with the previously recorded IPv6 and TLS gaps.
+
+
+### Bounded connection ACK application
+
+`Anvil/Core/quic_connection_ack.pbi` now owns application of a pending
+Initial/Handshake ACK event to the connection's sent history and CRYPTO
+stream. Admission requires the receive owner's authentication flag, a pending
+ACK event and matching packet space/stream owners. Initial packet protection
+is not certificate identity; TLS still validates the peer. Pending output
+must finish before ACK admission, and sender admission refuses an active ACK
+job, preserving history ordering without overlapping ledger writers.
+
+Step returns after one existing ledger validation/event step, marking at most
+256 stream bytes, or reclaiming at most 256 bytes. The existing ledger first
+validates the entire wire ACK before applying packet events. Each event's
+metadata cookie must point to that packet's exact slot in the connection's
+owned metadata array before it is dereferenced. Stream offsets and lengths
+are checked, and the receive parser advances only after every history and
+stream operation completes. Failure begins terminal connection closure;
+already applied effects are not rolled back. Existing close ownership cancels
+the underlying ACK lock and invalidates the connection's streams. No I/O,
+crypto execution or waiting occurs inside this module.
+
+The live fixture uses the shared ACK driver, yielding to network service
+between its steps. Capture 293 on Anvil 488 passed 30 checks and the peer
+independently verified client Finished and h3. Admission without the existing
+authentication flag was refused without changing driver/history state, then
+the original flag was restored. Repeated Begin and a competing send were
+refused. The receive event remained pending throughout ACK application; on
+completion its parser advanced, the history lock was released, repeated Step
+was idempotent and readmission without another pending event was refused.
+
+The live ACK used six dispatcher steps, with a 39 us maximum. The exchange
+and first close took 1.409771 seconds; maximum sender Step was 1.242 ms, TLS
+operation Step 1.761 ms, foreground service gap 1.948 ms and service call
+243 us. There were 258 TLS worker calls and 264 complete context checks.
+These are observations, not hard timing or throughput guarantees. Existing
+deadline, cancellation, state preservation, output ownership and close checks
+remained enabled. The corrupted-certificate run also retained these checks
+while refusing the signature; the peer did not complete TLS.
+
+The shared fixture compiled for BCM2837 with its real timer/RNG adapter;
+it was not executed on Pi 3. Exact source, raw reports, peer results, payloads,
+identities and qualification records are retained in
+`docs/evidence/anvil-ipv6-20261030/quic-connection-ack488`. Both physical runs
+returned with healthy cores, fonts and Vulkan and watchdog off. Installed
+Anvil remains 488; no resident image/API changed and candidate 491 remains
+uninstalled. Packet decryption/framing and TLS receive dispatch still live in
+the fixture. Application frames/HANDSHAKE_DONE, recovery, congestion/flow,
+streams/QPACK and real HTTP/3 requests remain, together with the earlier IPv6
+and TLS compatibility/device-blocking work.

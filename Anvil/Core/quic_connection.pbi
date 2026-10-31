@@ -39,6 +39,14 @@ Structure QuicConnectionSend
  cryptoResult.i
  worker.TlsWorkerJob
 EndStructure
+Structure QuicConnectionAck
+ phase.i ; 0 fresh,1 ledger,2 mark bytes,3 reclaim,4 accept,5 done,-1 failed
+ result.i
+ level.i
+ offset.i
+ remaining.i
+ events.i
+EndStructure
 Structure QuicConnection
  phase.i ; 0 fresh,1 active,2 closing,3 closed
  result.i
@@ -64,6 +72,7 @@ Structure QuicConnection
  tlsOp.QuicTlsOperation
  outgoing.QuicConnectionSend
  initialRetired.i
+ acknowledge.QuicConnectionAck
 EndStructure
 ; Span table order: RX data/bits,TX data/bits,ACK ranges,sent slots/metadata,
 ; TLS snapshot,handshake/receive/output/config,local/peer parameters/entries,
