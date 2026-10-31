@@ -120,6 +120,9 @@ Structure QuicConnection
  applicationHistory.QuicHandshakeSent
  applicationAck.QuicHandshakeSentAck
  applicationSent.i[512]
+ recoveryRtt.QuicRtt
+ recoveryTimer.QuicProbeTimer
+ recoveryLoss.QuicHandshakeSentLoss
 EndStructure
 ; Span table order: RX data/bits,TX data/bits,ACK ranges,sent slots/metadata,
 ; TLS snapshot,handshake/receive/output/config,local/peer parameters/entries,
@@ -192,15 +195,50 @@ Procedure.i QuicConnectionBegin(*c.QuicConnection,spans.i,socket.i,now.i,timeout
  If rc=0 : rc=qconn_Space(*c,@*c\handshake,2,1) : EndIf
  If rc=0 : rc=QuicApplicationStateInit(@*c\applicationState) : EndIf
  If rc=0 : rc=QuicHandshakeSentInit(@*c\applicationHistory,4,@*c\applicationSent,128) : EndIf
+ If rc=0 : rc=QuicRttInit(@*c\recoveryRtt,333000,1000) : EndIf
+ If rc=0 : rc=QuicProbeTimerInit(@*c\recoveryTimer) : EndIf
  If rc<>0 : *c\phase=2 : *c\result=rc : ProcedureReturn rc : EndIf
  *c\socket=socket
  ProcedureReturn 0
 EndProcedure
+; Connection-owned recovery operations. Caller still supplies scheduling policy
+; and consumes each loss event before Step. Recovery cannot run during close.
+Procedure.i QuicConnectionRecoveryPoll(*c.QuicConnection,now.i)
+ If qconn_Span(*c,SizeOf(QuicConnection))=0 : ProcedureReturn #QUIC_CONNECTION_ARGUMENT : EndIf
+ If *c\phase<>1 : ProcedureReturn #QUIC_CONNECTION_STATE : EndIf
+ ProcedureReturn QuicProbeTimerPoll(@*c\recoveryTimer,now)
+EndProcedure
+Procedure.i qconn_LossOwned(*c.QuicConnection)
+ ProcedureReturn Bool(*c\recoveryLoss\owner=@*c\initial\history Or *c\recoveryLoss\owner=@*c\handshake\history Or *c\recoveryLoss\owner=@*c\applicationHistory)
+EndProcedure
+Procedure.i QuicConnectionLossBegin(*c.QuicConnection,level.i,now.i,delay.i,threshold.i)
+ Define history.i
+ If qconn_Span(*c,SizeOf(QuicConnection))=0 : ProcedureReturn #QUIC_CONNECTION_ARGUMENT : EndIf
+ If *c\phase<>1 : ProcedureReturn #QUIC_CONNECTION_STATE : EndIf
+ If *c\controlPhase>=1 And *c\controlPhase<=3 : ProcedureReturn #QUIC_CONNECTION_STATE : EndIf
+ If *c\outgoing\phase<>0 And *c\outgoing\phase<>6 : ProcedureReturn #QUIC_CONNECTION_STATE : EndIf
+ Select level
+  Case 0 : history=@*c\initial\history
+  Case 2 : history=@*c\handshake\history
+  Case 4 : history=@*c\applicationHistory
+  Default : ProcedureReturn #QUIC_CONNECTION_ARGUMENT
+ EndSelect
+ ProcedureReturn QuicHandshakeSentLossBegin(@*c\recoveryLoss,history,now,delay,threshold)
+EndProcedure
+Procedure.i QuicConnectionLossStep(*c.QuicConnection)
+ If qconn_Span(*c,SizeOf(QuicConnection))=0 : ProcedureReturn #QUIC_CONNECTION_ARGUMENT : EndIf
+ If *c\phase<>1 Or qconn_LossOwned(*c)=0 : ProcedureReturn #QUIC_CONNECTION_STATE : EndIf
+ ProcedureReturn QuicHandshakeSentLossStep(@*c\recoveryLoss)
+EndProcedure
 Procedure.i QuicConnectionClose(*c.QuicConnection,reason.i)
+ Define rc.i
  If qconn_Span(*c,SizeOf(QuicConnection))=0 : ProcedureReturn #QUIC_CONNECTION_ARGUMENT : EndIf
  If *c\phase=3 : ProcedureReturn 1 : EndIf
  If *c\phase=2 : ProcedureReturn 0 : EndIf
  If *c\phase<>1 : ProcedureReturn #QUIC_CONNECTION_STATE : EndIf
+ If *c\recoveryTimer\phase=1
+  rc=QuicProbeTimerDiscard(@*c\recoveryTimer) : If rc<>0 : ProcedureReturn rc : EndIf
+ EndIf
  *c\phase=2 : *c\result=reason : *c\closeStage=0
  ProcedureReturn 0
 EndProcedure
@@ -310,6 +348,11 @@ Procedure.i QuicConnectionCloseStep(*c.QuicConnection)
  ; cleanup instead of allowing a packet cancellation to reset its GCM job.
  If TlsWorkerBusy()<>0 And TlsWorkerOwns(@*c\tlsOp\context\worker)=0 And TlsWorkerOwns(@*c\outgoing\worker)=0 And TlsWorkerOwns(@*c\incoming\worker)=0 And TlsWorkerOwns(@*c\application\worker)=0 : ProcedureReturn #TLSWORK_BUSY : EndIf
  If *c\closeStage=0
+  If *c\recoveryLoss\phase=1
+   If qconn_LossOwned(*c)=0 : ProcedureReturn #QUIC_CONNECTION_STATE : EndIf
+   rc=QuicHandshakeSentLossCancel(@*c\recoveryLoss)
+   If rc<>#QUIC_SENT_CANCELLED : ProcedureReturn rc : EndIf
+  EndIf
   If *c\applicationAck\phase=1 Or *c\applicationAck\phase=2
    rc=QuicHandshakeSentAckCancel(@*c\applicationAck)
    If rc<>#QUIC_SENT_CANCELLED : ProcedureReturn rc : EndIf
