@@ -131,11 +131,62 @@ def build(compiler,out):
  check('bad prune budget','QuicHandshakeSentPrune(@s,65)',-3461)
  reserve();reserve();commit(len(slots)-1);ack({len(slots)-1});prune()
  ack({len(slots)-2,len(slots)-1});prune()
+
+ def loss_scan(now,delay=1000,threshold=3,stop_after=0):
+  acked=[n for n,x in enumerate(slots) if x[0]&16]
+  newest=max(acked,default=-1);victims=[];deadlines=[]
+  for n,x in enumerate(slots):
+   sent,flight,done,lost=bool(x[0]&2),bool(x[0]&8),bool(x[0]&16),bool(x[0]&32)
+   if n>=first and n<newest and sent and flight and not done and not lost:
+    if newest-n>=threshold or now-x[2]>=delay:victims.append(n)
+    else:deadlines.append(min((1<<63)-1,x[2]+delay))
+  if stop_after:victims=victims[:stop_after]
+  rows=[(n,*slots[n][1:],slots[n][0],slots[n][1]) for n in victims]
+  # rows are PN,bytes,time,cookie,previous flags,removed flight bytes.
+  digest=fnv(b''.join(struct.pack('<6q',*row) for row in rows))
+  values=[len(rows),sum(r[1] for r in rows),sum(r[5] for r in rows),sum(r[3] for r in rows),sum(r[2] for r in rows),digest]
+  check('begin loss scan',f'QuicHandshakeSentLossBegin(@lossJob,@s,{now},{delay},{threshold})',0)
+  code(f'rc=RunLoss({stop_after})');check('loss terminal','rc',1 if stop_after and rows else 2)
+  for f,v in zip(['events','byteSum','flightSum','cookieSum','timeSum','eventHash'],values):check('loss events '+f,f,v)
+  for n in victims:slots[n][0]=(slots[n][0]|32)&~8
+  if stop_after and rows:
+   check('cancel loss after event','QuicHandshakeSentLossCancel(@lossJob)',-3467)
+   check('cancel loss terminal','QuicHandshakeSentLossStep(@lossJob)',-3467)
+  else:
+   check('loss next deadline','lossJob\\nextTime',min(deadlines,default=0))
+   check('loss terminal repeat','QuicHandshakeSentLossStep(@lossJob)',2)
+  check('loss unlocked','s\\busy',0);observe('loss ledger')
+ init(8,4)
+ for _ in range(6):reserve();commit(len(slots)-1)
+ loss_scan(500);ack({3});loss_scan(500);prune();loss_scan(1100);loss_scan(1101);loss_scan(1102);loss_scan(20000)
+ ack({0});loss_scan(20000);ack({5});loss_scan(20000);ack(set(range(6)));prune()
+ init(8,2)
+ reserve();commit(0,eliciting=0);reserve();commit(1,500,eliciting=0,padded=1);reserve();reserve();commit(3)
+ ack({3});loss_scan(500);loss_scan(1101);ack({2},error=-3465)
+ init(128,0)
+ for _ in range(128):reserve();commit(len(slots)-1)
+ loss_scan(227);ack({127})
+ check('begin bounded loss','QuicHandshakeSentLossBegin(@lossJob,@s,227,1000,1000)',0)
+ check('bounded loss step','QuicHandshakeSentLossStep(@lossJob)',0)
+ check('bounded loss cursor','lossJob\\cursor',64)
+ check('loss busy reserve','QuicHandshakeSentReserve(@s)',-3464)
+ check('loss busy prune','QuicHandshakeSentPrune(@s,64)',-3464)
+ check('loss busy discard','QuicHandshakeSentDiscard(@s)',-3464)
+ check('loss busy ACK','QuicHandshakeSentAckBegin(@other,@s,0,@frame)',-3464)
+ check('loss cancel no events','QuicHandshakeSentLossCancel(@lossJob)',-3467);observe('loss cancellation unchanged')
+ loss_scan(227,stop_after=1);loss_scan(227);ack(set(range(128)));prune();prune()
+ for args in ['-1,1000,3','0,1000,3','227,0,3','227,1000,2']:
+  check('invalid loss admission',f'QuicHandshakeSentLossBegin(@lossJob,@s,{args})',-3461)
+ check('loss owner alias','QuicHandshakeSentLossBegin(@s,@s,227,1000,3)',-3461)
+ init(4,4)
+ reserve();commit(0,time=(1<<63)-11);reserve();commit(1,time=(1<<63)-10);ack({1})
+ loss_scan((1<<63)-10,100)
  assert 256+len(cases)*8<=65536
  source=out/'proof.pi4'
  source.write_text(r'''XIncludeFile "RaspberryPi4/Lib/mmu.pi4"
 XIncludeFile "Anvil/Network/quic_handshake_sent.pbi"
 Global s.QuicHandshakeSent,job.QuicHandshakeSentAck,other.QuicHandshakeSentAck,frame.QuicHandshakeFrame
+Global lossJob.QuicHandshakeSentLoss
 Global Dim storage.a[131104]
 Global Dim wire.a[1100]
 Global events.i,byteSum.i,flightSum.i,cookieSum.i,timeSum.i,eventHash.i
@@ -155,6 +206,25 @@ Procedure.i RunAck(stopAfter.i)
    cookieSum=cookieSum+job\cookie : timeSum=timeSum+job\sentAt
    For i=0 To 5
     v=PeekI(@job\number+i*8)
+    For k=0 To 7 : eventHash=((eventHash ! ((v>>(k*8))&255))*16777619)&$FFFFFFFF : Next
+   Next
+   If stopAfter<>0 And events=stopAfter : ProcedureReturn rc : EndIf
+  ElseIf rc<>0
+   ProcedureReturn rc
+  EndIf
+ Next
+ ProcedureReturn -9999
+EndProcedure
+Procedure.i RunLoss(stopAfter.i)
+ Define rc.i,n.i,i.i,v.i,k.i
+ events=0 : byteSum=0 : flightSum=0 : cookieSum=0 : timeSum=0 : eventHash=2166136261
+ For n=0 To 19999
+  rc=QuicHandshakeSentLossStep(@lossJob)
+  If rc=1
+   events=events+1 : byteSum=byteSum+lossJob\packetBytes : flightSum=flightSum+lossJob\inFlightBytes
+   cookieSum=cookieSum+lossJob\cookie : timeSum=timeSum+lossJob\sentAt
+   For i=0 To 5
+    v=PeekI(@lossJob\number+i*8)
     For k=0 To 7 : eventHash=((eventHash ! ((v>>(k*8))&255))*16777619)&$FFFFFFFF : Next
    Next
    If stopAfter<>0 And events=stopAfter : ProcedureReturn rc : EndIf

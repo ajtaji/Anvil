@@ -1,5 +1,5 @@
 ; SPDX-License-Identifier: MIT
-; Independent RFC 9000 sections12.3/13.1/19.3, RFC 9002 sections4.1/6.4.
+; Independent RFC 9000 sections12.3/13.1/19.3, RFC 9002 sections4.1/6.1/6.4.
 ; Bounded Initial/Handshake/Application sent history; legacy API names retained.
 ; Caller owns transport, keys and recovery. ACKed prefixes may be reclaimed;
 ; packet numbers never restart and unsent gaps are never forgotten.
@@ -236,4 +236,82 @@ Procedure.i QuicHandshakeSentAckCancel(*j.QuicHandshakeSentAck)
  If quics_Span(*j,SizeOf(QuicHandshakeSentAck))=0 : ProcedureReturn #QUIC_SENT_ARGUMENT : EndIf
  If *j\phase<>1 And *j\phase<>2 : ProcedureReturn #QUIC_SENT_STATE : EndIf
  ProcedureReturn quics_End(*j,#QUIC_SENT_CANCELLED)
+EndProcedure
+
+; Cooperative acknowledgment-based loss scan. Timing/RTT policy and timers are
+; supplied by the caller. Loss never erases metadata or permits PN reuse.
+Structure QuicHandshakeSentLoss
+ phase.i
+ result.i
+ owner.i
+ cursor.i
+ now.i
+ delay.i
+ threshold.i
+ nextTime.i
+ number.i
+ packetBytes.i
+ sentAt.i
+ cookie.i
+ flags.i
+ inFlightBytes.i
+EndStructure
+; A completed, authenticated ACK has already updated largestAcked. now and
+; delay use the same monotonic unit as Commit. Supply the path's computed loss
+; delay (RTT/reordering/granularity); this API does not estimate it or run PTO.
+Procedure.i QuicHandshakeSentLossBegin(*j.QuicHandshakeSentLoss,*s.QuicHandshakeSent,now.i,delay.i,threshold.i)
+ Define rc.i,i.i
+ rc=quics_Ready(*s) : If rc<0 : ProcedureReturn rc : EndIf
+ If quics_Span(*j,SizeOf(QuicHandshakeSentLoss))=0 Or now<0 Or now<*s\lastTime Or delay<1 Or threshold<3 Or threshold>#QUIC_INTEGER_MAX : ProcedureReturn #QUIC_SENT_ARGUMENT : EndIf
+ If *s\busy<>0 : ProcedureReturn #QUIC_SENT_BUSY : EndIf
+ If quics_Overlap(*j,SizeOf(QuicHandshakeSentLoss),*s,SizeOf(QuicHandshakeSent)) Or quics_Overlap(*j,SizeOf(QuicHandshakeSentLoss),*s\entries,*s\capacity*32) : ProcedureReturn #QUIC_SENT_ARGUMENT : EndIf
+ If *j\phase=1 : ProcedureReturn #QUIC_SENT_BUSY : EndIf
+ For i=0 To SizeOf(QuicHandshakeSentLoss)-1 : PokeA(*j+i,0) : Next
+ *j\phase=1 : *j\owner=*s : *j\cursor=*s\first
+ *j\now=now : *j\delay=delay : *j\threshold=threshold
+ *s\busy=*j : ProcedureReturn 0
+EndProcedure
+; 0 more,1 newly lost packet event,2 done. Consume each event before Step.
+; At most64 slots visited per call; nextTime is valid only at DONE,0 if none.
+; Already lost/ACKed/unsent/non-flight packets are not reported again. A newer
+; unACKed tail requires PTO/probing, not acknowledgment-based declaration.
+Procedure.i QuicHandshakeSentLossStep(*j.QuicHandshakeSentLoss)
+ Define *s.QuicHandshakeSent,rc.i,i.i,p.i,flags.i,number.i,sent.i,due.i
+ If quics_Span(*j,SizeOf(QuicHandshakeSentLoss))=0 : ProcedureReturn #QUIC_SENT_ARGUMENT : EndIf
+ If *j\phase=2 : ProcedureReturn 2 : EndIf
+ If *j\phase=-1 : ProcedureReturn *j\result : EndIf
+ If *j\phase<>1 : ProcedureReturn #QUIC_SENT_STATE : EndIf
+ *s=*j\owner : rc=quics_Ready(*s) : If rc<0 : ProcedureReturn rc : EndIf
+ If *s\busy<>*j : ProcedureReturn #QUIC_SENT_STATE : EndIf
+ For i=0 To 63
+  If *j\cursor>=*s\issued Or *j\cursor>=*s\largestAcked
+   *j\phase=2 : *s\busy=0 : ProcedureReturn 2
+  EndIf
+  number=*j\cursor : *j\cursor=number+1
+  p=*s\entries+(number % *s\capacity)*32 : flags=PeekI(p)
+  If (flags&58)=10
+   sent=PeekI(p+16)
+   If *s\largestAcked-number>=*j\threshold Or *j\now-sent>=*j\delay
+    *j\number=number : *j\packetBytes=PeekI(p+8) : *j\sentAt=sent
+    *j\cookie=PeekI(p+24) : *j\flags=flags : *j\inFlightBytes=*j\packetBytes
+    *s\inFlight=*s\inFlight-*j\packetBytes : PokeI(p,(flags|32)&(~8))
+    ProcedureReturn 1
+   EndIf
+   due=$7FFFFFFFFFFFFFFF
+   If *j\delay<=$7FFFFFFFFFFFFFFF-sent : due=sent+*j\delay : EndIf
+   If *j\nextTime=0 Or due<*j\nextTime : *j\nextTime=due : EndIf
+  EndIf
+ Next
+ ProcedureReturn 0
+EndProcedure
+; Cancellation preserves loss events already delivered. Consume/requeue their
+; frames or close; never roll back loss flags or free borrowed metadata early.
+Procedure.i QuicHandshakeSentLossCancel(*j.QuicHandshakeSentLoss)
+ Define *s.QuicHandshakeSent,rc.i
+ If quics_Span(*j,SizeOf(QuicHandshakeSentLoss))=0 : ProcedureReturn #QUIC_SENT_ARGUMENT : EndIf
+ If *j\phase<>1 : ProcedureReturn #QUIC_SENT_STATE : EndIf
+ *s=*j\owner : rc=quics_Ready(*s) : If rc<0 : ProcedureReturn rc : EndIf
+ If *s\busy<>*j : ProcedureReturn #QUIC_SENT_STATE : EndIf
+ *s\busy=0 : *j\phase=-1 : *j\result=#QUIC_SENT_CANCELLED
+ ProcedureReturn #QUIC_SENT_CANCELLED
 EndProcedure
