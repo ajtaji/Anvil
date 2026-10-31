@@ -1,0 +1,1237 @@
+; Physical interoperability fixture, NOT a production connection scheduler.
+; Generated header supplies shared TLS, QUIC, UDP, board entropy and test CA.
+; Runs TLS arithmetic through the shared cooperative worker; UDP stays in
+; the foreground dispatcher, outside the worker context.
+; No Retry, migration, recovery timer, general application dispatch or HTTP/3 requests.
+; The first protected 1-RTT packet is authenticated and its frame syntax is
+; decoded. HANDSHAKE_DONE and NEW_CONNECTION_ID effects run; ACK transmission
+; now produces an application ACK/PING after all supported effects succeed.
+; Other frame kinds are refused without committing an application receipt.
+; TLS completion is also checked independently by the server.
+Global probeTimer.QuicProbeTimer,timerFault.i,timerBase.i,timerDue.i,timerFired.i,timerCount.i
+Global pathRtt.QuicRtt,rttSamples.i,rttFault.i
+Global Dim rttTrace.i[32]
+Global connection.QuicConnection
+Global Dim connectionSpans.i[40]
+Global bufferWiped.i,closeFault.i,storageRefused.i,closeCalls.i,maxCloseStep.i
+Global closeHold.TlsWorkerJob,closeHoldRuns.i
+Global lifecycleFault.i,lifecycleProbes.i
+Global Dim foreignHs.a[32768]
+Global Dim foreignRecv.a[16645]
+Global services.i,*pet,*clock,started.i,handle.i,maxService.i
+Global ep.UdpEndpoint,info.UdpDatagramInfo,status.UdpSocketStatus
+Global peerBytes.i,hsReady.i,paramsReady.i,initialDiscarded.i
+Global received.i,sent.i,ackEvents.i,appAuthenticated.i,stage.i
+Global lastPump.i,maxPumpGap.i,maxTlsStep.i,maxSendStep.i,sendSteps.i
+Global sendFault.i,sendProbes.i,packetCancelChecked.i
+Global cidFault.i,cidChecks.i
+Global Dim savedClient.a[8]
+Global feedFault.i,keyCancelled.i,feedSteps.i,maxFeedStep.i
+Global keyOp.QuicTlsOperation,probeKey.QuicKeyJob,probeKeys.QuicKeys
+Global preparedKeyOp.QuicTlsOperation
+Global applicationFrame.QuicApplicationFrame,applicationFrames.i,doneSeen.i
+Global retireFault.i,retireChecked.i
+Global Dim controlSaved.a[1472]
+Global controlFault.i,controlChecked.i,controlDelay.i,controlReceipt.i
+Global peerIdsFault.i,peerIdsChecked.i,peerIdsFrames.i
+Global confirmFault.i,confirmChecked.i,confirmForeign.i,confirmSecretPresent.i
+Global applicationStateFault.i
+Global applicationFault.i,applicationBadTag.i,applicationCancelled.i,applicationPing.i
+Global lossPhase.i,lossAckCount.i,lossFault.i,lossEvents.i,lossChecked.i,lossJob.QuicHandshakeSentLoss
+Global probeFault.i,probeChecked.i,probeNumber.i,probeBytes.i
+Global deliveryProbes.i
+Global applicationDelivery.i,deliveryFault.i,deliveryEvents.i,deliverySteps.i,deliveryNumber.i
+Global applicationSteps.i,maxApplicationStep.i,applicationNumber.i,applicationWriteReady.i
+Global savedApplicationBytes.i,savedApplicationKeys.QuicKeys
+Global Dim savedApplication.a[1472]
+Global startupFault.i,startupChecks.i,startupSteps.i,maxStartupStep.i
+Global ackFault.i,ackChecks.i,ackSteps.i,maxAckStep.i
+Global receiveFault.i,receiveCancelled.i,receiveSteps.i,maxReceiveStep.i,savedReceiveBytes.i
+Global Dim savedReceive.a[1472]
+Global Dim savedOriginal.a[8]
+Global deadlineOp.QuicTlsOperation,outputOp.QuicTlsOperation,inputOp.QuicTlsOperation
+Global probeTx.QuicCryptoTx,probeRx.QuicCryptoRx,probeOut.QuicTlsOutput
+Global operationFault.i,operationProbes.i,extraContextChecks.i
+Global Dim probeData.a[4096]
+Global Dim probeBits.a[1024]
+Global Dim probeOutput.a[2048]
+Global Dim probeSnapshot.a[#TLS13_CONTEXT_SIZE]
+Global liveJob.TlsContextWorkerJob,otherJob.TlsWorkerJob
+Global refusedJob.TlsContextWorkerJob
+Global contextFault.i,contextChecks.i,cancelChecked.i
+Global Dim ownerSnapshot.a[#TLS13_CONTEXT_SIZE]
+Global Dim retrySnapshot.a[#TLS13_CONTEXT_SIZE]
+Global Dim beforeSnapshot.a[#TLS13_CONTEXT_SIZE]
+Global Dim afterSnapshot.a[#TLS13_CONTEXT_SIZE]
+Global liveOperation.i,liveSpace.i
+Global liveResult.i,workerSteps.i,maxWorkerStep.i,ownershipChecks.i,ownershipFault.i
+Procedure.i HooksClear()
+ ProcedureReturn Bool(X509PauseHook=0 And TlsRootsPauseHook=0 And TlsRecDecryptHook=0 And TlsRecEncryptHook=0 And Tls13PauseHook=0 And Tls13SetupPauseHook=0 And EcdsaVerifyHook=0 And RsaPublicHook=0 And X25519ComputeHook=0)
+EndProcedure
+Global Dim rxData.a[65536]
+Global Dim rxBits.a[8192]
+Global Dim txData.a[8192]
+Global Dim txBits.a[2048]
+Global Dim ackRanges.a[2048]
+Global Dim sentSlots.a[8192]
+Global Dim sentMeta.a[4096]
+Global Dim originalId.a[8]
+Global Dim clientId.a[8]
+Global Dim peerId.a[20]
+Global Dim packet.a[1472]
+Global Dim output.a[1472]
+Global Dim tlsBytes.a[2048]
+Global Dim tlsHs.a[32768]
+Global Dim tlsRecv.a[16645]
+Global Dim tlsConfig.a[48]
+Global Dim localParameters.a[128]
+Global Dim peerParameters.a[4096]
+Global Dim parameterEntries.a[2048]
+Procedure CaptureTable()
+ ASM
+ adrp x1, global_services
+ add x1, x1, #:lo12:global_services
+ str x0, [x1]
+ EndASM
+EndProcedure
+Procedure.i Service()
+ Define t.i,rc.i,cost.i
+ pet() : t=clock()
+ If lastPump<>0 And t-lastPump>maxPumpGap : maxPumpGap=t-lastPump : EndIf
+ lastPump=t : rc=UdpPayloadService() : cost=clock()-t
+ If cost>maxService : maxService=cost : EndIf
+ If rc<0 : ProcedureReturn rc : EndIf
+ If connection\phase=1
+  rc=QuicConnectionCheckDeadline(@connection,HwMicros())
+  If rc<>0 : ProcedureReturn rc : EndIf
+ EndIf
+ ProcedureReturn rc
+EndProcedure
+Procedure.i Pump()
+ Define rc.i
+ rc=Service()
+ If rc<0 : ProcedureReturn rc : EndIf
+ ProcedureReturn rc
+EndProcedure
+Procedure.i KeyDone(rc.i)
+ Define p.i,n.i,t.i,cost.i
+ If rc<>0 : ProcedureReturn rc : EndIf
+ n=Tls13ContextSave(@ownerSnapshot[0],#TLS13_CONTEXT_SIZE)
+ rc=QuicTlsOperationBegin(@connection\tlsOp,@ownerSnapshot[0],#TLS13_CONTEXT_SIZE,5,@connection\keyjob,connection\keyjob\keys,0,0,20000000)
+ If rc<>1 : ProcedureReturn rc : EndIf
+ Repeat
+  TlsSliceBefore()
+  t=HwMicros() : rc=QuicTlsOperationStep(@connection\tlsOp) : cost=HwMicros()-t
+  TlsSliceAfter(cost)
+  If rc<>0 : Break : EndIf
+  p=Service() : If p<0 : rc=p : Break : EndIf
+ ForEver
+ If rc=1
+  n=Tls13ContextRestore(@ownerSnapshot[0],#TLS13_CONTEXT_SIZE)
+  If connection\tlsOp\result=1 : ProcedureReturn 0 : EndIf
+  ProcedureReturn connection\tlsOp\result
+ EndIf
+ If connection\tlsOp\phase=1 : QuicTlsOperationCancel(@connection\tlsOp) : EndIf
+ ProcedureReturn rc
+EndProcedure
+Procedure.i StartHandshake()
+ Define rc.i,n.i,t.i,cost.i,pending.i
+ rc=PrepareTlsProbe(1,0) : If rc<>1 : ProcedureReturn rc : EndIf
+ rc=QuicConnectionStartBegin(@connection,20000000) : If rc<>0 : ProcedureReturn rc : EndIf
+ If QuicConnectionStartBegin(@connection,20000000)<>#QUIC_START_STATE : startupFault=1 : EndIf
+ If QuicConnectionSendBegin(@connection,0,0)<>#QUIC_SEND_STATE : startupFault=2 : EndIf
+ If QuicConnectionReceiveBegin(@connection,0,@packet[0],1)<>#QUIC_RECEIVE_STATE : startupFault=3 : EndIf
+ Repeat
+  If connection\startup\phase=6 And operationProbes=1
+   n=Tls13ContextRestore(@ownerSnapshot[0],#TLS13_CONTEXT_SIZE)
+   rc=PrepareTlsProbe(2,@connection\initial) : If rc<>1 : ProcedureReturn rc : EndIf
+  EndIf
+  pending=Bool(connection\startup\phase=2 Or connection\startup\phase=5 Or connection\startup\phase=7)
+  If pending : TlsSliceBefore() : EndIf
+  t=HwMicros() : rc=QuicConnectionStartStep(@connection) : cost=HwMicros()-t
+  If pending : TlsSliceAfter(cost) : EndIf
+  startupSteps=startupSteps+1 : If cost>maxStartupStep : maxStartupStep=cost : EndIf
+  n=Service() : If n<0 : ProcedureReturn n : EndIf
+  If rc<>0 : Break : EndIf
+ ForEver
+ If rc<>1 : ProcedureReturn rc : EndIf
+ If QuicConnectionStartStep(@connection)<>1 Or QuicConnectionStartBegin(@connection,20000000)<>#QUIC_START_STATE : startupFault=4 : EndIf
+ If connection\initial\readKeys\ready<>1 Or connection\initial\writeKeys\ready<>1 Or connection\initial\tx\tail<=0 : startupFault=5 : EndIf
+ startupChecks=1
+ n=Tls13ContextRestore(@ownerSnapshot[0],#TLS13_CONTEXT_SIZE)
+ ProcedureReturn 0
+EndProcedure
+Procedure.i SendSpace(*s.QuicConnectionSpace)
+ Define rc.i,n.i,t.i,cost.i,held.i,i.i,number.i,inFlight.i
+ rc=QuicConnectionSendBegin(@connection,*s\level,peerBytes)
+ If rc<>0 : ProcedureReturn rc : EndIf
+ Repeat
+  n=Pump() : If n<0 : ProcedureReturn n : EndIf
+  t=clock() : rc=QuicConnectionSendStep(@connection) : cost=clock()-t
+  If cost>maxSendStep : maxSendStep=cost : EndIf
+  sendSteps=sendSteps+1
+  If connection\outgoing\worker\phase=1
+   If TlsWorkerBegin(@otherJob,@CloseHoldEntry,0)<>#TLSWORK_BUSY : sendFault=1 : EndIf
+  EndIf
+  If rc=2
+   If held=0
+    number=connection\outgoing\number : inFlight=*s\history\inFlight
+    For i=0 To 1199 : probeOutput[i]=output[i] : Next
+    If QuicConnectionSendBegin(@connection,*s\level,peerBytes)<>#QUIC_SEND_STATE : sendFault=2 : EndIf
+    If QuicConnectionSendAccepted(@connection,1199,clock())<>#QUIC_SEND_ARGUMENT : sendFault=3 : EndIf
+    If QuicConnectionSendCompleted(@connection,0)<>#QUIC_SEND_STATE : sendFault=4 : EndIf
+    If QuicConnectionSendStep(@connection)<>2 Or connection\outgoing\number<>number Or *s\history\inFlight<>inFlight : sendFault=5 : EndIf
+    For i=0 To 1199 : If probeOutput[i]<>output[i] : sendFault=6 : EndIf : Next
+    held=1 : sendProbes=sendProbes+1
+   Else
+    n=UdpPayloadSendTo(handle,@ep,QuicConnectionBuffer(@connection,16),connection\outgoing\bytes)
+    If n<>#SVC_EAGAIN
+     If n<1 : ProcedureReturn n : EndIf
+     ; UDP returns an acceptance ticket, not a byte count. A positive ticket
+     ; owns the whole datagram; acknowledge its requested length separately.
+     n=QuicConnectionSendAccepted(@connection,connection\outgoing\bytes,clock())
+     If n<>0 : ProcedureReturn n : EndIf
+    EndIf
+   EndIf
+  ElseIf rc=3
+   n=UdpPayloadStatus(handle,@status) : If n<>0 : ProcedureReturn n : EndIf
+   If status\txState=#UDP_TX_SENT
+    rc=QuicConnectionSendCompleted(@connection,0)
+    If rc=1 : sent=sent+1 : initialDiscarded=connection\initialRetired : EndIf
+   ElseIf status\txState=#UDP_TX_FAILED
+    rc=QuicConnectionSendCompleted(@connection,status\txError)
+   EndIf
+  EndIf
+  If rc<0 : ProcedureReturn rc : EndIf
+ Until rc=1
+ ProcedureReturn 0
+EndProcedure
+Procedure.i HandleAck(*s.QuicConnectionSpace)
+ Define rc.i,n.i,phase.i,t.i,cost.i,authenticated.i
+ phase=connection\acknowledge\phase
+ authenticated=connection\receive\authenticated : connection\receive\authenticated=0
+ rc=QuicConnectionAckBegin(@connection)
+ If rc<>#QUIC_CONNECTION_ACK_STATE Or connection\acknowledge\phase<>phase Or *s\history\busy<>0 : ackFault=1 : EndIf
+ connection\receive\authenticated=authenticated
+ If authenticated<>1 : ackFault=7 : EndIf
+ rc=QuicConnectionAckBegin(@connection)
+ If rc<>0 : ProcedureReturn rc : EndIf
+ If QuicConnectionAckBegin(@connection)<>#QUIC_CONNECTION_ACK_STATE : ackFault=2 : EndIf
+ If QuicConnectionSendBegin(@connection,*s\level,peerBytes)<>#QUIC_SENT_BUSY : ackFault=3 : EndIf
+ Repeat
+  n=Pump() : If n<0 : ProcedureReturn n : EndIf
+  t=clock() : rc=QuicConnectionAckStep(@connection) : cost=clock()-t
+  ackSteps=ackSteps+1 : If cost>maxAckStep : maxAckStep=cost : EndIf
+  If rc=0 And connection\receive\process\phase<>2 : ackFault=4 : EndIf
+ Until rc<>0
+ If rc<>1 : ProcedureReturn rc : EndIf
+ If connection\receive\process\phase<>1 Or *s\history\busy<>0 : ackFault=5 : EndIf
+ If QuicConnectionAckStep(@connection)<>1 Or QuicConnectionAckBegin(@connection)<>#QUIC_CONNECTION_ACK_STATE : ackFault=6 : EndIf
+ ackEvents=ackEvents+connection\acknowledge\events : ackChecks=ackChecks+1
+ ProcedureReturn 0
+EndProcedure
+Procedure.i FeedTls(*s.QuicConnectionSpace)
+ Define rc.i,n.i,t.i,cost.i,pending.i
+ n=Tls13ContextSave(@ownerSnapshot[0],#TLS13_CONTEXT_SIZE)
+ If operationProbes=2 : OperationProbe(3) : OperationProbe(4) : OperationProbe(5) : EndIf
+ otherJob\result=773 : refusedJob\snapshot=771 : refusedJob\capacity=772 : refusedJob\worker\result=773
+ rc=QuicConnectionTlsBegin(@connection,*s\level,peerBytes,20000000)
+ If rc<>0 : ProcedureReturn rc : EndIf
+ If QuicConnectionTlsBegin(@connection,*s\level,peerBytes,20000000)<>#QUIC_FEED_STATE : feedFault=1 : EndIf
+ Repeat
+  n=Pump() : If n<0 : ProcedureReturn n : EndIf
+  pending=Bool(connection\tlsOp\phase=1)
+  If pending : TlsSliceBefore() : EndIf
+  t=HwMicros() : rc=QuicConnectionTlsStep(@connection) : cost=HwMicros()-t
+  If pending : TlsSliceAfter(cost) : EndIf
+  feedSteps=feedSteps+1 : If cost>maxFeedStep : maxFeedStep=cost : EndIf
+ Until rc<>0
+ n=Tls13ContextRestore(@ownerSnapshot[0],#TLS13_CONTEXT_SIZE)
+ hsReady=Bool(connection\handshake\readKeys\ready=1 And connection\handshake\writeKeys\ready=1)
+ paramsReady=connection\feed\parametersReady
+ If rc<>1 : ProcedureReturn rc : EndIf
+ If QuicConnectionTlsStep(@connection)<>1 : feedFault=2 : EndIf
+ ProcedureReturn 0
+EndProcedure
+Procedure.i ApplicationCrypt(packetAddress.i,bytes.i,idBytes.i,number.i,encrypt.i)
+ Define rc.i,n.i,t.i,cost.i,*keys.QuicKeys
+ *keys=@connection\appRead : If encrypt : *keys=@connection\appWrite : EndIf
+ rc=QuicApplicationPacketBegin(@connection\application,*keys,packetAddress,bytes,idBytes,number,encrypt)
+ If rc<>0 : ProcedureReturn rc : EndIf
+ If QuicApplicationPacketBegin(@connection\application,*keys,packetAddress,bytes,idBytes,number,encrypt)<>#QUIC_APP_PACKET_STATE : applicationFault=1 : EndIf
+ If QuicConnectionSendBegin(@connection,0,peerBytes)<>#QUIC_SEND_STATE : applicationFault=2 : EndIf
+ If connection\handshakeConfirmed=0 And QuicConnectionHandshakeDone(@connection)<>#QUIC_CONNECTION_STATE : confirmFault=1 : EndIf
+ If TlsWorkerBegin(@otherJob,@CloseHoldEntry,0)<>#TLSWORK_BUSY : applicationFault=3 : EndIf
+ Repeat
+  t=HwMicros() : rc=QuicApplicationPacketStep(@connection\application) : cost=HwMicros()-t
+  applicationSteps=applicationSteps+1 : If cost>maxApplicationStep : maxApplicationStep=cost : EndIf
+  n=Service() : If n<0 : ProcedureReturn n : EndIf
+ Until rc<>0
+ If QuicApplicationPacketStep(@connection\application)<>rc : applicationFault=4 : EndIf
+ ProcedureReturn rc
+EndProcedure
+Procedure.i SendApplicationPing()
+ Define rc.i,n.i,t.i,cost.i,i.i
+ If applicationPing<>0 Or connection\appWrite\ready<>1 : ProcedureReturn -9441 : EndIf
+ applicationWriteReady=1
+ controlDelay=QuicApplicationAckDelay(@connection\applicationState,HwMicros(),3)
+ rc=QuicConnectionControlBegin(@connection,HwMicros(),3,1) : If rc<>0 : ProcedureReturn rc : EndIf
+ If connection\controlNumber<>0 Or connection\applicationState\nextNumber<>1 : controlFault=1 : EndIf
+ If QuicConnectionControlBegin(@connection,HwMicros(),3,1)<>#QUIC_CONTROL_STATE : controlFault=2 : EndIf
+ If QuicConnectionControlCompleted(@connection,0)<>#QUIC_CONTROL_STATE : controlFault=3 : EndIf
+ Repeat
+  t=HwMicros() : rc=QuicConnectionControlStep(@connection) : cost=HwMicros()-t
+  applicationSteps=applicationSteps+1 : If cost>maxApplicationStep : maxApplicationStep=cost : EndIf
+  n=Service() : If n<0 : ProcedureReturn n : EndIf
+ Until rc<>0
+ If rc<>2 : ProcedureReturn rc : EndIf
+ If QuicConnectionControlStep(@connection)<>2 Or connection\applicationState\ack\pending<>1 : controlFault=4 : EndIf
+ If QuicConnectionSendBegin(@connection,2,peerBytes)<>#QUIC_SEND_STATE : controlFault=5 : EndIf
+ For i=0 To connection\controlBytes-1 : controlSaved[i]=output[i] : Next
+ Repeat
+  n=Service() : If n<0 : ProcedureReturn n : EndIf
+  rc=UdpPayloadSendTo(handle,@ep,@output[0],connection\controlBytes)
+ Until rc<>#SVC_EAGAIN
+ If rc<1 : ProcedureReturn rc : EndIf
+ rc=QuicConnectionControlAccepted(@connection,HwMicros()) : If rc<>0 : ProcedureReturn rc : EndIf
+ If QuicConnectionControlStep(@connection)<>3 Or connection\applicationState\ack\pending<>1 : controlFault=6 : EndIf
+ If QuicConnectionControlAccepted(@connection,HwMicros())<>#QUIC_CONTROL_STATE : controlFault=7 : EndIf
+ Repeat
+  n=Service() : If n<0 : ProcedureReturn n : EndIf
+  rc=UdpPayloadStatus(handle,@status) : If rc<>0 : ProcedureReturn rc : EndIf
+  If status\txState=#UDP_TX_FAILED : ProcedureReturn status\txError : EndIf
+ Until status\txState=#UDP_TX_SENT
+ For i=0 To connection\controlBytes-1 : If controlSaved[i]<>output[i] : controlFault=8 : EndIf : Next
+ rc=QuicConnectionControlCompleted(@connection,0) : If rc<>1 : ProcedureReturn rc : EndIf
+ If QuicConnectionControlStep(@connection)<>1 Or connection\applicationState\ack\pending<>0 : controlFault=9 : EndIf
+ If QuicConnectionControlCompleted(@connection,0)<>#QUIC_CONTROL_STATE : controlFault=10 : EndIf
+ controlChecked=1 : applicationPing=1 : ProcedureReturn 0
+EndProcedure
+
+Procedure.i SendApplicationProbe(expected.i)
+ Define rc.i,n.i,i.i
+ If connection\applicationState\ack\pending<>0 : probeFault=1 : ProcedureReturn -9491 : EndIf
+ If QuicConnectionControlBegin(@connection,HwMicros(),3,0)<>#QUIC_CONTROL_STATE : probeFault=2 : EndIf
+ If QuicConnectionControlBegin(@connection,-1,3,1)<>#QUIC_CONTROL_ARGUMENT : probeFault=3 : EndIf
+ If connection\applicationState\nextNumber<>expected : probeFault=4 : EndIf
+ rc=QuicConnectionControlBegin(@connection,HwMicros(),3,1) : If rc<>0 : ProcedureReturn rc : EndIf
+ probeNumber=connection\controlNumber : probeBytes=connection\controlBytes
+ If probeNumber<>expected Or connection\applicationState\nextNumber<>expected+1 Or connection\controlHasAck<>0 Or connection\controlToken<>0 Or probeBytes<>22+peerBytes : probeFault=5 : EndIf
+ Repeat
+  rc=QuicConnectionControlStep(@connection)
+  n=Service() : If n<0 : ProcedureReturn n : EndIf
+ Until rc<>0
+ If rc<>2 : ProcedureReturn rc : EndIf
+ For i=0 To probeBytes-1 : controlSaved[i]=output[i] : Next
+ Repeat
+  n=Service() : If n<0 : ProcedureReturn n : EndIf
+  rc=UdpPayloadSendTo(handle,@ep,@output[0],probeBytes)
+ Until rc<>#SVC_EAGAIN
+ If rc<1 : ProcedureReturn rc : EndIf
+ rc=QuicConnectionControlAccepted(@connection,HwMicros()) : If rc<>0 : ProcedureReturn rc : EndIf
+ Repeat
+  n=Service() : If n<0 : ProcedureReturn n : EndIf
+  rc=UdpPayloadStatus(handle,@status) : If rc<>0 : ProcedureReturn rc : EndIf
+  If status\txState=#UDP_TX_FAILED : ProcedureReturn status\txError : EndIf
+ Until status\txState=#UDP_TX_SENT
+ For i=0 To probeBytes-1 : If controlSaved[i]<>output[i] : probeFault=6 : EndIf : Next
+ rc=QuicConnectionControlCompleted(@connection,0) : If rc<>1 : ProcedureReturn rc : EndIf
+ If connection\applicationState\ack\pending<>0 Or connection\applicationHistory\issued<>expected+1 Or connection\applicationHistory\first<>1 Or connection\applicationHistory\inFlight<>expected*probeBytes : probeFault=7 : EndIf
+ probeChecked=1 : ProcedureReturn 0
+EndProcedure
+Procedure.i ConfirmHandshake()
+ Define rc.i,n.i,i.i,expected.i,beforeRead.QuicKeys,beforeWrite.QuicKeys
+ CheckHandshakeSecretRetirement()
+ For i=0 To #TLS13_CONTEXT_SIZE-1 : retrySnapshot[i]=ownerSnapshot[i] : Next
+ For i=0 To SizeOf(QuicKeys)-1
+  PokeA(@beforeRead+i,PeekA(@connection\appRead+i))
+  PokeA(@beforeWrite+i,PeekA(@connection\appWrite+i))
+ Next
+ confirmForeign=Bool(peerBytes=0)
+ If confirmForeign : ForeignContext() : EndIf
+ n=Tls13ContextSave(@beforeSnapshot[0],#TLS13_CONTEXT_SIZE)
+ rc=TlsWorkerBegin(@closeHold,@CloseHoldEntry,0)
+ If rc<>1 : confirmFault=3 : ProcedureReturn rc : EndIf
+ If QuicConnectionHandshakeDone(@connection)<>#TLSWORK_BUSY Or connection\handshakeConfirmed<>0 : confirmFault=4 : EndIf
+ If TlsWorkerCancel(@closeHold)<>1 : confirmFault=5 : EndIf
+ rc=QuicConnectionHandshakeDone(@connection)
+ If rc<>1 : confirmFault=6 : ProcedureReturn rc : EndIf
+ n=Tls13ContextSave(@afterSnapshot[0],#TLS13_CONTEXT_SIZE)
+ For i=0 To #TLS13_CONTEXT_SIZE-1
+  expected=retrySnapshot[i]
+  If (i>=272 And i<=367) Or (i>=400 And i<=463) Or (i>=528 And i<=623)
+   If expected<>0 : confirmSecretPresent=confirmSecretPresent+1 : EndIf
+   expected=0
+  EndIf
+  If ownerSnapshot[i]<>expected : confirmFault=7 : EndIf
+  If confirmForeign
+   If beforeSnapshot[i]<>afterSnapshot[i] : confirmFault=8 : EndIf
+  Else
+   If ownerSnapshot[i]<>afterSnapshot[i] : confirmFault=9 : EndIf
+  EndIf
+ Next
+ For i=0 To SizeOf(QuicKeys)-1
+  If PeekA(@connection\handshake\readKeys+i)<>0 Or PeekA(@connection\handshake\writeKeys+i)<>0 : confirmFault=10 : EndIf
+  If PeekA(@connection\appRead+i)<>PeekA(@beforeRead+i) Or PeekA(@connection\appWrite+i)<>PeekA(@beforeWrite+i) : confirmFault=11 : EndIf
+ Next
+ If confirmSecretPresent=0 : confirmFault=12 : EndIf
+ If connection\handshakeConfirmed<>1 Or connection\timeout<>0 Or connection\handshake\history\phase<>2 Or connection\handshake\history\inFlight<>0 Or connection\handshake\rx\phase<>3 Or connection\handshake\tx\phase<>3 : confirmFault=13 : EndIf
+ If QuicConnectionHandshakeDone(@connection)<>1 : confirmFault=14 : EndIf
+ If QuicConnectionReceiveBegin(@connection,2,@packet[0],1)<>6 : confirmFault=15 : EndIf
+ If QuicConnectionSendBegin(@connection,2,peerBytes)<>#QUIC_SEND_STATE : confirmFault=16 : EndIf
+ If QuicConnectionTlsBegin(@connection,2,peerBytes,20000000)<>#QUIC_FEED_STATE : confirmFault=17 : EndIf
+ If QuicConnectionCheckDeadline(@connection,connection\started+20000001)<>0 : confirmFault=18 : EndIf
+ If connection\applicationState\ack\count<>0 : confirmFault=19 : EndIf
+ n=Tls13ContextRestore(@ownerSnapshot[0],#TLS13_CONTEXT_SIZE)
+ n=Tls13ContextWipe(@retrySnapshot[0],#TLS13_CONTEXT_SIZE)
+ confirmChecked=1 : ProcedureReturn 1
+EndProcedure
+Procedure.i PacketOne(p.i,bytes.i)
+ Define rc.i,i.i,t.i,cost.i,old.i,known.i,count.i,cursor.i,n.i,receivedAt.i,eliciting.i,*s.QuicConnectionSpace
+ receivedAt=HwMicros()
+ rc=QuicPacketRead(@connection\header,p,bytes,8) : If rc<>1 : ProcedureReturn -9307 : EndIf
+ If connection\header\kind=4
+  If connection\header\destinationBytes<>8 : ProcedureReturn -9308 : EndIf
+  For i=0 To 7 : If PeekA(p+connection\header\destinationOffset+i)<>clientId[i] : ProcedureReturn -9309 : EndIf : Next
+  If Tls13State<>#TLS13_ST_CONNECTED : ProcedureReturn -9310 : EndIf
+  If connection\peerIds\phase=0
+   rc=QuicConnectionPeerIdsInit(@connection,2) : If rc<>0 : ProcedureReturn rc : EndIf
+   If QuicPeerIdsFind(@connection\peerIds,0)<=0 : peerIdsFault=1 : EndIf
+   peerIdsChecked=1
+  EndIf
+  savedApplicationBytes=connection\header\packetBytes
+  For i=0 To savedApplicationBytes-1 : savedApplication[i]=PeekA(p+i) : Next
+  For i=0 To SizeOf(QuicKeys)-1 : PokeA(@savedApplicationKeys+i,PeekA(@connection\appRead+i)) : Next
+  PokeA(p+savedApplicationBytes-1,PeekA(p+savedApplicationBytes-1)!1)
+  rc=ApplicationCrypt(p,savedApplicationBytes,8,connection\applicationState\largestAuthenticated,0)
+  If rc<>#QUIC_CRYPTO_AUTH : applicationFault=5 : ProcedureReturn -9442 : EndIf
+  For i=0 To savedApplicationBytes-1
+   old=savedApplication[i] : If i=savedApplicationBytes-1 : old=old!1 : EndIf
+   If PeekA(p+i)<>old : applicationFault=6 : EndIf
+  Next
+  If connection\applicationState\largestAuthenticated<>-1 : applicationStateFault=2 : EndIf
+  If QuicConnectionHandshakeDone(@connection)<>#QUIC_CONNECTION_STATE Or connection\handshakeConfirmed<>0 : confirmFault=2 : EndIf
+  applicationBadTag=1
+  For i=0 To savedApplicationBytes-1 : PokeA(p+i,savedApplication[i]) : Next
+  rc=ApplicationCrypt(p,savedApplicationBytes,8,connection\applicationState\largestAuthenticated,0) : If rc<>1 : ProcedureReturn rc : EndIf
+  applicationNumber=connection\application\crypto\number
+  old=QuicApplicationAuthenticated(@connection\applicationState,applicationNumber)
+  If old<>0 Or connection\applicationState\largestAuthenticated<>applicationNumber Or connection\applicationState\ack\count<>0 : applicationStateFault=3 : EndIf
+  cursor=0
+  While cursor<connection\application\crypto\plainBytes
+   n=QuicApplicationFrameRead(p+connection\application\crypto\plainOffset+cursor,connection\application\crypto\plainBytes-cursor,@applicationFrame)
+   If n<1 : ProcedureReturn n : EndIf
+   cursor=cursor+n
+   If applicationFrame\base\kind<>0 And applicationFrame\base\kind<>1 And applicationFrame\base\kind<>24 And applicationFrame\base\kind<>30 : ProcedureReturn -9471 : EndIf
+   eliciting=eliciting | applicationFrame\base\eliciting
+   If applicationFrame\base\kind<>0 : applicationFrames=applicationFrames+1 : EndIf
+   If applicationFrame\base\kind=30
+    doneSeen=1 : rc=ConfirmHandshake() : If rc<>1 : ProcedureReturn rc : EndIf
+   EndIf
+   If applicationFrame\base\kind=24
+    rc=QuicConnectionPeerIdAdd(@connection,applicationFrame\sequence,applicationFrame\retire,applicationFrame\base\data,applicationFrame\idBytes,applicationFrame\resetToken)
+    If rc<0 : ProcedureReturn rc : EndIf
+    peerIdsFrames=peerIdsFrames+1
+    old=QuicPeerIdsFind(@connection\peerIds,applicationFrame\sequence)
+    If old<=0 : peerIdsFault=2 : ProcedureReturn -9461 : EndIf
+    If PeekI(old+8)<>applicationFrame\idBytes Or PeekI(old+24)<>1 : peerIdsFault=3 : EndIf
+    For i=0 To applicationFrame\idBytes-1 : If PeekA(old+32+i)<>PeekA(applicationFrame\base\data+i) : peerIdsFault=4 : EndIf : Next
+    For i=0 To 15 : If PeekA(old+52+i)<>PeekA(applicationFrame\resetToken+i) : peerIdsFault=5 : EndIf : Next
+    If QuicConnectionPeerIdAdd(@connection,applicationFrame\sequence,applicationFrame\retire,applicationFrame\base\data,applicationFrame\idBytes,applicationFrame\resetToken)<>0 : peerIdsFault=6 : EndIf
+   EndIf
+   rc=Pump() : If rc<0 : ProcedureReturn rc : EndIf
+  Wend
+  rc=QuicApplicationProcessed(@connection\applicationState,applicationNumber,eliciting,receivedAt)
+  If rc<>1 : ProcedureReturn rc : EndIf
+  controlReceipt=applicationNumber
+  appAuthenticated=1 : ProcedureReturn 0
+ EndIf
+ If connection\header\kind=0 : *s=@connection\initial
+ ElseIf connection\header\kind=2 : *s=@connection\handshake
+ Else : ProcedureReturn -9311 : EndIf
+ If savedReceiveBytes=0 And *s\level=0
+  savedReceiveBytes=connection\header\packetBytes
+  For i=0 To savedReceiveBytes-1 : savedReceive[i]=PeekA(p+i) : Next
+  For i=0 To 7 : savedOriginal[i]=originalId[i] : savedClient[i]=clientId[i] : Next
+ EndIf
+ known=connection\peerIdKnown : count=connection\peerIdBytes
+ old=PeekA(p+connection\header\destinationOffset)
+ PokeA(p+connection\header\destinationOffset,old!1)
+ rc=QuicConnectionReceivePacketBegin(@connection,p,connection\header\packetBytes)
+ PokeA(p+connection\header\destinationOffset,old)
+ If rc<>6 Or connection\peerIdKnown<>known Or connection\peerIdBytes<>count : cidFault=1 : EndIf
+ If known<>0 And count>0
+  old=PeekA(p+connection\header\sourceOffset)
+  PokeA(p+connection\header\sourceOffset,old!1)
+  rc=QuicConnectionReceivePacketBegin(@connection,p,connection\header\packetBytes)
+  PokeA(p+connection\header\sourceOffset,old)
+  If rc<>6 Or connection\peerIdKnown<>known Or connection\peerIdBytes<>count : cidFault=2 : EndIf
+ EndIf
+ rc=QuicConnectionReceivePacketBegin(@connection,p,connection\header\packetBytes)
+ If rc=6 : ProcedureReturn 0 : EndIf
+ If rc<>0 : ProcedureReturn rc : EndIf
+ If connection\peerIdKnown<>known Or connection\peerIdBytes<>count : cidFault=3 : EndIf
+ cidChecks=cidChecks+1
+ Repeat
+  rc=Pump() : If rc<0 : ProcedureReturn rc : EndIf
+  t=clock() : rc=QuicConnectionReceiveStep(@connection) : cost=clock()-t
+  receiveSteps=receiveSteps+1 : If cost>maxReceiveStep : maxReceiveStep=cost : EndIf
+  If TlsWorkerOwns(@connection\incoming\worker)=1
+   If QuicConnectionReceiveBegin(@connection,*s\level,p,connection\header\packetBytes)<>#QUIC_RECEIVE_STATE : receiveFault=1 : EndIf
+   If QuicConnectionSendBegin(@connection,*s\level,peerBytes)<>#QUIC_SEND_STATE : receiveFault=2 : EndIf
+  EndIf
+  If rc=2 : rc=HandleAck(*s) : If rc=0 : rc=1 : EndIf : EndIf
+ Until rc<>1
+ If rc=6 : ProcedureReturn 0 : EndIf
+ If rc<>4 : ProcedureReturn rc : EndIf
+ If QuicConnectionReceiveStep(@connection)<>4 : receiveFault=3 : EndIf
+ peerBytes=connection\peerIdBytes
+ If connection\peerIdKnown<>1 Or peerBytes<>connection\header\sourceBytes : cidFault=4 : EndIf
+ rc=FeedTls(*s) : If rc<>0 : ProcedureReturn rc : EndIf
+ ProcedureReturn SendSpace(*s)
+EndProcedure
+
+
+Procedure.i CheckDeliveryRefusals()
+ Define f.QuicHandshakeFrame,range.i,rc.i
+ f\kind=2 : f\count=1 : f\rangeBytes=1 : f\ranges=@range : f\largest=1
+ rc=QuicHandshakeSentAckBegin(@connection\applicationAck,@connection\applicationHistory,2,@f)
+ If rc<>#QUIC_SENT_ARGUMENT Or connection\applicationHistory\busy<>0 : deliveryFault=3 : ProcedureReturn -9487 : EndIf
+ deliveryProbes=deliveryProbes+1
+ rc=QuicHandshakeSentAckBegin(@connection\applicationAck,@connection\applicationHistory,4,@f)
+ If rc<>0 : ProcedureReturn rc : EndIf
+ rc=QuicHandshakeSentAckStep(@connection\applicationAck)
+ If rc<>#QUIC_SENT_UNSENT Or connection\applicationHistory\acked<>0 Or connection\applicationHistory\busy<>0 Or connection\applicationHistory\inFlight<>connection\controlBytes : deliveryFault=4 : ProcedureReturn -9488 : EndIf
+ deliveryProbes=deliveryProbes+1 : f\largest=0
+ rc=QuicHandshakeSentAckBegin(@connection\applicationAck,@connection\applicationHistory,4,@f)
+ If rc<>0 : ProcedureReturn rc : EndIf
+ rc=QuicHandshakeSentAckStep(@connection\applicationAck)
+ If rc<>0 Or connection\applicationAck\phase<>2 Or connection\applicationHistory\acked<>0 : deliveryFault=5 : ProcedureReturn -9489 : EndIf
+ rc=QuicHandshakeSentAckCancel(@connection\applicationAck)
+ If rc<>#QUIC_SENT_CANCELLED Or connection\applicationHistory\busy<>0 Or connection\applicationHistory\acked<>0 Or connection\applicationHistory\inFlight<>connection\controlBytes : deliveryFault=6 : ProcedureReturn -9490 : EndIf
+ deliveryProbes=deliveryProbes+1 : ProcedureReturn 0
+EndProcedure
+
+; Continue the actual exchange after TX; consume authenticated peer ACKs.
+Procedure.i ReceiveApplicationAck()
+ Define peerExponent.i,peerDelay.i,*parameter.QuicParameter
+ Define rc.i,n.i,i.i,p.i,bytes.i,cursor.i,used.i,pn.i,seen.i,eliciting.i,receivedAt.i,untilTime.i
+ peerExponent=3 : peerDelay=25000
+ *parameter=QuicParametersFind(@connection\params,10)
+ If *parameter : peerExponent=*parameter\value : EndIf
+ *parameter=QuicParametersFind(@connection\params,11)
+ If *parameter : peerDelay=*parameter\value*1000 : EndIf
+ If lossPhase=0
+  rc=CheckDeliveryRefusals() : If rc<>0 : ProcedureReturn rc : EndIf
+ EndIf
+ untilTime=HwMicros()+3000000
+ While (lossPhase=0 And applicationDelivery=0) Or (lossPhase=1 And lossAckCount<3-2*#PTO_PROBE_TEST)
+  n=Service() : If n<0 : ProcedureReturn n : EndIf
+  If HwMicros()>untilTime : ProcedureReturn -9481 : EndIf
+  bytes=UdpPayloadReceive(handle,@info,@packet[0],1472)
+  If bytes=#SVC_EAGAIN : Continue : EndIf
+  If bytes<1 : ProcedureReturn bytes : EndIf
+  If info\family<>4 Or info\peerPort<>55442 : ProcedureReturn -9482 : EndIf
+  For i=0 To 15 : If PeekA(@info\peerAddress+i)<>PeekA(@ep\address+i) : ProcedureReturn -9483 : EndIf : Next
+  p=@packet[0] : receivedAt=HwMicros()
+  rc=QuicPacketRead(@connection\header,p,bytes,8) : If rc<>1 : Continue : EndIf
+  If connection\header\kind<>4 : Continue : EndIf
+  If connection\header\destinationBytes<>8 : ProcedureReturn -9484 : EndIf
+  For i=0 To 7 : If PeekA(p+connection\header\destinationOffset+i)<>clientId[i] : ProcedureReturn -9485 : EndIf : Next
+  rc=ApplicationCrypt(p,connection\header\packetBytes,8,connection\applicationState\largestAuthenticated,0)
+  If rc<>1 : ProcedureReturn rc : EndIf
+  pn=connection\application\crypto\number
+  seen=QuicApplicationAuthenticated(@connection\applicationState,pn)
+  If seen<0 : ProcedureReturn seen : EndIf
+  If seen=1 : Continue : EndIf
+  cursor=0 : eliciting=0
+  While cursor<connection\application\crypto\plainBytes
+   used=QuicApplicationFrameRead(p+connection\application\crypto\plainOffset+cursor,connection\application\crypto\plainBytes-cursor,@applicationFrame)
+   If used<1 : ProcedureReturn used : EndIf
+   cursor=cursor+used : eliciting=eliciting | applicationFrame\base\eliciting
+   If applicationFrame\base\kind=0 Or applicationFrame\base\kind=1
+    ElseIf applicationFrame\base\kind=2 Or applicationFrame\base\kind=3
+     rc=QuicHandshakeSentAckBegin(@connection\applicationAck,@connection\applicationHistory,4,@applicationFrame\base)
+     If rc<>0 : ProcedureReturn rc : EndIf
+     Repeat
+      rc=QuicHandshakeSentAckStep(@connection\applicationAck) : deliverySteps=deliverySteps+1
+      If rc=1
+       If lossPhase=1
+        lossAckCount=lossAckCount+1
+        If connection\applicationAck\number<2 Or connection\applicationAck\number>4 Or connection\applicationAck\packetBytes<>probeBytes Or connection\applicationAck\inFlightBytes<>probeBytes : lossFault=1 : EndIf
+       Else
+       deliveryEvents=deliveryEvents+1
+       If connection\applicationAck\number<>0 Or connection\applicationAck\packetBytes<>connection\controlBytes Or connection\applicationAck\inFlightBytes<>connection\controlBytes : deliveryFault=1 : EndIf
+       EndIf
+      EndIf
+      n=Service() : If n<0 : ProcedureReturn n : EndIf
+     Until rc=2 Or rc<0
+     If rc<>2 : ProcedureReturn rc : EndIf
+     rc=QuicRttAck(@pathRtt,@connection\applicationAck,receivedAt,peerExponent,peerDelay,connection\handshakeConfirmed)
+     If rc<0 : ProcedureReturn rc : EndIf
+     If rc=1
+      If rttSamples<4
+       rttTrace[rttSamples*8]=connection\applicationAck\largest
+       rttTrace[rttSamples*8+1]=receivedAt : rttTrace[rttSamples*8+2]=connection\applicationAck\rttSentAt
+       rttTrace[rttSamples*8+3]=connection\applicationAck\rttDelay
+       rttTrace[rttSamples*8+4]=peerExponent : rttTrace[rttSamples*8+5]=peerDelay
+       rttTrace[rttSamples*8+6]=4 : rttTrace[rttSamples*8+7]=connection\handshakeConfirmed
+      Else
+       rttFault=1
+      EndIf
+      rttSamples=rttSamples+1
+     EndIf
+     If lossPhase=0 And connection\applicationHistory\acked=1
+      If connection\applicationHistory\inFlight<>0 Or connection\applicationHistory\largestAcked<>0 : deliveryFault=2 : EndIf
+      applicationDelivery=1 : deliveryNumber=pn
+      rc=QuicHandshakeSentPrune(@connection\applicationHistory,64)
+      If rc<>1 Or connection\applicationHistory\first<>1 Or connection\applicationHistory\issued<>1 : deliveryFault=7 : EndIf
+     EndIf
+    ElseIf applicationFrame\base\kind=24
+     rc=QuicConnectionPeerIdAdd(@connection,applicationFrame\sequence,applicationFrame\retire,applicationFrame\base\data,applicationFrame\idBytes,applicationFrame\resetToken)
+     If rc<0 : ProcedureReturn rc : EndIf
+    ElseIf applicationFrame\base\kind=30
+     rc=QuicConnectionHandshakeDone(@connection) : If rc<>1 : ProcedureReturn rc : EndIf
+    Else
+     ProcedureReturn -9486
+   EndIf
+  Wend
+  rc=QuicApplicationProcessed(@connection\applicationState,pn,eliciting,receivedAt)
+  If rc<>1 : ProcedureReturn rc : EndIf
+ Wend
+ ProcedureReturn 0
+EndProcedure
+
+; Real missing-datagram proof: PN1 is discarded by the peer before decryption.
+; Three later authenticated deliveries trigger the packet threshold, not a timer.
+Procedure.i CheckProbeLoss()
+ Define rc.i,n.i,i.i,highest.i,delay.i
+ highest=4-2*#PTO_PROBE_TEST
+ If #PTO_PROBE_TEST
+  rc=QuicProbeTimerInit(@probeTimer) : If rc<>0 : ProcedureReturn rc : EndIf
+  timerBase=connection\applicationHistory\lastTime
+  rc=QuicProbeTimerArm(@probeTimer,@pathRtt,connection\handshakeConfirmed,25000,-1,-1,timerBase)
+  If rc<>1 : ProcedureReturn rc : EndIf
+  timerDue=probeTimer\deadline
+  Repeat
+   n=Service() : If n<0 : QuicProbeTimerDiscard(@probeTimer) : ProcedureReturn n : EndIf
+   timerFired=HwMicros() : rc=QuicProbeTimerPoll(@probeTimer,timerFired)
+  Until rc<>0
+  If rc<>1 : ProcedureReturn rc : EndIf
+  timerCount=timerCount+1
+  If probeTimer\level<>4 Or probeTimer\backoff<>1 Or timerFired<timerDue : timerFault=1 : EndIf
+  If QuicProbeTimerPoll(@probeTimer,HwMicros())<>0 : timerFault=2 : EndIf
+  If connection\applicationHistory\inFlight<>probeBytes Or connection\applicationHistory\acked<>1 : timerFault=3 : EndIf
+ EndIf
+ For i=2 To highest
+  rc=SendApplicationProbe(i) : If rc<>0 : ProcedureReturn rc : EndIf
+ Next
+ rc=QuicHandshakeSentLossBegin(@lossJob,@connection\applicationHistory,HwMicros(),$7FFFFFFFFFFFFFFF,3)
+ If rc<>0 : ProcedureReturn rc : EndIf
+ rc=QuicHandshakeSentLossStep(@lossJob)
+ If rc<>2 Or connection\applicationHistory\inFlight<>highest*probeBytes : lossFault=2 : EndIf
+ If lossJob\phase=1 : QuicHandshakeSentLossCancel(@lossJob) : ProcedureReturn -9492 : EndIf
+ lossPhase=1
+ rc=ReceiveApplicationAck() : If rc<>0 : ProcedureReturn rc : EndIf
+ If lossAckCount<>highest-1 Or connection\applicationHistory\acked<>highest Or connection\applicationHistory\largestAcked<>highest Or connection\applicationHistory\inFlight<>probeBytes : lossFault=3 : EndIf
+ delay=$7FFFFFFFFFFFFFFF
+ If #PTO_PROBE_TEST
+  delay=QuicRttLossDelay(@pathRtt)
+  rc=QuicProbeTimerAcknowledged(@probeTimer,1,1) : If rc<>0 : ProcedureReturn rc : EndIf
+  If probeTimer\backoff<>0 : timerFault=4 : EndIf
+ EndIf
+ rc=QuicHandshakeSentLossBegin(@lossJob,@connection\applicationHistory,HwMicros(),delay,3)
+ If rc<>0 : ProcedureReturn rc : EndIf
+ Repeat
+  rc=QuicHandshakeSentLossStep(@lossJob)
+  If rc=1
+   lossEvents=lossEvents+1
+   If lossJob\number<>1 Or lossJob\packetBytes<>probeBytes Or lossJob\inFlightBytes<>probeBytes Or lossJob\sentAt<=0 : lossFault=4 : EndIf
+  EndIf
+  n=Service()
+  If n<0
+   If lossJob\phase=1 : QuicHandshakeSentLossCancel(@lossJob) : EndIf
+   ProcedureReturn n
+  EndIf
+ Until rc=2 Or rc<0
+ If rc<>2 : ProcedureReturn rc : EndIf
+ If lossEvents<>1 Or connection\applicationHistory\inFlight<>0 Or connection\applicationHistory\busy<>0 : lossFault=5 : EndIf
+ If #PTO_PROBE_TEST
+  rc=QuicProbeTimerArm(@probeTimer,@pathRtt,1,25000,-1,-1,-1)
+  If rc<>0 Or probeTimer\armed<>0 : timerFault=5 : EndIf
+ EndIf
+ rc=QuicHandshakeSentPrune(@connection\applicationHistory,64)
+ If rc<>0 Or connection\applicationHistory\first<>1 Or connection\applicationHistory\issued<>highest+1 : lossFault=6 : EndIf
+ rc=QuicHandshakeSentLossBegin(@lossJob,@connection\applicationHistory,HwMicros(),$7FFFFFFFFFFFFFFF,3)
+ If rc<>0 : ProcedureReturn rc : EndIf
+ rc=QuicHandshakeSentLossStep(@lossJob)
+ If rc<>2 Or connection\applicationHistory\inFlight<>0 : lossFault=7 : EndIf
+ If lossJob\phase=1 : QuicHandshakeSentLossCancel(@lossJob) : ProcedureReturn -9493 : EndIf
+ lossChecked=1 : ProcedureReturn 0
+EndProcedure
+
+Procedure.i Run()
+ Define rc.i,n.i,i.i,p.i,packetBytes.i
+ rc=QuicRttInit(@pathRtt,333000,1000) : If rc<>0 : ProcedureReturn rc : EndIf
+ stage=1
+ X509ResetAnchors() : X509AddAnchorEC(1,?RootDn,#ROOT_DN_BYTES,23,?RootKey,65)
+ Tls13SetHsBuffer(@tlsHs[0],32768) : Tls13SetRecvBuffer(@tlsRecv[0],16645)
+ QuicCipherInvalidateHook=@Tls13RecInvalidateCipher
+ rc=Tls13Init(?HostName,15,#TEST_UNIX) : If rc<>1 : ProcedureReturn -9316 : EndIf
+ stage=2
+ rc=DrbgAutoSeed() : If rc<>1 : ProcedureReturn rc : EndIf
+ rc=DrbgGenerate(@originalId[0],8) : If rc<>8 : ProcedureReturn -9317 : EndIf
+ rc=DrbgGenerate(@clientId[0],8) : If rc<>8 : ProcedureReturn -9318 : EndIf
+ rc=Tls13SetAlpn(?Alpn,3) : If rc<>1 : ProcedureReturn -9320 : EndIf
+ For i=0 To #LOCAL_PARAMETER_BYTES-1 : localParameters[i]=PeekA(?LocalTemplate+i) : Next
+ For i=0 To 7 : localParameters[i+2]=clientId[i] : Next
+ rc=Tls13SetQuicParameters(@tlsConfig[0],@localParameters[0],#LOCAL_PARAMETER_BYTES,@peerParameters[0],4096)
+ If rc<>1 : ProcedureReturn -9321 : EndIf
+ stage=3
+ rc=StartHandshake() : If rc<>0 : ProcedureReturn rc : EndIf
+ rc=SendSpace(@connection\initial) : If rc<>0 : ProcedureReturn rc : EndIf
+ stage=4
+ While appAuthenticated=0
+  rc=Pump() : If rc<0 : ProcedureReturn rc : EndIf
+  n=UdpPayloadReceive(handle,@info,@packet[0],1472)
+  If n<>#SVC_EAGAIN
+   If n<1 : ProcedureReturn n : EndIf
+   If info\family<>4 Or info\peerPort<>55442 : ProcedureReturn -9322 : EndIf
+   For i=0 To 15 : If PeekA(@info\peerAddress+i)<>PeekA(@ep\address+i) : ProcedureReturn -9323 : EndIf : Next
+   received=received+1 : p=0
+   While p<n
+    ; An unparseable datagram remainder is discarded, not a connection error.
+    ; Already authenticated coalesced packets retain their effects.
+    rc=QuicPacketRead(@connection\header,@packet[p],n-p,8) : If rc<>1 : Break : EndIf
+    packetBytes=connection\header\packetBytes
+    rc=PacketOne(@packet[p],packetBytes) : If rc<>0 : ProcedureReturn rc : EndIf
+    p=p+packetBytes
+   Wend
+  EndIf
+ Wend
+ stage=5 : rc=SendApplicationPing() : If rc<>0 : ProcedureReturn rc : EndIf
+ rc=ReceiveApplicationAck() : If rc<>0 : ProcedureReturn rc : EndIf
+ rc=SendApplicationProbe(1) : If rc<>0 : ProcedureReturn rc : EndIf
+ If #DROP_PROBE_TEST : ProcedureReturn CheckProbeLoss() : EndIf
+ ProcedureReturn 0
+EndProcedure
+Procedure.i LiveEntry()
+ Define *s.QuicConnectionSpace
+ *s=liveSpace
+ Select liveOperation
+  Case 1 : liveResult=Tls13NewKeyShare()
+  Case 2 : liveResult=QuicTlsOutputBegin(@connection\tlsOutput,@*s\tx,@tlsBytes[0],2048)
+  Case 3 : liveResult=QuicCryptoTlsStep(@*s\rx)
+  Default : liveResult=-9325
+ EndSelect
+ ProcedureReturn 1
+EndProcedure
+; Compare complete snapshots, not just a few state flags. The foreground
+; deliberately selects unrelated metadata while the real connection is paused.
+Procedure ForeignContext()
+ Tls13State=901 : Tls13Err=902 : TlsNameLen=42 : TlsQuicConfig=0
+ TlsClientRandom[0]=167 : TlsSessionId[0]=89 : TlsGroup=903
+EndProcedure
+Procedure CheckContext()
+ Define i.i,n.i
+ n=Tls13ContextSave(@afterSnapshot[0],#TLS13_CONTEXT_SIZE)
+ For i=0 To #TLS13_CONTEXT_SIZE-1
+  If beforeSnapshot[i]<>afterSnapshot[i] : contextFault=1 : EndIf
+  ; White-box check: the temporary foreground secret snapshot is wiped.
+  If PeekA(@tlsctxw_caller[0]+i)<>0 : contextFault=2 : EndIf
+ Next
+ contextChecks=contextChecks+1
+EndProcedure
+Procedure OperationProbe(kind.i)
+ Define i.i,rc.i,n.i,ticks.i,t.i
+ For i=0 To #TLS13_CONTEXT_SIZE-1 : probeSnapshot[i]=ownerSnapshot[i] : Next
+ ForeignContext() : n=Tls13ContextSave(@beforeSnapshot[0],#TLS13_CONTEXT_SIZE)
+ Select kind
+  Case 1
+   rc=QuicTlsOperationBegin(@deadlineOp,@probeSnapshot[0],#TLS13_CONTEXT_SIZE,1,0,0,0,0,1)
+   If rc<>1 : operationFault=1 : ProcedureReturn : EndIf
+   t=HwMicros() : While HwMicros()-t<3 : Wend
+   rc=QuicTlsOperationStep(@deadlineOp) : CheckContext() : extraContextChecks=extraContextChecks+1
+   If rc<>#QUIC_OP_TIMEOUT Or deadlineOp\phase<>-1 Or TlsWorkerBusy()<>0 : operationFault=2 : EndIf
+   If QuicTlsOperationBegin(@deadlineOp,@probeSnapshot[0],#TLS13_CONTEXT_SIZE,1,0,0,0,0,1000)<>#QUIC_OP_STATE : operationFault=3 : EndIf
+  Case 2
+   rc=QuicCryptoTxInit(@probeTx,0,@probeData[0],4096,@probeBits[0],1024)
+   If rc<>0 : operationFault=4 : ProcedureReturn : EndIf
+   rc=QuicTlsOperationBegin(@outputOp,@probeSnapshot[0],#TLS13_CONTEXT_SIZE,2,@probeTx,@probeOut,@probeOutput[0],2048,20000000)
+   If rc<>1 : operationFault=5 : ProcedureReturn : EndIf
+   ; Deterministic cancellation checkpoint only: restore the production slice
+   ; immediately afterward. Live connection\handshake timing never uses this test setting.
+   ticks=tlsjob_sliceTicks : tlsjob_sliceTicks=1
+   rc=QuicTlsOperationStep(@outputOp) : tlsjob_sliceTicks=ticks
+   CheckContext() : extraContextChecks=extraContextChecks+1
+   If rc<>0 Or probeOut\phase<>3 : operationFault=6 : EndIf
+   rc=QuicTlsOperationCancel(@outputOp) : CheckContext() : extraContextChecks=extraContextChecks+1
+   If rc<>#QUIC_OP_CANCELLED Or probeOut\phase<>-1 Or probeTx\phase<>3 Or TlsWorkerBusy()<>0 : operationFault=7 : EndIf
+   If QuicCryptoTxAppend(@probeTx,@probeOutput[0],1)<>#QUIC_TX_STATE : operationFault=8 : EndIf
+  Case 3
+   rc=QuicCryptoRxInit(@probeRx,0,@probeData[0],4096,@probeBits[0],512)
+   If rc<>0 : operationFault=9 : ProcedureReturn : EndIf
+   rc=QuicTlsOperationBegin(@inputOp,@probeSnapshot[0],#TLS13_CONTEXT_SIZE,3,@probeRx,0,0,0,20000000)
+   If rc<>1 : operationFault=10 : ProcedureReturn : EndIf
+   rc=QuicTlsOperationCancel(@inputOp) : CheckContext() : extraContextChecks=extraContextChecks+1
+   If rc<>#QUIC_OP_CANCELLED Or probeRx\phase<>3 Or probeRx\offered<>0 Or TlsWorkerBusy()<>0 : operationFault=11 : EndIf
+  Case 4
+   rc=QuicTlsOperationBegin(@keyOp,@probeSnapshot[0],#TLS13_CONTEXT_SIZE,4,@probeKey,@probeKeys,Tls13ContextTrafficSecret(@probeSnapshot[0],#TLS13_CONTEXT_SIZE,1,0),32,20000000)
+   If rc<>1 : operationFault=13 : ProcedureReturn : EndIf
+   ticks=tlsjob_sliceTicks : tlsjob_sliceTicks=1
+   rc=QuicTlsOperationStep(@keyOp) : tlsjob_sliceTicks=ticks
+   CheckContext() : extraContextChecks=extraContextChecks+1
+   If rc<>0 Or probeKey\phase=0 : operationFault=14 : EndIf
+   rc=QuicTlsOperationCancel(@keyOp) : CheckContext() : extraContextChecks=extraContextChecks+1
+   If rc<>#QUIC_OP_CANCELLED Or probeKey\phase<>0 Or TlsWorkerBusy()<>0 : operationFault=15 : EndIf
+   For i=0 To SizeOf(QuicKeys)-1 : If PeekA(@probeKeys+i)<>0 : operationFault=16 : EndIf : Next
+   keyCancelled=1
+  Case 5
+   rc=QuicInitialKeysBegin(@probeKey,@probeKeys,@originalId[0],8,1)
+   If rc<>0 : operationFault=17 : ProcedureReturn : EndIf
+   ; A mismatched output owner must be refused without adopting or wiping it.
+   rc=QuicTlsOperationBegin(@preparedKeyOp,@probeSnapshot[0],#TLS13_CONTEXT_SIZE,5,@probeKey,@connection\appWrite,0,0,20000000)
+   If rc<>#QUIC_OP_STATE Or preparedKeyOp\phase<>0 Or probeKey\phase<>1 Or TlsWorkerBusy()<>0 : operationFault=18 : EndIf
+   rc=QuicTlsOperationBegin(@preparedKeyOp,@probeSnapshot[0],#TLS13_CONTEXT_SIZE,5,@probeKey,@probeKeys,0,0,20000000)
+   If rc<>1 : operationFault=19 : ProcedureReturn : EndIf
+   ticks=tlsjob_sliceTicks : tlsjob_sliceTicks=1
+   rc=QuicTlsOperationStep(@preparedKeyOp) : tlsjob_sliceTicks=ticks
+   CheckContext() : extraContextChecks=extraContextChecks+1
+   If rc<>0 Or probeKey\phase=0 : operationFault=20 : EndIf
+   rc=QuicTlsOperationCancel(@preparedKeyOp) : CheckContext() : extraContextChecks=extraContextChecks+1
+   If rc<>#QUIC_OP_CANCELLED Or probeKey\phase<>0 Or TlsWorkerBusy()<>0 : operationFault=21 : EndIf
+   For i=0 To SizeOf(QuicKeys)-1 : If PeekA(@probeKeys+i)<>0 : operationFault=22 : EndIf : Next
+ EndSelect
+ For i=0 To #TLS13_CONTEXT_SIZE-1 : If probeSnapshot[i]<>0 : operationFault=12 : EndIf : Next
+ n=Tls13ContextRestore(@ownerSnapshot[0],#TLS13_CONTEXT_SIZE)
+ operationProbes=operationProbes+1
+EndProcedure
+Procedure TlsSliceBefore()
+ Define n.i
+  If TlsWorkerBegin(@otherJob,@LiveEntry,0)<>#TLSWORK_BUSY : ownershipFault=1 : EndIf
+  If TlsWorkerStep(@otherJob)<>#TLSWORK_OWNER Or TlsWorkerCancel(@otherJob)<>#TLSWORK_OWNER : ownershipFault=2 : EndIf
+  If otherJob\task<>0 Or otherJob\phase<>0 Or otherJob\result<>773 : ownershipFault=3 : EndIf
+  If HooksClear()<>1 Or TlsWorkerBusy()<>1 : ownershipFault=4 : EndIf
+  If TlsContextWorkerBegin(@refusedJob,@ownerSnapshot[0],#TLS13_CONTEXT_SIZE,@LiveEntry,0)<>#TLSWORK_BUSY : contextFault=6 : EndIf
+  If TlsContextWorkerStep(@refusedJob)<>#TLSWORK_OWNER Or TlsContextWorkerCancel(@refusedJob)<>#TLSWORK_OWNER : contextFault=7 : EndIf
+  If refusedJob\snapshot<>771 Or refusedJob\capacity<>772 Or refusedJob\worker\result<>773 Or refusedJob\worker\task<>0 : contextFault=8 : EndIf
+  ownershipChecks=ownershipChecks+1
+  ForeignContext() : n=Tls13ContextSave(@beforeSnapshot[0],#TLS13_CONTEXT_SIZE)
+EndProcedure
+Procedure TlsSliceAfter(cost.i)
+  CheckContext()
+  If cost>maxWorkerStep : maxWorkerStep=cost : EndIf
+  workerSteps=workerSteps+1
+  If HooksClear()<>1 : ownershipFault=5 : EndIf
+EndProcedure
+Procedure.i PrepareTlsProbe(operation.i,space.i)
+ Define rc.i,t.i,cost.i,n.i,i.i
+ liveOperation=operation : liveSpace=space
+ otherJob\result=773
+ refusedJob\snapshot=771 : refusedJob\capacity=772 : refusedJob\worker\result=773
+ n=Tls13ContextSave(@ownerSnapshot[0],#TLS13_CONTEXT_SIZE)
+ If TlsContextWorkerBegin(@refusedJob,@refusedJob,#TLS13_CONTEXT_SIZE,@LiveEntry,0)<>#TLSWORK_STATE : contextFault=5 : EndIf
+ If operation=1 And cancelChecked=0
+  For i=0 To #TLS13_CONTEXT_SIZE-1 : retrySnapshot[i]=ownerSnapshot[i] : Next
+  rc=TlsContextWorkerBegin(@liveJob,@ownerSnapshot[0],#TLS13_CONTEXT_SIZE,@LiveEntry,0)
+  If rc<>1 : ProcedureReturn rc : EndIf
+  ForeignContext() : n=Tls13ContextSave(@beforeSnapshot[0],#TLS13_CONTEXT_SIZE)
+  rc=TlsContextWorkerStep(@liveJob) : CheckContext()
+  If rc<>0 : contextFault=3 : ProcedureReturn -9326 : EndIf
+  rc=TlsContextWorkerCancel(@liveJob) : CheckContext()
+  If rc<>1 : ProcedureReturn rc : EndIf
+  For i=0 To #TLS13_CONTEXT_SIZE-1
+   If ownerSnapshot[i]<>0 : contextFault=4 : EndIf
+   ownerSnapshot[i]=retrySnapshot[i]
+  Next
+  n=Tls13ContextRestore(@ownerSnapshot[0],#TLS13_CONTEXT_SIZE)
+  n=Tls13ContextWipe(@retrySnapshot[0],#TLS13_CONTEXT_SIZE)
+  cancelChecked=1
+ EndIf
+ If operationProbes=operation-1 : OperationProbe(operation) : EndIf
+ If operationFault<>0 : ProcedureReturn -9327 : EndIf
+ ProcedureReturn 1
+EndProcedure
+Procedure SetupSpans()
+ PokeI(@connectionSpans[0]+0,@rxData[0]) : PokeI(@connectionSpans[0]+8,QuicConnectionBufferBytes(0))
+ PokeI(@connectionSpans[0]+16,@rxBits[0]) : PokeI(@connectionSpans[0]+24,QuicConnectionBufferBytes(1))
+ PokeI(@connectionSpans[0]+32,@txData[0]) : PokeI(@connectionSpans[0]+40,QuicConnectionBufferBytes(2))
+ PokeI(@connectionSpans[0]+48,@txBits[0]) : PokeI(@connectionSpans[0]+56,QuicConnectionBufferBytes(3))
+ PokeI(@connectionSpans[0]+64,@ackRanges[0]) : PokeI(@connectionSpans[0]+72,QuicConnectionBufferBytes(4))
+ PokeI(@connectionSpans[0]+80,@sentSlots[0]) : PokeI(@connectionSpans[0]+88,QuicConnectionBufferBytes(5))
+ PokeI(@connectionSpans[0]+96,@sentMeta[0]) : PokeI(@connectionSpans[0]+104,QuicConnectionBufferBytes(6))
+ PokeI(@connectionSpans[0]+112,@ownerSnapshot[0]) : PokeI(@connectionSpans[0]+120,QuicConnectionBufferBytes(7))
+ PokeI(@connectionSpans[0]+128,@tlsHs[0]) : PokeI(@connectionSpans[0]+136,QuicConnectionBufferBytes(8))
+ PokeI(@connectionSpans[0]+144,@tlsRecv[0]) : PokeI(@connectionSpans[0]+152,QuicConnectionBufferBytes(9))
+ PokeI(@connectionSpans[0]+160,@tlsBytes[0]) : PokeI(@connectionSpans[0]+168,QuicConnectionBufferBytes(10))
+ PokeI(@connectionSpans[0]+176,@tlsConfig[0]) : PokeI(@connectionSpans[0]+184,QuicConnectionBufferBytes(11))
+ PokeI(@connectionSpans[0]+192,@localParameters[0]) : PokeI(@connectionSpans[0]+200,QuicConnectionBufferBytes(12))
+ PokeI(@connectionSpans[0]+208,@peerParameters[0]) : PokeI(@connectionSpans[0]+216,QuicConnectionBufferBytes(13))
+ PokeI(@connectionSpans[0]+224,@parameterEntries[0]) : PokeI(@connectionSpans[0]+232,QuicConnectionBufferBytes(14))
+ PokeI(@connectionSpans[0]+240,@packet[0]) : PokeI(@connectionSpans[0]+248,QuicConnectionBufferBytes(15))
+ PokeI(@connectionSpans[0]+256,@output[0]) : PokeI(@connectionSpans[0]+264,QuicConnectionBufferBytes(16))
+ PokeI(@connectionSpans[0]+272,@originalId[0]) : PokeI(@connectionSpans[0]+280,QuicConnectionBufferBytes(17))
+ PokeI(@connectionSpans[0]+288,@clientId[0]) : PokeI(@connectionSpans[0]+296,QuicConnectionBufferBytes(18))
+ PokeI(@connectionSpans[0]+304,@peerId[0]) : PokeI(@connectionSpans[0]+312,QuicConnectionBufferBytes(19))
+EndProcedure
+Procedure.i CloseHoldEntry()
+ closeHoldRuns=closeHoldRuns+1
+ If ScYield()<>1 : ProcedureReturn 0 : EndIf
+ closeHoldRuns=closeHoldRuns+1 : ProcedureReturn 1
+EndProcedure
+Procedure.i CloseConnection(reason.i)
+ Define rc.i,n.i,i.i,j.i,p.i,t.i,cost.i,saved.i
+ rc=TlsWorkerBegin(@closeHold,@CloseHoldEntry,0)
+ If rc=1
+ rc=TlsWorkerStep(@closeHold)
+ If rc<>0 Or closeHoldRuns<>1 : closeFault=1 : EndIf
+ rc=QuicConnectionClose(@connection,reason)
+ saved=Tls13State : rc=QuicConnectionCloseStep(@connection)
+ If rc<>#TLSWORK_BUSY Or connection\closeStage<>0 Or Tls13State<>saved Or SchedState(closeHold\task)<>#SCHED_READY : closeFault=2 : EndIf
+ rc=TlsWorkerStep(@closeHold)
+ If rc<>1 Or closeHoldRuns<>2 : closeFault=3 : EndIf
+ Else
+  closeFault=8
+  rc=QuicConnectionClose(@connection,reason)
+ EndIf
+ Repeat
+  t=HwMicros() : rc=QuicConnectionCloseStep(@connection) : cost=HwMicros()-t
+  If cost>maxCloseStep : maxCloseStep=cost : EndIf
+  closeCalls=closeCalls+1
+  If rc=2
+   If QuicConnectionSocketClosed(@connection,handle+1,0)<>#QUIC_CONNECTION_STATE Or connection\socket<>handle : closeFault=4 : EndIf
+   If QuicConnectionSocketClosed(@connection,handle,-1)<>#QUIC_CONNECTION_IO Or connection\socket<>handle : closeFault=5 : EndIf
+   n=UdpPayloadClose(handle)
+   n=QuicConnectionSocketClosed(@connection,handle,n)
+   If n<>0 : ProcedureReturn n : EndIf
+  ElseIf rc<0
+   ProcedureReturn rc
+  EndIf
+  n=Service() : If n<0 : ProcedureReturn n : EndIf
+ Until rc=1
+ bufferWiped=1
+ For i=0 To 19
+  p=PeekI(@connectionSpans[0]+i*16) : n=QuicConnectionBufferBytes(i)
+  For j=0 To n-1 : If PeekA(p+j)<>0 : bufferWiped=0 : EndIf : Next
+ Next
+ For i=16 To SizeOf(QuicConnection)-1 : If PeekA(@connection+i)<>0 : closeFault=6 : EndIf : Next
+ If connection\result<>reason Or TlsHsAddr<>0 Or TlsRecvAddr<>0 : closeFault=7 : EndIf
+ If QuicConnectionCloseStep(@connection)<>1 Or QuicConnectionClose(@connection,123)<>1 Or connection\result<>reason : closeFault=8 : EndIf
+ ProcedureReturn 0
+EndProcedure
+Procedure CheckConnectionLifecycle()
+ Define rc.i,n.i,i.i,j.i,p.i,slice.i,socket.i
+ socket=UdpPayloadOpen(4,0,55013)
+ If socket<=0 : lifecycleFault=1 : ProcedureReturn : EndIf
+ rc=QuicConnectionBegin(@connection,@connectionSpans[0],socket,HwMicros(),20000000)
+ If rc<>0 : lifecycleFault=2 : n=UdpPayloadClose(socket) : ProcedureReturn : EndIf
+ Tls13SetHsBuffer(@tlsHs[0],32768) : Tls13SetRecvBuffer(@tlsRecv[0],16645)
+ rc=Tls13Init(?HostName,15,#TEST_UNIX)
+ If rc<>1 : lifecycleFault=3 : EndIf
+ rc=Tls13ContextSave(@ownerSnapshot[0],#TLS13_CONTEXT_SIZE)
+ Tls13SetHsBuffer(@foreignHs[0],32768) : Tls13SetRecvBuffer(@foreignRecv[0],16645)
+ rc=Tls13Init(?HostName,15,#TEST_UNIX)
+ If rc<>1 : lifecycleFault=4 : EndIf
+ foreignHs[0]=68 : foreignHs[32767]=69 : foreignRecv[0]=51 : foreignRecv[16644]=52
+ rc=Tls13ContextSave(@beforeSnapshot[0],#TLS13_CONTEXT_SIZE)
+ rc=QuicTlsOperationBegin(@connection\tlsOp,@ownerSnapshot[0],#TLS13_CONTEXT_SIZE,1,0,0,0,0,20000000)
+ If rc<>1 : lifecycleFault=5 : EndIf
+ slice=tlsjob_sliceTicks : tlsjob_sliceTicks=1
+ rc=QuicTlsOperationStep(@connection\tlsOp)
+ tlsjob_sliceTicks=slice
+ If rc<>0 Or connection\tlsOp\phase<>1 Or TlsWorkerBusy()<>1 : lifecycleFault=6 : EndIf
+ ; Advance the caller-supplied overall clock to its boundary, without sleeping
+ ; or expiring the independent operation timer. Cancellation must stop a live
+ ; suspended crypto context before erasing storage.
+ rc=QuicConnectionCheckDeadline(@connection,connection\started+connection\timeout-1)
+ If rc<>0 Or connection\phase<>1 : lifecycleFault=7 : EndIf
+ rc=QuicConnectionCheckDeadline(@connection,connection\started+connection\timeout)
+ If rc<>#QUIC_CONNECTION_TIMEOUT Or connection\phase<>2 Or connection\result<>#QUIC_CONNECTION_TIMEOUT : lifecycleFault=8 : EndIf
+ lifecycleProbes=lifecycleProbes+1
+ rc=QuicConnectionCloseStep(@connection)
+ If rc<>0 Or connection\closeStage<>1 Or connection\tlsOp\phase<>-1 Or TlsWorkerBusy()<>0 : lifecycleFault=9 : EndIf
+ If connection\initial\rx\phase<>3 Or connection\handshake\rx\phase<>3 Or connection\initial\tx\phase<>3 Or connection\handshake\tx\phase<>3 : lifecycleFault=17 : EndIf
+ lifecycleProbes=lifecycleProbes+1
+ Repeat
+  rc=QuicConnectionCloseStep(@connection)
+  If rc=2
+   n=UdpPayloadClose(socket) : n=QuicConnectionSocketClosed(@connection,socket,n)
+   If n<>0 : lifecycleFault=10 : ProcedureReturn : EndIf
+  ElseIf rc<0
+   lifecycleFault=11 : ProcedureReturn
+  EndIf
+  n=Service()
+ Until rc=1
+ For i=0 To 19
+  p=PeekI(@connectionSpans[0]+i*16) : n=QuicConnectionBufferBytes(i)
+  For j=0 To n-1 : If PeekA(p+j)<>0 : lifecycleFault=12 : EndIf : Next
+ Next
+ If connection\result<>#QUIC_CONNECTION_TIMEOUT : lifecycleFault=13 : EndIf
+ rc=Tls13ContextSave(@afterSnapshot[0],#TLS13_CONTEXT_SIZE)
+ For i=0 To #TLS13_CONTEXT_SIZE-1 : If beforeSnapshot[i]<>afterSnapshot[i] : lifecycleFault=14 : EndIf : Next
+ If foreignHs[0]<>68 Or foreignHs[32767]<>69 Or foreignRecv[0]<>51 Or foreignRecv[16644]<>52 : lifecycleFault=15 : EndIf
+ If TlsWorkerBusy()<>0 Or GcmJobBusy()<>0 Or HooksClear()<>1 : lifecycleFault=16 : EndIf
+ lifecycleProbes=lifecycleProbes+1
+ rc=Tls13ContextRestore(@ownerSnapshot[0],#TLS13_CONTEXT_SIZE)
+EndProcedure
+Procedure CheckPacketCancellation()
+ Define rc.i,n.i,i.i,socket.i,slice.i
+ socket=UdpPayloadOpen(4,0,55013)
+ If socket<=0 : sendFault=7 : ProcedureReturn : EndIf
+ rc=QuicConnectionBegin(@connection,@connectionSpans[0],socket,HwMicros(),20000000)
+ If rc<>0 : sendFault=8 : n=UdpPayloadClose(socket) : ProcedureReturn : EndIf
+ n=DrbgGenerate(@originalId[0],8)
+ rc=KeyDone(QuicInitialKeysBegin(@connection\keyjob,@connection\initial\writeKeys,@originalId[0],8,0))
+ If n<>8 Or rc<>0 : sendFault=9 : EndIf
+ rc=QuicCryptoTxAppend(@connection\initial\tx,@probeData[0],8)
+ If rc<>8 : sendFault=10 : EndIf
+ rc=QuicConnectionSendBegin(@connection,0,0)
+ If rc<>0 : sendFault=11 : EndIf
+ For i=0 To 7
+  rc=QuicConnectionSendStep(@connection)
+  If rc<>0 : sendFault=12 : EndIf
+  If connection\outgoing\encryptStarted=1 : Break : EndIf
+ Next
+ slice=tlsjob_sliceTicks : tlsjob_sliceTicks=1
+ rc=QuicConnectionSendStep(@connection)
+ tlsjob_sliceTicks=slice
+ If rc<>0 Or connection\sendJob\phase=0 Or TlsWorkerOwns(@connection\outgoing\worker)<>1 : sendFault=13 : EndIf
+ rc=QuicConnectionClose(@connection,-9420)
+ rc=QuicConnectionCloseStep(@connection)
+ If rc<>0 Or connection\closeStage<>1 Or TlsWorkerBusy()<>0 Or GcmJobBusy()<>0 Or connection\sendJob\phase<>0 : sendFault=14 : EndIf
+ Repeat
+  rc=QuicConnectionCloseStep(@connection)
+  If rc=2
+   n=UdpPayloadClose(socket) : n=QuicConnectionSocketClosed(@connection,socket,n)
+   If n<>0 : sendFault=15 : ProcedureReturn : EndIf
+  ElseIf rc<0
+   sendFault=16 : ProcedureReturn
+  EndIf
+  n=Service()
+ Until rc=1
+ If connection\result<>-9420 Or QuicConnectionSendStep(@connection)<>#QUIC_SEND_STATE Or HooksClear()<>1 : sendFault=17 : EndIf
+ packetCancelChecked=1
+EndProcedure
+Procedure CheckReceiveCancellation()
+ Define socket.i,rc.i,n.i,i.i,slice.i
+ socket=UdpPayloadOpen(4,0,55013)
+ If socket<=0 : receiveFault=4 : ProcedureReturn : EndIf
+ rc=QuicConnectionBegin(@connection,@connectionSpans[0],socket,HwMicros(),20000000)
+ If rc<>0 : receiveFault=5 : n=UdpPayloadClose(socket) : ProcedureReturn : EndIf
+ For i=0 To 7 : originalId[i]=savedOriginal[i] : clientId[i]=savedClient[i] : Next
+ For i=0 To savedReceiveBytes-1 : packet[i]=savedReceive[i] : Next
+ rc=KeyDone(QuicInitialKeysBegin(@connection\keyjob,@connection\initial\readKeys,@originalId[0],8,1))
+ If rc<>0 : receiveFault=6 : EndIf
+ packet[savedReceiveBytes-1]=packet[savedReceiveBytes-1]!1
+ rc=QuicConnectionReceivePacketBegin(@connection,@packet[0],savedReceiveBytes)
+ If rc<>0 : cidFault=5 : EndIf
+ Repeat
+  rc=QuicConnectionReceiveStep(@connection) : n=Service()
+ Until rc<>1
+ If rc<>6 Or connection\peerIdKnown<>0 Or connection\peerIdBytes<>0 Or connection\initial\largest<>-1 : cidFault=6 : EndIf
+ For i=0 To 19 : If peerId[i]<>0 : cidFault=7 : EndIf : Next
+ For i=0 To savedReceiveBytes-1 : packet[i]=savedReceive[i] : Next
+ rc=QuicConnectionReceivePacketBegin(@connection,@packet[0],savedReceiveBytes)
+ If rc<>0 : receiveFault=7 : EndIf
+ rc=QuicConnectionReceiveStep(@connection)
+ If rc<>1 : receiveFault=8 : EndIf
+ slice=tlsjob_sliceTicks : tlsjob_sliceTicks=1
+ rc=QuicConnectionReceiveStep(@connection)
+ tlsjob_sliceTicks=slice
+ If rc<>1 Or TlsWorkerOwns(@connection\incoming\worker)<>1 : receiveFault=9 : EndIf
+ rc=QuicConnectionClose(@connection,-9430)
+ rc=QuicConnectionCloseStep(@connection)
+ If rc<>0 Or connection\closeStage<>1 Or TlsWorkerBusy()<>0 Or GcmJobBusy()<>0 Or connection\receive\crypto\phase<>0 : receiveFault=10 : EndIf
+ Repeat
+  rc=QuicConnectionCloseStep(@connection)
+  If rc=2
+   n=UdpPayloadClose(socket) : n=QuicConnectionSocketClosed(@connection,socket,n)
+   If n<>0 : receiveFault=11 : ProcedureReturn : EndIf
+  ElseIf rc<0
+   receiveFault=12 : ProcedureReturn
+  EndIf
+  n=Service()
+ Until rc=1
+ If connection\result<>-9430 Or QuicConnectionReceiveStep(@connection)<>#QUIC_RECEIVE_STATE Or HooksClear()<>1 : receiveFault=13 : EndIf
+ receiveCancelled=1
+EndProcedure
+Procedure CheckApplicationCancellation()
+ Define socket.i,rc.i,n.i,i.i,slice.i
+ If savedApplicationBytes=0 : applicationFault=7 : ProcedureReturn : EndIf
+ socket=UdpPayloadOpen(4,0,55013)
+ If socket<=0 : applicationFault=8 : ProcedureReturn : EndIf
+ rc=QuicConnectionBegin(@connection,@connectionSpans[0],socket,HwMicros(),20000000)
+ If rc<>0 : applicationFault=9 : n=UdpPayloadClose(socket) : ProcedureReturn : EndIf
+ For i=0 To savedApplicationBytes-1 : packet[i]=savedApplication[i] : Next
+ For i=0 To SizeOf(QuicKeys)-1 : PokeA(@connection\appRead+i,PeekA(@savedApplicationKeys+i)) : Next
+ rc=QuicApplicationPacketBegin(@connection\application,@connection\appRead,@packet[0],savedApplicationBytes,8,-1,0)
+ If rc<>0 : applicationFault=10 : EndIf
+ slice=tlsjob_sliceTicks : tlsjob_sliceTicks=1
+ rc=QuicApplicationPacketStep(@connection\application) : tlsjob_sliceTicks=slice
+ If rc<>0 Or connection\application\crypto\phase=0 Or TlsWorkerOwns(@connection\application\worker)<>1 : applicationFault=11 : EndIf
+ rc=QuicConnectionClose(@connection,-9443) : rc=QuicConnectionCloseStep(@connection)
+ If rc<>0 Or connection\closeStage<>1 Or TlsWorkerBusy()<>0 Or GcmJobBusy()<>0 Or connection\application\crypto\phase<>0 : applicationFault=12 : EndIf
+ If QuicApplicationPacketStep(@connection\application)<>#QUIC_APP_PACKET_CANCELLED : applicationFault=13 : EndIf
+ Repeat
+  rc=QuicConnectionCloseStep(@connection)
+  If rc=2
+   n=UdpPayloadClose(socket) : n=QuicConnectionSocketClosed(@connection,socket,n)
+   If n<>0 : applicationFault=14 : ProcedureReturn : EndIf
+  ElseIf rc<0
+   applicationFault=15 : ProcedureReturn
+  EndIf
+  n=Service()
+ Until rc=1
+ QuicKeysWipe(@savedApplicationKeys)
+ If connection\result<>-9443 Or HooksClear()<>1 : applicationFault=16 : EndIf
+ applicationCancelled=1
+EndProcedure
+Procedure CheckHandshakeSecretRetirement()
+ Define i.i,n.i,expected.i
+ For i=0 To #TLS13_CONTEXT_SIZE-1 : probeSnapshot[i]=ownerSnapshot[i] : Next
+ If Tls13ContextRetireHandshakeSecrets(0,#TLS13_CONTEXT_SIZE)<>0 : retireFault=1 : EndIf
+ If Tls13ContextRetireHandshakeSecrets($7FFFFFFFFFFFFFF0,#TLS13_CONTEXT_SIZE)<>0 : retireFault=2 : EndIf
+ If Tls13ContextRetireHandshakeSecrets(@probeSnapshot[0],#TLS13_CONTEXT_SIZE-1)<>0 : retireFault=3 : EndIf
+ For i=0 To #TLS13_CONTEXT_SIZE-1 : If probeSnapshot[i]<>ownerSnapshot[i] : retireFault=4 : EndIf : Next
+ PokeI(@probeSnapshot[0]+168,#TLS13_ST_SEND_FINISHED)
+ For i=0 To #TLS13_CONTEXT_SIZE-1 : retrySnapshot[i]=probeSnapshot[i] : Next
+ If Tls13ContextRetireHandshakeSecrets(@probeSnapshot[0],#TLS13_CONTEXT_SIZE)<>0 : retireFault=5 : EndIf
+ For i=0 To #TLS13_CONTEXT_SIZE-1
+  If probeSnapshot[i]<>retrySnapshot[i] : retireFault=6 : EndIf
+  probeSnapshot[i]=ownerSnapshot[i]
+ Next
+ ForeignContext() : n=Tls13ContextSave(@beforeSnapshot[0],#TLS13_CONTEXT_SIZE)
+ If Tls13ContextRetireHandshakeSecrets(@probeSnapshot[0],#TLS13_CONTEXT_SIZE)<>1 : retireFault=7 : EndIf
+ n=Tls13ContextSave(@afterSnapshot[0],#TLS13_CONTEXT_SIZE)
+ For i=0 To #TLS13_CONTEXT_SIZE-1
+  If beforeSnapshot[i]<>afterSnapshot[i] : retireFault=8 : EndIf
+  expected=ownerSnapshot[i]
+  If (i>=272 And i<=367) Or (i>=400 And i<=463) Or (i>=528 And i<=623) : expected=0 : EndIf
+  If probeSnapshot[i]<>expected : retireFault=9 : EndIf
+ Next
+ If Tls13ContextRetireHandshakeSecrets(@probeSnapshot[0],#TLS13_CONTEXT_SIZE)<>1 : retireFault=10 : EndIf
+ n=Tls13ContextRestore(@probeSnapshot[0],#TLS13_CONTEXT_SIZE)
+ n=Tls13ContextSave(@afterSnapshot[0],#TLS13_CONTEXT_SIZE)
+ For i=0 To #TLS13_CONTEXT_SIZE-1 : If afterSnapshot[i]<>probeSnapshot[i] : retireFault=11 : EndIf : Next
+ n=Tls13ContextRestore(@ownerSnapshot[0],#TLS13_CONTEXT_SIZE)
+ n=Tls13ContextWipe(@probeSnapshot[0],#TLS13_CONTEXT_SIZE)
+ n=Tls13ContextWipe(@retrySnapshot[0],#TLS13_CONTEXT_SIZE)
+ retireChecked=1
+EndProcedure
+Procedure FixtureMark(value.i)
+ PokeI($E1C0FF00,value) : MmuCleanRange($E1C0FF00,64)
+EndProcedure
+Procedure.i Main()
+ CaptureTable()
+ PokeI($E1C0FF08,services) : FixtureMark(1)
+ Define i.i,rc.i,closed.i,cleanup.i,admit.i,saved.i,tlsState.i,tlsError.i,x509Error.i,certCount.i,alert.i,workerBytes.i
+ rc=UdpPayloadBind(services) : If rc<>0 : ProcedureReturn 71 : EndIf
+ FixtureMark(2)
+ pet=PeekI(services+16+6*8) : clock=PeekI(services+16+11*8) : started=clock()
+ FixtureMark(3)
+ MmuClearNc() : MmuAddNc($08A00000,$09200000) : MmuAddNc($08100000,$08180000)
+ FixtureMark(4)
+ rc=MmuBuildTables($4F80000) : If rc<>0 : ProcedureReturn 72 : EndIf
+ FixtureMark(5)
+ MmuEnableCached()
+ FixtureMark(6)
+ workerBytes=(?FixtureImageEnd-$1000000)&-4
+ If TlsWorkerInstall($1000000,workerBytes)<>1 : MmuDisableCachedFlushed() : ProcedureReturn 73 : EndIf
+ FixtureMark(7)
+ For i=0 To 65535 : PokeA($E1C00000+i,0) : Next
+ FixtureMark(8)
+ PokeI($E1C00000,$55445331) : PokeI($E1C00008,#REPORT_COUNT)
+ PokeI($E1C002A0,@CloseHoldEntry) : PokeI($E1C002A8,$1000000+workerBytes)
+ ep\family=4 : ep\kind=0 : ep\port=55442
+ For i=0 To 15 : PokeA(@ep\address+i,PeekA(?Peer+i)) : Next
+ handle=UdpPayloadOpen(4,0,55013)
+ FixtureMark(9)
+ SetupSpans()
+ storageRefused=1
+ saved=connectionSpans[0] : connectionSpans[0]=@connection
+ If QuicConnectionBegin(@connection,@connectionSpans[0],handle,HwMicros(),20000000)<>#QUIC_CONNECTION_ARGUMENT : storageRefused=0 : EndIf
+ connectionSpans[0]=saved
+ saved=connectionSpans[2] : connectionSpans[2]=connectionSpans[0]
+ If QuicConnectionBegin(@connection,@connectionSpans[0],handle,HwMicros(),20000000)<>#QUIC_CONNECTION_ARGUMENT : storageRefused=0 : EndIf
+ connectionSpans[2]=saved
+ connectionSpans[1]=connectionSpans[1]-1
+ If QuicConnectionBegin(@connection,@connectionSpans[0],handle,HwMicros(),20000000)<>#QUIC_CONNECTION_ARGUMENT : storageRefused=0 : EndIf
+ connectionSpans[1]=connectionSpans[1]+1
+ For i=0 To SizeOf(QuicConnection)-1 : If PeekA(@connection+i)<>0 : storageRefused=0 : EndIf : Next
+ If handle>0
+  admit=QuicConnectionBegin(@connection,@connectionSpans[0],handle,HwMicros(),20000000)
+  FixtureMark(10)
+  If admit=0 : rc=Run()
+ If probeTimer\phase=1 : QuicProbeTimerDiscard(@probeTimer) : EndIf : Else : rc=admit : EndIf
+  tlsState=Tls13State : tlsError=Tls13Err : x509Error=Tls13X509Err : certCount=TlsCertCount : alert=Tls13Alert
+  If admit=0 : closed=CloseConnection(rc) : Else : closed=UdpPayloadClose(handle) : EndIf
+ Else
+  rc=handle : closed=-1
+ EndIf
+ For i=0 To SizeOf(QuicApplicationState)-1 : If PeekA(@connection\applicationState+i)<>0 : applicationStateFault=4 : EndIf : Next
+ PokeI($E1C00298,applicationStateFault)
+ PokeI($E1C002B0,retireFault) : PokeI($E1C002B8,retireChecked)
+ PokeI($E1C002C0,confirmFault) : PokeI($E1C002C8,confirmChecked)
+ For i=0 To SizeOf(QuicPeerIds)-1 : If PeekA(@connection\peerIds+i)<>0 : peerIdsFault=7 : EndIf : Next
+ For i=0 To 575 : If PeekA(@connection\peerIdRecords+i)<>0 : peerIdsFault=8 : EndIf : Next
+ PokeI($E1C00300,controlFault) : PokeI($E1C00308,controlChecked)
+ PokeI($E1C00310,controlDelay) : PokeI($E1C00318,controlReceipt)
+ PokeI($E1C002E0,peerIdsFault) : PokeI($E1C002E8,peerIdsChecked) : PokeI($E1C002F0,peerIdsFrames)
+ PokeI($E1C002D0,confirmForeign) : PokeI($E1C002D8,confirmSecretPresent)
+ PokeI($E1C00100,rc) : PokeI($E1C00108,tlsState) : PokeI($E1C00110,tlsError)
+ PokeI($E1C00220,peerBytes)
+ PokeI($E1C00248,applicationFrames) : PokeI($E1C00250,doneSeen)
+ PokeI($E1C00228,startupFault) : PokeI($E1C00230,startupChecks)
+ PokeI($E1C00238,maxStartupStep) : PokeI($E1C00240,startupSteps)
+ PokeI($E1C00118,x509Error) : PokeI($E1C00120,paramsReady) : PokeI($E1C00128,appAuthenticated)
+ PokeI($E1C00130,initialDiscarded) : PokeI($E1C00138,Bool(certCount>=1)) : PokeI($E1C00140,Bool(ackEvents>0))
+ PokeI($E1C00148,closed) : PokeI($E1C00150,GcmJobBusy()) : PokeI($E1C00158,Bool(sent>=2 And received>=1))
+ PokeI($E1C00040,maxService) : PokeI($E1C00048,stage) : PokeI($E1C00050,received) : PokeI($E1C00058,sent)
+ PokeI($E1C00060,clock()-started) : PokeI($E1C00068,alert) : PokeI($E1C00070,ackEvents)
+ PokeI($E1C00078,maxPumpGap) : PokeI($E1C00080,maxTlsStep)
+ PokeI($E1C00088,maxWorkerStep) : PokeI($E1C00090,workerSteps) : PokeI($E1C00098,ownershipChecks)
+ PokeI($E1C00160,ownershipFault) : PokeI($E1C00168,Bool(workerSteps>1 And ownershipChecks=workerSteps))
+ PokeI($E1C00170,Bool(TlsWorkerBusy()=0 And TlsWorkerFaulted()=0 And HooksClear()=1 And unexpectedProfile=0))
+ PokeI($E1C00178,contextFault) : PokeI($E1C00180,cancelChecked) : PokeI($E1C000A0,contextChecks)
+ PokeI($E1C00188,operationFault) : PokeI($E1C00190,operationProbes) : PokeI($E1C000A8,extraContextChecks)
+ PokeI($E1C00198,connection\phase) : PokeI($E1C001A0,bufferWiped) : PokeI($E1C001A8,closeFault) : PokeI($E1C001B0,storageRefused)
+ PokeI($E1C000B0,maxCloseStep) : PokeI($E1C000B8,closeCalls)
+ PokeI($E1C000C0,maxSendStep) : PokeI($E1C000C8,sendSteps)
+ PokeI($E1C000D0,maxAckStep) : PokeI($E1C000D8,ackSteps)
+ PokeI($E1C001E0,ackFault) : PokeI($E1C001E8,Bool(ackChecks>0))
+ CheckConnectionLifecycle()
+ PokeI($E1C001B8,lifecycleFault) : PokeI($E1C001C0,lifecycleProbes)
+ CheckPacketCancellation()
+ CheckReceiveCancellation()
+ CheckApplicationCancellation()
+ PokeI($E1C00210,cidFault) : PokeI($E1C00218,Bool(cidChecks>0))
+ PokeI($E1C00200,feedFault) : PokeI($E1C00208,keyCancelled)
+ PokeI($E1C000F0,maxFeedStep) : PokeI($E1C000F8,feedSteps)
+ PokeI($E1C001F0,receiveFault) : PokeI($E1C001F8,receiveCancelled)
+ PokeI($E1C000E0,maxReceiveStep) : PokeI($E1C000E8,receiveSteps)
+ PokeI($E1C001C8,sendFault) : PokeI($E1C001D0,Bool(sendProbes=sent And sent>=1)) : PokeI($E1C001D8,packetCancelChecked)
+ PokeI($E1C00258,applicationWriteReady) : PokeI($E1C00260,applicationFault)
+ PokeI($E1C00268,applicationSteps) : PokeI($E1C00270,maxApplicationStep)
+ PokeI($E1C00278,applicationCancelled) : PokeI($E1C00280,applicationPing)
+ PokeI($E1C00500,timerFault) : PokeI($E1C00508,timerCount)
+ PokeI($E1C00510,timerBase) : PokeI($E1C00518,timerDue) : PokeI($E1C00520,timerFired)
+ PokeI($E1C00528,probeTimer\phase)
+ PokeI($E1C00390,rttFault) : PokeI($E1C00398,rttSamples)
+ PokeI($E1C003A0,pathRtt\latest) : PokeI($E1C003A8,pathRtt\minimum)
+ PokeI($E1C003B0,pathRtt\smoothed) : PokeI($E1C003B8,pathRtt\variation)
+ PokeI($E1C003C0,QuicRttLossDelay(@pathRtt)) : PokeI($E1C003C8,QuicRttPto(@pathRtt,4,1,25000,0))
+ For i=0 To 31 : PokeI($E1C00400+i*8,rttTrace[i]) : Next
+ PokeI($E1C00370,lossFault) : PokeI($E1C00378,lossChecked)
+ PokeI($E1C00380,lossAckCount) : PokeI($E1C00388,lossEvents)
+ PokeI($E1C00350,probeFault) : PokeI($E1C00358,probeChecked)
+ PokeI($E1C00360,probeNumber) : PokeI($E1C00368,probeBytes)
+ PokeI($E1C00348,deliveryProbes)
+ PokeI($E1C00320,deliveryFault) : PokeI($E1C00328,applicationDelivery)
+ PokeI($E1C00330,deliveryEvents) : PokeI($E1C00338,deliverySteps) : PokeI($E1C00340,deliveryNumber)
+ PokeI($E1C00288,applicationNumber) : PokeI($E1C00290,applicationBadTag)
+ cleanup=Tls13ContextWipe(@beforeSnapshot[0],#TLS13_CONTEXT_SIZE)
+ cleanup=Tls13ContextWipe(@afterSnapshot[0],#TLS13_CONTEXT_SIZE)
+ Tls13PauseHook=0 : Tls13SetupPauseHook=0 : QuicCipherInvalidateHook=0
+ X509PauseHook=0 : EcdsaVerifyHook=0 : X25519ComputeHook=0
+ MmuDisableCachedFlushed() : ProcedureReturn 0
+EndProcedure

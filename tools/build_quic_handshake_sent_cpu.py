@@ -266,6 +266,43 @@ def build(compiler,out):
  check('cancel partial ACK','QuicHandshakeSentAckCancel(@job)',-3467)
  check('cancelled ACK cannot sample','QuicRttAck(@rtt,@job,10000,3,25000,1)',-3462)
  check('cancel preserves RTT','rtt\\latest',2000)
+
+ # Timer-space selection, boundary firing, backoff and ownership lifecycle.
+ reset_rtt();check('probe init','QuicProbeTimerInit(@timer)',0)
+ def arm(initial,handshake,application,confirmed=1,backoff=0):
+  eligible=[(base+min(M,(333000+666000+(25000 if level==4 else 0))*(1<<backoff)),level) for base,level in [(initial,0),(handshake,2),(application,4)] if base>=0 and (level!=4 or confirmed)]
+  expected=min([(min(M,d),level) for d,level in eligible],default=(0,-1))
+  check('arm spaces',f'QuicProbeTimerArm(@timer,@rtt,{confirmed},25000,{initial},{handshake},{application})',int(bool(eligible)))
+  check('selected deadline','timer\\deadline',expected[0]);check('selected space','timer\\level',expected[1])
+  return expected[0]
+ for spaces in [(-1,-1,-1),(0,-1,-1),(-1,5,-1),(-1,-1,0),(100,100,0),(100,200,0),(200,100,0),(100000,100000,0)]:arm(*spaces)
+ arm(-1,-1,0,confirmed=0);arm(0,1,0,confirmed=0)
+ due=arm(-1,-1,0)
+ check('before deadline','QuicProbeTimerPoll(@timer,1023999)',0)
+ check('at deadline','QuicProbeTimerPoll(@timer,1024000)',1)
+ check('expiry backoff','timer\\backoff',1)
+ check('expiry only once','QuicProbeTimerPoll(@timer,1024001)',0)
+ arm(-1,-1,100,backoff=1)
+ check('unvalidated ACK','QuicProbeTimerAcknowledged(@timer,1,0)',0);check('backoff retained','timer\\backoff',1)
+ check('duplicate ACK','QuicProbeTimerAcknowledged(@timer,0,1)',0);check('backoff retained','timer\\backoff',1)
+ check('fresh validated ACK','QuicProbeTimerAcknowledged(@timer,1,1)',0);check('backoff reset','timer\\backoff',0)
+ due=arm(5,-1,-1)
+ for args in ['2,25000,0,-1,-1','1,-1,0,-1,-1','1,25000,-2,-1,-1']:
+  check('bad arm atomic',f'QuicProbeTimerArm(@timer,@rtt,{args})',-3461)
+ check('refused arm preserves deadline','timer\\deadline',due)
+ check('negative poll','QuicProbeTimerPoll(@timer,-1)',-3461)
+ check('cancel timer','QuicProbeTimerDiscard(@timer)',0)
+ check('closed timer cannot fire','QuicProbeTimerPoll(@timer,999999999)',-3462)
+ check('closed arm refused','QuicProbeTimerArm(@timer,@rtt,1,0,0,0,0)',-3462)
+ check('reinitialize timer','QuicProbeTimerInit(@timer)',0)
+ # Repeated expiries reach saturation without a shift overflow or event loop.
+ for k in range(65):
+  due=arm(0,-1,-1,backoff=min(k,63))
+  check('backoff expiry',f'QuicProbeTimerPoll(@timer,{due})',1)
+  check('bounded backoff','timer\\backoff',min(k+1,63))
+ arm(M,M,M,backoff=63)
+ check('saturated tie prefers initial','timer\\level',0)
+ check('discard saturated timer','QuicProbeTimerDiscard(@timer)',0)
  assert 256+len(cases)*8<=65536
  source=out/'proof.pi4'
  source.write_text(r'''XIncludeFile "RaspberryPi4/Lib/mmu.pi4"
@@ -273,6 +310,7 @@ XIncludeFile "Anvil/Network/quic_handshake_sent.pbi"
 Global s.QuicHandshakeSent,job.QuicHandshakeSentAck,other.QuicHandshakeSentAck,frame.QuicHandshakeFrame
 Global lossJob.QuicHandshakeSentLoss
 Global rtt.QuicRtt
+Global timer.QuicProbeTimer
 Global Dim storage.a[131104]
 Global Dim wire.a[1100]
 Global events.i,byteSum.i,flightSum.i,cookieSum.i,timeSum.i,eventHash.i

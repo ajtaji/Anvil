@@ -178,7 +178,7 @@ class Peer:
             assert time.monotonic()<end,'No authenticated application ACK covering HANDSHAKE_DONE'
             self.stop.wait(.01)
 
-    def check_probe_loss(self, timeout=2):
+    def check_probe_loss(self, timeout=2, upto=4):
         end=time.monotonic()+timeout
         while True:
             self.check()
@@ -187,10 +187,10 @@ class Peer:
                      and e['data']['header']['packet_type']=='1RTT']
             numbers={int(p['header']['packet_number']) for p in packets}
             assert 1 not in numbers,'Discarded probe reached the authenticated receiver'
-            if {0,2,3,4}<=numbers:
+            if ({0}|set(range(2,upto+1)))<=numbers:
                 assert self.result.get('dropped_probe'),self.result
                 for p in packets:
-                    if int(p['header']['packet_number']) in (2,3,4):
+                    if int(p['header']['packet_number']) in range(2,upto+1):
                         assert [f['frame_type'] for f in p['frames']]==['ping'],p
                 self.result['probe_loss_verified']=True
                 return

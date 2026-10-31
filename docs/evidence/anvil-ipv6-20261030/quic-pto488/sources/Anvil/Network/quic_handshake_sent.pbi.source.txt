@@ -1,0 +1,516 @@
+; SPDX-License-Identifier: MIT
+; Independent RFC 9000 sections12.3/13.1/19.3, RFC 9002 sections4.1/5/6 (with verified erratum7539).
+; Bounded Initial/Handshake/Application sent history; legacy API names retained.
+; Caller owns transport, keys and recovery. ACKed prefixes may be reclaimed;
+; packet numbers never restart and unsent gaps are never forgotten.
+XIncludeFile "Anvil/Network/quic_handshake_frames.pbi"
+#QUIC_SENT_ARGUMENT=-3461
+#QUIC_SENT_STATE=-3462
+#QUIC_SENT_LIMIT=-3463
+#QUIC_SENT_BUSY=-3464
+#QUIC_SENT_UNSENT=-3465
+#QUIC_SENT_FORMAT=-3466
+#QUIC_SENT_CANCELLED=-3467
+Structure QuicHandshakeSent
+ phase.i
+ level.i
+ entries.i
+ capacity.i
+ issued.i
+ first.i
+ lastSent.i
+ lastTime.i
+ busy.i
+ acked.i
+ largestAcked.i
+ inFlight.i
+EndStructure
+Structure QuicHandshakeSentAck
+ phase.i
+ result.i
+ owner.i
+ source.i
+ bytes.i
+ count.i
+ largest.i
+ cursor.i
+ rangeIndex.i
+ low.i
+ high.i
+ current.i
+ number.i
+ packetBytes.i
+ sentAt.i
+ cookie.i
+ flags.i
+ inFlightBytes.i
+ rttLargestNew.i
+ rttSentAt.i
+ rttEliciting.i
+ rttUsed.i
+ rttDelay.i
+EndStructure
+Procedure.i quics_Span(p.i,n.i)
+ If p<=0 Or n<0 Or p>$7FFFFFFFFFFFFFFF-n : ProcedureReturn 0 : EndIf
+ ProcedureReturn 1
+EndProcedure
+Procedure.i quics_Overlap(a.i,n.i,b.i,m.i)
+ ProcedureReturn Bool(a<b+m And b<a+n)
+EndProcedure
+Procedure.i quics_Ready(*s.QuicHandshakeSent)
+ If quics_Span(*s,SizeOf(QuicHandshakeSent))=0 : ProcedureReturn #QUIC_SENT_ARGUMENT : EndIf
+ If *s\phase<>1 Or (*s\level<>0 And *s\level<>2 And *s\level<>4) Or *s\capacity<1 Or *s\capacity>4096 : ProcedureReturn #QUIC_SENT_STATE : EndIf
+ If quics_Span(*s\entries,*s\capacity*32)=0 Or *s\issued<0 Or *s\first<0 Or *s\first>*s\issued Or *s\issued-*s\first>*s\capacity Or *s\issued>#QUIC_INTEGER_MAX+1 : ProcedureReturn #QUIC_SENT_STATE : EndIf
+ ProcedureReturn 0
+EndProcedure
+; Zero-initialized context or a discarded OLD connection only. Never restart
+; packet numbering with existing keys. Slots are32 bytes: flags,bytes,time,cookie.
+; Slots form a ring. first is the exclusive proven-ACKed prefix; issued is
+; the next absolute packet number, not a slot index. No unsent PN is pruned.
+Procedure.i QuicHandshakeSentInit(*s.QuicHandshakeSent,level.i,entries.i,capacity.i)
+ Define i.i
+ If quics_Span(*s,SizeOf(QuicHandshakeSent))=0 Or (level<>0 And level<>2 And level<>4) Or capacity<1 Or capacity>4096 : ProcedureReturn #QUIC_SENT_ARGUMENT : EndIf
+ If quics_Span(entries,capacity*32)=0 Or quics_Overlap(*s,SizeOf(QuicHandshakeSent),entries,capacity*32) : ProcedureReturn #QUIC_SENT_ARGUMENT : EndIf
+ If *s\busy<>0 : ProcedureReturn #QUIC_SENT_BUSY : EndIf
+ If *s\phase<>0 And *s\phase<>2 : ProcedureReturn #QUIC_SENT_STATE : EndIf
+ For i=0 To SizeOf(QuicHandshakeSent)-1 : PokeA(*s+i,0) : Next
+ *s\phase=1 : *s\level=level : *s\entries=entries : *s\capacity=capacity
+ *s\lastSent=-1 : *s\largestAcked=-1 : ProcedureReturn 0
+EndProcedure
+; Reserve BEFORE encrypting. A failed/cancelled protection/send burns its PN.
+; Returns PN>=0. Exhaustion is a local limit, never permission to reuse a PN.
+Procedure.i QuicHandshakeSentReserve(*s.QuicHandshakeSent)
+ Define rc.i,p.i,n.i,i.i
+ rc=quics_Ready(*s) : If rc<0 : ProcedureReturn rc : EndIf
+ If *s\busy<>0 : ProcedureReturn #QUIC_SENT_BUSY : EndIf
+ If *s\issued-*s\first=*s\capacity Or *s\issued>#QUIC_INTEGER_MAX : ProcedureReturn #QUIC_SENT_LIMIT : EndIf
+ n=*s\issued : p=*s\entries+(n % *s\capacity)*32
+ For i=0 To 31 : PokeA(p+i,0) : Next
+ PokeI(p,1) : *s\issued=n+1 : ProcedureReturn n
+EndProcedure
+; Record once after transport acceptance, BEFORE processing peer ACKs. Merely
+; encrypting/reserving is not sending. Uncertain send outcomes must close the
+; connection, not retry an accepted ciphertext under the same packet number.
+; Eliciting OR padded packets count in flight. Time uses one monotonic clock.
+Procedure.i QuicHandshakeSentCommit(*s.QuicHandshakeSent,number.i,bytes.i,time.i,eliciting.i,padded.i,cookie.i)
+ Define rc.i,p.i,flags.i
+ rc=quics_Ready(*s) : If rc<0 : ProcedureReturn rc : EndIf
+ If *s\busy<>0 : ProcedureReturn #QUIC_SENT_BUSY : EndIf
+ If number<0 Or bytes<1 Or bytes>65527 Or time<0 Or (eliciting<>0 And eliciting<>1) Or (padded<>0 And padded<>1) : ProcedureReturn #QUIC_SENT_ARGUMENT : EndIf
+ If number>=*s\issued : ProcedureReturn #QUIC_SENT_UNSENT : EndIf
+ If number<*s\first : ProcedureReturn #QUIC_SENT_STATE : EndIf
+ p=*s\entries+(number % *s\capacity)*32
+ If PeekI(p)<>1 Or number<=*s\lastSent Or time<*s\lastTime : ProcedureReturn #QUIC_SENT_STATE : EndIf
+ flags=2+eliciting*4
+ If eliciting Or padded : flags=flags|8 : *s\inFlight=*s\inFlight+bytes : EndIf
+ PokeI(p,flags) : PokeI(p+8,bytes) : PokeI(p+16,time) : PokeI(p+24,cookie)
+ *s\lastSent=number : *s\lastTime=time : ProcedureReturn 0
+EndProcedure
+; Declaring loss does not erase sent history: a later ACK remains valid.
+; Scheduling loss, congestion responses and retransmitting frames are external.
+Procedure.i QuicHandshakeSentLost(*s.QuicHandshakeSent,number.i)
+ Define rc.i,p.i,flags.i
+ rc=quics_Ready(*s) : If rc<0 : ProcedureReturn rc : EndIf
+ If *s\busy<>0 : ProcedureReturn #QUIC_SENT_BUSY : EndIf
+ If number<0 : ProcedureReturn #QUIC_SENT_ARGUMENT : EndIf
+ If number>=*s\issued : ProcedureReturn #QUIC_SENT_UNSENT : EndIf
+ If number<*s\first : ProcedureReturn 0 : EndIf
+ p=*s\entries+(number % *s\capacity)*32 : flags=PeekI(p)
+ If (flags&2)=0 : ProcedureReturn #QUIC_SENT_UNSENT : EndIf
+ If flags&48 : ProcedureReturn 0 : EndIf
+ If flags&8 : *s\inFlight=*s\inFlight-PeekI(p+8) : EndIf
+ PokeI(p,(flags|32)&(~8)) : ProcedureReturn 1
+EndProcedure
+; Reclaim at most budget (1..64) contiguous fully acknowledged slots.
+; Returns reclaimed count. An outstanding/lost/unsent slot stops reclamation.
+; Old ACK ranges below first are safe to ignore: every such PN was ACKed.
+Procedure.i QuicHandshakeSentPrune(*s.QuicHandshakeSent,budget.i)
+ Define rc.i,n.i,p.i,i.i
+ rc=quics_Ready(*s) : If rc<0 : ProcedureReturn rc : EndIf
+ If *s\busy<>0 : ProcedureReturn #QUIC_SENT_BUSY : EndIf
+ If budget<1 Or budget>64 : ProcedureReturn #QUIC_SENT_ARGUMENT : EndIf
+ While n<budget And *s\first<*s\issued
+  p=*s\entries+(*s\first % *s\capacity)*32
+  If (PeekI(p)&18)<>18 : Break : EndIf
+  For i=0 To 31 : PokeA(p+i,0) : Next
+  *s\first=*s\first+1 : n=n+1
+ Wend
+ ProcedureReturn n
+EndProcedure
+Procedure.i QuicHandshakeSentDiscard(*s.QuicHandshakeSent)
+ Define rc.i
+ rc=quics_Ready(*s) : If rc<0 : ProcedureReturn rc : EndIf
+ If *s\busy<>0 : ProcedureReturn #QUIC_SENT_BUSY : EndIf
+ *s\phase=2 : *s\inFlight=0 : ProcedureReturn 0
+EndProcedure
+Procedure.i quics_End(*j.QuicHandshakeSentAck,rc.i)
+ Define *s.QuicHandshakeSent
+ *s=*j\owner
+ If *s<>0
+  If *s\busy=*j : *s\busy=0 : EndIf
+ EndIf
+ *j\result=rc : *j\phase=-1 : ProcedureReturn rc
+EndProcedure
+; Begin only after packet authentication. Frame/range bytes remain immutable
+; and borrowed through completion. Locks the ledger against all public writes.
+; ECN counters and ACK delay are not interpreted here. Level must match the
+; authenticated packet's number space. Initial protection is not peer identity.
+Procedure.i QuicHandshakeSentAckBegin(*j.QuicHandshakeSentAck,*s.QuicHandshakeSent,level.i,*f.QuicHandshakeFrame)
+ Define rc.i,i.i
+ rc=quics_Ready(*s) : If rc<0 : ProcedureReturn rc : EndIf
+ If quics_Span(*j,SizeOf(QuicHandshakeSentAck))=0 Or quics_Span(*f,SizeOf(QuicHandshakeFrame))=0 : ProcedureReturn #QUIC_SENT_ARGUMENT : EndIf
+ If *s\busy<>0 : ProcedureReturn #QUIC_SENT_BUSY : EndIf
+ If level<>*s\level Or (*f\kind<>2 And *f\kind<>3) Or *f\count<1 Or *f\count>64 Or *f\rangeBytes<1 Or *f\rangeBytes>1016 Or *f\largest<0 Or *f\largest>#QUIC_INTEGER_MAX Or *f\delay<0 Or *f\delay>#QUIC_INTEGER_MAX : ProcedureReturn #QUIC_SENT_ARGUMENT : EndIf
+ If quics_Span(*f\ranges,*f\rangeBytes)=0 : ProcedureReturn #QUIC_SENT_ARGUMENT : EndIf
+ If quics_Overlap(*j,SizeOf(QuicHandshakeSentAck),*s,SizeOf(QuicHandshakeSent)) Or quics_Overlap(*j,SizeOf(QuicHandshakeSentAck),*s\entries,*s\capacity*32) : ProcedureReturn #QUIC_SENT_ARGUMENT : EndIf
+ If quics_Overlap(*f,SizeOf(QuicHandshakeFrame),*s,SizeOf(QuicHandshakeSent)) Or quics_Overlap(*f,SizeOf(QuicHandshakeFrame),*s\entries,*s\capacity*32) Or quics_Overlap(*f,SizeOf(QuicHandshakeFrame),*j,SizeOf(QuicHandshakeSentAck)) : ProcedureReturn #QUIC_SENT_ARGUMENT : EndIf
+ If quics_Overlap(*f\ranges,*f\rangeBytes,*s,SizeOf(QuicHandshakeSent)) Or quics_Overlap(*f\ranges,*f\rangeBytes,*s\entries,*s\capacity*32) Or quics_Overlap(*f\ranges,*f\rangeBytes,*j,SizeOf(QuicHandshakeSentAck)) : ProcedureReturn #QUIC_SENT_ARGUMENT : EndIf
+ If *j\phase=1 Or *j\phase=2 : ProcedureReturn #QUIC_SENT_BUSY : EndIf
+ For i=0 To SizeOf(QuicHandshakeSentAck)-1 : PokeA(*j+i,0) : Next
+ *j\phase=1 : *j\owner=*s : *j\source=*f\ranges : *j\bytes=*f\rangeBytes
+ *j\count=*f\count : *j\largest=*f\largest : *j\current=-1 : *j\rttDelay=*f\delay
+ *s\busy=*j : ProcedureReturn 0
+EndProcedure
+Procedure.i quics_Range(*j.QuicHandshakeSentAck)
+ Define n.i,gap.i,length.i,high.i
+ If *j\rangeIndex=*j\count
+  If *j\cursor<>*j\bytes : ProcedureReturn #QUIC_SENT_FORMAT : EndIf
+  ProcedureReturn 1
+ EndIf
+ high=*j\largest
+ If *j\rangeIndex>0
+  n=QuicIntegerRead(*j\source+*j\cursor,*j\bytes-*j\cursor,@gap)
+  If n<0 : ProcedureReturn #QUIC_SENT_FORMAT : EndIf
+  *j\cursor=*j\cursor+n
+  If *j\low<2 Or gap>*j\low-2 : ProcedureReturn #QUIC_SENT_FORMAT : EndIf
+  high=*j\low-gap-2
+ EndIf
+ n=QuicIntegerRead(*j\source+*j\cursor,*j\bytes-*j\cursor,@length)
+ If n<0 Or length>high : ProcedureReturn #QUIC_SENT_FORMAT : EndIf
+ *j\cursor=*j\cursor+n : *j\high=high : *j\low=high-length
+ *j\current=high : *j\rangeIndex=*j\rangeIndex+1 : ProcedureReturn 0
+EndProcedure
+; 0=more,1=new ACK event,2=done,negative=fatal. First validates the ENTIRE ACK
+; without changing packet state; each step visits at most64 packet slots.
+; Then emits one newly acknowledged packet per event (number/bytes/time/cookie,
+; previous flags and removed inFlightBytes). Repeated ACKs emit no new events.
+; Consume each event before Step again. Accept the receive packet's ACK event
+; only at DONE. On error reject it/close. No rollback after application starts.
+Procedure.i QuicHandshakeSentAckStep(*j.QuicHandshakeSentAck)
+ Define *s.QuicHandshakeSent,rc.i,i.i,p.i,flags.i
+ If quics_Span(*j,SizeOf(QuicHandshakeSentAck))=0 : ProcedureReturn #QUIC_SENT_ARGUMENT : EndIf
+ If *j\phase=3 : ProcedureReturn 2 : EndIf
+ If *j\phase=-1 : ProcedureReturn *j\result : EndIf
+ If *j\phase<>1 And *j\phase<>2 : ProcedureReturn #QUIC_SENT_STATE : EndIf
+ *s=*j\owner
+ rc=quics_Ready(*s) : If rc<0 : ProcedureReturn rc : EndIf
+ If *s\busy<>*j : ProcedureReturn #QUIC_SENT_STATE : EndIf
+ For i=0 To 63
+  If *j\current<*j\low
+   rc=quics_Range(*j)
+   If rc<0 : ProcedureReturn quics_End(*j,rc) : EndIf
+   If rc=1
+    If *j\phase=1
+     *j\phase=2 : *j\cursor=0 : *j\rangeIndex=0 : *j\current=-1 : *j\low=0
+     ProcedureReturn 0
+    EndIf
+    *j\phase=3 : *s\busy=0 : ProcedureReturn 2
+   EndIf
+   If *j\high>=*s\issued : ProcedureReturn quics_End(*j,#QUIC_SENT_UNSENT) : EndIf
+  EndIf
+  If *j\current<*s\first
+   ; Skip the proven delivered prefix without iterating over old PN values.
+   *j\current=*j\low-1
+  Else
+  p=*s\entries+(*j\current % *s\capacity)*32 : flags=PeekI(p)
+  If (flags&2)=0 : ProcedureReturn quics_End(*j,#QUIC_SENT_UNSENT) : EndIf
+  *j\current=*j\current-1
+  If *j\phase=2 And (flags&16)=0
+   *j\number=*j\current+1 : *j\packetBytes=PeekI(p+8) : *j\sentAt=PeekI(p+16)
+   *j\cookie=PeekI(p+24) : *j\flags=flags : *j\inFlightBytes=0
+   If *j\number=*j\largest : *j\rttLargestNew=1 : *j\rttSentAt=*j\sentAt : EndIf
+   If flags&4 : *j\rttEliciting=1 : EndIf
+   If flags&8 : *j\inFlightBytes=*j\packetBytes : *s\inFlight=*s\inFlight-*j\packetBytes : EndIf
+   PokeI(p,(flags|16)&(~8)) : *s\acked=*s\acked+1
+   If *j\number>*s\largestAcked : *s\largestAcked=*j\number : EndIf
+   ProcedureReturn 1
+  EndIf
+  EndIf
+ Next
+ ProcedureReturn 0
+EndProcedure
+Procedure.i QuicHandshakeSentAckCancel(*j.QuicHandshakeSentAck)
+ If quics_Span(*j,SizeOf(QuicHandshakeSentAck))=0 : ProcedureReturn #QUIC_SENT_ARGUMENT : EndIf
+ If *j\phase<>1 And *j\phase<>2 : ProcedureReturn #QUIC_SENT_STATE : EndIf
+ ProcedureReturn quics_End(*j,#QUIC_SENT_CANCELLED)
+EndProcedure
+
+; Cooperative acknowledgment-based loss scan. Timing/RTT policy and timers are
+; supplied by the caller. Loss never erases metadata or permits PN reuse.
+Structure QuicHandshakeSentLoss
+ phase.i
+ result.i
+ owner.i
+ cursor.i
+ now.i
+ delay.i
+ threshold.i
+ nextTime.i
+ number.i
+ packetBytes.i
+ sentAt.i
+ cookie.i
+ flags.i
+ inFlightBytes.i
+EndStructure
+; A completed, authenticated ACK has already updated largestAcked. now and
+; delay use the same monotonic unit as Commit. Supply the path's computed loss
+; delay (RTT/reordering/granularity); this API does not estimate it or run PTO.
+Procedure.i QuicHandshakeSentLossBegin(*j.QuicHandshakeSentLoss,*s.QuicHandshakeSent,now.i,delay.i,threshold.i)
+ Define rc.i,i.i
+ rc=quics_Ready(*s) : If rc<0 : ProcedureReturn rc : EndIf
+ If quics_Span(*j,SizeOf(QuicHandshakeSentLoss))=0 Or now<0 Or now<*s\lastTime Or delay<1 Or threshold<3 Or threshold>#QUIC_INTEGER_MAX : ProcedureReturn #QUIC_SENT_ARGUMENT : EndIf
+ If *s\busy<>0 : ProcedureReturn #QUIC_SENT_BUSY : EndIf
+ If quics_Overlap(*j,SizeOf(QuicHandshakeSentLoss),*s,SizeOf(QuicHandshakeSent)) Or quics_Overlap(*j,SizeOf(QuicHandshakeSentLoss),*s\entries,*s\capacity*32) : ProcedureReturn #QUIC_SENT_ARGUMENT : EndIf
+ If *j\phase=1 : ProcedureReturn #QUIC_SENT_BUSY : EndIf
+ For i=0 To SizeOf(QuicHandshakeSentLoss)-1 : PokeA(*j+i,0) : Next
+ *j\phase=1 : *j\owner=*s : *j\cursor=*s\first
+ *j\now=now : *j\delay=delay : *j\threshold=threshold
+ *s\busy=*j : ProcedureReturn 0
+EndProcedure
+; 0 more,1 newly lost packet event,2 done. Consume each event before Step.
+; At most64 slots visited per call; nextTime is valid only at DONE,0 if none.
+; Already lost/ACKed/unsent/non-flight packets are not reported again. A newer
+; unACKed tail requires PTO/probing, not acknowledgment-based declaration.
+Procedure.i QuicHandshakeSentLossStep(*j.QuicHandshakeSentLoss)
+ Define *s.QuicHandshakeSent,rc.i,i.i,p.i,flags.i,number.i,sent.i,due.i
+ If quics_Span(*j,SizeOf(QuicHandshakeSentLoss))=0 : ProcedureReturn #QUIC_SENT_ARGUMENT : EndIf
+ If *j\phase=2 : ProcedureReturn 2 : EndIf
+ If *j\phase=-1 : ProcedureReturn *j\result : EndIf
+ If *j\phase<>1 : ProcedureReturn #QUIC_SENT_STATE : EndIf
+ *s=*j\owner : rc=quics_Ready(*s) : If rc<0 : ProcedureReturn rc : EndIf
+ If *s\busy<>*j : ProcedureReturn #QUIC_SENT_STATE : EndIf
+ For i=0 To 63
+  If *j\cursor>=*s\issued Or *j\cursor>=*s\largestAcked
+   *j\phase=2 : *s\busy=0 : ProcedureReturn 2
+  EndIf
+  number=*j\cursor : *j\cursor=number+1
+  p=*s\entries+(number % *s\capacity)*32 : flags=PeekI(p)
+  If (flags&58)=10
+   sent=PeekI(p+16)
+   If *s\largestAcked-number>=*j\threshold Or *j\now-sent>=*j\delay
+    *j\number=number : *j\packetBytes=PeekI(p+8) : *j\sentAt=sent
+    *j\cookie=PeekI(p+24) : *j\flags=flags : *j\inFlightBytes=*j\packetBytes
+    *s\inFlight=*s\inFlight-*j\packetBytes : PokeI(p,(flags|32)&(~8))
+    ProcedureReturn 1
+   EndIf
+   due=$7FFFFFFFFFFFFFFF
+   If *j\delay<=$7FFFFFFFFFFFFFFF-sent : due=sent+*j\delay : EndIf
+   If *j\nextTime=0 Or due<*j\nextTime : *j\nextTime=due : EndIf
+  EndIf
+ Next
+ ProcedureReturn 0
+EndProcedure
+; Cancellation preserves loss events already delivered. Consume/requeue their
+; frames or close; never roll back loss flags or free borrowed metadata early.
+Procedure.i QuicHandshakeSentLossCancel(*j.QuicHandshakeSentLoss)
+ Define *s.QuicHandshakeSent,rc.i
+ If quics_Span(*j,SizeOf(QuicHandshakeSentLoss))=0 : ProcedureReturn #QUIC_SENT_ARGUMENT : EndIf
+ If *j\phase<>1 : ProcedureReturn #QUIC_SENT_STATE : EndIf
+ *s=*j\owner : rc=quics_Ready(*s) : If rc<0 : ProcedureReturn rc : EndIf
+ If *s\busy<>*j : ProcedureReturn #QUIC_SENT_STATE : EndIf
+ *s\busy=0 : *j\phase=-1 : *j\result=#QUIC_SENT_CANCELLED
+ ProcedureReturn #QUIC_SENT_CANCELLED
+EndProcedure
+
+
+; Path timing, independent of packet-number spaces and transport scheduling.
+; Protocol equations independently expressed as checked integer arithmetic.
+; Same monotonic units throughout (recommended microseconds, initial333000,
+; granularity1000). Caller resets on a new path and owns timer/backoff policy.
+Structure QuicRtt
+ phase.i
+ hasSample.i
+ latest.i
+ minimum.i
+ smoothed.i
+ variation.i
+ granularity.i
+EndStructure
+Procedure.i quics_RttReady(*r.QuicRtt)
+ If quics_Span(*r,SizeOf(QuicRtt))=0 : ProcedureReturn #QUIC_SENT_ARGUMENT : EndIf
+ If *r\phase<>1 : ProcedureReturn #QUIC_SENT_STATE : EndIf
+ If *r\hasSample<0 Or *r\hasSample>1 Or *r\latest<1 Or *r\smoothed<1 Or *r\variation<0 Or *r\granularity<1 : ProcedureReturn #QUIC_SENT_STATE : EndIf
+ If *r\minimum<0 Or *r\minimum>*r\latest : ProcedureReturn #QUIC_SENT_STATE : EndIf
+ If *r\hasSample=1 And *r\minimum=0 : ProcedureReturn #QUIC_SENT_STATE : EndIf
+ ProcedureReturn 0
+EndProcedure
+Procedure.i QuicRttInit(*r.QuicRtt,initial.i,granularity.i)
+ If quics_Span(*r,SizeOf(QuicRtt))=0 Or initial<1 Or granularity<1 : ProcedureReturn #QUIC_SENT_ARGUMENT : EndIf
+ *r\phase=1 : *r\hasSample=0 : *r\latest=initial : *r\minimum=0
+ *r\smoothed=initial : *r\variation=initial/2 : *r\granularity=granularity
+ ProcedureReturn 0
+EndProcedure
+; Exact floor of weighted mean without forming the overflowing weighted sum.
+Procedure.i quics_RttBlend(previous.i,sample.i,divisor.i)
+ ProcedureReturn (previous/divisor)*(divisor-1)+sample/divisor+((previous%divisor)*(divisor-1)+sample%divisor)/divisor
+EndProcedure
+; Call once per fully validated ACK: its largest PN must be newly acknowledged
+; and at least one newly acknowledged packet must be ack-eliciting. elapsed is
+; receive time minus that largest PN's send time, not time since the ACK job ran.
+; delay is already decoded into local units. Never pass unchecked shifted input.
+; This math helper does not authenticate ACKs or enforce sampling eligibility.
+Procedure.i QuicRttSample(*r.QuicRtt,elapsed.i,delay.i,maxDelay.i,level.i,confirmed.i)
+ Define rc.i,adjusted.i,minimum.i,delta.i
+ rc=quics_RttReady(*r) : If rc<0 : ProcedureReturn rc : EndIf
+ If elapsed<1 Or delay<0 Or maxDelay<0 Or confirmed<0 Or confirmed>1 : ProcedureReturn #QUIC_SENT_ARGUMENT : EndIf
+ If level<>0 And level<>2 And level<>4 : ProcedureReturn #QUIC_SENT_ARGUMENT : EndIf
+ If *r\hasSample=0
+  *r\latest=elapsed : *r\minimum=elapsed : *r\smoothed=elapsed : *r\variation=elapsed/2 : *r\hasSample=1
+  ProcedureReturn 0
+ EndIf
+ minimum=*r\minimum : If elapsed<minimum : minimum=elapsed : EndIf
+ If level<>4 : delay=0 : EndIf
+ If confirmed=1 And delay>maxDelay : delay=maxDelay : EndIf
+ adjusted=elapsed
+ If delay<=elapsed-minimum : adjusted=elapsed-delay : EndIf
+ delta=*r\smoothed-adjusted : If delta<0 : delta=-delta : EndIf
+ ; Erratum7539: variation uses the previous smoothed value.
+ *r\variation=quics_RttBlend(*r\variation,delta,4)
+ *r\smoothed=quics_RttBlend(*r\smoothed,adjusted,8)
+ *r\latest=elapsed : *r\minimum=minimum
+ ProcedureReturn 0
+EndProcedure
+; Round the9/8 threshold upward; saturate unrepresentable durations.
+Procedure.i QuicRttLossDelay(*r.QuicRtt)
+ Define rc.i,n.i,extra.i
+ rc=quics_RttReady(*r) : If rc<0 : ProcedureReturn rc : EndIf
+ n=*r\latest : If *r\smoothed>n : n=*r\smoothed : EndIf
+ extra=n/8 : If n%8 : extra=extra+1 : EndIf
+ If extra>$7FFFFFFFFFFFFFFF-n : n=$7FFFFFFFFFFFFFFF : Else : n=n+extra : EndIf
+ If n<*r\granularity : n=*r\granularity : EndIf
+ ProcedureReturn n
+EndProcedure
+; No application-space PTO before confirmation. The caller selects the earliest
+; eligible space, supplies the connection backoff, and arms/restarts the timer.
+; Expiry calls for fresh probes: it is not proof of packet loss.
+Procedure.i QuicRttPto(*r.QuicRtt,level.i,confirmed.i,maxDelay.i,backoff.i)
+ Define rc.i,n.i,spread.i
+ rc=quics_RttReady(*r) : If rc<0 : ProcedureReturn rc : EndIf
+ If confirmed<0 Or confirmed>1 Or maxDelay<0 Or backoff<0 Or backoff>63 : ProcedureReturn #QUIC_SENT_ARGUMENT : EndIf
+ If level<>0 And level<>2 And level<>4 : ProcedureReturn #QUIC_SENT_ARGUMENT : EndIf
+ If level=4 And confirmed=0 : ProcedureReturn #QUIC_SENT_STATE : EndIf
+ spread=$7FFFFFFFFFFFFFFF
+ If *r\variation<=$7FFFFFFFFFFFFFFF/4 : spread=*r\variation*4 : EndIf
+ If spread<*r\granularity : spread=*r\granularity : EndIf
+ n=$7FFFFFFFFFFFFFFF
+ If spread<=$7FFFFFFFFFFFFFFF-*r\smoothed : n=*r\smoothed+spread : EndIf
+ If level=4
+  If maxDelay>$7FFFFFFFFFFFFFFF-n : n=$7FFFFFFFFFFFFFFF : Else : n=n+maxDelay : EndIf
+ EndIf
+ If n>($7FFFFFFFFFFFFFFF>>backoff) : ProcedureReturn $7FFFFFFFFFFFFFFF : EndIf
+ ProcedureReturn n<<backoff
+EndProcedure
+Procedure.i QuicRttDeadline(sentAt.i,duration.i)
+ If sentAt<0 Or duration<1 : ProcedureReturn #QUIC_SENT_ARGUMENT : EndIf
+ If duration>$7FFFFFFFFFFFFFFF-sentAt : ProcedureReturn $7FFFFFFFFFFFFFFF : EndIf
+ ProcedureReturn sentAt+duration
+EndProcedure
+
+; Consume timing evidence only after the entire ACK job completes successfully.
+; The largest new packet need not itself elicit ACK if another new packet did.
+; Caller authenticates the ACK and supplies its original receive timestamp and
+; validated peer delay exponent/cap in local microseconds. Keep owner alive.
+; 1 sampled,0 ineligible/already consumed,negative refused; no sample on cancel.
+Procedure.i QuicRttAck(*r.QuicRtt,*j.QuicHandshakeSentAck,receivedAt.i,exponent.i,maxDelay.i,confirmed.i)
+ Define *s.QuicHandshakeSent,rc.i,delay.i
+ If quics_Span(*r,SizeOf(QuicRtt))=0 Or quics_Span(*j,SizeOf(QuicHandshakeSentAck))=0 : ProcedureReturn #QUIC_SENT_ARGUMENT : EndIf
+ If *j\phase<>3 : ProcedureReturn #QUIC_SENT_STATE : EndIf
+ *s=*j\owner : rc=quics_Ready(*s) : If rc<0 : ProcedureReturn rc : EndIf
+ If quics_Overlap(*r,SizeOf(QuicRtt),*j,SizeOf(QuicHandshakeSentAck)) Or quics_Overlap(*r,SizeOf(QuicRtt),*s,SizeOf(QuicHandshakeSent)) Or quics_Overlap(*r,SizeOf(QuicRtt),*s\entries,*s\capacity*32) : ProcedureReturn #QUIC_SENT_ARGUMENT : EndIf
+ rc=quics_RttReady(*r) : If rc<0 : ProcedureReturn rc : EndIf
+ If receivedAt<0 Or exponent<0 Or exponent>20 Or maxDelay<0 Or confirmed<0 Or confirmed>1 : ProcedureReturn #QUIC_SENT_ARGUMENT : EndIf
+ If *j\rttUsed=1 : ProcedureReturn 0 : EndIf
+ If *j\rttLargestNew=0 Or *j\rttEliciting=0 : *j\rttUsed=1 : ProcedureReturn 0 : EndIf
+ If receivedAt<=*j\rttSentAt : ProcedureReturn #QUIC_SENT_ARGUMENT : EndIf
+ delay=$7FFFFFFFFFFFFFFF
+ If *j\rttDelay<=($7FFFFFFFFFFFFFFF>>exponent) : delay=*j\rttDelay<<exponent : EndIf
+ rc=QuicRttSample(*r,receivedAt-*j\rttSentAt,delay,maxDelay,*s\level,confirmed)
+ If rc<>0 : ProcedureReturn rc : EndIf
+ *j\rttUsed=1 : ProcedureReturn 1
+EndProcedure
+
+
+; Poll-driven PTO ownership. No asynchronous callback or borrowed packet storage.
+; Supply -1 for a space without usable keys/outstanding eliciting packets. The
+; client address-validation no-flight probe policy remains a caller decision.
+Structure QuicProbeTimer
+ phase.i
+ backoff.i
+ armed.i
+ deadline.i
+ level.i
+EndStructure
+Procedure.i quics_ProbeReady(*t.QuicProbeTimer)
+ If quics_Span(*t,SizeOf(QuicProbeTimer))=0 : ProcedureReturn #QUIC_SENT_ARGUMENT : EndIf
+ If *t\phase<>1 Or *t\backoff<0 Or *t\backoff>63 Or *t\armed<0 Or *t\armed>1 : ProcedureReturn #QUIC_SENT_STATE : EndIf
+ If *t\deadline<0 Or (*t\level<>-1 And *t\level<>0 And *t\level<>2 And *t\level<>4) : ProcedureReturn #QUIC_SENT_STATE : EndIf
+ If *t\armed=1 And (*t\deadline=0 Or *t\level=-1) : ProcedureReturn #QUIC_SENT_STATE : EndIf
+ ProcedureReturn 0
+EndProcedure
+Procedure.i QuicProbeTimerInit(*t.QuicProbeTimer)
+ If quics_Span(*t,SizeOf(QuicProbeTimer))=0 : ProcedureReturn #QUIC_SENT_ARGUMENT : EndIf
+ *t\phase=1 : *t\backoff=0 : *t\armed=0 : *t\deadline=0 : *t\level=-1
+ ProcedureReturn 0
+EndProcedure
+; Recompute after sends/ACKs/key discard. Earliest eligible space wins; ties
+; prefer Initial then Handshake. Application is excluded until confirmation.
+; Returns1 armed,0 no eligible space. Refusals leave the previous timer intact.
+Procedure.i QuicProbeTimerArm(*t.QuicProbeTimer,*r.QuicRtt,confirmed.i,maxDelay.i,lastInitial.i,lastHandshake.i,lastApplication.i)
+ Define rc.i,level.i,base.i,duration.i,due.i,best.i,selected.i
+ rc=quics_ProbeReady(*t) : If rc<0 : ProcedureReturn rc : EndIf
+ rc=quics_RttReady(*r) : If rc<0 : ProcedureReturn rc : EndIf
+ If quics_Overlap(*t,SizeOf(QuicProbeTimer),*r,SizeOf(QuicRtt)) : ProcedureReturn #QUIC_SENT_ARGUMENT : EndIf
+ If confirmed<0 Or confirmed>1 Or maxDelay<0 Or lastInitial< -1 Or lastHandshake< -1 Or lastApplication< -1 : ProcedureReturn #QUIC_SENT_ARGUMENT : EndIf
+ best=$7FFFFFFFFFFFFFFF : selected=-1
+ For level=0 To 4 Step 2
+  base=lastInitial
+  If level=2 : base=lastHandshake : EndIf
+  If level=4 : base=lastApplication : If confirmed=0 : base=-1 : EndIf : EndIf
+  If base>=0
+   duration=QuicRttPto(*r,level,confirmed,maxDelay,*t\backoff)
+   If duration<0 : ProcedureReturn duration : EndIf
+   due=QuicRttDeadline(base,duration)
+   If selected=-1 Or due<best : best=due : selected=level : EndIf
+  EndIf
+ Next
+ *t\level=selected : *t\armed=0 : *t\deadline=0
+ If selected>=0 : *t\armed=1 : *t\deadline=best : EndIf
+ ProcedureReturn *t\armed
+EndProcedure
+; One expiry event, not packet loss. Caller consumes level and sends fresh probe
+; packet numbers, then rearms from actual sent history. No busy-wait inside API.
+Procedure.i QuicProbeTimerPoll(*t.QuicProbeTimer,now.i)
+ Define rc.i
+ rc=quics_ProbeReady(*t) : If rc<0 : ProcedureReturn rc : EndIf
+ If now<0 : ProcedureReturn #QUIC_SENT_ARGUMENT : EndIf
+ If *t\armed=0 Or now<*t\deadline : ProcedureReturn 0 : EndIf
+ *t\armed=0 : If *t\backoff<63 : *t\backoff=*t\backoff+1 : EndIf
+ ProcedureReturn 1
+EndProcedure
+; Caller certifies fresh authenticated delivery and peer address validation.
+; Resetting backoff does not change the existing deadline: Arm must follow ACK
+; processing before the next Poll, using current RTT and outstanding spaces.
+Procedure.i QuicProbeTimerAcknowledged(*t.QuicProbeTimer,fresh.i,validated.i)
+ Define rc.i
+ rc=quics_ProbeReady(*t) : If rc<0 : ProcedureReturn rc : EndIf
+ If fresh<0 Or fresh>1 Or validated<0 Or validated>1 : ProcedureReturn #QUIC_SENT_ARGUMENT : EndIf
+ If fresh=1 And validated=1 : *t\backoff=0 : EndIf
+ ProcedureReturn 0
+EndProcedure
+Procedure.i QuicProbeTimerDiscard(*t.QuicProbeTimer)
+ Define rc.i
+ rc=quics_ProbeReady(*t) : If rc<0 : ProcedureReturn rc : EndIf
+ *t\phase=0 : *t\backoff=0 : *t\armed=0 : *t\deadline=0 : *t\level=-1
+ ProcedureReturn 0
+EndProcedure

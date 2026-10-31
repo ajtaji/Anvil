@@ -8,6 +8,7 @@
 ; now produces an application ACK/PING after all supported effects succeed.
 ; Other frame kinds are refused without committing an application receipt.
 ; TLS completion is also checked independently by the server.
+Global probeTimer.QuicProbeTimer,timerFault.i,timerBase.i,timerDue.i,timerFired.i,timerCount.i
 Global pathRtt.QuicRtt,rttSamples.i,rttFault.i
 Global Dim rttTrace.i[32]
 Global connection.QuicConnection
@@ -524,7 +525,7 @@ Procedure.i ReceiveApplicationAck()
   rc=CheckDeliveryRefusals() : If rc<>0 : ProcedureReturn rc : EndIf
  EndIf
  untilTime=HwMicros()+3000000
- While (lossPhase=0 And applicationDelivery=0) Or (lossPhase=1 And lossAckCount<3)
+ While (lossPhase=0 And applicationDelivery=0) Or (lossPhase=1 And lossAckCount<3-2*#PTO_PROBE_TEST)
   n=Service() : If n<0 : ProcedureReturn n : EndIf
   If HwMicros()>untilTime : ProcedureReturn -9481 : EndIf
   bytes=UdpPayloadReceive(handle,@info,@packet[0],1472)
@@ -604,19 +605,42 @@ EndProcedure
 ; Real missing-datagram proof: PN1 is discarded by the peer before decryption.
 ; Three later authenticated deliveries trigger the packet threshold, not a timer.
 Procedure.i CheckProbeLoss()
- Define rc.i,n.i,i.i
- For i=2 To 4
+ Define rc.i,n.i,i.i,highest.i,delay.i
+ highest=4-2*#PTO_PROBE_TEST
+ If #PTO_PROBE_TEST
+  rc=QuicProbeTimerInit(@probeTimer) : If rc<>0 : ProcedureReturn rc : EndIf
+  timerBase=connection\applicationHistory\lastTime
+  rc=QuicProbeTimerArm(@probeTimer,@pathRtt,connection\handshakeConfirmed,25000,-1,-1,timerBase)
+  If rc<>1 : ProcedureReturn rc : EndIf
+  timerDue=probeTimer\deadline
+  Repeat
+   n=Service() : If n<0 : QuicProbeTimerDiscard(@probeTimer) : ProcedureReturn n : EndIf
+   timerFired=HwMicros() : rc=QuicProbeTimerPoll(@probeTimer,timerFired)
+  Until rc<>0
+  If rc<>1 : ProcedureReturn rc : EndIf
+  timerCount=timerCount+1
+  If probeTimer\level<>4 Or probeTimer\backoff<>1 Or timerFired<timerDue : timerFault=1 : EndIf
+  If QuicProbeTimerPoll(@probeTimer,HwMicros())<>0 : timerFault=2 : EndIf
+  If connection\applicationHistory\inFlight<>probeBytes Or connection\applicationHistory\acked<>1 : timerFault=3 : EndIf
+ EndIf
+ For i=2 To highest
   rc=SendApplicationProbe(i) : If rc<>0 : ProcedureReturn rc : EndIf
  Next
  rc=QuicHandshakeSentLossBegin(@lossJob,@connection\applicationHistory,HwMicros(),$7FFFFFFFFFFFFFFF,3)
  If rc<>0 : ProcedureReturn rc : EndIf
  rc=QuicHandshakeSentLossStep(@lossJob)
- If rc<>2 Or connection\applicationHistory\inFlight<>4*probeBytes : lossFault=2 : EndIf
+ If rc<>2 Or connection\applicationHistory\inFlight<>highest*probeBytes : lossFault=2 : EndIf
  If lossJob\phase=1 : QuicHandshakeSentLossCancel(@lossJob) : ProcedureReturn -9492 : EndIf
  lossPhase=1
  rc=ReceiveApplicationAck() : If rc<>0 : ProcedureReturn rc : EndIf
- If lossAckCount<>3 Or connection\applicationHistory\acked<>4 Or connection\applicationHistory\largestAcked<>4 Or connection\applicationHistory\inFlight<>probeBytes : lossFault=3 : EndIf
- rc=QuicHandshakeSentLossBegin(@lossJob,@connection\applicationHistory,HwMicros(),$7FFFFFFFFFFFFFFF,3)
+ If lossAckCount<>highest-1 Or connection\applicationHistory\acked<>highest Or connection\applicationHistory\largestAcked<>highest Or connection\applicationHistory\inFlight<>probeBytes : lossFault=3 : EndIf
+ delay=$7FFFFFFFFFFFFFFF
+ If #PTO_PROBE_TEST
+  delay=QuicRttLossDelay(@pathRtt)
+  rc=QuicProbeTimerAcknowledged(@probeTimer,1,1) : If rc<>0 : ProcedureReturn rc : EndIf
+  If probeTimer\backoff<>0 : timerFault=4 : EndIf
+ EndIf
+ rc=QuicHandshakeSentLossBegin(@lossJob,@connection\applicationHistory,HwMicros(),delay,3)
  If rc<>0 : ProcedureReturn rc : EndIf
  Repeat
   rc=QuicHandshakeSentLossStep(@lossJob)
@@ -632,8 +656,12 @@ Procedure.i CheckProbeLoss()
  Until rc=2 Or rc<0
  If rc<>2 : ProcedureReturn rc : EndIf
  If lossEvents<>1 Or connection\applicationHistory\inFlight<>0 Or connection\applicationHistory\busy<>0 : lossFault=5 : EndIf
+ If #PTO_PROBE_TEST
+  rc=QuicProbeTimerArm(@probeTimer,@pathRtt,1,25000,-1,-1,-1)
+  If rc<>0 Or probeTimer\armed<>0 : timerFault=5 : EndIf
+ EndIf
  rc=QuicHandshakeSentPrune(@connection\applicationHistory,64)
- If rc<>0 Or connection\applicationHistory\first<>1 Or connection\applicationHistory\issued<>5 : lossFault=6 : EndIf
+ If rc<>0 Or connection\applicationHistory\first<>1 Or connection\applicationHistory\issued<>highest+1 : lossFault=6 : EndIf
  rc=QuicHandshakeSentLossBegin(@lossJob,@connection\applicationHistory,HwMicros(),$7FFFFFFFFFFFFFFF,3)
  If rc<>0 : ProcedureReturn rc : EndIf
  rc=QuicHandshakeSentLossStep(@lossJob)
@@ -1133,7 +1161,8 @@ Procedure.i Main()
  If handle>0
   admit=QuicConnectionBegin(@connection,@connectionSpans[0],handle,HwMicros(),20000000)
   FixtureMark(10)
-  If admit=0 : rc=Run() : Else : rc=admit : EndIf
+  If admit=0 : rc=Run()
+ If probeTimer\phase=1 : QuicProbeTimerDiscard(@probeTimer) : EndIf : Else : rc=admit : EndIf
   tlsState=Tls13State : tlsError=Tls13Err : x509Error=Tls13X509Err : certCount=TlsCertCount : alert=Tls13Alert
   If admit=0 : closed=CloseConnection(rc) : Else : closed=UdpPayloadClose(handle) : EndIf
  Else
@@ -1184,6 +1213,9 @@ Procedure.i Main()
  PokeI($E1C00258,applicationWriteReady) : PokeI($E1C00260,applicationFault)
  PokeI($E1C00268,applicationSteps) : PokeI($E1C00270,maxApplicationStep)
  PokeI($E1C00278,applicationCancelled) : PokeI($E1C00280,applicationPing)
+ PokeI($E1C00500,timerFault) : PokeI($E1C00508,timerCount)
+ PokeI($E1C00510,timerBase) : PokeI($E1C00518,timerDue) : PokeI($E1C00520,timerFired)
+ PokeI($E1C00528,probeTimer\phase)
  PokeI($E1C00390,rttFault) : PokeI($E1C00398,rttSamples)
  PokeI($E1C003A0,pathRtt\latest) : PokeI($E1C003A8,pathRtt\minimum)
  PokeI($E1C003B0,pathRtt\smoothed) : PokeI($E1C003B8,pathRtt\variation)

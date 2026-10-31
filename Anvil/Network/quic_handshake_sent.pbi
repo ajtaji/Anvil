@@ -439,3 +439,78 @@ Procedure.i QuicRttAck(*r.QuicRtt,*j.QuicHandshakeSentAck,receivedAt.i,exponent.
  If rc<>0 : ProcedureReturn rc : EndIf
  *j\rttUsed=1 : ProcedureReturn 1
 EndProcedure
+
+
+; Poll-driven PTO ownership. No asynchronous callback or borrowed packet storage.
+; Supply -1 for a space without usable keys/outstanding eliciting packets. The
+; client address-validation no-flight probe policy remains a caller decision.
+Structure QuicProbeTimer
+ phase.i
+ backoff.i
+ armed.i
+ deadline.i
+ level.i
+EndStructure
+Procedure.i quics_ProbeReady(*t.QuicProbeTimer)
+ If quics_Span(*t,SizeOf(QuicProbeTimer))=0 : ProcedureReturn #QUIC_SENT_ARGUMENT : EndIf
+ If *t\phase<>1 Or *t\backoff<0 Or *t\backoff>63 Or *t\armed<0 Or *t\armed>1 : ProcedureReturn #QUIC_SENT_STATE : EndIf
+ If *t\deadline<0 Or (*t\level<>-1 And *t\level<>0 And *t\level<>2 And *t\level<>4) : ProcedureReturn #QUIC_SENT_STATE : EndIf
+ If *t\armed=1 And (*t\deadline=0 Or *t\level=-1) : ProcedureReturn #QUIC_SENT_STATE : EndIf
+ ProcedureReturn 0
+EndProcedure
+Procedure.i QuicProbeTimerInit(*t.QuicProbeTimer)
+ If quics_Span(*t,SizeOf(QuicProbeTimer))=0 : ProcedureReturn #QUIC_SENT_ARGUMENT : EndIf
+ *t\phase=1 : *t\backoff=0 : *t\armed=0 : *t\deadline=0 : *t\level=-1
+ ProcedureReturn 0
+EndProcedure
+; Recompute after sends/ACKs/key discard. Earliest eligible space wins; ties
+; prefer Initial then Handshake. Application is excluded until confirmation.
+; Returns1 armed,0 no eligible space. Refusals leave the previous timer intact.
+Procedure.i QuicProbeTimerArm(*t.QuicProbeTimer,*r.QuicRtt,confirmed.i,maxDelay.i,lastInitial.i,lastHandshake.i,lastApplication.i)
+ Define rc.i,level.i,base.i,duration.i,due.i,best.i,selected.i
+ rc=quics_ProbeReady(*t) : If rc<0 : ProcedureReturn rc : EndIf
+ rc=quics_RttReady(*r) : If rc<0 : ProcedureReturn rc : EndIf
+ If quics_Overlap(*t,SizeOf(QuicProbeTimer),*r,SizeOf(QuicRtt)) : ProcedureReturn #QUIC_SENT_ARGUMENT : EndIf
+ If confirmed<0 Or confirmed>1 Or maxDelay<0 Or lastInitial< -1 Or lastHandshake< -1 Or lastApplication< -1 : ProcedureReturn #QUIC_SENT_ARGUMENT : EndIf
+ best=$7FFFFFFFFFFFFFFF : selected=-1
+ For level=0 To 4 Step 2
+  base=lastInitial
+  If level=2 : base=lastHandshake : EndIf
+  If level=4 : base=lastApplication : If confirmed=0 : base=-1 : EndIf : EndIf
+  If base>=0
+   duration=QuicRttPto(*r,level,confirmed,maxDelay,*t\backoff)
+   If duration<0 : ProcedureReturn duration : EndIf
+   due=QuicRttDeadline(base,duration)
+   If selected=-1 Or due<best : best=due : selected=level : EndIf
+  EndIf
+ Next
+ *t\level=selected : *t\armed=0 : *t\deadline=0
+ If selected>=0 : *t\armed=1 : *t\deadline=best : EndIf
+ ProcedureReturn *t\armed
+EndProcedure
+; One expiry event, not packet loss. Caller consumes level and sends fresh probe
+; packet numbers, then rearms from actual sent history. No busy-wait inside API.
+Procedure.i QuicProbeTimerPoll(*t.QuicProbeTimer,now.i)
+ Define rc.i
+ rc=quics_ProbeReady(*t) : If rc<0 : ProcedureReturn rc : EndIf
+ If now<0 : ProcedureReturn #QUIC_SENT_ARGUMENT : EndIf
+ If *t\armed=0 Or now<*t\deadline : ProcedureReturn 0 : EndIf
+ *t\armed=0 : If *t\backoff<63 : *t\backoff=*t\backoff+1 : EndIf
+ ProcedureReturn 1
+EndProcedure
+; Caller certifies fresh authenticated delivery and peer address validation.
+; Resetting backoff does not change the existing deadline: Arm must follow ACK
+; processing before the next Poll, using current RTT and outstanding spaces.
+Procedure.i QuicProbeTimerAcknowledged(*t.QuicProbeTimer,fresh.i,validated.i)
+ Define rc.i
+ rc=quics_ProbeReady(*t) : If rc<0 : ProcedureReturn rc : EndIf
+ If fresh<0 Or fresh>1 Or validated<0 Or validated>1 : ProcedureReturn #QUIC_SENT_ARGUMENT : EndIf
+ If fresh=1 And validated=1 : *t\backoff=0 : EndIf
+ ProcedureReturn 0
+EndProcedure
+Procedure.i QuicProbeTimerDiscard(*t.QuicProbeTimer)
+ Define rc.i
+ rc=quics_ProbeReady(*t) : If rc<0 : ProcedureReturn rc : EndIf
+ *t\phase=0 : *t\backoff=0 : *t\armed=0 : *t\deadline=0 : *t\level=-1
+ ProcedureReturn 0
+EndProcedure
