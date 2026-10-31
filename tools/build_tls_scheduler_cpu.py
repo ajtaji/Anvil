@@ -41,6 +41,30 @@ EndProcedure''')
  If ScRunHandle(background)<>background Or backgroundRuns<>1 Or backgroundClean<>1 Or ScResult(background)<>711 : ctxVerdict=-993 : EndIf
  If ScReap(background)<>1 : ctxVerdict=-992 : EndIf
  If unexpectedProfile<>0 : ctxVerdict=-991 : EndIf''')
+ s=s.replace('Procedure KeyContextRun',r'''Global contender.TlsWorkerJob
+Global contenderRuns.i
+Procedure.i ContenderTask()
+ contenderRuns=contenderRuns+1
+ If ScYield()<>1 : ProcedureReturn 0 : EndIf
+ contenderRuns=contenderRuns+1
+ ProcedureReturn 1
+EndProcedure
+Procedure KeyContextRun''')
+ s=s.replace(' For i=0 To cn-1 : RsaSig[i]=',r''' ; A different protocol owns the shared worker across suspension. Stream
+ ; TLS must defer and must not cancel that owner or its root-store state.
+ contenderRuns=0
+ If TlsWorkerBegin(@contender,@ContenderTask,0)<>1 : ctxVerdict=-990 : ProcedureReturn : EndIf
+ If TlsWorkerStep(@contender)<>0 Or contenderRuns<>1 : ctxVerdict=-989 : ProcedureReturn : EndIf
+ caller=tlsc_slot : tlsw_Advance()
+ If tlsc_slot<>caller Or tlsw_handle<>0 Or ctxVerdict<>0 : ctxVerdict=-988 : ProcedureReturn : EndIf
+ tlsw_Cancel(tlsc_handles[caller])
+ If ctxRootCancelled<>0 Or TlsWorkerBusy()<>1 : ctxVerdict=-987 : ProcedureReturn : EndIf
+ If TlsWorkerStep(@contender)<>1 Or contenderRuns<>2 : ctxVerdict=-986 : ProcedureReturn : EndIf
+ If TlsWorkerBegin(@contender,@ContenderTask,0)<>1 : ctxVerdict=-985 : ProcedureReturn : EndIf
+ If TlsWorkerStep(@contender)<>0 : ctxVerdict=-984 : ProcedureReturn : EndIf
+ If TlsWorkerCancel(@contender)<>1 Or TlsWorkerBusy()<>0 Or ctxRootCancelled<>0 : ctxVerdict=-983 : ProcedureReturn : EndIf
+ For i=0 To cn-1 : RsaSig[i]=''')
+ s=s.replace('tlsw_handle',r'tlsw_job\task')
  names=re.findall(r'^XIncludeFile "([^"]+)"',s,re.M)
  source=out/'proof.pi4';source.write_text(s,encoding='utf8')
  q=subprocess.run([str(resolve_compiler(compiler)),'--compile',str(source),'-t','pi4','--load-addr','0x1000000','--stack-addr','0x4f00000','--entry-returns','--wants-services','-o',str(out/'proof.img')],env=dict(os.environ,PMF_ROOT=str(root)),capture_output=True,text=True,timeout=180,creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))

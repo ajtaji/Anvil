@@ -1,5 +1,7 @@
 ; Physical interoperability fixture, NOT a production connection scheduler.
 ; Generated header supplies shared TLS, QUIC, UDP, board entropy and test CA.
+; Runs TLS arithmetic through the shared cooperative worker; UDP stays in
+; the foreground dispatcher, outside the worker context.
 ; No Retry, migration, recovery timer, application frames or HTTP/3 requests.
 ; The final protected 1-RTT packet is authenticated, but its frames are NOT
 ; interpreted. TLS completion is also checked independently by the server.
@@ -23,6 +25,12 @@ Global ep.UdpEndpoint,info.UdpDatagramInfo,status.UdpSocketStatus
 Global peerBytes.i,hsReady.i,paramsReady.i,initialDiscarded.i
 Global received.i,sent.i,ackEvents.i,appAuthenticated.i,stage.i
 Global lastPump.i,maxPumpGap.i,maxTlsStep.i
+Global liveJob.TlsWorkerJob,otherJob.TlsWorkerJob
+Global liveOperation.i,liveSpace.i
+Global liveResult.i,workerSteps.i,maxWorkerStep.i,ownershipChecks.i,ownershipFault.i
+Procedure.i HooksClear()
+ ProcedureReturn Bool(X509PauseHook=0 And TlsRootsPauseHook=0 And TlsRecDecryptHook=0 And TlsRecEncryptHook=0 And Tls13PauseHook=0 And Tls13SetupPauseHook=0 And EcdsaVerifyHook=0 And RsaPublicHook=0 And X25519ComputeHook=0)
+EndProcedure
 Global Dim rxData.a[65536]
 Global Dim rxBits.a[8192]
 Global Dim txData.a[8192]
@@ -49,7 +57,7 @@ Procedure CaptureTable()
  str x0, [x1]
  EndASM
 EndProcedure
-Procedure.i Pump()
+Procedure.i Service()
  Define t.i,rc.i,cost.i
  pet() : t=clock()
  If lastPump<>0 And t-lastPump>maxPumpGap : maxPumpGap=t-lastPump : EndIf
@@ -58,34 +66,11 @@ Procedure.i Pump()
  If clock()-started>20000000 : ProcedureReturn -9301 : EndIf
  ProcedureReturn rc
 EndProcedure
-Procedure.i TlsPump()
- ProcedureReturn Bool(Pump()>=0)
-EndProcedure
-; The fixture owns all crypto scratch. Pump does only network service; it
-; never starts another TLS or crypto operation. The peer uses P-256 only.
-Procedure.i VerifyP256(curve.i,hash.i,hashBytes.i,key.i,keyBytes.i,sig.i,sigBytes.i)
+Procedure.i Pump()
  Define rc.i
- If curve<>23 : EcdsaLastErr=#ECDSA_ERR_CURVE : ProcedureReturn -1 : EndIf
- rc=EcdsaJobBegin(hash,hashBytes,key,keyBytes,sig,sigBytes,1)
- If rc<0 : ProcedureReturn 0 : EndIf
- While rc=0
-  If Pump()<0 : EcdsaJobCancel() : ProcedureReturn 0 : EndIf
-  rc=EcdsaJobStep()
- Wend
- If rc<>1 : EcdsaJobCancel() : ProcedureReturn 0 : EndIf
- ProcedureReturn EcdsaJobResult
-EndProcedure
-Procedure.i ComputeX25519(out.i,scalar.i,point.i)
- Define rc.i,i.i
- rc=X25519JobBegin(out,scalar,point)
- While rc=0
-  If Pump()<0 : X25519JobCancel() : rc=-1 : Break : EndIf
-  rc=X25519JobStep()
- Wend
- If rc=1 : ProcedureReturn 1 : EndIf
- ; TLS also rejects the all-zero shared secret if computation is cancelled.
- For i=0 To 31 : PokeA(out+i,0) : Next
- ProcedureReturn 0
+ rc=Service()
+ If rc<0 : ProcedureReturn rc : EndIf
+ ProcedureReturn rc
 EndProcedure
 Procedure.i WaitTx()
  Define rc.i
@@ -115,7 +100,7 @@ Procedure.i KeyDone(rc.i)
 EndProcedure
 Procedure.i MakeOutput(*s.LiveSpace)
  Define rc.i,p.i
- rc=QuicTlsOutputBegin(@tlsOutput,@*s\tx,@tlsBytes[0],2048)
+ rc=DoTls(2,*s)
  If rc<>1 : ProcedureReturn -9302 : EndIf
  Repeat
   p=Pump() : If p<0 : ProcedureReturn p : EndIf
@@ -200,7 +185,7 @@ Procedure.i FeedTls(*s.LiveSpace)
  Define rc.i,p.i,stepStarted.i,stepCost.i
  Repeat
   p=Pump() : If p<0 : ProcedureReturn p : EndIf
-  stepStarted=clock() : rc=QuicCryptoTlsStep(@*s\rx) : stepCost=clock()-stepStarted
+  stepStarted=clock() : rc=DoTls(3,*s) : stepCost=clock()-stepStarted
   If stepCost>maxTlsStep : maxTlsStep=stepCost : EndIf
  Until rc<=0
  If rc<0 : ProcedureReturn rc : EndIf
@@ -276,14 +261,13 @@ Procedure.i Run()
  rc=InitSpace(@handshake,2,1) : If rc<>0 : ProcedureReturn rc : EndIf
  X509ResetAnchors() : X509AddAnchorEC(1,?RootDn,#ROOT_DN_BYTES,23,?RootKey,65)
  Tls13SetHsBuffer(@tlsHs[0],32768) : Tls13SetRecvBuffer(@tlsRecv[0],16645)
- Tls13PauseHook=@TlsPump : Tls13SetupPauseHook=@TlsPump : QuicCipherInvalidateHook=@Tls13RecInvalidateCipher
- X509PauseHook=@TlsPump : EcdsaVerifyHook=@VerifyP256 : X25519ComputeHook=@ComputeX25519
+ QuicCipherInvalidateHook=@Tls13RecInvalidateCipher
  rc=Tls13Init(?HostName,15,#TEST_UNIX) : If rc<>1 : ProcedureReturn -9316 : EndIf
  stage=2
  rc=DrbgAutoSeed() : If rc<>1 : ProcedureReturn rc : EndIf
  rc=DrbgGenerate(@originalId[0],8) : If rc<>8 : ProcedureReturn -9317 : EndIf
  rc=DrbgGenerate(@clientId[0],8) : If rc<>8 : ProcedureReturn -9318 : EndIf
- rc=Tls13NewKeyShare() : If rc<>1 : ProcedureReturn -9319 : EndIf
+ rc=DoTls(1,0) : If rc<>1 : ProcedureReturn -9319 : EndIf
  rc=Tls13SetAlpn(?Alpn,3) : If rc<>1 : ProcedureReturn -9320 : EndIf
  For i=0 To #LOCAL_PARAMETER_BYTES-1 : localParameters[i]=PeekA(?LocalTemplate+i) : Next
  For i=0 To 7 : localParameters[i+2]=clientId[i] : Next
@@ -313,6 +297,41 @@ Procedure.i Run()
  Wend
  stage=5 : ProcedureReturn 0
 EndProcedure
+Procedure.i LiveEntry()
+ Define *s.LiveSpace
+ *s=liveSpace
+ Select liveOperation
+  Case 1 : liveResult=Tls13NewKeyShare()
+  Case 2 : liveResult=QuicTlsOutputBegin(@tlsOutput,@*s\tx,@tlsBytes[0],2048)
+  Case 3 : liveResult=QuicCryptoTlsStep(@*s\rx)
+  Default : liveResult=-9325
+ EndSelect
+ ProcedureReturn 1
+EndProcedure
+Procedure.i DoTls(operation.i,space.i)
+ Define rc.i,t.i,cost.i
+ liveOperation=operation : liveSpace=space
+ otherJob\result=773
+ rc=TlsWorkerBegin(@liveJob,@LiveEntry,0)
+ If rc<>1 : ProcedureReturn rc : EndIf
+ Repeat
+  If TlsWorkerBegin(@otherJob,@LiveEntry,0)<>#TLSWORK_BUSY : ownershipFault=1 : EndIf
+  If TlsWorkerStep(@otherJob)<>#TLSWORK_OWNER Or TlsWorkerCancel(@otherJob)<>#TLSWORK_OWNER : ownershipFault=2 : EndIf
+  If otherJob\task<>0 Or otherJob\phase<>0 Or otherJob\result<>773 : ownershipFault=3 : EndIf
+  If HooksClear()<>1 Or TlsWorkerBusy()<>1 : ownershipFault=4 : EndIf
+  ownershipChecks=ownershipChecks+1
+  t=HwMicros() : rc=TlsWorkerStep(@liveJob) : cost=HwMicros()-t
+  If cost>maxWorkerStep : maxWorkerStep=cost : EndIf
+  workerSteps=workerSteps+1
+  If HooksClear()<>1 : ownershipFault=5 : EndIf
+  If rc<>0 : Break : EndIf
+  ; Foreground network service executes after the context has actually yielded.
+  rc=Service() : If rc<0 : Break : EndIf
+ ForEver
+ If rc=1 : ProcedureReturn liveResult : EndIf
+ If liveJob\task<>0 : TlsWorkerCancel(@liveJob) : EndIf
+ ProcedureReturn rc
+EndProcedure
 Procedure.i Main()
  CaptureTable()
  Define i.i,rc.i,closed.i,cleanup.i
@@ -321,6 +340,7 @@ Procedure.i Main()
  MmuClearNc() : MmuAddNc($08A00000,$09200000) : MmuAddNc($08100000,$08180000)
  rc=MmuBuildTables($4F80000) : If rc<>0 : ProcedureReturn 72 : EndIf
  MmuEnableCached()
+ If TlsWorkerInstall($1000000,$80000)<>1 : MmuDisableCachedFlushed() : ProcedureReturn 73 : EndIf
  For i=0 To 65535 : PokeA($E1C00000+i,0) : Next
  PokeI($E1C00000,$55445331) : PokeI($E1C00008,#REPORT_COUNT)
  ep\family=4 : ep\kind=0 : ep\port=55442
@@ -337,6 +357,9 @@ Procedure.i Main()
  PokeI($E1C00040,maxService) : PokeI($E1C00048,stage) : PokeI($E1C00050,received) : PokeI($E1C00058,sent)
  PokeI($E1C00060,clock()-started) : PokeI($E1C00068,Tls13Alert) : PokeI($E1C00070,ackEvents)
  PokeI($E1C00078,maxPumpGap) : PokeI($E1C00080,maxTlsStep)
+ PokeI($E1C00088,maxWorkerStep) : PokeI($E1C00090,workerSteps) : PokeI($E1C00098,ownershipChecks)
+ PokeI($E1C00160,ownershipFault) : PokeI($E1C00168,Bool(workerSteps>1 And ownershipChecks=workerSteps))
+ PokeI($E1C00170,Bool(TlsWorkerBusy()=0 And TlsWorkerFaulted()=0 And HooksClear()=1 And unexpectedProfile=0))
  QuicKeysWipe(@initial\readKeys) : QuicKeysWipe(@initial\writeKeys)
  QuicKeysWipe(@handshake\readKeys) : QuicKeysWipe(@handshake\writeKeys) : QuicKeysWipe(@appRead)
  Tls13PauseHook=0 : Tls13SetupPauseHook=0 : QuicCipherInvalidateHook=0

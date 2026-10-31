@@ -4396,3 +4396,70 @@ and has NOT replaced installed Anvil 488. The ownership fix is source/RAM-qualif
 not yet deployed in the resident monitor. Live QUIC still needs its production
 connection worker and application packet/HTTP/3 processing; the preceding TLS,
 IPv6 and HTTP/3 limitations remain open.
+
+
+### Shared TLS/QUIC cooperative arithmetic owner
+
+`Anvil/Core/tls_worker.pbi` now owns cooperative execution and arithmetic hooks
+for both stream TLS and QUIC callers. The existing stream TLS adapter uses it;
+the physical QUIC fixture uses the same implementation. This is shared code,
+with the existing qualified AArch64 same-core backend and a soft 1 ms slice.
+It is not timer preemption or a new per-board implementation.
+
+A caller keeps a `TlsWorkerJob` descriptor and its referenced buffers alive.
+`TlsWorkerBegin` admits only one owner and refuses competing work without
+changing either descriptor or the current task. `TlsWorkerStep` resumes only
+that owner's named context. Hooks are installed only during execution and
+cleared on return, while scratch ownership persists across suspension.
+Wrong-owner step/cancel requests are refused. Entries return 1 after normal
+execution and store their protocol result in caller-owned storage; another
+return, bad task state or failed reap latches an execution fault. Cancellation
+wipes crypto job scratch, not caller buffers. Normal completion preserves
+crypto results. Foreign installed hooks or active crypto jobs prevent admission.
+
+The dispatcher owns fairness, deadlines, connection snapshots and transport
+cleanup. Clearing hooks does not make suspended crypto scratch available to
+other callers. The worker does not cancel the shared root loader: that belongs
+to the stream TLS connection adapter. TLS defers while another protocol owns
+the worker. Existing connection selection, handshake deadline and cancellation
+remain in that adapter. A production multiplexed QUIC connection adapter still
+needs its own TLS snapshots and lifecycle integration.
+
+On installed Anvil 488, capture 276 passed the 31-case TLS/crypto regression,
+including RSA/X25519 results, cancellation/wiping, an unrelated queued task,
+and new competing-owner checks. A different owner suspended and resumed while
+TLS deferred without changing its selected slot, cancelling the owner, or
+cancelling root loading. The competing owner also cancelled independently.
+The same fixture compiled for Pi 3; no Pi 3 execution is claimed.
+
+Capture 275 completed a fresh certificate-verified QUIC/TLS handshake against
+the independent server, which confirmed client Finished and h3 ALPN. All 15
+checks passed, including repeated competing begin/step/cancel refusals, unchanged
+refused descriptors, scoped hooks and complete worker release. There were 260
+worker dispatches. Maximum worker call time was 1.659 ms; maximum foreground
+network-service gap was 1.703 ms and maximum service call was 237 us. Total
+fixture time was 1.350177 s. The earlier fixture's TLS operation could occupy
+its caller for 126.594 ms; now its arithmetic context returns to the foreground
+dispatcher between slices. The whole TLS operation still takes multiple slices:
+this measures responsiveness, not a 76-fold cryptographic speedup.
+
+Capture 277 rejected the deliberately corrupted certificate signature with
+the expected TLS/X509 errors; the independent peer did not complete TLS.
+Ownership, foreground dispatch and hook-release checks also passed on that
+failure path. Reports, identities, exact source snapshots and peer results are
+under `docs/evidence/anvil-ipv6-20261030/shared-worker488`.
+
+Two compile refusals are retained: a missing architectural counter include,
+and a conservative indirect-service recursion refusal when the entire fixture
+was placed inside a worker. The final fixture keeps all network ABI calls in
+the foreground and puts only TLS arithmetic operations in cooperative contexts.
+No compiler check was disabled or replaced with an unchecked call trampoline.
+
+The full Anvil 490 image compiled through the normal build-stamp mechanism.
+It is retained as an uninstalled candidate; the resident Pi remains Anvil 488.
+Cores, fonts and Vulkan were healthy and the watchdog was off after the tests.
+This qualifies shared worker integration, not a completed HTTP/3 client:
+production connection lifecycle, application packet/ACK processing,
+HANDSHAKE_DONE/key retirement, recovery, congestion/flow control, streams/QPACK
+and real HTTP/3 requests remain. Earlier TLS/device blocking and public
+off-link IPv6/RDNSS limitations also remain open.

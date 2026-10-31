@@ -1,0 +1,31 @@
+pmfc: BCM2711 image linked for $1000000 (default is $80000, the firmware's)
+pmfc: BCM2711 initial stack top $4F00000 (default is $8000000); the stack grows down from here
+pmfc: BCM2711 --entry-returns; Main()'s value comes back in x0, the loader's stack and DAIF are left as they were
+pmfc: --wants-services; the container asks Anvil to enter this payload with the service table in x0 (payload ABI 1.0)
+pmfc: C:\Users\ajtaj\Documents\Codex\2026-10-19\c-users-ajtaj-documents-codex-2026\work\anvil-ipv6-20261030\quic-worker1576\proof.pi4  ->  BCM2711
+> Intrinsics for BCM2711: bcm2711_hardware.def
+[DEBUG] Attempting to load intrinsics from: C:\Users\ajtaj\Desktop\Anvil\RaspberryPi4\Intrinsics\bcm2711_hardware.def
+> Loaded Hardware Intrinsics from bcm2711_hardware.def
+pmfc: pin aliases from Boards/Raspberry_Pi_4.board
+[TRACE]    ... parsing line 24550 of 24770
+> F_CPU = 1500000000 Hz, from the board's ClockSpeed. Nothing in the Pi 4 backend derives from it:
+>       delay()/millis() run on CNTPCT_EL0 (54 MHz, fixed) and the
+>       UART takes its reference clock explicitly. The part BOOTS at
+>       600 MHz - call ClockInit() (RaspberryPi4/Lib/clocks.pi4 in the
+>       Anvil repository) to reach this.
+--------------------------------------------------
+FRONTEND FATAL ERROR: Recursion is refused on every target, and these procedures call each other in a loop: LiveEntry -> Run -> KeyDone -> Pump -> Service -> (through the variable 'pet') LiveEntry.
+  LiveEntry calls Run at proof.pi4 line 357
+  Run calls KeyDone at proof.pi4 line 331
+  KeyDone calls Pump at proof.pi4 line 150
+  Pump calls Service at proof.pi4 line 125
+  Service calls LiveEntry through the variable 'pet' at proof.pi4 line 116
+A step written 'pet(...)' is a call through a variable, and a call through a variable is treated as a call to every procedure whose address can reach it - followed through the assignments this program writes. Assign the pointer a procedure that does not lead back here, or call by name, to break the loop. Note that at least one pointer in this program ('entry') could not be followed exactly: its value is loaded from memory, so it was taken to be any procedure whose address this program stores INTO memory: tlsjob_transcriptyield, tlsjob_x25519, tlsjob_rsa, tlsjob_setupyield, tlsjob_gcmencrypt, tlsjob_x509yield, tlsjob_gcmdecrypt, liveentry, tlsjob_ecdsa, tlsjob_rootyield, scbootstrap.
+A program on these boards runs for as long as the board has power, and recursion makes how deep the stack goes depend on the data it is given - so no build can prove the stack is big enough, and one input deeper than any before it runs off the end of the stack. Without a loop in the calls, the deepest call chain is fixed when the program is built. Rewrite it iteratively: a While or Repeat loop, with an explicit stack array where the algorithm needs one. See Help/Guide/10_when_it_says_no.txt.
+At proof.pi4 line 116
+(in a procedure call, 'pet')
+COMPILATION HALTED. Check your syntax or variable scopes.
+--------------------------------------------------
+NOTE: 307 further frontend messages were withheld - each came after an error above had already halted the code it was in, and anything the walk met after that is read out of a half-built expression, so it names lines that are not at fault. Fix the errors above and build again.
+pmfc: IR generation failed
+pmfc: BUILD FAILED - no output produced.
