@@ -34,6 +34,8 @@ Global peerIdsFault.i,peerIdsChecked.i,peerIdsFrames.i
 Global confirmFault.i,confirmChecked.i,confirmForeign.i,confirmSecretPresent.i
 Global applicationStateFault.i
 Global applicationFault.i,applicationBadTag.i,applicationCancelled.i,applicationPing.i
+Global deliveryProbes.i
+Global applicationDelivery.i,deliveryFault.i,deliveryEvents.i,deliverySteps.i,deliveryNumber.i
 Global applicationSteps.i,maxApplicationStep.i,applicationNumber.i,applicationWriteReady.i
 Global savedApplicationBytes.i,savedApplicationKeys.QuicKeys
 Global Dim savedApplication.a[1472]
@@ -286,9 +288,9 @@ Procedure.i SendApplicationPing()
   rc=UdpPayloadSendTo(handle,@ep,@output[0],connection\controlBytes)
  Until rc<>#SVC_EAGAIN
  If rc<1 : ProcedureReturn rc : EndIf
- rc=QuicConnectionControlAccepted(@connection) : If rc<>0 : ProcedureReturn rc : EndIf
+ rc=QuicConnectionControlAccepted(@connection,HwMicros()) : If rc<>0 : ProcedureReturn rc : EndIf
  If QuicConnectionControlStep(@connection)<>3 Or connection\applicationState\ack\pending<>1 : controlFault=6 : EndIf
- If QuicConnectionControlAccepted(@connection)<>#QUIC_CONTROL_STATE : controlFault=7 : EndIf
+ If QuicConnectionControlAccepted(@connection,HwMicros())<>#QUIC_CONTROL_STATE : controlFault=7 : EndIf
  Repeat
   n=Service() : If n<0 : ProcedureReturn n : EndIf
   rc=UdpPayloadStatus(handle,@status) : If rc<>0 : ProcedureReturn rc : EndIf
@@ -451,6 +453,89 @@ Procedure.i PacketOne(p.i,bytes.i)
  rc=FeedTls(*s) : If rc<>0 : ProcedureReturn rc : EndIf
  ProcedureReturn SendSpace(*s)
 EndProcedure
+
+
+Procedure.i CheckDeliveryRefusals()
+ Define f.QuicHandshakeFrame,range.i,rc.i
+ f\kind=2 : f\count=1 : f\rangeBytes=1 : f\ranges=@range : f\largest=1
+ rc=QuicHandshakeSentAckBegin(@connection\applicationAck,@connection\applicationHistory,2,@f)
+ If rc<>#QUIC_SENT_ARGUMENT Or connection\applicationHistory\busy<>0 : deliveryFault=3 : ProcedureReturn -9487 : EndIf
+ deliveryProbes=deliveryProbes+1
+ rc=QuicHandshakeSentAckBegin(@connection\applicationAck,@connection\applicationHistory,4,@f)
+ If rc<>0 : ProcedureReturn rc : EndIf
+ rc=QuicHandshakeSentAckStep(@connection\applicationAck)
+ If rc<>#QUIC_SENT_UNSENT Or connection\applicationHistory\acked<>0 Or connection\applicationHistory\busy<>0 Or connection\applicationHistory\inFlight<>connection\controlBytes : deliveryFault=4 : ProcedureReturn -9488 : EndIf
+ deliveryProbes=deliveryProbes+1 : f\largest=0
+ rc=QuicHandshakeSentAckBegin(@connection\applicationAck,@connection\applicationHistory,4,@f)
+ If rc<>0 : ProcedureReturn rc : EndIf
+ rc=QuicHandshakeSentAckStep(@connection\applicationAck)
+ If rc<>0 Or connection\applicationAck\phase<>2 Or connection\applicationHistory\acked<>0 : deliveryFault=5 : ProcedureReturn -9489 : EndIf
+ rc=QuicHandshakeSentAckCancel(@connection\applicationAck)
+ If rc<>#QUIC_SENT_CANCELLED Or connection\applicationHistory\busy<>0 Or connection\applicationHistory\acked<>0 Or connection\applicationHistory\inFlight<>connection\controlBytes : deliveryFault=6 : ProcedureReturn -9490 : EndIf
+ deliveryProbes=deliveryProbes+1 : ProcedureReturn 0
+EndProcedure
+
+; Continue the actual exchange after TX; consume authenticated peer ACKs.
+Procedure.i ReceiveApplicationAck()
+ Define rc.i,n.i,i.i,p.i,bytes.i,cursor.i,used.i,pn.i,seen.i,eliciting.i,receivedAt.i,untilTime.i
+ rc=CheckDeliveryRefusals() : If rc<>0 : ProcedureReturn rc : EndIf
+ untilTime=HwMicros()+3000000
+ While applicationDelivery=0
+  n=Service() : If n<0 : ProcedureReturn n : EndIf
+  If HwMicros()>untilTime : ProcedureReturn -9481 : EndIf
+  bytes=UdpPayloadReceive(handle,@info,@packet[0],1472)
+  If bytes=#SVC_EAGAIN : Continue : EndIf
+  If bytes<1 : ProcedureReturn bytes : EndIf
+  If info\family<>4 Or info\peerPort<>55442 : ProcedureReturn -9482 : EndIf
+  For i=0 To 15 : If PeekA(@info\peerAddress+i)<>PeekA(@ep\address+i) : ProcedureReturn -9483 : EndIf : Next
+  p=@packet[0] : receivedAt=HwMicros()
+  rc=QuicPacketRead(@connection\header,p,bytes,8) : If rc<>1 : Continue : EndIf
+  If connection\header\kind<>4 : Continue : EndIf
+  If connection\header\destinationBytes<>8 : ProcedureReturn -9484 : EndIf
+  For i=0 To 7 : If PeekA(p+connection\header\destinationOffset+i)<>clientId[i] : ProcedureReturn -9485 : EndIf : Next
+  rc=ApplicationCrypt(p,connection\header\packetBytes,8,connection\applicationState\largestAuthenticated,0)
+  If rc<>1 : ProcedureReturn rc : EndIf
+  pn=connection\application\crypto\number
+  seen=QuicApplicationAuthenticated(@connection\applicationState,pn)
+  If seen<0 : ProcedureReturn seen : EndIf
+  If seen=1 : Continue : EndIf
+  cursor=0 : eliciting=0
+  While cursor<connection\application\crypto\plainBytes
+   used=QuicApplicationFrameRead(p+connection\application\crypto\plainOffset+cursor,connection\application\crypto\plainBytes-cursor,@applicationFrame)
+   If used<1 : ProcedureReturn used : EndIf
+   cursor=cursor+used : eliciting=eliciting | applicationFrame\base\eliciting
+   If applicationFrame\base\kind=0 Or applicationFrame\base\kind=1
+    ElseIf applicationFrame\base\kind=2 Or applicationFrame\base\kind=3
+     rc=QuicHandshakeSentAckBegin(@connection\applicationAck,@connection\applicationHistory,4,@applicationFrame\base)
+     If rc<>0 : ProcedureReturn rc : EndIf
+     Repeat
+      rc=QuicHandshakeSentAckStep(@connection\applicationAck) : deliverySteps=deliverySteps+1
+      If rc=1
+       deliveryEvents=deliveryEvents+1
+       If connection\applicationAck\number<>0 Or connection\applicationAck\packetBytes<>connection\controlBytes Or connection\applicationAck\inFlightBytes<>connection\controlBytes : deliveryFault=1 : EndIf
+      EndIf
+      n=Service() : If n<0 : ProcedureReturn n : EndIf
+     Until rc=2 Or rc<0
+     If rc<>2 : ProcedureReturn rc : EndIf
+     If connection\applicationHistory\acked=1
+      If connection\applicationHistory\inFlight<>0 Or connection\applicationHistory\largestAcked<>0 : deliveryFault=2 : EndIf
+      applicationDelivery=1 : deliveryNumber=pn
+     EndIf
+    ElseIf applicationFrame\base\kind=24
+     rc=QuicConnectionPeerIdAdd(@connection,applicationFrame\sequence,applicationFrame\retire,applicationFrame\base\data,applicationFrame\idBytes,applicationFrame\resetToken)
+     If rc<0 : ProcedureReturn rc : EndIf
+    ElseIf applicationFrame\base\kind=30
+     rc=QuicConnectionHandshakeDone(@connection) : If rc<>1 : ProcedureReturn rc : EndIf
+    Else
+     ProcedureReturn -9486
+   EndIf
+  Wend
+  rc=QuicApplicationProcessed(@connection\applicationState,pn,eliciting,receivedAt)
+  If rc<>1 : ProcedureReturn rc : EndIf
+ Wend
+ ProcedureReturn 0
+EndProcedure
+
 Procedure.i Run()
  Define rc.i,n.i,i.i,p.i,packetBytes.i
  stage=1
@@ -489,7 +574,8 @@ Procedure.i Run()
    Wend
   EndIf
  Wend
- stage=5 : ProcedureReturn SendApplicationPing()
+ stage=5 : rc=SendApplicationPing() : If rc<>0 : ProcedureReturn rc : EndIf
+ ProcedureReturn ReceiveApplicationAck()
 EndProcedure
 Procedure.i LiveEntry()
  Define *s.QuicConnectionSpace
@@ -988,6 +1074,9 @@ Procedure.i Main()
  PokeI($E1C00258,applicationWriteReady) : PokeI($E1C00260,applicationFault)
  PokeI($E1C00268,applicationSteps) : PokeI($E1C00270,maxApplicationStep)
  PokeI($E1C00278,applicationCancelled) : PokeI($E1C00280,applicationPing)
+ PokeI($E1C00348,deliveryProbes)
+ PokeI($E1C00320,deliveryFault) : PokeI($E1C00328,applicationDelivery)
+ PokeI($E1C00330,deliveryEvents) : PokeI($E1C00338,deliverySteps) : PokeI($E1C00340,deliveryNumber)
  PokeI($E1C00288,applicationNumber) : PokeI($E1C00290,applicationBadTag)
  cleanup=Tls13ContextWipe(@beforeSnapshot[0],#TLS13_CONTEXT_SIZE)
  cleanup=Tls13ContextWipe(@afterSnapshot[0],#TLS13_CONTEXT_SIZE)

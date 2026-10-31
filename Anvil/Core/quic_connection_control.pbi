@@ -28,7 +28,11 @@ Procedure.i QuicConnectionControlBegin(*c.QuicConnection,now.i,exponent.i,ping.i
  If *c\peerIdBytes<0 Or *c\peerIdBytes>20 Or *c\applicationState\ack\pending<>1 : ProcedureReturn #QUIC_CONTROL_STATE : EndIf
  If TlsWorkerBusy()<>0 : ProcedureReturn #TLSWORK_BUSY : EndIf
  rc=QuicApplicationAckDelay(@*c\applicationState,now,exponent) : If rc<0 : ProcedureReturn rc : EndIf
+ If *c\applicationHistory\busy<>0 Or *c\applicationHistory\issued<>*c\applicationState\nextNumber : ProcedureReturn #QUIC_CONTROL_STATE : EndIf
+ If *c\applicationHistory\issued>=*c\applicationHistory\capacity : ProcedureReturn #QUIC_SENT_LIMIT : EndIf
  number=QuicApplicationNumberReserve(@*c\applicationState) : If number<0 : ProcedureReturn number : EndIf
+ rc=QuicHandshakeSentReserve(@*c\applicationHistory)
+ If rc<>number : ProcedureReturn quicco_Fail(*c,#QUIC_CONTROL_STATE) : EndIf
  p=QuicConnectionBuffer(*c,16) : header=1+*c\peerIdBytes+4
  n=QuicApplicationAckWrite(@*c\applicationState,p+header,1472-header-16-ping,@token,now,exponent)
  If n<0 : ProcedureReturn quicco_Fail(*c,n) : EndIf
@@ -39,7 +43,7 @@ Procedure.i QuicConnectionControlBegin(*c.QuicConnection,now.i,exponent.i,ping.i
  *c\controlBytes=header+n+ping+16 : *c\controlNumber=number : *c\controlToken=token
  rc=QuicApplicationPacketBegin(@*c\application,@*c\appWrite,p,*c\controlBytes,*c\peerIdBytes,number,1)
  If rc<>0 : ProcedureReturn quicco_Fail(*c,rc) : EndIf
- *c\controlPhase=1 : ProcedureReturn 0
+ *c\controlEliciting=ping : *c\controlPhase=1 : ProcedureReturn 0
 EndProcedure
 ; 0 computing,2 immutable ciphertext ready,3 awaiting actual transport result,
 ; 1 complete,negative failure. Dispatcher can service other work between steps.
@@ -56,9 +60,12 @@ Procedure.i QuicConnectionControlStep(*c.QuicConnection)
  *c\controlPhase=2 : ProcedureReturn 2
 EndProcedure
 ; Call only when transport ACCEPTED these exact bytes, never on EAGAIN.
-Procedure.i QuicConnectionControlAccepted(*c.QuicConnection)
+Procedure.i QuicConnectionControlAccepted(*c.QuicConnection,now.i)
+ Define rc.i
  If quicco_Span(*c,SizeOf(QuicConnection))=0 : ProcedureReturn #QUIC_CONTROL_ARGUMENT : EndIf
  If *c\phase<>1 Or *c\controlPhase<>2 : ProcedureReturn #QUIC_CONTROL_STATE : EndIf
+ rc=QuicHandshakeSentCommit(@*c\applicationHistory,*c\controlNumber,*c\controlBytes,now,*c\controlEliciting,0,0)
+ If rc<>0 : ProcedureReturn quicco_Fail(*c,rc) : EndIf
  *c\controlPhase=3 : ProcedureReturn 0
 EndProcedure
 ; result=0 means actual successful transmission, not mere queue acceptance.

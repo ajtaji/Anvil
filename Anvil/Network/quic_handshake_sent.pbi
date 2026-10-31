@@ -1,6 +1,7 @@
 ; SPDX-License-Identifier: MIT
 ; Independent RFC 9000 sections12.3/13.1/19.3, RFC 9002 sections4.1/6.4.
-; Initial/Handshake sent history. Caller owns transport, keys and recovery.
+; Bounded Initial/Handshake/Application sent history; legacy API names retained.
+; Caller owns transport, keys and recovery. No pruning or PN reuse.
 XIncludeFile "Anvil/Network/quic_handshake_frames.pbi"
 #QUIC_SENT_ARGUMENT=-3461
 #QUIC_SENT_STATE=-3462
@@ -51,16 +52,16 @@ Procedure.i quics_Overlap(a.i,n.i,b.i,m.i)
 EndProcedure
 Procedure.i quics_Ready(*s.QuicHandshakeSent)
  If quics_Span(*s,SizeOf(QuicHandshakeSent))=0 : ProcedureReturn #QUIC_SENT_ARGUMENT : EndIf
- If *s\phase<>1 Or (*s\level<>0 And *s\level<>2) Or *s\capacity<1 Or *s\capacity>4096 : ProcedureReturn #QUIC_SENT_STATE : EndIf
+ If *s\phase<>1 Or (*s\level<>0 And *s\level<>2 And *s\level<>4) Or *s\capacity<1 Or *s\capacity>4096 : ProcedureReturn #QUIC_SENT_STATE : EndIf
  If quics_Span(*s\entries,*s\capacity*32)=0 Or *s\issued<0 Or *s\issued>*s\capacity : ProcedureReturn #QUIC_SENT_STATE : EndIf
  ProcedureReturn 0
 EndProcedure
 ; Zero-initialized context or a discarded OLD connection only. Never restart
 ; packet numbering with existing keys. Slots are32 bytes: flags,bytes,time,cookie.
-; No pruning: retain sent/unsent facts until this handshake space is discarded.
+; No pruning: retain sent/unsent facts until this number space is discarded.
 Procedure.i QuicHandshakeSentInit(*s.QuicHandshakeSent,level.i,entries.i,capacity.i)
  Define i.i
- If quics_Span(*s,SizeOf(QuicHandshakeSent))=0 Or (level<>0 And level<>2) Or capacity<1 Or capacity>4096 : ProcedureReturn #QUIC_SENT_ARGUMENT : EndIf
+ If quics_Span(*s,SizeOf(QuicHandshakeSent))=0 Or (level<>0 And level<>2 And level<>4) Or capacity<1 Or capacity>4096 : ProcedureReturn #QUIC_SENT_ARGUMENT : EndIf
  If quics_Span(entries,capacity*32)=0 Or quics_Overlap(*s,SizeOf(QuicHandshakeSent),entries,capacity*32) : ProcedureReturn #QUIC_SENT_ARGUMENT : EndIf
  If *s\busy<>0 : ProcedureReturn #QUIC_SENT_BUSY : EndIf
  If *s\phase<>0 And *s\phase<>2 : ProcedureReturn #QUIC_SENT_STATE : EndIf

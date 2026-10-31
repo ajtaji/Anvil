@@ -115,6 +115,10 @@ Structure QuicConnection
  controlBytes.i
  controlNumber.i
  controlToken.i
+ controlEliciting.i
+ applicationHistory.QuicHandshakeSent
+ applicationAck.QuicHandshakeSentAck
+ applicationSent.i[512]
 EndStructure
 ; Span table order: RX data/bits,TX data/bits,ACK ranges,sent slots/metadata,
 ; TLS snapshot,handshake/receive/output/config,local/peer parameters/entries,
@@ -186,6 +190,7 @@ Procedure.i QuicConnectionBegin(*c.QuicConnection,spans.i,socket.i,now.i,timeout
  rc=qconn_Space(*c,@*c\initial,0,0)
  If rc=0 : rc=qconn_Space(*c,@*c\handshake,2,1) : EndIf
  If rc=0 : rc=QuicApplicationStateInit(@*c\applicationState) : EndIf
+ If rc=0 : rc=QuicHandshakeSentInit(@*c\applicationHistory,4,@*c\applicationSent,128) : EndIf
  If rc<>0 : *c\phase=2 : *c\result=rc : ProcedureReturn rc : EndIf
  *c\socket=socket
  ProcedureReturn 0
@@ -304,6 +309,13 @@ Procedure.i QuicConnectionCloseStep(*c.QuicConnection)
  ; cleanup instead of allowing a packet cancellation to reset its GCM job.
  If TlsWorkerBusy()<>0 And TlsWorkerOwns(@*c\tlsOp\context\worker)=0 And TlsWorkerOwns(@*c\outgoing\worker)=0 And TlsWorkerOwns(@*c\incoming\worker)=0 And TlsWorkerOwns(@*c\application\worker)=0 : ProcedureReturn #TLSWORK_BUSY : EndIf
  If *c\closeStage=0
+  If *c\applicationAck\phase=1 Or *c\applicationAck\phase=2
+   rc=QuicHandshakeSentAckCancel(@*c\applicationAck)
+   If rc<>#QUIC_SENT_CANCELLED : ProcedureReturn rc : EndIf
+  EndIf
+  If *c\applicationHistory\phase=1
+   rc=QuicHandshakeSentDiscard(@*c\applicationHistory) : If rc<>0 : ProcedureReturn rc : EndIf
+  EndIf
   If *c\application\phase=1
    rc=QuicApplicationPacketCancel(@*c\application)
    If rc<>#QUIC_APP_PACKET_CANCELLED : ProcedureReturn rc : EndIf
