@@ -4145,3 +4145,66 @@ policy, RTT/ECN/congestion/flow handling, streams/QPACK and a certificate-verifi
 HTTP/3 request remain open, along with earlier TLS/public off-link IPv6 work.
 Protocol references: [RFC 9000](https://www.rfc-editor.org/rfc/rfc9000.html#section-13.1)
 and [RFC 9002](https://www.rfc-editor.org/rfc/rfc9002.html#section-6.4).
+
+
+### Retained outgoing CRYPTO data
+
+`quic_crypto_send.pbi` adds caller-owned outgoing byte rings for Initial,
+Handshake and Application CRYPTO streams; 0-RTT is refused. Capacity is 4096
+through 262144 bytes, in multiples of four, plus a two-bit-per-byte state map.
+Append copies at most 16384 bytes and initializes each newly exposed state;
+Init does not clear whole backing allocations. Offsets remain monotonic through
+ring wrap and are checked against the CRYPTO offset-plus-length limit.
+
+States distinguish fresh, transmitted, retry-ready and acknowledged bytes.
+Sent is called after transport acceptance, not frame generation. Retry and Ack
+validate the whole retained range first and refuse never-transmitted bytes
+without partial mutation. Neither late send completion nor retry can resurrect
+acknowledged bytes. Already reclaimed prefixes are harmless no-ops. Packet
+numbers and validated sent-packet metadata remain external: only a legitimate
+packet ACK permits applying its CRYPTO ranges here.
+
+Find scans at most 4096 positions and borrows a contiguous ready slice; it
+returns a next scan offset when no ready data occurs within that budget.
+The owner must copy the slice before reclaiming/reusing its storage. Frame
+writes an exact CRYPTO frame, including a range crossing ring wrap, with no
+writes on capacity refusal. Reclaim releases only the contiguous acknowledged
+prefix and at most 16384 bytes per call. It is not secret erasure. The owner
+serializes all access and discards stream storage with its keys; Init must not
+restart offsets within a live encryption-level stream.
+
+Capture 258 on Anvil 488 passed 523 report assertions against independent byte
+and state arrays: exact data/metadata with guards, generated frame bytes,
+partial scans, ring wrap, buffer exhaustion, out-of-order ACKs, retry/ACK races,
+never-sent refusal, retired ranges, aliases and the 62-bit offset boundary.
+The complete fixture also compiled for Pi 3 without a hardware execution claim.
+
+Capture 259 extended the live UDP example. The Pi sent retained CRYPTO bytes
+under packet zero; the independent peer verified them but withheld its ACK.
+A fixed test timer marked that transmission lost and requested retry. The Pi
+rebuilt the same CRYPTO range under fresh packet one. The peer independently
+unprotected and decrypted both packets, checked their full headers and contents,
+then acknowledged both. Sent-history validation and the byte store retired the
+three retained bytes exactly once, including the late ACK for the lost copy.
+All 23 report assertions and peer checks passed; no extra responses occurred.
+The fixed timer and three-byte payload are deliberate fixture controls, not a
+production recovery policy or real TLS handshake.
+
+Evidence is under `docs/evidence/anvil-ipv6-20261030/quic-send488`. Both physical
+runs returned with healthy cores/fonts/Vulkan and watchdog off; Anvil 488 is
+unchanged. General connection/TLS output ownership, recovery timing, RTT/ECN,
+congestion/flow control, streams/QPACK and a certificate-verified HTTP/3 request
+remain open, as do the earlier TLS and public off-link IPv6 items. Protocol
+references: [RFC 9000 sections 13.3 and 19.6](https://www.rfc-editor.org/rfc/rfc9000.html#section-13.3)
+and [RFC 9001 section 4.1.3](https://www.rfc-editor.org/rfc/rfc9001.html#section-4.1.3).
+
+
+The first publication layering check rejected calls to private receive-module
+span helpers. Outgoing retention now owns those helpers locally. The original
+refusal is archived rather than reported as a pass. Final captures 260 and 261
+passed the same 523 retention assertions and 23 live-retry assertions plus the
+independent peer checks. The final Pi 3 fixture compiled too. The standalone
+retention image remained byte-identical; the combined live fixture changed.
+Final source snapshots are under `sources-final` in the same evidence directory;
+original runs and snapshots remain available. Health checks still passed and
+Anvil 488 remains installed.

@@ -5,7 +5,7 @@ from pmf_compiler import resolve_compiler
 
 def build(compiler,out):
  root=Path(__file__).resolve().parents[1];out.mkdir(parents=True,exist_ok=False)
- names=['RaspberryPi4/Lib/mmu.pi4','Anvil/Network/udp_payload.pbi','Anvil/Core/sha256.pbi','Anvil/Crypto/hmac.pbi','Anvil/Crypto/hkdf.pbi','Anvil/Crypto/aes.pbi','Anvil/Crypto/gcm.pbi','Anvil/Crypto/gcm_job.pbi','Anvil/Network/quic_handshake_receive.pbi','Anvil/Network/quic_handshake_sent.pbi']
+ names=['RaspberryPi4/Lib/mmu.pi4','Anvil/Network/udp_payload.pbi','Anvil/Core/sha256.pbi','Anvil/Crypto/hmac.pbi','Anvil/Crypto/hkdf.pbi','Anvil/Crypto/aes.pbi','Anvil/Crypto/gcm.pbi','Anvil/Crypto/gcm_job.pbi','Anvil/Network/quic_handshake_receive.pbi','Anvil/Network/quic_handshake_sent.pbi','Anvil/Network/quic_crypto_send.pbi']
  s='\n'.join('XIncludeFile "'+n+'"' for n in names)+r'''
 Global services.i,*pet,*clock
 Global ep.UdpEndpoint,info.UdpDatagramInfo,status.UdpSocketStatus
@@ -14,6 +14,9 @@ Global receive.QuicHandshakeReceive,sendJob.QuicPacketJob,spec.QuicLongPacketSpe
 Global rx.QuicCryptoRx,ack.QuicHandshakeAck
 Global history.QuicHandshakeSent,ackJob.QuicHandshakeSentAck,ackEvents.i
 Global Dim historySlots.a[4096]
+Global tx.QuicCryptoTx,lastSend.i,reclaimed.i
+Global Dim txData.a[4096]
+Global Dim txStates.a[1024]
 Global Dim packet.a[1472]
 Global Dim output.a[1472]
 Global Dim data.a[4096]
@@ -46,8 +49,8 @@ Procedure.i WaitTx(h.i)
 EndProcedure
 Procedure.i SendAck(h.i)
  Define i.i,n.i,rc.i,token.i,started.i,pn.i
- ; This fixture owns exactly one outgoing protected packet; never reuse PN 0.
- If sent<>0 : ProcedureReturn -9213 : EndIf
+ ; This fixture sends at most two copies, each under its own fresh PN.
+ If sent>=2 : ProcedureReturn -9213 : EndIf
  pn=QuicHandshakeSentReserve(@history) : If pn<0 : ProcedureReturn pn : EndIf
  spec\kind=0 : spec\destination=?ServerId : spec\destinationBytes=4
  spec\source=?ClientId : spec\sourceBytes=8 : spec\number=pn : spec\numberBytes=4
@@ -55,6 +58,7 @@ Procedure.i SendAck(h.i)
  n=QuicLongPacketWrite(@spec,@output[0],1472) : If n<>26 : ProcedureReturn -9202 : EndIf
  For i=n To 1199 : output[i]=0 : Next
  rc=QuicHandshakeAckWrite(@ack,@output[n],1158,@token) : If rc<>5 : ProcedureReturn -9203 : EndIf
+ rc=QuicCryptoTxFrame(@tx,0,3,@output[n+5],1153) : If rc<>6 : ProcedureReturn -9215 : EndIf
  rc=QuicPacketJobBegin(@sendJob,@writeKeys,@output[0],1200,0,pn,1)
  If rc<>0 : ProcedureReturn rc : EndIf
  started=clock()
@@ -65,10 +69,11 @@ Procedure.i SendAck(h.i)
  Until rc<>0
  If rc<>1 : ProcedureReturn rc : EndIf
  rc=UdpPayloadSendTo(h,@ep,@output[0],1200) : If rc<1 : ProcedureReturn rc : EndIf
- rc=QuicHandshakeSentCommit(@history,pn,1200,clock(),0,1,0) : If rc<>0 : ProcedureReturn rc : EndIf
+ rc=QuicHandshakeSentCommit(@history,pn,1200,clock(),1,1,0) : If rc<>0 : ProcedureReturn rc : EndIf
+ rc=QuicCryptoTxSent(@tx,0,3) : If rc<>0 : ProcedureReturn rc : EndIf
  rc=WaitTx(h) : If rc<>0 : ProcedureReturn rc : EndIf
  rc=QuicHandshakeAckSent(@ack,token) : If rc<>1 : ProcedureReturn -9205 : EndIf
- sent=sent+1 : ProcedureReturn 0
+ sent=sent+1 : lastSend=clock() : ProcedureReturn 0
 EndProcedure
 Procedure.i Run(h.i)
  Define i.i,n.i,rc.i,started.i,part.i,header.QuicPacketHeader
@@ -76,6 +81,8 @@ Procedure.i Run(h.i)
  rc=QuicCryptoRxInit(@rx,0,@data[0],4096,@bits[0],512) : If rc<>0 : ProcedureReturn rc : EndIf
  rc=QuicHandshakeAckInit(@ack,0,@ranges[0],64) : If rc<>0 : ProcedureReturn rc : EndIf
  rc=QuicHandshakeSentInit(@history,0,@historySlots[0],128) : If rc<>0 : ProcedureReturn rc : EndIf
+ rc=QuicCryptoTxInit(@tx,0,@txData[0],4096,@txStates[0],1024) : If rc<>0 : ProcedureReturn rc : EndIf
+ rc=QuicCryptoTxAppend(@tx,?Outgoing,3) : If rc<>3 : ProcedureReturn -9216 : EndIf
  rc=QuicInitialKeysBegin(@keyjob,@readKeys,?OriginalId,8,1)
  While rc=0 : pet() : rc=QuicKeyJobStep(@keyjob) : Wend
  If rc<>1 : ProcedureReturn rc : EndIf
@@ -107,7 +114,12 @@ Procedure.i Run(h.i)
       Repeat
        rc=Pump() : If rc<0 : ProcedureReturn rc : EndIf
        rc=QuicHandshakeSentAckStep(@ackJob)
-       If rc=1 : ackEvents=ackEvents+1 : EndIf
+       If rc=1
+        ackEvents=ackEvents+1
+        part=QuicCryptoTxAck(@tx,ackJob\cookie,3) : If part<>0 : ProcedureReturn part : EndIf
+        part=QuicCryptoTxReclaim(@tx,4096) : If part<0 : ProcedureReturn part : EndIf
+        reclaimed=reclaimed+part
+       EndIf
        If clock()-started>=8000000 : QuicHandshakeSentAckCancel(@ackJob) : ProcedureReturn -9214 : EndIf
       Until rc<>0 And rc<>1
       If rc<>2 : QuicHandshakeReceiveReject(@receive) : ProcedureReturn rc : EndIf
@@ -127,6 +139,12 @@ Procedure.i Run(h.i)
     ProcedureReturn rc
    EndIf
   EndIf
+  ; A fixed test timer deliberately exercises retry; not a recovery policy.
+  If sent=1 And clock()-lastSend>300000 And history\acked=0
+   rc=QuicHandshakeSentLost(@history,0) : If rc<>1 : ProcedureReturn -9217 : EndIf
+   rc=QuicCryptoTxRetry(@tx,0,3) : If rc<>0 : ProcedureReturn rc : EndIf
+   rc=SendAck(h) : If rc<>0 : ProcedureReturn rc : EndIf
+  EndIf
  Wend
  If received<>4 : ProcedureReturn -9212 : EndIf
  ProcedureReturn 0
@@ -140,7 +158,7 @@ Procedure.i Main()
  rc=MmuBuildTables($4F80000) : If rc<>0 : ProcedureReturn 72 : EndIf
  MmuEnableCached()
  For i=0 To 65535 : PokeA($E1C00000+i,0) : Next
- PokeI($E1C00000,$55445331) : PokeI($E1C00008,20)
+ PokeI($E1C00000,$55445331) : PokeI($E1C00008,23)
  ep\family=4 : ep\kind=0 : ep\port=55442
  For i=0 To 15 : PokeA(@ep\address+i,PeekA(?Peer+i)) : Next
  h=UdpPayloadOpen(4,0,55013)
@@ -155,6 +173,7 @@ Procedure.i Main()
  PokeI($E1C00168,closed) : PokeI($E1C00170,GcmJobBusy())
  PokeI($E1C00178,history\issued) : PokeI($E1C00180,history\acked) : PokeI($E1C00188,history\inFlight)
  PokeI($E1C00190,history\largestAcked) : PokeI($E1C00198,ackEvents)
+ PokeI($E1C001A0,tx\base) : PokeI($E1C001A8,tx\tail) : PokeI($E1C001B0,reclaimed)
  PokeI($E1C00040,maxService)
  QuicKeysWipe(@readKeys) : QuicKeysWipe(@writeKeys)
  MmuDisableCachedFlushed() : ProcedureReturn 0
@@ -168,6 +187,8 @@ ServerId:
  Data.a 87,88,89,90
 Hello:
  Data.a 81,72,48,49
+Outgoing:
+ Data.a 120,121,122
 Peer:
  Data.a 192,168,1,104,0,0,0,0,0,0,0,0,0,0,0,0
 EndDataSection
@@ -182,8 +203,8 @@ EndDataSection
    if dep not in names:names.append(dep);todo.append(dep)
  code=re.search(r'occupying \$([0-9A-Fa-f]+)\.\.\$([0-9A-Fa-f]+)',log);bss=re.search(r'bss \$([0-9A-Fa-f]+)\.\.\$([0-9A-Fa-f]+)',log)
  payload=(out/'proof.img.pmf').read_bytes();ranges={'code':['0x'+x for x in code.groups()],'bss':['0x'+x for x in bss.groups()],'stack':['0x4e00000','0x4efffff'],'report':['0xe1c00000','0xe1c0ffff'],'tables':['0x4f80000','0x4f82fff']}
- labels=['result','received','bad tags','duplicates','completed','ACKs sent','queued bytes','ACK ranges','pending ACK','largest PN','byte a','byte b','byte c','socket close','crypto busy','issued','acknowledged','in flight','largest acknowledged','ACK events']
- cases=[dict(name=n,expected=v) for n,v in zip(labels,[0,4,1,1,2,1,3,1,0,2,97,98,99,0,0,1,1,0,0,1])]
+ labels=['result','received','bad tags','duplicates','completed','ACKs sent','queued bytes','ACK ranges','pending ACK','largest PN','byte a','byte b','byte c','socket close','crypto busy','issued','acknowledged','in flight','largest acknowledged','ACK events','TX base','TX tail','reclaimed']
+ cases=[dict(name=n,expected=v) for n,v in zip(labels,[0,4,1,1,2,2,3,1,0,2,97,98,99,0,0,2,2,0,1,2,3,3,3])]
  (out/'identity.json').write_text(json.dumps(dict(bytes=len(payload),sha256=hashlib.sha256(payload).hexdigest(),checked_ranges=ranges,source_hashes={n:hashlib.sha256((root/n).read_bytes()).hexdigest() for n in names},cases=cases),indent=2))
 if __name__=='__main__':
  ap=argparse.ArgumentParser(description=__doc__);ap.add_argument('--compiler',required=True);ap.add_argument('--out',type=Path,required=True)

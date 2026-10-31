@@ -35,7 +35,7 @@ class Peer:
       assert self.socket.sendto(packet,address)==1200
       self.events.append(dict(direction='send',name=name,wire=packet.hex(),time=time.time()))
     else:
-     assert self.acks==0,'Unexpected additional reply'
+     assert self.acks<2,'Unexpected additional reply'
      assert len(wire)==1200,len(wire)
      secret,key,iv,hp=keys(CID,0)
      # These fixed offsets belong only to this fixture's two known CIDs and
@@ -43,21 +43,23 @@ class Peer:
      mask=Cipher(algorithms.AES(hp),modes.ECB()).encryptor().update(wire[26:42])
      header=bytearray(wire[:26]);header[0]^=mask[0]&15
      for i in range(4):header[22+i]^=mask[1+i]
-     assert bytes(header)==long(0,dcid=b'WXYZ',scid=b'abcdefgh',pn=0,pnbytes=4,cipher=1174)
-     plain=AESGCM(key).decrypt(iv,wire[26:],bytes(header))
-     assert plain==b'\x02\x01\x00\x00\x00'+bytes(1153)
+     assert bytes(header)==long(0,dcid=b'WXYZ',scid=b'abcdefgh',pn=self.acks,pnbytes=4,cipher=1174)
+     nonce=(int.from_bytes(iv,'big')^self.acks).to_bytes(12,'big')
+     plain=AESGCM(key).decrypt(nonce,wire[26:],bytes(header))
+     assert plain==b'\x02\x01\x00\x00\x00\x06\x00\x03xyz'+bytes(1147)
      self.acks+=1
+     if self.acks==1:continue # Deliberately withhold the first ACK to exercise retry.
      # ACK the Pi's padded Initial, using a fresh server packet number. This
      # ACK-only packet must not start an acknowledgment response loop.
-     reply=b'\x02\x00\x00\x00\x00'+bytes(1153)
+     reply=b'\x02\x01\x00\x00\x01'+bytes(1153)
      header=long(0,dcid=b'abcdefgh',scid=b'WXYZ',pn=2,pnbytes=4,cipher=1174)
      packet=protect(header,reply,2,keys(CID,1))
      assert self.socket.sendto(packet,address)==1200
-     self.events.append(dict(direction='send',name='acknowledge Pi packet zero',wire=packet.hex(),time=time.time()))
+     self.events.append(dict(direction='send',name='acknowledge both Pi transmissions',wire=packet.hex(),time=time.time()))
   except Exception as e:self.errors.append(repr(e))
  def check(self):
   assert not self.errors,self.errors
-  assert self.acks==1,self.acks
+  assert self.acks==2,self.acks
  def __exit__(self,*exc):
   self.stop.set();self.worker.join(timeout=3);self.socket.close()
   if self.worker.is_alive():self.errors.append('Peer failed to stop')
