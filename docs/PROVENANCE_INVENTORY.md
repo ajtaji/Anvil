@@ -1603,3 +1603,5 @@ text is unchanged; no new board execution or boot claim follows.
 | `Anvil/Network/h2_request.pbi` | protocol-facts | ietf-rfc | IETF specification | RFC 9113 sections 8.2/8.3 and RFC 7541 sections 5/6; original conversion of finalized WebRequest headers into bounded never-indexed HPACK fields. |
 
 | `Anvil/Network/ipv6_udp.pbi` | protocol-facts | ietf-rfc | IETF specification | RFC 768 and RFC 8200 section 8.1; independently written UDP IPv6 framing using shared packet/checksum code. No implementation copied. |
+
+| `Anvil/Network/quic_crypto_stream.pbi` | protocol-facts | ietf-rfc | IETF specification | RFC 9000 sections 7.5/19.6 and RFC 9001 section 4.1.3; independently written CRYPTO frame reader and bounded per-level receive reassembly. No implementation copied. |

@@ -3803,3 +3803,43 @@ QUIC connection ownership, CRYPTO reassembly, recovery/flow/congestion control,
 streams and QPACK still need implementation and live HTTP/3 qualification.
 Remaining TLS blocking/compatibility and public off-link IPv6/RDNSS web
 qualification are also open. A UDP socket API is not a complete web stack.
+
+
+### QUIC CRYPTO receive framing and reassembly
+
+`quic_crypto_stream.pbi` adds a borrowed CRYPTO frame reader and a caller-owned
+receive context for each encryption level. It accepts nonminimal variable
+integers, checks complete lengths and the 62-bit offset limit, and leaves the
+view unchanged on malformed input. Packet authentication must precede feeding
+the stream; the module does not authenticate packets or peers.
+
+Initial, Handshake and Application contexts are independent; 0-RTT CRYPTO is
+refused. Each context owns a data ring and presence bitmap. Storage capacity
+is 4096 through 262144 bytes, in multiples of eight, with capacity/8 bitmap
+bytes. This is a forward offset window from the consumed position, not an
+unbounded sparse-offset store: data outside that window returns LIMIT even
+if fewer actual bytes have been retained. The connection owner must map that
+resource refusal to CRYPTO_BUFFER_EXCEEDED or provide more storage; it must
+not acknowledge and silently lose handshake data.
+
+Put checks at most 16384 bytes and validates all retained overlaps before
+writing. Equal retransmissions do not add data; conflicting retained bytes
+are refused atomically. Already consumed prefixes are ignored, not retained
+for later comparison. Peek offers at most 4096 contiguous bytes and stops at
+a ring boundary; Consume accepts only the latest offer, including partial
+TLS acceptance. Init invalidates borrows and clears the bitmap, not payload
+bytes. Seal rejects a TLS receive-level transition with any older data left
+unconsumed; sealed levels accept old retransmissions but no new bytes.
+Caller-owned contexts and storage must remain exclusive and unmodified.
+
+Physical capture 246 on Anvil 488 passed 486 checks, including a deterministic
+independent byte-map oracle, out-of-order data, duplicates, conflicting late
+overlaps, wrap, partial consumption, empty high-offset frames, length overflow,
+encryption-level changes, aliases and work bounds. Capture 245 passed the
+earlier suite. The full fixture also compiled for Pi 3; it was not run there.
+Cores, fonts and Vulkan remained healthy; watchdog off. Evidence is in
+`docs/evidence/anvil-ipv6-20261030/quic-stream488`.
+
+This is physical execution of the receive component, not a live QUIC handshake.
+The installed monitor stays at 488. Connection ownership, frame dispatch and
+TLS handoff, recovery, streams, QPACK and live HTTP/3 qualification remain open.
