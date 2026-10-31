@@ -58,6 +58,7 @@ Procedure.i QuicConnectionSendBegin(*c.QuicConnection,level.i,peerBytes.i)
   If *c\initialRetired<>0 : ProcedureReturn #QUIC_SEND_STATE : EndIf
   *s=@*c\initial
  Else
+  If *c\handshakeConfirmed<>0 : ProcedureReturn #QUIC_SEND_STATE : EndIf
   *s=@*c\handshake
  EndIf
  If *s\writeKeys\ready<>1 : ProcedureReturn #QUIC_SEND_STATE : EndIf

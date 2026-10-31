@@ -99,6 +99,7 @@ Structure QuicConnection
  tlsOp.QuicTlsOperation
  outgoing.QuicConnectionSend
  initialRetired.i
+ handshakeConfirmed.i
  acknowledge.QuicConnectionAck
  incoming.QuicConnectionReceive
  feed.QuicConnectionTls
@@ -208,6 +209,42 @@ Procedure.i QuicConnectionClearDeadline(*c.QuicConnection)
  If qconn_Span(*c,SizeOf(QuicConnection))=0 : ProcedureReturn #QUIC_CONNECTION_ARGUMENT : EndIf
  If *c\phase<>1 : ProcedureReturn #QUIC_CONNECTION_STATE : EndIf
  *c\timeout=0 : ProcedureReturn 0
+EndProcedure
+; Client-side HANDSHAKE_DONE effect. Caller has decoded this frame from the
+; current authenticated application packet; syntax alone never authenticates it.
+; Does not accept/ACK other frames in that packet. Serialized dispatch only.
+; 1 applied/already confirmed,negative unchanged refusal. Retires Handshake
+; protection, retransmission state and persistent TLS handshake secrets together.
+Procedure.i QuicConnectionHandshakeDone(*c.QuicConnection)
+ Define snapshot.i,selected.i,rc.i
+ If qconn_Span(*c,SizeOf(QuicConnection))=0 : ProcedureReturn #QUIC_CONNECTION_ARGUMENT : EndIf
+ If *c\phase<>1 : ProcedureReturn #QUIC_CONNECTION_STATE : EndIf
+ If *c\application\phase<>2 Or *c\application\result<>1 Or *c\application\encrypt<>0 Or *c\application\keys<>@*c\appRead : ProcedureReturn #QUIC_CONNECTION_STATE : EndIf
+ If *c\handshakeConfirmed=1 : ProcedureReturn 1 : EndIf
+ If TlsWorkerBusy()<>0 : ProcedureReturn #TLSWORK_BUSY : EndIf
+ If *c\startup\phase<>9 Or *c\feed\phase<>12 Or *c\tlsOp\phase<>2 : ProcedureReturn #QUIC_CONNECTION_STATE : EndIf
+ If *c\incoming\phase<>0 And *c\incoming\phase<>4 And *c\incoming\phase<>6 : ProcedureReturn #QUIC_CONNECTION_STATE : EndIf
+ If *c\outgoing\phase<>0 And *c\outgoing\phase<>6 : ProcedureReturn #QUIC_CONNECTION_STATE : EndIf
+ If *c\acknowledge\phase<>0 And *c\acknowledge\phase<>5 : ProcedureReturn #QUIC_CONNECTION_STATE : EndIf
+ If *c\initialRetired<>1 Or *c\appRead\ready<>1 Or *c\appWrite\ready<>1 : ProcedureReturn #QUIC_CONNECTION_STATE : EndIf
+ If *c\handshake\history\phase<>1 Or *c\handshake\history\busy<>0 : ProcedureReturn #QUIC_CONNECTION_STATE : EndIf
+ If *c\handshake\rx\phase<>1 And *c\handshake\rx\phase<>2 : ProcedureReturn #QUIC_CONNECTION_STATE : EndIf
+ If *c\handshake\tx\phase<>1 : ProcedureReturn #QUIC_CONNECTION_STATE : EndIf
+ snapshot=QuicConnectionBuffer(*c,7)
+ If Tls13ContextState(snapshot,#TLS13_CONTEXT_SIZE)<>#TLS13_ST_CONNECTED : ProcedureReturn #QUIC_CONNECTION_STATE : EndIf
+ If Tls13ContextMatchesBuffers(snapshot,#TLS13_CONTEXT_SIZE,QuicConnectionBuffer(*c,8),QuicConnectionBuffer(*c,9),QuicConnectionBuffer(*c,11))<>1 : ProcedureReturn #QUIC_CONNECTION_STATE : EndIf
+ selected=Bool(TlsHsAddr=QuicConnectionBuffer(*c,8) And TlsRecvAddr=QuicConnectionBuffer(*c,9) And TlsQuicConfig=QuicConnectionBuffer(*c,11))
+ If selected And Tls13State<>#TLS13_ST_CONNECTED : ProcedureReturn #QUIC_CONNECTION_STATE : EndIf
+ ; All operations below have validated ownership/state and cannot refuse under
+ ; the serialized-dispatch contract. No pending transport output is discarded.
+ rc=Tls13ContextRetireHandshakeSecrets(snapshot,#TLS13_CONTEXT_SIZE)
+ If selected : rc=Tls13ContextRestore(snapshot,#TLS13_CONTEXT_SIZE) : EndIf
+ QuicKeysWipe(@*c\handshake\readKeys) : QuicKeysWipe(@*c\handshake\writeKeys)
+ rc=QuicHandshakeSentDiscard(@*c\handshake\history)
+ rc=QuicCryptoTlsAbandon(@*c\handshake\rx)
+ rc=QuicCryptoTxAbandon(@*c\handshake\tx)
+ *c\handshakeConfirmed=1 : *c\timeout=0
+ ProcedureReturn 1
 EndProcedure
 ; CloseStep returns2 until the dispatcher closes exactly this UDP handle.
 ; Confirm only a successful real close. I/O failure retains socket ownership.

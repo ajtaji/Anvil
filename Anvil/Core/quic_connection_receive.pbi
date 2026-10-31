@@ -48,6 +48,7 @@ Procedure.i QuicConnectionReceiveBegin(*c.QuicConnection,level.i,packet.i,bytes.
  ElseIf level=2 : *s=@*c\handshake
  Else : ProcedureReturn #QUIC_RECEIVE_ARGUMENT : EndIf
  If level=0 And *c\initialRetired<>0 : ProcedureReturn 6 : EndIf
+ If level=2 And *c\handshakeConfirmed<>0 : ProcedureReturn 6 : EndIf
  If *s\readKeys\ready<>1 : ProcedureReturn #QUIC_RECEIVE_STATE : EndIf
  rc=QuicPacketRead(@h,packet,bytes,8)
  If rc<>1 : ProcedureReturn 6 : EndIf

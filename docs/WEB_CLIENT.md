@@ -5286,3 +5286,45 @@ and the boot image were unchanged. The same composition compiled with the real
 Pi3 adapter but was not executed there. Application frame effects/ACK transmission,
 confirmation/key retirement, recovery/congestion/flow, streams/QPACK/real HTTP3,
 and remaining IPv6/TLS/device work are still open.
+
+
+### Client handshake confirmation and key retirement (2026-10-31)
+
+`QuicConnectionHandshakeDone` applies the client-side effect of a decoded
+HANDSHAKE_DONE frame from the current authenticated application packet. The
+caller supplies the validated frame event; this API is not a packet parser.
+It additionally requires a successful decrypt with this connection's read
+keys, completed TLS startup/feed and no pending send/receive/ACK/crypto work.
+It returns1 after confirmation, including duplicates, or a negative unchanged
+refusal. It retires Handshake read/write packet keys, the Handshake sent ledger
+and CRYPTO streams, cleans the owned TLS snapshot and restores that cleaned
+snapshot only if this connection is selected. Application keys/state survive.
+The confirmed flag and cleared handshake deadline are committed together.
+Old Handshake input is dropped; old-level output and TLS feed cannot restart.
+This does not ACK the application packet or claim other frame effects succeeded.
+
+Physical evidence is retained under
+`docs/evidence/anvil-ipv6-20261030/quic-handshake-confirm488/`.
+One identical PMF ran against independent peers with eight-byte and zero-byte
+connection IDs, captures325/326, on resident Anvil488. Both passed36 primary
+checks and additional application, retirement, lifecycle and confirmation
+assertions. The eight-byte run exercised the selected owner; the zero-byte run
+exercised an unrelated selected TLS context. All snapshot bytes and both packet
+key structures were checked: previously nonzero handshake material disappeared,
+application material was preserved, and the unrelated context did not change.
+The tests also exercised bad-tag/pending-decrypt/busy-worker refusal, repeated
+confirmation, retired-level refusal/drop, deadline clearing and empty ACK
+receipts. Both peers authenticated a subsequent client1-RTT PING and verified
+Finished/h3. The peer's zero-CID fixture omits invalid empty NEW_CONNECTION_ID
+frames, as documented in its source.
+
+Measured exchange durations were1,419,170us and410,754us; maximum foreground
+service gaps were1,882us and1,947us. These are individual fixture measurements,
+not performance guarantees. Both runs returned x0=0 with cores/fonts/Vulkan
+health checks passing and watchdogoff. Retained screenshots are monitor-return
+evidence, not UI/input or rendering correctness tests. The actual Pi3 adapter
+compiled; it was not executed. Resident488 and the boot image were unchanged.
+
+Application frame effects beyond HANDSHAKE_DONE and their ACK transmission,
+recovery/congestion/flow control, streams/QPACK/real HTTP3, key updates,
+Retry/migration and remaining IPv6/TLS/device work remain open.
