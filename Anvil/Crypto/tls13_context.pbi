@@ -20,6 +20,20 @@ Procedure.i Tls13ContextMatchesBuffers(snapshot.i,capacity.i,handshake.i,receive
  If Tls13ContextState(snapshot,capacity)<0 : ProcedureReturn 0 : EndIf
  ProcedureReturn Bool(PeekI(snapshot+1224)=handshake And PeekI(snapshot+1248)=receive And PeekI(snapshot+2920)=config)
 EndProcedure
+; Caller has confirmed the handshake and excluded all concurrent crypto work.
+; Snapshot-only retirement: this does NOT select or change global working state.
+; Restore this snapshot separately if it is the currently selected connection.
+; Retains master/application secrets, application record keys and metadata.
+; Erases early/derived/handshake material, ephemeral DH/private and Finished key.
+; 1 success (idempotent),0 refused before mutation. No QUIC confirmation itself.
+Procedure.i Tls13ContextRetireHandshakeSecrets(snapshot.i,capacity.i)
+ Define i.i
+ If Tls13ContextState(snapshot,capacity)<>#TLS13_ST_CONNECTED : ProcedureReturn 0 : EndIf
+ For i=272 To 367 : PokeA(snapshot+i,0) : Next
+ For i=400 To 463 : PokeA(snapshot+i,0) : Next
+ For i=528 To 623 : PokeA(snapshot+i,0) : Next
+ ProcedureReturn 1
+EndProcedure
 Procedure.i Tls13ContextSave(dst.i,capacity.i)
  If dst=0 Or capacity<#TLS13_CONTEXT_SIZE : ProcedureReturn 0 : EndIf
  TlsCopy(dst+0,@secTlsWKey[0],16)

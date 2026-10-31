@@ -5252,3 +5252,37 @@ not executed there. No reset or resident update was needed. Application frame
 effects and ACK transmission, handshake confirmation/key retirement, recovery,
 congestion/flow control, streams/QPACK/realHTTP3 and remaining IPv6/TLS/device
 work remain open.
+
+
+### Completed-handshake TLS snapshot cleanup (2026-10-31)
+
+`Tls13ContextRetireHandshakeSecrets(snapshot, capacity)` is a shared Crypto
+primitive for connection owners that have confirmed their handshake and excluded
+concurrent crypto work. It accepts only a complete, connected TLS snapshot,
+returns1 on success and0 on unchanged refusal, and is idempotent. It erases
+256 bytes of early/derived/handshake secrets, ephemeral DH/private material and
+the Finished key. Master/application secrets, application record keys and all
+other snapshot bytes survive. It does not select or modify global TLS working
+state: an owner must separately restore the cleaned snapshot if its connection
+is currently selected. It does not itself confirm a QUIC handshake or discard
+QUIC packet keys/recovery state, nor claim erasure of arbitrary older copies.
+
+Physical Anvil488 evidence is retained in
+`docs/evidence/anvil-ipv6-20261030/tls-handshake-secrets488/`.
+The live certificate-verified QUIC fixture returned x0=0, capture324, passing36
+existing checks plus retirement/application/lifecycle assertions. It checks
+null/overflow pointers, short capacity and pre-Finished state without mutation;
+checks every snapshot byte against the expected erasures/preserved bytes;
+checks a different selected TLS context remains unchanged; checks idempotence;
+and restores/re-saves the cleaned snapshot before returning to the original
+context. The test cleans a separate snapshot: production connection confirmation
+and selected-context retirement remain to be integrated. The independent peer
+verified Finished/h3 and authenticated client1-RTT PING. The measured exchange
+was1,417,956us; maximum service dispatch242us and gap1,882us. These are fixture
+observations, not general latency guarantees.
+
+Cores, fonts and Vulkan remained healthy; watchdog was off afterward. Resident488
+and the boot image were unchanged. The same composition compiled with the real
+Pi3 adapter but was not executed there. Application frame effects/ACK transmission,
+confirmation/key retirement, recovery/congestion/flow, streams/QPACK/real HTTP3,
+and remaining IPv6/TLS/device work are still open.

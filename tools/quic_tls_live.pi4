@@ -25,6 +25,7 @@ Global feedFault.i,keyCancelled.i,feedSteps.i,maxFeedStep.i
 Global keyOp.QuicTlsOperation,probeKey.QuicKeyJob,probeKeys.QuicKeys
 Global preparedKeyOp.QuicTlsOperation
 Global applicationFrame.QuicApplicationFrame,applicationFrames.i,doneSeen.i
+Global retireFault.i,retireChecked.i
 Global applicationStateFault.i
 Global applicationFault.i,applicationBadTag.i,applicationCancelled.i,applicationPing.i
 Global applicationSteps.i,maxApplicationStep.i,applicationNumber.i,applicationWriteReady.i
@@ -771,6 +772,38 @@ Procedure CheckApplicationCancellation()
  If connection\result<>-9443 Or HooksClear()<>1 : applicationFault=16 : EndIf
  applicationCancelled=1
 EndProcedure
+Procedure CheckHandshakeSecretRetirement()
+ Define i.i,n.i,expected.i
+ For i=0 To #TLS13_CONTEXT_SIZE-1 : probeSnapshot[i]=ownerSnapshot[i] : Next
+ If Tls13ContextRetireHandshakeSecrets(0,#TLS13_CONTEXT_SIZE)<>0 : retireFault=1 : EndIf
+ If Tls13ContextRetireHandshakeSecrets($7FFFFFFFFFFFFFF0,#TLS13_CONTEXT_SIZE)<>0 : retireFault=2 : EndIf
+ If Tls13ContextRetireHandshakeSecrets(@probeSnapshot[0],#TLS13_CONTEXT_SIZE-1)<>0 : retireFault=3 : EndIf
+ For i=0 To #TLS13_CONTEXT_SIZE-1 : If probeSnapshot[i]<>ownerSnapshot[i] : retireFault=4 : EndIf : Next
+ PokeI(@probeSnapshot[0]+168,#TLS13_ST_SEND_FINISHED)
+ For i=0 To #TLS13_CONTEXT_SIZE-1 : retrySnapshot[i]=probeSnapshot[i] : Next
+ If Tls13ContextRetireHandshakeSecrets(@probeSnapshot[0],#TLS13_CONTEXT_SIZE)<>0 : retireFault=5 : EndIf
+ For i=0 To #TLS13_CONTEXT_SIZE-1
+  If probeSnapshot[i]<>retrySnapshot[i] : retireFault=6 : EndIf
+  probeSnapshot[i]=ownerSnapshot[i]
+ Next
+ ForeignContext() : n=Tls13ContextSave(@beforeSnapshot[0],#TLS13_CONTEXT_SIZE)
+ If Tls13ContextRetireHandshakeSecrets(@probeSnapshot[0],#TLS13_CONTEXT_SIZE)<>1 : retireFault=7 : EndIf
+ n=Tls13ContextSave(@afterSnapshot[0],#TLS13_CONTEXT_SIZE)
+ For i=0 To #TLS13_CONTEXT_SIZE-1
+  If beforeSnapshot[i]<>afterSnapshot[i] : retireFault=8 : EndIf
+  expected=ownerSnapshot[i]
+  If (i>=272 And i<=367) Or (i>=400 And i<=463) Or (i>=528 And i<=623) : expected=0 : EndIf
+  If probeSnapshot[i]<>expected : retireFault=9 : EndIf
+ Next
+ If Tls13ContextRetireHandshakeSecrets(@probeSnapshot[0],#TLS13_CONTEXT_SIZE)<>1 : retireFault=10 : EndIf
+ n=Tls13ContextRestore(@probeSnapshot[0],#TLS13_CONTEXT_SIZE)
+ n=Tls13ContextSave(@afterSnapshot[0],#TLS13_CONTEXT_SIZE)
+ For i=0 To #TLS13_CONTEXT_SIZE-1 : If afterSnapshot[i]<>probeSnapshot[i] : retireFault=11 : EndIf : Next
+ n=Tls13ContextRestore(@ownerSnapshot[0],#TLS13_CONTEXT_SIZE)
+ n=Tls13ContextWipe(@probeSnapshot[0],#TLS13_CONTEXT_SIZE)
+ n=Tls13ContextWipe(@retrySnapshot[0],#TLS13_CONTEXT_SIZE)
+ retireChecked=1
+EndProcedure
 Procedure.i Main()
  CaptureTable()
  Define i.i,rc.i,closed.i,cleanup.i,admit.i,saved.i,tlsState.i,tlsError.i,x509Error.i,certCount.i,alert.i,workerBytes.i
@@ -802,6 +835,7 @@ Procedure.i Main()
  If handle>0
   admit=QuicConnectionBegin(@connection,@connectionSpans[0],handle,HwMicros(),20000000)
   If admit=0 : rc=Run() : Else : rc=admit : EndIf
+  If rc=0 And admit=0 : CheckHandshakeSecretRetirement() : EndIf
   tlsState=Tls13State : tlsError=Tls13Err : x509Error=Tls13X509Err : certCount=TlsCertCount : alert=Tls13Alert
   If admit=0 : closed=CloseConnection(rc) : Else : closed=UdpPayloadClose(handle) : EndIf
  Else
@@ -809,6 +843,7 @@ Procedure.i Main()
  EndIf
  For i=0 To SizeOf(QuicApplicationState)-1 : If PeekA(@connection\applicationState+i)<>0 : applicationStateFault=4 : EndIf : Next
  PokeI($E1C00298,applicationStateFault)
+ PokeI($E1C002B0,retireFault) : PokeI($E1C002B8,retireChecked)
  PokeI($E1C00100,rc) : PokeI($E1C00108,tlsState) : PokeI($E1C00110,tlsError)
  PokeI($E1C00220,peerBytes)
  PokeI($E1C00248,applicationFrames) : PokeI($E1C00250,doneSeen)
