@@ -7,6 +7,7 @@
 ; borrowed. Serialized dispatcher only; no I/O or wait loops are hidden here.
 ; Child jobs use only this owner's storage. Start no work once closing begins,
 ; and honor the shared worker's crypto exclusion across suspended execution.
+XIncludeFile "Anvil/Core/quic_application_packet.pbi"
 #QUIC_CONNECTION_ARGUMENT=-3511
 #QUIC_CONNECTION_TIMEOUT=-3512
 #QUIC_CONNECTION_STATE=-3513
@@ -103,6 +104,7 @@ Structure QuicConnection
  peerIdKnown.i
  peerIdBytes.i
  startup.QuicConnectionStart
+ application.QuicApplicationPacket
 EndStructure
 ; Span table order: RX data/bits,TX data/bits,ACK ranges,sent slots/metadata,
 ; TLS snapshot,handshake/receive/output/config,local/peer parameters/entries,
@@ -222,8 +224,12 @@ Procedure.i QuicConnectionCloseStep(*c.QuicConnection)
  If *c\phase<>2 : ProcedureReturn #QUIC_CONNECTION_STATE : EndIf
  ; Another suspended TLS operation retains shared arithmetic scratch. Defer
  ; cleanup instead of allowing a packet cancellation to reset its GCM job.
- If TlsWorkerBusy()<>0 And TlsWorkerOwns(@*c\tlsOp\context\worker)=0 And TlsWorkerOwns(@*c\outgoing\worker)=0 And TlsWorkerOwns(@*c\incoming\worker)=0 : ProcedureReturn #TLSWORK_BUSY : EndIf
+ If TlsWorkerBusy()<>0 And TlsWorkerOwns(@*c\tlsOp\context\worker)=0 And TlsWorkerOwns(@*c\outgoing\worker)=0 And TlsWorkerOwns(@*c\incoming\worker)=0 And TlsWorkerOwns(@*c\application\worker)=0 : ProcedureReturn #TLSWORK_BUSY : EndIf
  If *c\closeStage=0
+  If *c\application\phase=1
+   rc=QuicApplicationPacketCancel(@*c\application)
+   If rc<>#QUIC_APP_PACKET_CANCELLED : ProcedureReturn rc : EndIf
+  EndIf
   If *c\tlsOp\phase=1
    rc=QuicTlsOperationCancel(@*c\tlsOp)
    If rc<>#QUIC_OP_CANCELLED : ProcedureReturn rc : EndIf

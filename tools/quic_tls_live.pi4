@@ -25,6 +25,10 @@ Global feedFault.i,keyCancelled.i,feedSteps.i,maxFeedStep.i
 Global keyOp.QuicTlsOperation,probeKey.QuicKeyJob,probeKeys.QuicKeys
 Global preparedKeyOp.QuicTlsOperation
 Global applicationFrame.QuicApplicationFrame,applicationFrames.i,doneSeen.i
+Global applicationFault.i,applicationBadTag.i,applicationCancelled.i,applicationPing.i
+Global applicationSteps.i,maxApplicationStep.i,applicationNumber.i,applicationWriteReady.i
+Global savedApplicationBytes.i,savedApplicationKeys.QuicKeys
+Global Dim savedApplication.a[1472]
 Global startupFault.i,startupChecks.i,startupSteps.i,maxStartupStep.i
 Global ackFault.i,ackChecks.i,ackSteps.i,maxAckStep.i
 Global receiveFault.i,receiveCancelled.i,receiveSteps.i,maxReceiveStep.i,savedReceiveBytes.i
@@ -234,6 +238,46 @@ Procedure.i FeedTls(*s.QuicConnectionSpace)
  If QuicConnectionTlsStep(@connection)<>1 : feedFault=2 : EndIf
  ProcedureReturn 0
 EndProcedure
+Procedure.i ApplicationCrypt(packetAddress.i,bytes.i,idBytes.i,number.i,encrypt.i)
+ Define rc.i,n.i,t.i,cost.i,*keys.QuicKeys
+ *keys=@connection\appRead : If encrypt : *keys=@connection\appWrite : EndIf
+ rc=QuicApplicationPacketBegin(@connection\application,*keys,packetAddress,bytes,idBytes,number,encrypt)
+ If rc<>0 : ProcedureReturn rc : EndIf
+ If QuicApplicationPacketBegin(@connection\application,*keys,packetAddress,bytes,idBytes,number,encrypt)<>#QUIC_APP_PACKET_STATE : applicationFault=1 : EndIf
+ If QuicConnectionSendBegin(@connection,0,peerBytes)<>#QUIC_SEND_STATE : applicationFault=2 : EndIf
+ If TlsWorkerBegin(@otherJob,@CloseHoldEntry,0)<>#TLSWORK_BUSY : applicationFault=3 : EndIf
+ Repeat
+  t=HwMicros() : rc=QuicApplicationPacketStep(@connection\application) : cost=HwMicros()-t
+  applicationSteps=applicationSteps+1 : If cost>maxApplicationStep : maxApplicationStep=cost : EndIf
+  n=Service() : If n<0 : ProcedureReturn n : EndIf
+ Until rc<>0
+ If QuicApplicationPacketStep(@connection\application)<>rc : applicationFault=4 : EndIf
+ ProcedureReturn rc
+EndProcedure
+Procedure.i SendApplicationPing()
+ Define rc.i,n.i,i.i,header.i,bytes.i
+ If applicationPing<>0 Or connection\appWrite\ready<>1 : ProcedureReturn -9441 : EndIf
+ applicationWriteReady=1
+ ; One diagnostic packet, PN0 exactly once under these fresh write keys.
+ ; Header: fixed bit, key phase0, spin0, four PN bytes, then PING and tag space.
+ PokeA(@output[0],$43)
+ For i=0 To peerBytes-1 : output[1+i]=peerId[i] : Next
+ NetWriteBE32(@output[0]+1+peerBytes,0)
+ header=1+peerBytes+4 : output[header]=1 : bytes=header+1+16
+ rc=ApplicationCrypt(@output[0],bytes,peerBytes,0,1) : If rc<>1 : ProcedureReturn rc : EndIf
+ Repeat
+  n=Service() : If n<0 : ProcedureReturn n : EndIf
+  rc=UdpPayloadSendTo(handle,@ep,@output[0],bytes)
+ Until rc<>#SVC_EAGAIN
+ If rc<1 : ProcedureReturn rc : EndIf
+ Repeat
+  n=Service() : If n<0 : ProcedureReturn n : EndIf
+  rc=UdpPayloadStatus(handle,@status) : If rc<>0 : ProcedureReturn rc : EndIf
+  If status\txState=#UDP_TX_FAILED : ProcedureReturn status\txError : EndIf
+ Until status\txState=#UDP_TX_SENT
+ applicationPing=1
+ ProcedureReturn 0
+EndProcedure
 Procedure.i PacketOne(p.i,bytes.i)
  Define rc.i,i.i,t.i,cost.i,old.i,known.i,count.i,cursor.i,n.i,*s.QuicConnectionSpace
  rc=QuicPacketRead(@connection\header,p,bytes,8) : If rc<>1 : ProcedureReturn -9307 : EndIf
@@ -241,15 +285,23 @@ Procedure.i PacketOne(p.i,bytes.i)
   If connection\header\destinationBytes<>8 : ProcedureReturn -9308 : EndIf
   For i=0 To 7 : If PeekA(p+connection\header\destinationOffset+i)<>clientId[i] : ProcedureReturn -9309 : EndIf : Next
   If Tls13State<>#TLS13_ST_CONNECTED : ProcedureReturn -9310 : EndIf
-  rc=QuicPacketJobBegin(@connection\sendJob,@connection\appRead,p,connection\header\packetBytes,8,-1,0) : If rc<>0 : ProcedureReturn rc : EndIf
-  Repeat
-   rc=Pump() : If rc<0 : ProcedureReturn rc : EndIf
-   rc=QuicPacketJobStep(@connection\sendJob)
-  Until rc<>0
-  If rc<>1 : ProcedureReturn rc : EndIf
+  savedApplicationBytes=connection\header\packetBytes
+  For i=0 To savedApplicationBytes-1 : savedApplication[i]=PeekA(p+i) : Next
+  For i=0 To SizeOf(QuicKeys)-1 : PokeA(@savedApplicationKeys+i,PeekA(@connection\appRead+i)) : Next
+  PokeA(p+savedApplicationBytes-1,PeekA(p+savedApplicationBytes-1)!1)
+  rc=ApplicationCrypt(p,savedApplicationBytes,8,-1,0)
+  If rc<>#QUIC_CRYPTO_AUTH : applicationFault=5 : ProcedureReturn -9442 : EndIf
+  For i=0 To savedApplicationBytes-1
+   old=savedApplication[i] : If i=savedApplicationBytes-1 : old=old!1 : EndIf
+   If PeekA(p+i)<>old : applicationFault=6 : EndIf
+  Next
+  applicationBadTag=1
+  For i=0 To savedApplicationBytes-1 : PokeA(p+i,savedApplication[i]) : Next
+  rc=ApplicationCrypt(p,savedApplicationBytes,8,-1,0) : If rc<>1 : ProcedureReturn rc : EndIf
+  applicationNumber=connection\application\crypto\number
   cursor=0
-  While cursor<connection\sendJob\plainBytes
-   n=QuicApplicationFrameRead(p+connection\sendJob\plainOffset+cursor,connection\sendJob\plainBytes-cursor,@applicationFrame)
+  While cursor<connection\application\crypto\plainBytes
+   n=QuicApplicationFrameRead(p+connection\application\crypto\plainOffset+cursor,connection\application\crypto\plainBytes-cursor,@applicationFrame)
    If n<1 : ProcedureReturn n : EndIf
    cursor=cursor+n
    If applicationFrame\base\kind<>0 : applicationFrames=applicationFrames+1 : EndIf
@@ -340,7 +392,7 @@ Procedure.i Run()
    Wend
   EndIf
  Wend
- stage=5 : ProcedureReturn 0
+ stage=5 : ProcedureReturn SendApplicationPing()
 EndProcedure
 Procedure.i LiveEntry()
  Define *s.QuicConnectionSpace
@@ -678,6 +730,37 @@ Procedure CheckReceiveCancellation()
  If connection\result<>-9430 Or QuicConnectionReceiveStep(@connection)<>#QUIC_RECEIVE_STATE Or HooksClear()<>1 : receiveFault=13 : EndIf
  receiveCancelled=1
 EndProcedure
+Procedure CheckApplicationCancellation()
+ Define socket.i,rc.i,n.i,i.i,slice.i
+ If savedApplicationBytes=0 : applicationFault=7 : ProcedureReturn : EndIf
+ socket=UdpPayloadOpen(4,0,55013)
+ If socket<=0 : applicationFault=8 : ProcedureReturn : EndIf
+ rc=QuicConnectionBegin(@connection,@connectionSpans[0],socket,HwMicros(),20000000)
+ If rc<>0 : applicationFault=9 : n=UdpPayloadClose(socket) : ProcedureReturn : EndIf
+ For i=0 To savedApplicationBytes-1 : packet[i]=savedApplication[i] : Next
+ For i=0 To SizeOf(QuicKeys)-1 : PokeA(@connection\appRead+i,PeekA(@savedApplicationKeys+i)) : Next
+ rc=QuicApplicationPacketBegin(@connection\application,@connection\appRead,@packet[0],savedApplicationBytes,8,-1,0)
+ If rc<>0 : applicationFault=10 : EndIf
+ slice=tlsjob_sliceTicks : tlsjob_sliceTicks=1
+ rc=QuicApplicationPacketStep(@connection\application) : tlsjob_sliceTicks=slice
+ If rc<>0 Or connection\application\crypto\phase=0 Or TlsWorkerOwns(@connection\application\worker)<>1 : applicationFault=11 : EndIf
+ rc=QuicConnectionClose(@connection,-9443) : rc=QuicConnectionCloseStep(@connection)
+ If rc<>0 Or connection\closeStage<>1 Or TlsWorkerBusy()<>0 Or GcmJobBusy()<>0 Or connection\application\crypto\phase<>0 : applicationFault=12 : EndIf
+ If QuicApplicationPacketStep(@connection\application)<>#QUIC_APP_PACKET_CANCELLED : applicationFault=13 : EndIf
+ Repeat
+  rc=QuicConnectionCloseStep(@connection)
+  If rc=2
+   n=UdpPayloadClose(socket) : n=QuicConnectionSocketClosed(@connection,socket,n)
+   If n<>0 : applicationFault=14 : ProcedureReturn : EndIf
+  ElseIf rc<0
+   applicationFault=15 : ProcedureReturn
+  EndIf
+  n=Service()
+ Until rc=1
+ QuicKeysWipe(@savedApplicationKeys)
+ If connection\result<>-9443 Or HooksClear()<>1 : applicationFault=16 : EndIf
+ applicationCancelled=1
+EndProcedure
 Procedure.i Main()
  CaptureTable()
  Define i.i,rc.i,closed.i,cleanup.i,admit.i,saved.i,tlsState.i,tlsError.i,x509Error.i,certCount.i,alert.i
@@ -737,12 +820,17 @@ Procedure.i Main()
  PokeI($E1C001B8,lifecycleFault) : PokeI($E1C001C0,lifecycleProbes)
  CheckPacketCancellation()
  CheckReceiveCancellation()
+ CheckApplicationCancellation()
  PokeI($E1C00210,cidFault) : PokeI($E1C00218,Bool(cidChecks>0))
  PokeI($E1C00200,feedFault) : PokeI($E1C00208,keyCancelled)
  PokeI($E1C000F0,maxFeedStep) : PokeI($E1C000F8,feedSteps)
  PokeI($E1C001F0,receiveFault) : PokeI($E1C001F8,receiveCancelled)
  PokeI($E1C000E0,maxReceiveStep) : PokeI($E1C000E8,receiveSteps)
  PokeI($E1C001C8,sendFault) : PokeI($E1C001D0,Bool(sendProbes=sent And sent>=1)) : PokeI($E1C001D8,packetCancelChecked)
+ PokeI($E1C00258,applicationWriteReady) : PokeI($E1C00260,applicationFault)
+ PokeI($E1C00268,applicationSteps) : PokeI($E1C00270,maxApplicationStep)
+ PokeI($E1C00278,applicationCancelled) : PokeI($E1C00280,applicationPing)
+ PokeI($E1C00288,applicationNumber) : PokeI($E1C00290,applicationBadTag)
  cleanup=Tls13ContextWipe(@beforeSnapshot[0],#TLS13_CONTEXT_SIZE)
  cleanup=Tls13ContextWipe(@afterSnapshot[0],#TLS13_CONTEXT_SIZE)
  Tls13PauseHook=0 : Tls13SetupPauseHook=0 : QuicCipherInvalidateHook=0

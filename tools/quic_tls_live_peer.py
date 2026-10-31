@@ -131,6 +131,23 @@ class Peer:
         assert self.result['error'] is None,self.result['error']
         assert self.result['complete'],self.result['events']
 
+    def check_application_ping(self, timeout=2):
+        """Require authenticated client 1-RTT PN0/PING, not merely a datagram."""
+        end=time.monotonic()+timeout
+        while True:
+            self.check()
+            events=[event for trace in self.logger.to_dict()['traces'] for event in trace['events']]
+            packets=[event['data'] for event in events if event['name']=='transport:packet_received'
+                     and event['data']['header']['packet_type']=='1RTT']
+            matches=[packet for packet in packets if int(packet['header']['packet_number'])==0
+                     and any(frame['frame_type']=='ping' for frame in packet['frames'])]
+            if matches:
+                self.result['application_ping_authenticated']=True
+                self.result['application_ping_packet_number']=0
+                return
+            assert time.monotonic()<end,'No authenticated client application PING'
+            self.stop.wait(.01)
+
 def selftest(directory, report, connection_id_length=8):
     """Verify this exact test CA/chain with a normal independent local client."""
     with Peer(directory,report,host='127.0.0.1',port=0,allowed='127.0.0.1',connection_id_length=connection_id_length) as peer:

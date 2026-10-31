@@ -25,6 +25,7 @@ Procedure.i QuicConnectionAckBegin(*c.QuicConnection)
  Define rc.i,i.i,level.i,*s.QuicConnectionSpace
  If quicca_Valid(*c)=0 : ProcedureReturn #QUIC_CONNECTION_ACK_ARGUMENT : EndIf
  If *c\phase<>1 Or (*c\acknowledge\phase<>0 And *c\acknowledge\phase<>5) : ProcedureReturn #QUIC_CONNECTION_ACK_STATE : EndIf
+ If *c\application\phase=1 : ProcedureReturn #QUIC_CONNECTION_ACK_STATE : EndIf
  If *c\startup\phase>=1 And *c\startup\phase<=8 : ProcedureReturn #QUIC_CONNECTION_ACK_STATE : EndIf
  If *c\receive\phase<>2 Or *c\receive\authenticated<>1 Or *c\receive\process\phase<>2 : ProcedureReturn #QUIC_CONNECTION_ACK_STATE : EndIf
  If *c\outgoing\phase<>0 And *c\outgoing\phase<>6 : ProcedureReturn #QUIC_SENT_BUSY : EndIf

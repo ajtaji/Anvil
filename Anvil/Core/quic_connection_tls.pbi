@@ -16,6 +16,7 @@ EndProcedure
 Procedure.i QuicConnectionTlsBegin(*c.QuicConnection,level.i,peerBytes.i,timeoutUs.i)
  If quiccf_Valid(*c)=0 Or (level<>0 And level<>2) Or peerBytes<0 Or peerBytes>20 Or timeoutUs<=0 : ProcedureReturn #QUIC_FEED_ARGUMENT : EndIf
  If *c\phase<>1 Or (*c\feed\phase<>0 And *c\feed\phase<>12) : ProcedureReturn #QUIC_FEED_STATE : EndIf
+ If *c\application\phase=1 : ProcedureReturn #QUIC_FEED_STATE : EndIf
  If *c\startup\phase>=1 And *c\startup\phase<=8 : ProcedureReturn #QUIC_FEED_STATE : EndIf
  If *c\peerIdKnown<>1 Or peerBytes<>*c\peerIdBytes : ProcedureReturn #QUIC_FEED_ARGUMENT : EndIf
  If *c\incoming\phase>=1 And *c\incoming\phase<=3 : ProcedureReturn #QUIC_FEED_STATE : EndIf
@@ -61,7 +62,8 @@ Procedure.i QuicConnectionTlsStep(*c.QuicConnection)
    *keys=@*c\handshake\readKeys
    If *c\feed\keyTarget=1 : *keys=@*c\handshake\writeKeys : EndIf
    If *c\feed\keyTarget=2 : *keys=@*c\appRead : EndIf
-   secret=Tls13ContextTrafficSecret(snapshot,#TLS13_CONTEXT_SIZE,Bool(*c\feed\keyTarget<>1),Bool(*c\feed\keyTarget=2))
+   If *c\feed\keyTarget=3 : *keys=@*c\appWrite : EndIf
+   secret=Tls13ContextTrafficSecret(snapshot,#TLS13_CONTEXT_SIZE,Bool(*c\feed\keyTarget=0 Or *c\feed\keyTarget=2),Bool(*c\feed\keyTarget>=2))
    rc=QuicTlsOperationBegin(@*c\tlsOp,snapshot,#TLS13_CONTEXT_SIZE,4,@*c\keyjob,*keys,secret,32,*c\feed\timeout)
    If rc=#TLSWORK_BUSY : ProcedureReturn 0 : EndIf
    If rc<>1 : ProcedureReturn quiccf_Fail(*c,rc) : EndIf
@@ -91,6 +93,7 @@ Procedure.i QuicConnectionTlsStep(*c.QuicConnection)
    If Tls13ContextState(snapshot,#TLS13_CONTEXT_SIZE)=#TLS13_ST_SEND_FINISHED
     If *c\feed\parametersReady<>1 : ProcedureReturn quiccf_Fail(*c,#QUIC_FEED_PARAMETERS) : EndIf
     If *c\appRead\ready<>1 : *c\feed\keyTarget=2 : *c\feed\phase=4 : ProcedureReturn 0 : EndIf
+    If *c\appWrite\ready<>1 : *c\feed\keyTarget=3 : *c\feed\phase=4 : ProcedureReturn 0 : EndIf
     *c\feed\phase=9
    Else
     *c\feed\phase=12 : ProcedureReturn 1

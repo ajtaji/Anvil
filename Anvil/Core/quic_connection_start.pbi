@@ -18,6 +18,7 @@ Procedure.i QuicConnectionStartBegin(*c.QuicConnection,timeoutUs.i)
  Define snapshot.i
  If quicst_Valid(*c)=0 Or timeoutUs<=0 : ProcedureReturn #QUIC_START_ARGUMENT : EndIf
  If *c\phase<>1 Or *c\startup\phase<>0 Or *c\peerIdKnown<>0 Or *c\initialRetired<>0 : ProcedureReturn #QUIC_START_STATE : EndIf
+ If *c\application\phase=1 : ProcedureReturn #QUIC_START_STATE : EndIf
  If *c\incoming\phase<>0 Or *c\outgoing\phase<>0 Or *c\acknowledge\phase<>0 Or *c\feed\phase<>0 : ProcedureReturn #QUIC_START_STATE : EndIf
  If *c\tlsOp\phase<>0 Or *c\tlsOutput\phase<>0 Or *c\keyjob\phase<>0 : ProcedureReturn #QUIC_START_STATE : EndIf
  If *c\initial\readKeys\ready<>0 Or *c\initial\writeKeys\ready<>0 Or *c\initial\tx\tail<>0 : ProcedureReturn #QUIC_START_STATE : EndIf

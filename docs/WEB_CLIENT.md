@@ -5089,3 +5089,55 @@ not change; the prior negative certificate proof was not rerun or counted as
 a new result. Application packet ownership, frame effects/ACKs, handshake
 confirmation and key retirement, recovery, streams/QPACK and real HTTP/3
 remain open, together with remaining IPv6/TLS/device work.
+
+### Cooperative application packet protection — 2026-10-31
+
+`Anvil/Core/quic_application_packet.pbi` exposes
+`QuicApplicationPacketBegin(op,keys,packet,bytes,idBytes,number,encrypt)`,
+`QuicApplicationPacketStep(op)` and `QuicApplicationPacketCancel(op)`.
+Begin returns0 on admission, Step returns0 pending or1 authenticated/encrypted,
+and negative results signal refusal/failure. Terminal Step results are stable.
+The common worker owns arithmetic scratch across suspension. Descriptor, keys
+and packet must remain disjoint, exclusive and alive until terminal return.
+Cancellation stops/reaps the worker before abandoning packet crypto; discard
+the partially processed packet. Borrowed traffic keys remain caller-owned.
+Never consume plaintext before successful authentication. Authentication
+failure preserves the original protected wire bytes.
+
+The operation accepts short-header packets only. Its caller binds the correct
+connection, keys and destination CID, supplies the largest authenticated
+incoming packet number or a unique outgoing packet number, and serializes
+protocol state. It does not allocate packet numbers, apply frames, perform UDP
+I/O or authorize key-phase changes. Those remain connection-dispatch duties.
+Connection close now cancels its owned application operation before wiping
+keys/storage. Other connection admissions refuse concurrent application work.
+The TLS feed derives both server-read and client-write application keys through
+the existing context worker before producing Client Finished.
+
+Evidence: `docs/evidence/anvil-ipv6-20261030/quic-application-packet488/`.
+Two final physical Pi4 runs on resident488 passed the36 existing checks and
+extra application/startup/lifecycle assertions with zero- and eight-byte peer
+IDs. The independent peer verified Client Finished/h3 and decrypted an outgoing
+1-RTT PN0/PING. The received application packet number is correlated with the
+peer's sent frame record. A locally corrupted authentication tag was rejected
+with protected bytes unchanged, followed by successful authentication of the
+original packet. A separate forced suspension was cancelled by connection
+close, releasing the worker and wiping owned storage.
+
+Application crypto maximum Step time was506/513 us; maximum foreground service
+gaps were1,885/1,882 us for zero/eight IDs. These are observed small-packet
+measurements, not hard scheduling guarantees or throughput benchmarks.
+The first development run's existing36 checks passed, but its new cancellation
+assertion failed because the harness invoked the probe twice after wiping its
+saved keys. That failed extension is retained separately; final runs use one
+invocation and pass. No resident update or reset was required. Cores, fonts and
+Vulkan remained healthy, with watchdog off. Pi3 compilation used its real
+hardware adapter; no Pi3 execution claim is made.
+
+This establishes bidirectional application packet protection, not a complete
+application transport. Packet-number/history management, frame effects and
+ACKs, HANDSHAKE_DONE confirmation and Handshake-key retirement, recovery,
+congestion/flow control, streams/QPACK and real HTTP/3 remain open. Earlier
+negative certificate results remain historical; this change's new negative
+test concerns application authentication. Remaining IPv6/TLS/device work is
+also unfinished.
