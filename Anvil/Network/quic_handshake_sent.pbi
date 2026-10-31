@@ -44,6 +44,11 @@ Structure QuicHandshakeSentAck
  cookie.i
  flags.i
  inFlightBytes.i
+ rttLargestNew.i
+ rttSentAt.i
+ rttEliciting.i
+ rttUsed.i
+ rttDelay.i
 EndStructure
 Procedure.i quics_Span(p.i,n.i)
  If p<=0 Or n<0 Or p>$7FFFFFFFFFFFFFFF-n : ProcedureReturn 0 : EndIf
@@ -155,7 +160,7 @@ Procedure.i QuicHandshakeSentAckBegin(*j.QuicHandshakeSentAck,*s.QuicHandshakeSe
  rc=quics_Ready(*s) : If rc<0 : ProcedureReturn rc : EndIf
  If quics_Span(*j,SizeOf(QuicHandshakeSentAck))=0 Or quics_Span(*f,SizeOf(QuicHandshakeFrame))=0 : ProcedureReturn #QUIC_SENT_ARGUMENT : EndIf
  If *s\busy<>0 : ProcedureReturn #QUIC_SENT_BUSY : EndIf
- If level<>*s\level Or (*f\kind<>2 And *f\kind<>3) Or *f\count<1 Or *f\count>64 Or *f\rangeBytes<1 Or *f\rangeBytes>1016 Or *f\largest<0 Or *f\largest>#QUIC_INTEGER_MAX : ProcedureReturn #QUIC_SENT_ARGUMENT : EndIf
+ If level<>*s\level Or (*f\kind<>2 And *f\kind<>3) Or *f\count<1 Or *f\count>64 Or *f\rangeBytes<1 Or *f\rangeBytes>1016 Or *f\largest<0 Or *f\largest>#QUIC_INTEGER_MAX Or *f\delay<0 Or *f\delay>#QUIC_INTEGER_MAX : ProcedureReturn #QUIC_SENT_ARGUMENT : EndIf
  If quics_Span(*f\ranges,*f\rangeBytes)=0 : ProcedureReturn #QUIC_SENT_ARGUMENT : EndIf
  If quics_Overlap(*j,SizeOf(QuicHandshakeSentAck),*s,SizeOf(QuicHandshakeSent)) Or quics_Overlap(*j,SizeOf(QuicHandshakeSentAck),*s\entries,*s\capacity*32) : ProcedureReturn #QUIC_SENT_ARGUMENT : EndIf
  If quics_Overlap(*f,SizeOf(QuicHandshakeFrame),*s,SizeOf(QuicHandshakeSent)) Or quics_Overlap(*f,SizeOf(QuicHandshakeFrame),*s\entries,*s\capacity*32) Or quics_Overlap(*f,SizeOf(QuicHandshakeFrame),*j,SizeOf(QuicHandshakeSentAck)) : ProcedureReturn #QUIC_SENT_ARGUMENT : EndIf
@@ -163,7 +168,7 @@ Procedure.i QuicHandshakeSentAckBegin(*j.QuicHandshakeSentAck,*s.QuicHandshakeSe
  If *j\phase=1 Or *j\phase=2 : ProcedureReturn #QUIC_SENT_BUSY : EndIf
  For i=0 To SizeOf(QuicHandshakeSentAck)-1 : PokeA(*j+i,0) : Next
  *j\phase=1 : *j\owner=*s : *j\source=*f\ranges : *j\bytes=*f\rangeBytes
- *j\count=*f\count : *j\largest=*f\largest : *j\current=-1
+ *j\count=*f\count : *j\largest=*f\largest : *j\current=-1 : *j\rttDelay=*f\delay
  *s\busy=*j : ProcedureReturn 0
 EndProcedure
 Procedure.i quics_Range(*j.QuicHandshakeSentAck)
@@ -223,6 +228,8 @@ Procedure.i QuicHandshakeSentAckStep(*j.QuicHandshakeSentAck)
   If *j\phase=2 And (flags&16)=0
    *j\number=*j\current+1 : *j\packetBytes=PeekI(p+8) : *j\sentAt=PeekI(p+16)
    *j\cookie=PeekI(p+24) : *j\flags=flags : *j\inFlightBytes=0
+   If *j\number=*j\largest : *j\rttLargestNew=1 : *j\rttSentAt=*j\sentAt : EndIf
+   If flags&4 : *j\rttEliciting=1 : EndIf
    If flags&8 : *j\inFlightBytes=*j\packetBytes : *s\inFlight=*s\inFlight-*j\packetBytes : EndIf
    PokeI(p,(flags|16)&(~8)) : *s\acked=*s\acked+1
    If *j\number>*s\largestAcked : *s\largestAcked=*j\number : EndIf
@@ -408,4 +415,27 @@ Procedure.i QuicRttDeadline(sentAt.i,duration.i)
  If sentAt<0 Or duration<1 : ProcedureReturn #QUIC_SENT_ARGUMENT : EndIf
  If duration>$7FFFFFFFFFFFFFFF-sentAt : ProcedureReturn $7FFFFFFFFFFFFFFF : EndIf
  ProcedureReturn sentAt+duration
+EndProcedure
+
+; Consume timing evidence only after the entire ACK job completes successfully.
+; The largest new packet need not itself elicit ACK if another new packet did.
+; Caller authenticates the ACK and supplies its original receive timestamp and
+; validated peer delay exponent/cap in local microseconds. Keep owner alive.
+; 1 sampled,0 ineligible/already consumed,negative refused; no sample on cancel.
+Procedure.i QuicRttAck(*r.QuicRtt,*j.QuicHandshakeSentAck,receivedAt.i,exponent.i,maxDelay.i,confirmed.i)
+ Define *s.QuicHandshakeSent,rc.i,delay.i
+ If quics_Span(*r,SizeOf(QuicRtt))=0 Or quics_Span(*j,SizeOf(QuicHandshakeSentAck))=0 : ProcedureReturn #QUIC_SENT_ARGUMENT : EndIf
+ If *j\phase<>3 : ProcedureReturn #QUIC_SENT_STATE : EndIf
+ *s=*j\owner : rc=quics_Ready(*s) : If rc<0 : ProcedureReturn rc : EndIf
+ If quics_Overlap(*r,SizeOf(QuicRtt),*j,SizeOf(QuicHandshakeSentAck)) Or quics_Overlap(*r,SizeOf(QuicRtt),*s,SizeOf(QuicHandshakeSent)) Or quics_Overlap(*r,SizeOf(QuicRtt),*s\entries,*s\capacity*32) : ProcedureReturn #QUIC_SENT_ARGUMENT : EndIf
+ rc=quics_RttReady(*r) : If rc<0 : ProcedureReturn rc : EndIf
+ If receivedAt<0 Or exponent<0 Or exponent>20 Or maxDelay<0 Or confirmed<0 Or confirmed>1 : ProcedureReturn #QUIC_SENT_ARGUMENT : EndIf
+ If *j\rttUsed=1 : ProcedureReturn 0 : EndIf
+ If *j\rttLargestNew=0 Or *j\rttEliciting=0 : *j\rttUsed=1 : ProcedureReturn 0 : EndIf
+ If receivedAt<=*j\rttSentAt : ProcedureReturn #QUIC_SENT_ARGUMENT : EndIf
+ delay=$7FFFFFFFFFFFFFFF
+ If *j\rttDelay<=($7FFFFFFFFFFFFFFF>>exponent) : delay=*j\rttDelay<<exponent : EndIf
+ rc=QuicRttSample(*r,receivedAt-*j\rttSentAt,delay,maxDelay,*s\level,confirmed)
+ If rc<>0 : ProcedureReturn rc : EndIf
+ *j\rttUsed=1 : ProcedureReturn 1
 EndProcedure

@@ -8,6 +8,8 @@
 ; now produces an application ACK/PING after all supported effects succeed.
 ; Other frame kinds are refused without committing an application receipt.
 ; TLS completion is also checked independently by the server.
+Global pathRtt.QuicRtt,rttSamples.i,rttFault.i
+Global Dim rttTrace.i[32]
 Global connection.QuicConnection
 Global Dim connectionSpans.i[40]
 Global bufferWiped.i,closeFault.i,storageRefused.i,closeCalls.i,maxCloseStep.i
@@ -511,7 +513,13 @@ EndProcedure
 
 ; Continue the actual exchange after TX; consume authenticated peer ACKs.
 Procedure.i ReceiveApplicationAck()
+ Define peerExponent.i,peerDelay.i,*parameter.QuicParameter
  Define rc.i,n.i,i.i,p.i,bytes.i,cursor.i,used.i,pn.i,seen.i,eliciting.i,receivedAt.i,untilTime.i
+ peerExponent=3 : peerDelay=25000
+ *parameter=QuicParametersFind(@connection\params,10)
+ If *parameter : peerExponent=*parameter\value : EndIf
+ *parameter=QuicParametersFind(@connection\params,11)
+ If *parameter : peerDelay=*parameter\value*1000 : EndIf
  If lossPhase=0
   rc=CheckDeliveryRefusals() : If rc<>0 : ProcedureReturn rc : EndIf
  EndIf
@@ -558,6 +566,20 @@ Procedure.i ReceiveApplicationAck()
       n=Service() : If n<0 : ProcedureReturn n : EndIf
      Until rc=2 Or rc<0
      If rc<>2 : ProcedureReturn rc : EndIf
+     rc=QuicRttAck(@pathRtt,@connection\applicationAck,receivedAt,peerExponent,peerDelay,connection\handshakeConfirmed)
+     If rc<0 : ProcedureReturn rc : EndIf
+     If rc=1
+      If rttSamples<4
+       rttTrace[rttSamples*8]=connection\applicationAck\largest
+       rttTrace[rttSamples*8+1]=receivedAt : rttTrace[rttSamples*8+2]=connection\applicationAck\rttSentAt
+       rttTrace[rttSamples*8+3]=connection\applicationAck\rttDelay
+       rttTrace[rttSamples*8+4]=peerExponent : rttTrace[rttSamples*8+5]=peerDelay
+       rttTrace[rttSamples*8+6]=4 : rttTrace[rttSamples*8+7]=connection\handshakeConfirmed
+      Else
+       rttFault=1
+      EndIf
+      rttSamples=rttSamples+1
+     EndIf
      If lossPhase=0 And connection\applicationHistory\acked=1
       If connection\applicationHistory\inFlight<>0 Or connection\applicationHistory\largestAcked<>0 : deliveryFault=2 : EndIf
       applicationDelivery=1 : deliveryNumber=pn
@@ -622,6 +644,7 @@ EndProcedure
 
 Procedure.i Run()
  Define rc.i,n.i,i.i,p.i,packetBytes.i
+ rc=QuicRttInit(@pathRtt,333000,1000) : If rc<>0 : ProcedureReturn rc : EndIf
  stage=1
  X509ResetAnchors() : X509AddAnchorEC(1,?RootDn,#ROOT_DN_BYTES,23,?RootKey,65)
  Tls13SetHsBuffer(@tlsHs[0],32768) : Tls13SetRecvBuffer(@tlsRecv[0],16645)
@@ -1161,6 +1184,11 @@ Procedure.i Main()
  PokeI($E1C00258,applicationWriteReady) : PokeI($E1C00260,applicationFault)
  PokeI($E1C00268,applicationSteps) : PokeI($E1C00270,maxApplicationStep)
  PokeI($E1C00278,applicationCancelled) : PokeI($E1C00280,applicationPing)
+ PokeI($E1C00390,rttFault) : PokeI($E1C00398,rttSamples)
+ PokeI($E1C003A0,pathRtt\latest) : PokeI($E1C003A8,pathRtt\minimum)
+ PokeI($E1C003B0,pathRtt\smoothed) : PokeI($E1C003B8,pathRtt\variation)
+ PokeI($E1C003C0,QuicRttLossDelay(@pathRtt)) : PokeI($E1C003C8,QuicRttPto(@pathRtt,4,1,25000,0))
+ For i=0 To 31 : PokeI($E1C00400+i*8,rttTrace[i]) : Next
  PokeI($E1C00370,lossFault) : PokeI($E1C00378,lossChecked)
  PokeI($E1C00380,lossAckCount) : PokeI($E1C00388,lossEvents)
  PokeI($E1C00350,probeFault) : PokeI($E1C00358,probeChecked)

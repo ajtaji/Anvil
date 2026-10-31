@@ -229,6 +229,43 @@ def build(compiler,out):
  observe_rtt('refusals preserve RTT')
  for start,duration in [(0,1),(100,999),(M-2,2),(M-2,3),(M,M),(0,M),(-1,1),(0,0)]:
   check('deadline',f'QuicRttDeadline({start},{duration})',-3461 if start<0 or duration<1 else min(M,start+duration))
+
+ # Eligibility comes from completed ledger events, not only the ACK largest PN.
+ reset_rtt();init(8,4)
+ reserve();commit(0,time=1000,eliciting=0)
+ reserve();commit(1,time=2000)
+ reserve();commit(2,time=3000,eliciting=0)
+ prepare({1,2})
+ check('RTT before validation','QuicRttAck(@rtt,@job,4000,3,25000,1)',-3462)
+ code('rc=RunAck(0)');apply({1,2});check('eligible ACK done','rc',2)
+ check('largest noneliciting still eligible','QuicRttAck(@rtt,@job,4000,3,25000,1)',1)
+ check('largest timestamp used','rtt\\latest',1000)
+ check('same completed ACK not sampled twice','QuicRttAck(@rtt,@job,9000,3,25000,1)',0)
+ check('duplicate helper unchanged','rtt\\latest',1000)
+ ack({0,1,2});check('duplicate largest no sample','QuicRttAck(@rtt,@job,10000,3,25000,1)',0)
+ reserve();commit(3,time=5000)
+ reserve();commit(4,time=6000,eliciting=0)
+ ack({4});check('only noneliciting newly ACKed','QuicRttAck(@rtt,@job,10000,3,25000,1)',0)
+ ack({3,4});check('new eliciting but old largest','QuicRttAck(@rtt,@job,10000,3,25000,1)',0)
+ check('ineligible samples unchanged','rtt\\latest',1000)
+ reserve();commit(5,time=7000)
+ prepare({5},mutation='frame\\delay=#QUIC_INTEGER_MAX')
+ # Mutation above occurs after frame parsing and before ACK admission.
+ code('rc=RunAck(0)');apply({5});check('large delay ACK done','rc',2)
+ check('bad receive clock','QuicRttAck(@rtt,@job,6999,20,25000,1)',-3461)
+ check('zero elapsed rejected','QuicRttAck(@rtt,@job,7000,20,25000,1)',-3461)
+ check('bad exponent','QuicRttAck(@rtt,@job,9000,21,25000,1)',-3461)
+ check('alias owner','QuicRttAck(@s,@job,9000,20,25000,1)',-3461)
+ check('refusals do not consume sample','job\\rttUsed',0)
+ check('saturated decode safe','QuicRttAck(@rtt,@job,9000,20,25000,1)',1)
+ check('raw sample retained','rtt\\latest',2000)
+ check('oversize delay not subtracted','rtt\\smoothed',1125)
+ reserve();commit(6,time=8000)
+ prepare({6});code('rc=RunAck(1)');apply({6},limit=1)
+ check('partial ACK cannot sample','QuicRttAck(@rtt,@job,10000,3,25000,1)',-3462)
+ check('cancel partial ACK','QuicHandshakeSentAckCancel(@job)',-3467)
+ check('cancelled ACK cannot sample','QuicRttAck(@rtt,@job,10000,3,25000,1)',-3462)
+ check('cancel preserves RTT','rtt\\latest',2000)
  assert 256+len(cases)*8<=65536
  source=out/'proof.pi4'
  source.write_text(r'''XIncludeFile "RaspberryPi4/Lib/mmu.pi4"
