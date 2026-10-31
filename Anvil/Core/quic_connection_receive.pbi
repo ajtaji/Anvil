@@ -30,11 +30,13 @@ Procedure.i quiccr_Decrypt()
  EndIf
  *c\incoming\result=rc : ProcedureReturn 1
 EndProcedure
+; Optional timestamp is the datagram dequeue time in recovery clock units.
+; -1 preserves legacy behavior without an RTT sample.
 ; 0 admitted,6 dropped without mutation,negative refused. Header/CID checks
 ; precede admission. Learning the peer ID waits for authenticated completion.
-Procedure.i QuicConnectionReceiveBegin(*c.QuicConnection,level.i,packet.i,bytes.i)
+Procedure.i QuicConnectionReceiveBeginAt(*c.QuicConnection,level.i,packet.i,bytes.i,receivedAt.i)
  Define i.i,p.i,rc.i,h.QuicPacketHeader,*s.QuicConnectionSpace
- If quiccr_Valid(*c)=0 : ProcedureReturn #QUIC_RECEIVE_ARGUMENT : EndIf
+ If quiccr_Valid(*c)=0 Or receivedAt< -1 : ProcedureReturn #QUIC_RECEIVE_ARGUMENT : EndIf
  If *c\phase<>1 Or (*c\incoming\phase<>0 And *c\incoming\phase<>4 And *c\incoming\phase<>6) : ProcedureReturn #QUIC_RECEIVE_STATE : EndIf
  If *c\application\phase=1 : ProcedureReturn #QUIC_RECEIVE_STATE : EndIf
  If *c\controlPhase>=1 And *c\controlPhase<=3 : ProcedureReturn #QUIC_RECEIVE_STATE : EndIf
@@ -63,21 +65,28 @@ Procedure.i QuicConnectionReceiveBegin(*c.QuicConnection,level.i,packet.i,bytes.
  EndIf
  For i=0 To SizeOf(QuicConnectionReceive)-1 : PokeA(@*c\incoming+i,0) : Next
  *c\incoming\phase=1 : *c\incoming\level=level : *c\incoming\packet=packet : *c\incoming\bytes=h\packetBytes
- *c\incoming\sourceOffset=h\sourceOffset : *c\incoming\sourceBytes=h\sourceBytes
+ *c\incoming\receivedAt=receivedAt : *c\incoming\sourceOffset=h\sourceOffset : *c\incoming\sourceBytes=h\sourceBytes
  ProcedureReturn 0
+EndProcedure
+; Legacy callers explicitly omit timestamp sampling.
+Procedure.i QuicConnectionReceiveBegin(*c.QuicConnection,level.i,packet.i,bytes.i)
+ ProcedureReturn QuicConnectionReceiveBeginAt(*c,level,packet,bytes,-1)
 EndProcedure
 ; Select the supported long-header packet space. Application/Retry/version
 ; negotiation remain outside this handshake receiver and are dropped here.
-Procedure.i QuicConnectionReceivePacketBegin(*c.QuicConnection,packet.i,bytes.i)
+Procedure.i QuicConnectionReceivePacketBeginAt(*c.QuicConnection,packet.i,bytes.i,receivedAt.i)
  Define p.i,h.QuicPacketHeader,rc.i
- If quiccr_Valid(*c)=0 : ProcedureReturn #QUIC_RECEIVE_ARGUMENT : EndIf
+ If quiccr_Valid(*c)=0 Or receivedAt< -1 : ProcedureReturn #QUIC_RECEIVE_ARGUMENT : EndIf
  If *c\phase<>1 Or (*c\incoming\phase<>0 And *c\incoming\phase<>4 And *c\incoming\phase<>6) : ProcedureReturn #QUIC_RECEIVE_STATE : EndIf
  p=QuicConnectionBuffer(*c,15)
  If bytes<1 Or bytes>1472 Or packet<p Or packet>p+1472-bytes : ProcedureReturn #QUIC_RECEIVE_ARGUMENT : EndIf
  rc=QuicPacketRead(@h,packet,bytes,8)
  If rc<>1 : ProcedureReturn 6 : EndIf
  If h\kind<>0 And h\kind<>2 : ProcedureReturn 6 : EndIf
- ProcedureReturn QuicConnectionReceiveBegin(*c,h\kind,packet,bytes)
+ ProcedureReturn QuicConnectionReceiveBeginAt(*c,h\kind,packet,bytes,receivedAt)
+EndProcedure
+Procedure.i QuicConnectionReceivePacketBegin(*c.QuicConnection,packet.i,bytes.i)
+ ProcedureReturn QuicConnectionReceivePacketBeginAt(*c,packet,bytes,-1)
 EndProcedure
 ; 1 pending,2 borrowed ACK,4 complete,5 peer close,6 discard,negative failure.
 ; One worker slice or frame-parser step per call. No parser/TLS work runs on

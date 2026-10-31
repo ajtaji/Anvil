@@ -52,6 +52,7 @@ Structure QuicConnectionAck
  offset.i
  remaining.i
  events.i
+ rttSample.i
 EndStructure
 Structure QuicConnectionReceive
  phase.i ; 0 fresh,1 admission,2 crypto,3 frames,4 done,6 drop,-1 failed
@@ -61,6 +62,7 @@ Structure QuicConnectionReceive
  bytes.i
  sourceOffset.i
  sourceBytes.i
+ receivedAt.i ; -1 means no timestamp supplied
  worker.TlsWorkerJob
 EndStructure
 Structure QuicConnectionTls

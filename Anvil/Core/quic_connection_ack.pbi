@@ -1,7 +1,7 @@
 ; Shared bounded application of an authenticated handshake ACK event.
 ; Include quic_connection first. The packet, ledger and stream remain borrowed
 ; and immutable to other dispatch work until done. No I/O, crypto or waits.
-; Applies sent history/CRYPTO ACKs and rearms PTO; RTT/loss/ECN remain external.
+; Applies sent history/CRYPTO ACKs and samples supplied receive timestamps and rearms PTO; loss/ECN remain external.
 ; Initial packet protection is not certificate identity; TLS validates the peer.
 #QUIC_CONNECTION_ACK_STATE=-3531
 #QUIC_CONNECTION_ACK_ARGUMENT=-3532
@@ -57,6 +57,11 @@ Procedure.i QuicConnectionAckStep(*c.QuicConnection)
   If rc<0 : ProcedureReturn quicca_Fail(*c,rc) : EndIf
   If rc=0 : ProcedureReturn 0 : EndIf
   If rc=2
+   If *c\incoming\receivedAt>=0
+    rc=QuicRttAck(@*c\recoveryRtt,@*c\ackJob,*c\incoming\receivedAt,0,0,0)
+    If rc<0 : ProcedureReturn quicca_Fail(*c,rc) : EndIf
+    *c\acknowledge\rttSample=rc
+   EndIf
    rc=QuicConnectionRecoveryRearm(*c,Bool(*c\acknowledge\events>0 And (*c\acknowledge\level=2 Or *c\handshakeConfirmed=1)))
    If rc<0 : ProcedureReturn quicca_Fail(*c,rc) : EndIf
    *c\acknowledge\phase=4 : ProcedureReturn 0

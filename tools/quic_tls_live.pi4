@@ -9,6 +9,8 @@
 ; Other frame kinds are refused without committing an application receipt.
 ; TLS completion is also checked independently by the server.
 Global recoveryCloseFault.i,recoveryCloseChecked.i
+Global handshakeRttCount.i,datagramReceivedAt.i
+Global Dim handshakeRttTrace.i[80]
 Global lossDispatchChecked.i,lossDispatchAt.i,lossDispatchDone.i
 Global priorityContext.QuicConnection
 Global Dim prioritySlots.i[48]
@@ -254,6 +256,15 @@ Procedure.i HandleAck(*s.QuicConnectionSpace)
  If rc<>1 : ProcedureReturn rc : EndIf
  If connection\receive\process\phase<>1 Or *s\history\busy<>0 : ackFault=5 : EndIf
  If QuicConnectionAckStep(@connection)<>1 Or QuicConnectionAckBegin(@connection)<>#QUIC_CONNECTION_ACK_STATE : ackFault=6 : EndIf
+ If connection\acknowledge\rttSample=1
+  If handshakeRttCount>=16 : ProcedureReturn -9497 : EndIf
+  handshakeRttTrace[handshakeRttCount*5]=connection\ackJob\largest
+  handshakeRttTrace[handshakeRttCount*5+1]=connection\incoming\receivedAt
+  handshakeRttTrace[handshakeRttCount*5+2]=connection\ackJob\rttSentAt
+  handshakeRttTrace[handshakeRttCount*5+3]=connection\ackJob\rttDelay
+  handshakeRttTrace[handshakeRttCount*5+4]=connection\acknowledge\level
+  handshakeRttCount=handshakeRttCount+1
+ EndIf
  ackEvents=ackEvents+connection\acknowledge\events : ackChecks=ackChecks+1
  ProcedureReturn 0
 EndProcedure
@@ -419,7 +430,7 @@ Procedure.i ConfirmHandshake()
 EndProcedure
 Procedure.i PacketOne(p.i,bytes.i)
  Define rc.i,i.i,t.i,cost.i,old.i,known.i,count.i,cursor.i,n.i,receivedAt.i,eliciting.i,*s.QuicConnectionSpace
- receivedAt=HwMicros()
+ receivedAt=datagramReceivedAt
  rc=QuicPacketRead(@connection\header,p,bytes,8) : If rc<>1 : ProcedureReturn -9307 : EndIf
  If connection\header\kind=4
   If connection\header\destinationBytes<>8 : ProcedureReturn -9308 : EndIf
@@ -488,17 +499,17 @@ Procedure.i PacketOne(p.i,bytes.i)
  known=connection\peerIdKnown : count=connection\peerIdBytes
  old=PeekA(p+connection\header\destinationOffset)
  PokeA(p+connection\header\destinationOffset,old!1)
- rc=QuicConnectionReceivePacketBegin(@connection,p,connection\header\packetBytes)
+ rc=QuicConnectionReceivePacketBeginAt(@connection,p,connection\header\packetBytes,receivedAt)
  PokeA(p+connection\header\destinationOffset,old)
  If rc<>6 Or connection\peerIdKnown<>known Or connection\peerIdBytes<>count : cidFault=1 : EndIf
  If known<>0 And count>0
   old=PeekA(p+connection\header\sourceOffset)
   PokeA(p+connection\header\sourceOffset,old!1)
-  rc=QuicConnectionReceivePacketBegin(@connection,p,connection\header\packetBytes)
+  rc=QuicConnectionReceivePacketBeginAt(@connection,p,connection\header\packetBytes,receivedAt)
   PokeA(p+connection\header\sourceOffset,old)
   If rc<>6 Or connection\peerIdKnown<>known Or connection\peerIdBytes<>count : cidFault=2 : EndIf
  EndIf
- rc=QuicConnectionReceivePacketBegin(@connection,p,connection\header\packetBytes)
+ rc=QuicConnectionReceivePacketBeginAt(@connection,p,connection\header\packetBytes,receivedAt)
  If rc=6 : ProcedureReturn 0 : EndIf
  If rc<>0 : ProcedureReturn rc : EndIf
  If connection\peerIdKnown<>known Or connection\peerIdBytes<>count : cidFault=3 : EndIf
@@ -841,6 +852,7 @@ Procedure.i Run()
   n=UdpPayloadReceive(handle,@info,@packet[0],1472)
   If n<>#SVC_EAGAIN
    If n<1 : ProcedureReturn n : EndIf
+   datagramReceivedAt=HwMicros()
    If info\family<>4 Or info\peerPort<>55442 : ProcedureReturn -9322 : EndIf
    For i=0 To 15 : If PeekA(@info\peerAddress+i)<>PeekA(@ep\address+i) : ProcedureReturn -9323 : EndIf : Next
    received=received+1 : p=0
@@ -1379,6 +1391,8 @@ Procedure.i Main()
  PokeI($E1C00278,applicationCancelled) : PokeI($E1C00280,applicationPing)
  PokeI($E1C005A0,priorityFault) : PokeI($E1C005A8,priorityChecks)
  PokeI($E1C005B0,priorityActual) : PokeI($E1C005B8,priorityWanted)
+ PokeI($E1C00600,handshakeRttCount)
+ For i=0 To 79 : PokeI($E1C00620+i*8,handshakeRttTrace[i]) : Next
  PokeI($E1C005C0,priorityLossEvents)
  PokeI($E1C005C8,lossDispatchChecked) : PokeI($E1C005D0,lossDispatchAt) : PokeI($E1C005D8,lossDispatchDone)
  PokeI($E1C00580,pollGuardFault) : PokeI($E1C00588,pollAckChecks)
