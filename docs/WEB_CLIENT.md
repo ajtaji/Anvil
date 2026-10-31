@@ -3966,3 +3966,45 @@ This is not a live QUIC connection or HTTP/3 request. Connection ownership and
 UDP integration, frame effects, ACK scheduling, loss/congestion/flow handling,
 streams, QPACK and actual authenticated HTTP/3 traffic remain open. The earlier
 TLS compatibility/device-blocking and public off-link IPv6 work also remains.
+
+
+### Handshake plaintext packet processing
+
+`quic_handshake_packet.pbi` combines frame decoding, CRYPTO receive storage and
+processed-packet tracking. The caller must first authenticate/decrypt the packet
+and bind its connection, encryption level and reconstructed packet number. A
+job starts zeroed, borrows immutable plaintext (at most 65535 bytes), and keeps
+the matching initialized receive and ACK contexts/storage exclusively owned.
+Begin refuses overlapping packet/job/storage and mismatched levels. It is not
+a decryptor, connection selector or peer-identity check.
+
+Step returns 1 for more work, 2 for an ACK event, 4 for completion, 5 for peer
+close, 6 for duplicate discard, or a negative fatal error. It decodes one frame
+or copies at most 16384 CRYPTO bytes per call. An ACK event remains pending until
+the connection applies it to sent-packet history and calls Accept, or calls
+Reject on failure. Close exposes the borrowed reason/code and terminates the
+job without acknowledging the packet or applying subsequent frames. Already
+processed packet numbers are discarded without interpreting their payload or
+changing ACK demand, including malformed or empty duplicate payloads.
+
+Receipt is recorded only after the entire packet succeeds. A malformed tail,
+rejected ACK event or exhausted receive/history storage leaves the packet
+unacknowledged. Earlier CRYPTO bytes may already have been queued: failure is
+terminal and requires closing the connection, not retrying or rolling back.
+Run TLS consumption after packet completion. A completed/discarded job can be
+reused; active, failed or close jobs cannot begin another packet. Repeated Step
+on a terminal job returns the same result without applying effects again.
+
+Capture 251 on Anvil 488 passed 120 integration assertions: event waiting and
+accept/reject, delayed receipt commit, duplicate suppression, malformed tails,
+peer close, 20000-byte CRYPTO data split at 16384 bytes, receive/history limits,
+out-of-order packets, source aliasing and wrong states/levels. These are synthetic
+plaintext packets; no live packet authentication or sent-history validation is
+claimed by the fixture. The complete fixture compiled for Pi 3 without execution
+there. Cores/fonts/Vulkan stayed healthy, watchdog off. Evidence is in
+`docs/evidence/anvil-ipv6-20261030/quic-packet488`; installed build 488 is unchanged.
+
+The next integration remains the connection's UDP/protection/send path, including
+actual ACK history validation, scheduling and retry, packet-number ownership,
+loss/congestion/flow handling, streams and QPACK, followed by certificate-verified
+HTTP/3 web traffic. Prior TLS and public off-link IPv6 qualification work is open.
