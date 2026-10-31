@@ -31,6 +31,14 @@ Procedure.i quictx_Ready(*s.QuicCryptoTx)
  If *s\phase<>1 Or (*s\level<>0 And *s\level<>2 And *s\level<>3) : ProcedureReturn #QUIC_TX_STATE : EndIf
  ProcedureReturn 0
 EndProcedure
+; Connection close makes all retained output unusable. Caller first stops any
+; execution borrowing these buffers; no packet or transcript state is undone.
+Procedure.i QuicCryptoTxAbandon(*s.QuicCryptoTx)
+ If quictx_Span(*s,SizeOf(QuicCryptoTx))=0 : ProcedureReturn #QUIC_TX_ARGUMENT : EndIf
+ If *s\phase<>1 And *s\phase<>3 : ProcedureReturn #QUIC_TX_STATE : EndIf
+ *s\phase=3
+ ProcedureReturn 0
+EndProcedure
 Procedure.i quictx_External(*s.QuicCryptoTx,p.i,n.i)
  If quictx_Span(p,n)=0 : ProcedureReturn 0 : EndIf
  If quictx_Overlap(p,n,*s,SizeOf(QuicCryptoTx)) Or quictx_Overlap(p,n,*s\data,*s\capacity) Or quictx_Overlap(p,n,*s\states,*s\capacity/4) : ProcedureReturn 0 : EndIf

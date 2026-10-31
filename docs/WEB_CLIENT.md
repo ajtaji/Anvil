@@ -4508,3 +4508,60 @@ currently exercised by the RAM QUIC integration fixture; no resident QUIC API
 is claimed. The Pi remains on Anvil 488 with healthy cores, fonts and Vulkan and
 watchdog off. Production operation/lifecycle integration, application packet
 processing and the previously listed HTTP/3, IPv6 and TLS gaps remain open.
+
+
+### QUIC TLS operation deadlines and terminal abandonment
+
+`Anvil/Core/quic_tls_operation.pbi` schedules key-share generation, TLS output
+building and authenticated CRYPTO input through the shared context worker.
+Begin validates ownership/storage and reserves the worker without executing
+crypto. Step runs one cooperative slice, preserving foreground TLS state.
+Completion returns 1 with the underlying protocol result in the descriptor;
+protocol refusal and transport errors retain their existing meanings. A
+completed operation can be followed by another; an abandoned operation is
+terminal and cannot be restarted with Begin.
+
+Per-operation deadlines are checked before and after a slice. Cancellation or
+timeout stops and reaps suspended execution before wiping its snapshot and
+invalidating the associated CRYPTO stream. Failure to stop retains ownership:
+the caller must retry/diagnose, never free the buffers. Deadlines are soft;
+they do not preempt an atomic step or replace the overall connection deadline.
+The dispatcher still owns UDP service, fairness and actual connection close.
+
+Outgoing and incoming stream owners now expose terminal abandonment. A TLS
+output job can be abandoned during its building phase, but this alone does not
+stop the coroutine or release storage. The builder checks its job/stream state
+when it returns and cannot publish output or revive a poisoned stream. The
+existing copy-phase Cancel contract is unchanged. Accepted transcript state is
+not rolled back: abandon and close the connection instead of reusing it.
+
+On installed Anvil 488, capture 281 passed 19 live QUIC checks and the peer
+independently confirmed client Finished and h3. Probes covered deadline expiry
+before execution, refusal to restart the terminal operation, cancellation of
+a suspended output builder, and input cancellation before execution. Each
+preserved foreground TLS state, wiped the cancelled snapshot and released its
+worker; cancelled streams refused further work. The output-cancel probe alone
+temporarily used a one-counter-tick slice to force a deterministic checkpoint,
+then restored the normal setting before live traffic and timing measurements.
+
+The live run measured 259 worker calls and 265 full context checks. Maximum
+operation Step was 1.762 ms, maximum foreground service gap 1.912 ms, maximum
+service call 237 us and total fixture time 1.404281 seconds. These observations
+are not hard timing guarantees. Capture 283 rejected the corrupted certificate
+signature; the peer did not complete TLS, and lifecycle/context checks passed.
+
+Capture 282 passed 92 output tests: the existing 79-case independent wire/hash,
+capacity, aliasing, retained-output and reentrancy corpus plus 13 abandonment
+checks. A builder was deliberately abandoned from its yield callback and then
+allowed to return. Its job stayed terminal, its stream stayed poisoned, no
+output bytes were exposed or retained, and copy/append were refused. Its TLS
+state had advanced, proving the test did not restore the transcript to retry.
+
+Exact source/payload identities, raw reports and peer results are published in
+`docs/evidence/anvil-ipv6-20261030/quic-operation488`. Cores, fonts and Vulkan
+were healthy and watchdog was off after all three runs. These shared modules
+were compiled into the RAM qualification payloads; no resident monitor API or
+image changed. Installed Anvil remains 488 and the previous uninstalled full
+candidate remains 491. Production connection lifecycle, application packets,
+recovery/congestion/flow control, streams/QPACK and real HTTP/3 traffic remain,
+as do the earlier IPv6 and TLS compatibility/device-blocking gaps.

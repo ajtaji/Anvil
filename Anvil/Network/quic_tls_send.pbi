@@ -51,8 +51,20 @@ Procedure.i QuicTlsOutputBegin(*j.QuicTlsOutput,*s.QuicCryptoTx,output.i,capacit
  ; it returns a complete message; callbacks cannot reenter this same job.
  *j\phase=3 : *j\stream=*s : *j\output=output : *j\offset=*s\tail : *j\level=level
  If level=0 : n=Tls13BuildClientHello(output,capacity) : Else : n=Tls13BuildClientFinished(output,capacity) : EndIf
+ ; A close may abandon output while the builder is suspended. Never publish
+ ; its result or revive its poisoned stream if that execution later returns.
+ If *j\phase<>3 Or *s\phase<>1 : ProcedureReturn #QUIC_OUTPUT_CANCELLED : EndIf
  If n<=0 Or n>need : ProcedureReturn quicto_Fail(*j,#QUIC_OUTPUT_TLS) : EndIf
  *j\bytes=n : *j\phase=1 : ProcedureReturn 1
+EndProcedure
+; Terminal abandonment for connection close, including a suspended builder.
+; This does NOT stop its coroutine or free buffers. Stop/reap execution before
+; releasing storage; a returning builder observes the poison above. Unlike
+; Cancel, this is not restricted to the already-built copy phase.
+Procedure.i QuicTlsOutputAbandon(*j.QuicTlsOutput)
+ If quicto_Span(*j,SizeOf(QuicTlsOutput))=0 : ProcedureReturn #QUIC_TX_ARGUMENT : EndIf
+ If *j\phase<>1 And *j\phase<>3 : ProcedureReturn #QUIC_OUTPUT_STATE : EndIf
+ ProcedureReturn quicto_Fail(*j,#QUIC_OUTPUT_CANCELLED)
 EndProcedure
 ; Return newly retained bytes<=256;0 after completion. Output remains immutable
 ; and this job has exclusive append ownership through completion. TLS builders

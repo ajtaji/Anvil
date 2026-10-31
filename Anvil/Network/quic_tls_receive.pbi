@@ -32,3 +32,11 @@ Procedure.i QuicCryptoTlsStep(*s.QuicCryptoRx)
  EndIf
  ProcedureReturn n
 EndProcedure
+; Terminal receive abandonment. Caller stops the TLS coroutine before freeing
+; storage and closes the connection; accepted transcript bytes are not undone.
+Procedure.i QuicCryptoTlsAbandon(*s.QuicCryptoRx)
+ If *s<=0 Or *s>$7FFFFFFFFFFFFFFF-SizeOf(QuicCryptoRx) : ProcedureReturn #QUIC_RX_ARGUMENT : EndIf
+ If *s\phase<>1 And *s\phase<>2 And *s\phase<>3 : ProcedureReturn #QUIC_RX_STATE : EndIf
+ *s\phase=3 : *s\offered=0
+ ProcedureReturn 0
+EndProcedure

@@ -25,6 +25,14 @@ Global ep.UdpEndpoint,info.UdpDatagramInfo,status.UdpSocketStatus
 Global peerBytes.i,hsReady.i,paramsReady.i,initialDiscarded.i
 Global received.i,sent.i,ackEvents.i,appAuthenticated.i,stage.i
 Global lastPump.i,maxPumpGap.i,maxTlsStep.i
+Global liveOp.QuicTlsOperation
+Global deadlineOp.QuicTlsOperation,outputOp.QuicTlsOperation,inputOp.QuicTlsOperation
+Global probeTx.QuicCryptoTx,probeRx.QuicCryptoRx,probeOut.QuicTlsOutput
+Global operationFault.i,operationProbes.i,extraContextChecks.i
+Global Dim probeData.a[4096]
+Global Dim probeBits.a[1024]
+Global Dim probeOutput.a[2048]
+Global Dim probeSnapshot.a[#TLS13_CONTEXT_SIZE]
 Global liveJob.TlsContextWorkerJob,otherJob.TlsWorkerJob
 Global refusedJob.TlsContextWorkerJob
 Global contextFault.i,contextChecks.i,cancelChecked.i
@@ -330,6 +338,51 @@ Procedure CheckContext()
  Next
  contextChecks=contextChecks+1
 EndProcedure
+Procedure.i BeginOperation(operation.i,space.i)
+ Define *s.LiveSpace
+ *s=space
+ If operation=1 : ProcedureReturn QuicTlsOperationBegin(@liveOp,@ownerSnapshot[0],#TLS13_CONTEXT_SIZE,1,0,0,0,0,20000000) : EndIf
+ If operation=2 : ProcedureReturn QuicTlsOperationBegin(@liveOp,@ownerSnapshot[0],#TLS13_CONTEXT_SIZE,2,@*s\tx,@tlsOutput,@tlsBytes[0],2048,20000000) : EndIf
+ ProcedureReturn QuicTlsOperationBegin(@liveOp,@ownerSnapshot[0],#TLS13_CONTEXT_SIZE,3,@*s\rx,0,0,0,20000000)
+EndProcedure
+Procedure OperationProbe(kind.i)
+ Define i.i,rc.i,n.i,ticks.i,t.i
+ For i=0 To #TLS13_CONTEXT_SIZE-1 : probeSnapshot[i]=ownerSnapshot[i] : Next
+ ForeignContext() : n=Tls13ContextSave(@beforeSnapshot[0],#TLS13_CONTEXT_SIZE)
+ Select kind
+  Case 1
+   rc=QuicTlsOperationBegin(@deadlineOp,@probeSnapshot[0],#TLS13_CONTEXT_SIZE,1,0,0,0,0,1)
+   If rc<>1 : operationFault=1 : ProcedureReturn : EndIf
+   t=HwMicros() : While HwMicros()-t<3 : Wend
+   rc=QuicTlsOperationStep(@deadlineOp) : CheckContext() : extraContextChecks=extraContextChecks+1
+   If rc<>#QUIC_OP_TIMEOUT Or deadlineOp\phase<>-1 Or TlsWorkerBusy()<>0 : operationFault=2 : EndIf
+   If QuicTlsOperationBegin(@deadlineOp,@probeSnapshot[0],#TLS13_CONTEXT_SIZE,1,0,0,0,0,1000)<>#QUIC_OP_STATE : operationFault=3 : EndIf
+  Case 2
+   rc=QuicCryptoTxInit(@probeTx,0,@probeData[0],4096,@probeBits[0],1024)
+   If rc<>0 : operationFault=4 : ProcedureReturn : EndIf
+   rc=QuicTlsOperationBegin(@outputOp,@probeSnapshot[0],#TLS13_CONTEXT_SIZE,2,@probeTx,@probeOut,@probeOutput[0],2048,20000000)
+   If rc<>1 : operationFault=5 : ProcedureReturn : EndIf
+   ; Deterministic cancellation checkpoint only: restore the production slice
+   ; immediately afterward. Live handshake timing never uses this test setting.
+   ticks=tlsjob_sliceTicks : tlsjob_sliceTicks=1
+   rc=QuicTlsOperationStep(@outputOp) : tlsjob_sliceTicks=ticks
+   CheckContext() : extraContextChecks=extraContextChecks+1
+   If rc<>0 Or probeOut\phase<>3 : operationFault=6 : EndIf
+   rc=QuicTlsOperationCancel(@outputOp) : CheckContext() : extraContextChecks=extraContextChecks+1
+   If rc<>#QUIC_OP_CANCELLED Or probeOut\phase<>-1 Or probeTx\phase<>3 Or TlsWorkerBusy()<>0 : operationFault=7 : EndIf
+   If QuicCryptoTxAppend(@probeTx,@probeOutput[0],1)<>#QUIC_TX_STATE : operationFault=8 : EndIf
+  Case 3
+   rc=QuicCryptoRxInit(@probeRx,0,@probeData[0],4096,@probeBits[0],512)
+   If rc<>0 : operationFault=9 : ProcedureReturn : EndIf
+   rc=QuicTlsOperationBegin(@inputOp,@probeSnapshot[0],#TLS13_CONTEXT_SIZE,3,@probeRx,0,0,0,20000000)
+   If rc<>1 : operationFault=10 : ProcedureReturn : EndIf
+   rc=QuicTlsOperationCancel(@inputOp) : CheckContext() : extraContextChecks=extraContextChecks+1
+   If rc<>#QUIC_OP_CANCELLED Or probeRx\phase<>3 Or probeRx\offered<>0 Or TlsWorkerBusy()<>0 : operationFault=11 : EndIf
+ EndSelect
+ For i=0 To #TLS13_CONTEXT_SIZE-1 : If probeSnapshot[i]<>0 : operationFault=12 : EndIf : Next
+ n=Tls13ContextRestore(@ownerSnapshot[0],#TLS13_CONTEXT_SIZE)
+ operationProbes=operationProbes+1
+EndProcedure
 Procedure.i DoTls(operation.i,space.i)
  Define rc.i,t.i,cost.i,n.i,i.i
  liveOperation=operation : liveSpace=space
@@ -354,7 +407,9 @@ Procedure.i DoTls(operation.i,space.i)
   n=Tls13ContextWipe(@retrySnapshot[0],#TLS13_CONTEXT_SIZE)
   cancelChecked=1
  EndIf
- rc=TlsContextWorkerBegin(@liveJob,@ownerSnapshot[0],#TLS13_CONTEXT_SIZE,@LiveEntry,0)
+ If operationProbes=operation-1 : OperationProbe(operation) : EndIf
+ If operationFault<>0 : ProcedureReturn -9327 : EndIf
+ rc=BeginOperation(operation,space)
  If rc<>1 : ProcedureReturn rc : EndIf
  Repeat
   If TlsWorkerBegin(@otherJob,@LiveEntry,0)<>#TLSWORK_BUSY : ownershipFault=1 : EndIf
@@ -366,7 +421,7 @@ Procedure.i DoTls(operation.i,space.i)
   If refusedJob\snapshot<>771 Or refusedJob\capacity<>772 Or refusedJob\worker\result<>773 Or refusedJob\worker\task<>0 : contextFault=8 : EndIf
   ownershipChecks=ownershipChecks+1
   ForeignContext() : n=Tls13ContextSave(@beforeSnapshot[0],#TLS13_CONTEXT_SIZE)
-  t=HwMicros() : rc=TlsContextWorkerStep(@liveJob) : cost=HwMicros()-t
+  t=HwMicros() : rc=QuicTlsOperationStep(@liveOp) : cost=HwMicros()-t
   CheckContext()
   If cost>maxWorkerStep : maxWorkerStep=cost : EndIf
   workerSteps=workerSteps+1
@@ -377,9 +432,9 @@ Procedure.i DoTls(operation.i,space.i)
  ForEver
  If rc=1
   n=Tls13ContextRestore(@ownerSnapshot[0],#TLS13_CONTEXT_SIZE)
-  ProcedureReturn liveResult
+  ProcedureReturn liveOp\result
  EndIf
- If liveJob\worker\task<>0 : TlsContextWorkerCancel(@liveJob) : EndIf
+ If liveOp\phase=1 : QuicTlsOperationCancel(@liveOp) : EndIf
  ProcedureReturn rc
 EndProcedure
 Procedure.i Main()
@@ -411,6 +466,7 @@ Procedure.i Main()
  PokeI($E1C00160,ownershipFault) : PokeI($E1C00168,Bool(workerSteps>1 And ownershipChecks=workerSteps))
  PokeI($E1C00170,Bool(TlsWorkerBusy()=0 And TlsWorkerFaulted()=0 And HooksClear()=1 And unexpectedProfile=0))
  PokeI($E1C00178,contextFault) : PokeI($E1C00180,cancelChecked) : PokeI($E1C000A0,contextChecks)
+ PokeI($E1C00188,operationFault) : PokeI($E1C00190,operationProbes) : PokeI($E1C000A8,extraContextChecks)
  cleanup=Tls13ContextWipe(@ownerSnapshot[0],#TLS13_CONTEXT_SIZE)
  cleanup=Tls13ContextWipe(@beforeSnapshot[0],#TLS13_CONTEXT_SIZE)
  cleanup=Tls13ContextWipe(@afterSnapshot[0],#TLS13_CONTEXT_SIZE)
