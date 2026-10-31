@@ -1004,6 +1004,9 @@ Procedure PmfEnter()
   If (gPmfFlags & #PMF_FLAG_WANTS_SERVICES) <> 0
     BuildServiceTable()
     SvcFileHReset()              ; no file handle outlives the payload that opened it
+    CompilerIf #CAP_NET = 1
+      UdpServiceCloseAll()
+    CompilerEndIf
     graphicsRc=GraphicsServiceEnter()
     If graphicsRc<>0
       gGoX0=0
@@ -1054,6 +1057,9 @@ Procedure PmfEnter()
       Print("   Graphics status: ") : PrintDec(graphicsRc) : PrintNl()
     EndIf
     SvcFileHReset()              ; and none is left open behind it
+    CompilerIf #CAP_NET = 1
+      UdpServiceCloseAll()
+    CompilerEndIf
   EndIf
 EndProcedure
 

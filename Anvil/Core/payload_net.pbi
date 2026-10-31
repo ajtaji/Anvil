@@ -1272,6 +1272,7 @@ Procedure.i PayNetService(sliceMs.i)
   NetServiceProfileRecord(profiling,9,phaseStart)
   phaseStart=HwMicros()
   paynet_TcpAdvanceAll(millis())
+  UdpServiceAdvance()
   NetServiceProfileRecord(profiling,10,phaseStart)
   phaseStart=HwMicros()
   TlsClientAdvance()                ; the TLS connection, if one is open

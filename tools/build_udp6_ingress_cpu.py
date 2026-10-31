@@ -66,7 +66,7 @@ def build(compiler,out):
  core=(root/'Anvil/Core/netconsole.pbi').read_text()
  def proc(name):
   m=re.search(r'^Procedure(?:\.i)? '+name+r'\([^\n]*\n.*?^EndProcedure',core,re.M|re.S);assert m,name;return m[0]+'\n'
- dispatcher='Global *gNetUdpSvcHook,*gNetUdp6SvcHook\n'+''.join(proc(n) for n in ['NetServiceSetUdpHook','NetServiceSetUdp6Hook','NetServiceInput'])
+ dispatcher='Global *gNetUdpSvcHook,*gNetUdp6SvcHook,*gNetDatagramHook\n'+''.join(proc(n) for n in ['NetServiceSetUdpHook','NetServiceSetUdp6Hook','NetServiceSetDatagramHook','NetServiceInput'])
  s='#HW_LINK_NONE=0\n#HW_LINK_WIRED=1\n#HW_LINK_FILE=5\n#DHCP_PORT_SERVER=67\n#DHCP_PORT_CLIENT=68\n#DHCPC_INIT=0\nXIncludeFile "RaspberryPi4/Lib/mmu.pi4"\nXIncludeFile "Anvil/Network/net.pbi"\n'+r'''
 Global legacy.i,owner.i,resolves.i,resolution.i,consume.i,mode.i
 Procedure.i millis()

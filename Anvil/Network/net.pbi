@@ -669,6 +669,7 @@ XIncludeFile "Anvil/Network/ipv6_udp.pbi"
                             ; computed" and a zero field is a wrong one.
 #NET_E_UDP_FULL    = -126  ; every persistent UDP listener slot on this
                            ; interface is in use
+#NET_E_UDP_OWNER   = -127  ; a different owner holds this UDP port
 
 
 ; ======================================================================
@@ -921,8 +922,9 @@ Global Dim net_udpBound.i[#NET_IF_KINDS] ; 0 = accept any port on this interface
 ; Persistent listeners coexist with the command's movable reply filter.
 ; DHCP client, DHCP server and future services therefore do not overwrite
 ; one another merely because a console command is waiting for a reply.
-#NET_UDP_LISTENERS = 8
+#NET_UDP_LISTENERS = 16
 Global Dim net_udpListen.i[#NET_IF_KINDS * #NET_UDP_LISTENERS]
+Global Dim net_udpOwner.i[#NET_IF_KINDS * #NET_UDP_LISTENERS]
 Global net_udpTxCksum.i         ; 1 = compute on transmit. See header.
 ; DHCP bring-up. 0 normally. 1 only while a DHCP exchange is in flight,
 ; when this stack must send from 0.0.0.0 and receive a broadcast reply
@@ -3179,11 +3181,15 @@ EndProcedure
 ; Deliver only datagrams for this destination port. 0 accepts any.
 Procedure.i NetUdpBind(kind.i, port.i)
   Define k.i
+  net_err=#NET_E_NONE
   If port < 0 Or port > 65535
     net_err = #NET_E_PORT
     ProcedureReturn 0
   EndIf
   If kind = #HW_LINK_NONE
+    For k = 1 To #NET_IF_KINDS - 1
+      If NetUdpPortOwner(k,port)>1 : net_err=#NET_E_UDP_OWNER : ProcedureReturn 0 : EndIf
+    Next
     For k = 1 To #NET_IF_KINDS - 1
       net_udpBound[k] = port
     Next
@@ -3193,6 +3199,7 @@ Procedure.i NetUdpBind(kind.i, port.i)
     net_err = #NET_E_ARG
     ProcedureReturn 0
   EndIf
+  If NetUdpPortOwner(kind,port)>1 : net_err=#NET_E_UDP_OWNER : ProcedureReturn 0 : EndIf
   net_udpBound[kind] = port
   ProcedureReturn 1
 EndProcedure
@@ -3217,39 +3224,70 @@ EndProcedure
 ;  `on` adds idempotently or removes the named port. There is no wildcard
 ;  listener: port zero remains NetUdpBind's deliberate accept-any mode.
 ; ----------------------------------------------------------------------
-Procedure.i NetUdpListen(kind.i, port.i, on.i)
+; Owner 1 preserves resident legacy registrations. Payload sockets use
+; generation-tagged owners greater than 1. Claim/release never displace
+; another owner, including when the caller is a legacy protocol.
+Procedure.i NetUdpPortOwner(kind.i,port.i)
+ Define i.i,first.i
+ If net_IfValid(kind)=0 Or port<1 Or port>65535 : ProcedureReturn 0 : EndIf
+ first=kind*#NET_UDP_LISTENERS
+ For i=0 To #NET_UDP_LISTENERS-1
+  If net_udpListen[first+i]=port : ProcedureReturn net_udpOwner[first+i] : EndIf
+ Next
+ ProcedureReturn 0
+EndProcedure
+Procedure.i NetUdpClaim(kind.i, port.i, owner.i)
   Define first.i
   Define i.i
   Define p.i
+  net_err=#NET_E_NONE
   If port < 1 Or port > 65535
     net_err = #NET_E_PORT
     ProcedureReturn 0
   EndIf
-  If net_IfValid(kind) = 0
+  If net_IfValid(kind) = 0 Or owner<1
     net_err = #NET_E_ARG
     ProcedureReturn 0
+  EndIf
+  If owner>1 And net_udpBound[kind]=port
+    net_err=#NET_E_UDP_OWNER : ProcedureReturn 0
   EndIf
   first = kind * #NET_UDP_LISTENERS
   For i = 0 To #NET_UDP_LISTENERS - 1
     p = net_udpListen[first + i]
     If p = port
-      If on = 0
-        net_udpListen[first + i] = 0
-      EndIf
+      If net_udpOwner[first+i]<>owner : net_err=#NET_E_UDP_OWNER : ProcedureReturn 0 : EndIf
       ProcedureReturn 1
     EndIf
   Next
-  If on = 0
-    ProcedureReturn 1
-  EndIf
   For i = 0 To #NET_UDP_LISTENERS - 1
     If net_udpListen[first + i] = 0
       net_udpListen[first + i] = port
+      net_udpOwner[first+i]=owner
       ProcedureReturn 1
     EndIf
   Next
   net_err = #NET_E_UDP_FULL
   ProcedureReturn 0
+EndProcedure
+
+Procedure.i NetUdpRelease(kind.i,port.i,owner.i)
+ Define i.i,first.i
+ net_err=#NET_E_NONE
+ If net_IfValid(kind)=0 Or owner<1 : net_err=#NET_E_ARG : ProcedureReturn 0 : EndIf
+ If port<1 Or port>65535 : net_err=#NET_E_PORT : ProcedureReturn 0 : EndIf
+ first=kind*#NET_UDP_LISTENERS
+ For i=0 To #NET_UDP_LISTENERS-1
+  If net_udpListen[first+i]=port
+   If net_udpOwner[first+i]<>owner : net_err=#NET_E_UDP_OWNER : ProcedureReturn 0 : EndIf
+   net_udpListen[first+i]=0 : net_udpOwner[first+i]=0 : ProcedureReturn 1
+  EndIf
+ Next
+ ProcedureReturn 1
+EndProcedure
+Procedure.i NetUdpListen(kind.i,port.i,on.i)
+ If on=0 : ProcedureReturn NetUdpRelease(kind,port,1) : EndIf
+ ProcedureReturn NetUdpClaim(kind,port,1)
 EndProcedure
 
 Procedure.i NetUdpListening(kind.i, port.i)
@@ -4259,6 +4297,7 @@ Procedure NetReset()
     net_udpBound[k] = 0
     For i = 0 To #NET_UDP_LISTENERS - 1
       net_udpListen[k * #NET_UDP_LISTENERS + i] = 0
+      net_udpOwner[k * #NET_UDP_LISTENERS + i] = 0
     Next
   Next
   net_llKind = 0
@@ -4375,6 +4414,8 @@ Procedure.i NetErrorText()
       ProcedureReturn "net: REFUSED - the TCP checksum does not verify. A TCP checksum is never optional, so a zero field is a wrong one and not an omission"
     Case #NET_E_UDP_FULL
       ProcedureReturn "net: REFUSED - every persistent UDP listener slot on this interface is in use"
+    Case #NET_E_UDP_OWNER
+      ProcedureReturn "net: REFUSED - a different owner holds this UDP port"
     Default
       ProcedureReturn "net: an unnumbered refusal, which is itself a defect"
   EndSelect

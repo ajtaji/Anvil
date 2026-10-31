@@ -716,7 +716,7 @@ buffers and saved state; returning from a payload closes all its TLS handles.
 
 @SECTION TLS application protocol negotiation
 
-ABI 1.13 fills reserved network slots 90 and 91. The table still has 200
+ABI 1.13 fills reserved network slots 90 and 91. That version has 200
 entries, and every older slot keeps its signature. Check major 1, minor at
 least 13 and at least 92 entries before reading these pointers.
 
@@ -741,7 +741,7 @@ network progress: continue calling the service and state slots.
 
 ABI 1.14 fills reserved network slot 92, SvcTlsDrain(handle). Check major 1,
 minor at least 14 and at least 93 entries before reading that pointer. The
-service table still has 200 entries; older indices and signatures do not move.
+service table had 200 entries at 1.14; 1.15 appends the datagram group.
 
 TLS send accepts a copied buffer into an asynchronous queue. A positive send
 result does not mean that encryption and TCP submission have finished.
@@ -812,3 +812,41 @@ handle. Check State and Close failed handles; RESOLVING includes trust/entropy
 preparation. Root loading closes the shared file between 4096-byte reads and
 refuses reentry. See WEB_CLIENT.md for cancellation, target limits and
 measurements. IPv6 and HTTP/2-3 remain unfinished.
+
+
+@SECTION Datagram sockets
+
+ABI 1.15 appends eight UDP services at slots 200 through 207. Existing slots
+retain their meanings. Include Anvil/Network/udp_payload.pbi and call
+UdpPayloadBind with the captured table pointer before using its wrappers.
+Older tables are refused with EABI. Targets without networking return ENOSYS.
+UDP is independent of the TCP/TLS capability of the monitor composition.
+
+Open selects IPv4 (4) or IPv6 (6), an interface, and a local port. Interface
+zero selects the current link; port zero allocates a port from 50000..65535.
+Four sockets are available, with exclusive interface/port ownership. Console,
+DHCP and reserved DNS/NTP ports cannot be claimed. This allocation is not a
+random-port security mechanism. Handles become invalid on Close or return.
+
+SendTo copies the endpoint and data, then returns a positive ticket. Call
+Service regularly and inspect Status: QUEUED, LINK, SENT or FAILED. SENT means
+link completion, not peer delivery. One send may be pending per socket; a new
+send then returns EAGAIN. Accepted packets are never replayed on receipt loss.
+The deadline is five seconds. Maximum data is 1472 bytes for IPv4 and 1232
+for IPv6. Neighbour resolution and link submission advance cooperatively.
+
+Receive returns one whole datagram, including its endpoint metadata. Empty
+queues return EAGAIN; a zero-length datagram returns zero. A short buffer is
+refused without consuming the packet. Peek supplies its size and tuple without
+consuming it; Discard intentionally removes it. Eight datagrams fit per socket;
+overflow drops the newcomer and increments the reported drop count.
+
+Endpoint, metadata and status records are documented in
+Anvil/Network/udp_socket_types.pbi. Addresses are network-order bytes. IPv4
+uses the first four bytes and zeroes the remaining twelve. Read address
+bytes with PeekA and write them with PokeA. Integers are
+native 64-bit. Call the services from the serialized foreground event loop;
+these are not concurrent CPU-safe entry points. They use existing device
+maintenance, so no hard upper bound on a complete Service call is promised.
+Multicast membership, fragmentation and path-MTU discovery are not provided.
+These datagrams are a foundation for QUIC; they are not a complete HTTP/3 client.

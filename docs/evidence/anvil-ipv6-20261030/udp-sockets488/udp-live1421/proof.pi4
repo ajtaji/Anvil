@@ -1,0 +1,81 @@
+XIncludeFile "RaspberryPi4/Lib/mmu.pi4"
+XIncludeFile "Anvil/Network/udp_payload.pbi"
+Global services.i,maxService.i
+Global *pet,*clock
+Global ep.UdpEndpoint,info.UdpDatagramInfo,status.UdpSocketStatus
+Global Dim data.a[1472]
+Global Dim received.a[1472]
+Procedure CaptureTable()
+ ASM
+ adrp x1, global_services
+ add x1, x1, #:lo12:global_services
+ str x0, [x1]
+ EndASM
+EndProcedure
+Procedure.i Probe(h.i,n.i,sequence.i)
+ Define i.i,rc.i,t.i,started.i,elapsed.i,got.i
+ For i=0 To n-1 : data[i]=(i*37+sequence)&255 : Next
+ rc=UdpPayloadSendTo(h,@ep,@data[0],n)
+ If rc<1 : ProcedureReturn rc : EndIf
+ started=clock()
+ While clock()-started<8000000
+  pet()
+  t=clock() : rc=UdpPayloadService() : elapsed=clock()-t
+  If elapsed>maxService : maxService=elapsed : EndIf
+  If rc<0 : ProcedureReturn rc : EndIf
+  rc=UdpPayloadStatus(h,@status) : If rc<>0 : ProcedureReturn rc : EndIf
+  If status\txState=#UDP_TX_FAILED : ProcedureReturn status\txError : EndIf
+  If got=0
+   rc=UdpPayloadReceive(h,@info,@received[0],1472)
+   If rc<>#SVC_EAGAIN
+    If rc<>n : ProcedureReturn -9101 : EndIf
+    If info\family<>ep\family Or info\peerPort<>ep\port : ProcedureReturn -9102 : EndIf
+    For i=0 To 15
+     If PeekA(@info\peerAddress+i)<>PeekA(@ep\address+i) : ProcedureReturn -9103 : EndIf
+    Next
+    For i=0 To n-1
+     If received[i]<>((i*37+sequence)&255) : ProcedureReturn -9104 : EndIf
+    Next
+    got=1
+   EndIf
+  EndIf
+  If got=1 And status\txState=#UDP_TX_SENT : ProcedureReturn 0 : EndIf
+ Wend
+ ProcedureReturn -9105
+EndProcedure
+Procedure.i Main()
+ CaptureTable()
+ Define i.i,rc.i,h.i,started.i
+ rc=UdpPayloadBind(services) : If rc<>0 : ProcedureReturn 71 : EndIf
+ pet=PeekI(services+16+6*8) : clock=PeekI(services+16+11*8)
+ MmuClearNc() : MmuAddNc($08A00000,$09200000) : MmuAddNc($08100000,$08180000)
+ rc=MmuBuildTables($4F80000) : If rc<>0 : ProcedureReturn 72 : EndIf
+ MmuEnableCached()
+ For i=0 To 4095 : PokeA($E1C00000+i,0) : Next
+ PokeI($E1C00000,$55445331) : PokeI($E1C00008,6)
+ started=clock()
+ ep\family=4 : ep\kind=0 : ep\port=55440
+ For i=0 To 15 : PokeA(@ep\address+i,PeekA(?Peer4+i)) : Next
+ h=UdpPayloadOpen(4,0,55011)
+ rc=Probe(h,0,0) : PokeI($E1C00100,rc)
+ rc=Probe(h,17,1) : PokeI($E1C00108,rc)
+ rc=Probe(h,1472,2) : PokeI($E1C00110,rc)
+ UdpPayloadClose(h)
+ ep\family=6 : ep\kind=0 : ep\port=55441
+ For i=0 To 15 : PokeA(@ep\address+i,PeekA(?Peer6+i)) : Next
+ h=UdpPayloadOpen(6,0,55012)
+ rc=Probe(h,0,3) : PokeI($E1C00118,rc)
+ rc=Probe(h,17,4) : PokeI($E1C00120,rc)
+ rc=Probe(h,1232,5) : PokeI($E1C00128,rc)
+ ; Leave this socket open deliberately: common payload return owns cleanup.
+ PokeI($E1C00040,maxService) : PokeI($E1C00048,clock()-started)
+ PokeI($E1C00050,PeekI(services+8)&$FFFFFFFF)
+ MmuDisableCachedFlushed()
+ ProcedureReturn 0
+EndProcedure
+DataSection
+Peer4:
+ Data.a 192,168,1,104,0,0,0,0,0,0,0,0,0,0,0,0
+Peer6:
+ Data.a 254,128,0,0,0,0,0,0,54,104,55,14,139,177,60,154
+EndDataSection

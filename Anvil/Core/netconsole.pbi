@@ -938,6 +938,10 @@ EndProcedure
 ; datagram was its own.
 Global *gNetUdpSvcHook = 0
 Global *gNetUdp6SvcHook = 0
+Global *gNetDatagramHook = 0
+Procedure NetServiceSetDatagramHook(*fn)
+  *gNetDatagramHook=*fn
+EndProcedure
 
 Procedure NetServiceSetUdpHook(*fn)
   *gNetUdpSvcHook = *fn
@@ -966,6 +970,9 @@ Procedure.i NetServiceInput(kind.i, *frame, rc.i)
       If *gNetUdp6SvcHook<>0
         If gNetUdp6SvcHook(kind)<>0 : ProcedureReturn 1 : EndIf
       EndIf
+      If *gNetDatagramHook<>0
+        If gNetDatagramHook(kind)<>0 : ProcedureReturn 1 : EndIf
+      EndIf
       ProcedureReturn 0
     EndIf
     ; Port 68 belongs to the per-interface DHCP client while that row has
@@ -988,6 +995,9 @@ Procedure.i NetServiceInput(kind.i, *frame, rc.i)
       If gNetUdpSvcHook(kind) <> 0
         ProcedureReturn 1
       EndIf
+    EndIf
+    If *gNetDatagramHook<>0
+      If gNetDatagramHook(kind)<>0 : ProcedureReturn 1 : EndIf
     EndIf
     own = NetConsoleOfferUdp(*frame, kind)
     If own = 2
@@ -1993,3 +2003,5 @@ Procedure NetConsoleSay()
     PrintN(".")
   EndIf
 EndProcedure
+
+XIncludeFile "Anvil/Core/udp_service.pbi"

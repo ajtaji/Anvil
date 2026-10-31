@@ -137,6 +137,8 @@
 ; Existing 200-entry shape and every prior signature remain unchanged.
 ; 1.14 - reserved net slot92: bounded TLS output draining before graceful close.
 ; Existing 200-entry shape and every prior signature remain unchanged.
-#SVC_ABI_MINOR   = 14
-#SVC_SLOT_COUNT  = 200         ; 184 at 1.0-1.2; 192 at 1.3; file handles appended at 1.4.
+; 1.15 - appended slots200..207: cooperative IPv4/IPv6 datagram sockets.
+; Every previous slot and signature is unchanged.
+#SVC_ABI_MINOR   = 15
+#SVC_SLOT_COUNT  = 208         ; Datagram group appended at 1.15.
                                ; The boot code sizes its check by it.

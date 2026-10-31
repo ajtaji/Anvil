@@ -3759,3 +3759,47 @@ interval, retaining verified 486 and 485 candidates as rollbacks. Capture 236
 repeated the two live verified HTTPS/HTTP/2 responses and graceful drain/close:
 70,053 bytes in 1.078 seconds, maximum observed step/service 2,532/2,362
 microseconds. Board health passed and the watchdog was off.
+
+
+### Payload datagrams: ABI 1.15
+
+Anvil now appends UDP slots 200-207: Open, SendTo, Receive, Peek, Status,
+Close, Service and Discard. `Anvil/Network/udp_payload.pbi` validates the
+table before binding. The resident owner is shared across compositions,
+including networking targets without the TCP/TLS payload group. Prior slots
+and signatures retain their meanings. The guide documents the fixed records,
+limits, serialized caller contract and asynchronous completion semantics.
+
+Four sockets own interface/port pairs, with eight copied receive datagrams
+and one copied pending send each. Whole-message receive, zero-length packets,
+peek/discard, queue-drop counts, generation-tagged handles and payload-return
+cleanup are supported. Protected control ports cannot be stolen. Link receipts
+are polled; losing a receipt never retransmits an accepted datagram. ARP uses
+tracked submission too. This does not promise a hard bound for existing device
+maintenance or claim that link completion means peer delivery.
+
+Physical captures 241 and 244 passed 115 owner/dispatch checks each. The final
+fixture removes a private helper dependency flagged by the publication gate. An initial IPv4 endpoint refusal exposed a
+typed-pointer byte-array access discrepancy: raw reads saw the right bytes but
+the compiled typed accessor did not. The endpoint validator now uses explicit
+byte reads and passes valid/invalid-address tests. The compiler discrepancy
+itself remains open, recorded in forum post 4365; earlier refusals are retained.
+
+Pi 4 build 488 and Pi 3 build 102 compiled. Build 488 is installed and verified
+by its entire running-image hash after a 90-second boot wait; 487 is retained
+as a verified rollback. Capture 242 exchanged six real datagrams through the
+new ABI with a desktop echo peer: IPv4 lengths 0, 17 and 1472; link-local IPv6
+lengths 0, 17 and 1232. The desktop independently checked every payload byte.
+Observed total exchange time was 71977 us and maximum Service time 531 us.
+These are observations, not deadline guarantees or public off-link IPv6 proof.
+
+Capture 243 then passed real certificate-verified HTTPS/HTTP2 regression:
+two streams, 70053 bytes, graceful TLS drain/close, ABI minor 15. Elapsed time
+was 1060759 us; maximum step/service times 2569/2690 us, drain 32 us.
+Cores, fonts and Vulkan remained healthy; watchdog off. No physical Pi 3 claim.
+Evidence: `docs/evidence/anvil-ipv6-20261030/udp-sockets488`.
+
+QUIC connection ownership, CRYPTO reassembly, recovery/flow/congestion control,
+streams and QPACK still need implementation and live HTTP/3 qualification.
+Remaining TLS blocking/compatibility and public off-link IPv6/RDNSS web
+qualification are also open. A UDP socket API is not a complete web stack.

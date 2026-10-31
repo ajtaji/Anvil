@@ -1,0 +1,704 @@
+#HW_LINK_NONE=0
+#HW_LINK_WIRED=1
+#HW_LINK_FILE=5
+#DHCP_PORT_SERVER=67
+#DHCP_PORT_CLIENT=68
+#DHCPC_INIT=0
+#SVC_ENOSYS=-100
+#SVC_ENOCAP=-101
+#SVC_EARG=-102
+#SVC_EBUSY=-103
+#SVC_ETIMEOUT=-104
+#SVC_EIO=-105
+#SVC_EPERM=-106
+#SVC_ESTATE=-108
+#SVC_EAGAIN=-110
+XIncludeFile "RaspberryPi4/Lib/mmu.pi4"
+XIncludeFile "Anvil/Network/net.pbi"
+XIncludeFile "Anvil/Core/udp_service.pbi"
+Global *gNetUdpSvcHook,*gNetUdp6SvcHook,*gNetDatagramHook
+Procedure NetServiceSetUdpHook(*fn)
+  *gNetUdpSvcHook = *fn
+EndProcedure
+Procedure NetServiceSetUdp6Hook(*fn)
+  *gNetUdp6SvcHook = *fn
+EndProcedure
+Procedure NetServiceSetDatagramHook(*fn)
+  *gNetDatagramHook=*fn
+EndProcedure
+Procedure.i NetServiceInput(kind.i, *frame, rc.i)
+  Define own.i
+  If rc = #NET_IN_REPLY
+    netcon_SendStaged(kind)
+    ProcedureReturn 1
+  EndIf
+  If rc = #NET_IN_TCP
+    TcpInput()
+    ProcedureReturn 1
+  EndIf
+  If rc = #NET_IN_UDP
+    If NetUdpRxFamily()=6
+      If *gNetUdp6SvcHook<>0
+        If gNetUdp6SvcHook(kind)<>0 : ProcedureReturn 1 : EndIf
+      EndIf
+      If *gNetDatagramHook<>0
+        If gNetDatagramHook(kind)<>0 : ProcedureReturn 1 : EndIf
+      EndIf
+      ProcedureReturn 0
+    EndIf
+    ; Port 68 belongs to the per-interface DHCP client while that row has
+    ; an active transaction or lease. Parse it here, in the one dispatcher,
+    ; then leave only an action value behind: the CYW43 receive pointer is
+    ; invalidated by the next read and must never be queued itself.
+    If NetUdpRxPort() = #DHCP_PORT_SERVER And NetUdpRxDstPort() = #DHCP_PORT_CLIENT
+      If DhcpClientState(kind) <> #DHCPC_INIT
+        DhcpClientInput(kind, NetUdpRxData(), NetUdpRxLen(), millis())
+        ProcedureReturn 1
+      EndIf
+    EndIf
+    ; DNS/SNTP ownership is exact-interface and exact-tuple. This callback
+    ; validates and copies bounded state only; packet construction and sends
+    ; remain in NtpServiceTick after receive scratch is no longer live.
+    If NtpServiceInput(kind) <> 0
+      ProcedureReturn 1
+    EndIf
+    If *gNetUdpSvcHook <> 0
+      If gNetUdpSvcHook(kind) <> 0
+        ProcedureReturn 1
+      EndIf
+    EndIf
+    If *gNetDatagramHook<>0
+      If gNetDatagramHook(kind)<>0 : ProcedureReturn 1 : EndIf
+    EndIf
+    own = NetConsoleOfferUdp(*frame, kind)
+    If own = 2
+      netcon_SendStaged(kind)
+    EndIf
+    If own <> 0
+      ProcedureReturn 1
+    EndIf
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+Global ticks.i,ready.i,submit.i,receipt.i,submissions.i,resolution.i
+Global Dim sent.a[1514]
+Procedure.i millis()
+ ProcedureReturn 0
+EndProcedure
+Procedure.i HwMicros()
+ ProcedureReturn ticks
+EndProcedure
+Procedure.i LinkKind()
+ ProcedureReturn 1
+EndProcedure
+Procedure.i HwLinkHas(kind.i)
+ ProcedureReturn kind=1
+EndProcedure
+Procedure.i HwLinkReady(kind.i)
+ ProcedureReturn ready
+EndProcedure
+Procedure.i LinkSendTracked(kind.i,p.i,n.i)
+ Define i.i
+ submissions=submissions+1
+ For i=0 To n-1 : sent[i]=PeekA(p+i) : Next
+ ProcedureReturn submit
+EndProcedure
+Procedure.i LinkTxReceipt(kind.i,ticket.i)
+ ProcedureReturn receipt
+EndProcedure
+Procedure netcon_SendStaged(kind.i)
+EndProcedure
+Procedure TcpInput()
+EndProcedure
+Procedure.i DhcpClientState(kind.i)
+ ProcedureReturn 1
+EndProcedure
+Procedure DhcpClientInput(kind.i,p.i,n.i,t.i)
+EndProcedure
+Procedure.i NtpServiceInput(kind.i)
+ ProcedureReturn 0
+EndProcedure
+Procedure.i NetConsoleOfferUdp(frame.i,kind.i)
+ ProcedureReturn 0
+EndProcedure
+Procedure.i Assigned(kind.i,source.i)
+ ProcedureReturn net_Same(source,?Local,16)
+EndProcedure
+Procedure.i SelectSource(kind.i,destination.i,source.i)
+ Define i.i
+ For i=0 To 15 : PokeA(source+i,PeekA(?Local+i)) : Next
+ ProcedureReturn kind
+EndProcedure
+Procedure.i Resolve(kind.i,source.i,destination.i,mac.i)
+ Define i.i
+ For i=0 To 5 : PokeA(mac+i,PeekA(?RemoteMac+i)) : Next
+ ProcedureReturn resolution
+EndProcedure
+Procedure.i Receive(kind.i,frame.i,n.i,out.i,capacity.i)
+ ProcedureReturn NetUdp6Input(kind,frame,n)
+EndProcedure
+Procedure.i Main()
+ Define rc.i,a.i,b.i,h.i,h2.i,j.i
+ Define ep.UdpEndpoint,info.UdpDatagramInfo,status.UdpSocketStatus
+ Dim data.a[16]
+ For j=0 To 131071 : PokeA($E1C00000+j,$A5) : Next
+ PokeI($E1C00000,$55445331)
+ MmuClearNc() : MmuAddNc($08A00000,$09200000) : MmuAddNc($08100000,$08180000)
+ rc=MmuBuildTables($4F80000) : If rc<>0 : ProcedureReturn 2 : EndIf
+ MmuEnableCached()
+UdpServiceCloseAll() : NetInit() : NetSetMac(1,?Mac) : NetSetIPv4(1,$C0000201,$FFFFFF00,0)
+NetSetTcp6Hooks(@Assigned,@Resolve) : NetSetTcp6ScopedSelectHook(@SelectSource) : NetSetIPv6InputHook(@Receive)
+NetServiceSetUdpHook(0) : NetServiceSetUdp6Hook(0)
+ticks=1000 : ready=1 : submit=77 : receipt=0 : submissions=0 : resolution=1
+udpControl\cursor=0
+ep\family=6 : ep\kind=1 : ep\port=443
+For j=0 To 15 : ep\address[j]=PeekA(?Peer+j) : Next
+data[0]=97 : data[1]=98 : data[2]=99
+
+PokeI($E1C00100+0*8,SizeOf(UdpEndpoint))
+PokeI($E1C00100+1*8,SizeOf(UdpDatagramInfo))
+PokeI($E1C00100+2*8,SizeOf(UdpSocketStatus))
+UdpServiceCloseAll() : NetInit() : NetSetMac(1,?Mac) : NetSetIPv4(1,$C0000201,$FFFFFF00,0)
+NetSetTcp6Hooks(@Assigned,@Resolve) : NetSetTcp6ScopedSelectHook(@SelectSource) : NetSetIPv6InputHook(@Receive)
+NetServiceSetUdpHook(0) : NetServiceSetUdp6Hook(0)
+ticks=1000 : ready=1 : submit=77 : receipt=0 : submissions=0 : resolution=1
+udpControl\cursor=0
+ep\family=6 : ep\kind=1 : ep\port=443
+For j=0 To 15 : ep\address[j]=PeekA(?Peer+j) : Next
+data[0]=97 : data[1]=98 : data[2]=99
+rc=NetUdpListen(1,51000,1)
+a=NetUdpClaim(1,51000,99)
+b=NetUdpRelease(1,51000,99)
+PokeI($E1C00100+3*8,rc)
+PokeI($E1C00100+4*8,a)
+PokeI($E1C00100+5*8,b)
+PokeI($E1C00100+6*8,NetUdpPortOwner(1,51000))
+UdpServiceCloseAll() : NetInit() : NetSetMac(1,?Mac) : NetSetIPv4(1,$C0000201,$FFFFFF00,0)
+NetSetTcp6Hooks(@Assigned,@Resolve) : NetSetTcp6ScopedSelectHook(@SelectSource) : NetSetIPv6InputHook(@Receive)
+NetServiceSetUdpHook(0) : NetServiceSetUdp6Hook(0)
+ticks=1000 : ready=1 : submit=77 : receipt=0 : submissions=0 : resolution=1
+udpControl\cursor=0
+ep\family=6 : ep\kind=1 : ep\port=443
+For j=0 To 15 : ep\address[j]=PeekA(?Peer+j) : Next
+data[0]=97 : data[1]=98 : data[2]=99
+NetUdpClaim(1,51000,99)
+rc=NetUdpBind(0,51000)
+a=NetUdpBoundPort(2)
+b=NetUdpListen(1,51000,0)
+PokeI($E1C00100+7*8,rc)
+PokeI($E1C00100+8*8,a)
+PokeI($E1C00100+9*8,b)
+PokeI($E1C00100+10*8,NetUdpPortOwner(1,51000))
+UdpServiceCloseAll() : NetInit() : NetSetMac(1,?Mac) : NetSetIPv4(1,$C0000201,$FFFFFF00,0)
+NetSetTcp6Hooks(@Assigned,@Resolve) : NetSetTcp6ScopedSelectHook(@SelectSource) : NetSetIPv6InputHook(@Receive)
+NetServiceSetUdpHook(0) : NetServiceSetUdp6Hook(0)
+ticks=1000 : ready=1 : submit=77 : receipt=0 : submissions=0 : resolution=1
+udpControl\cursor=0
+ep\family=6 : ep\kind=1 : ep\port=443
+For j=0 To 15 : ep\address[j]=PeekA(?Peer+j) : Next
+data[0]=97 : data[1]=98 : data[2]=99
+NetUdpBind(2,52000)
+NetUdpClaim(1,51000,99)
+rc=NetUdpBind(0,51000)
+PokeI($E1C00100+11*8,rc)
+PokeI($E1C00100+12*8,NetUdpBoundPort(2))
+UdpServiceCloseAll() : NetInit() : NetSetMac(1,?Mac) : NetSetIPv4(1,$C0000201,$FFFFFF00,0)
+NetSetTcp6Hooks(@Assigned,@Resolve) : NetSetTcp6ScopedSelectHook(@SelectSource) : NetSetIPv6InputHook(@Receive)
+NetServiceSetUdpHook(0) : NetServiceSetUdp6Hook(0)
+ticks=1000 : ready=1 : submit=77 : receipt=0 : submissions=0 : resolution=1
+udpControl\cursor=0
+ep\family=6 : ep\kind=1 : ep\port=443
+For j=0 To 15 : ep\address[j]=PeekA(?Peer+j) : Next
+data[0]=97 : data[1]=98 : data[2]=99
+rc=NetUdpClaim(1,51000,99)
+a=NetUdpClaim(1,51000,99)
+b=NetUdpRelease(1,51000,99)
+PokeI($E1C00100+13*8,rc)
+PokeI($E1C00100+14*8,a)
+PokeI($E1C00100+15*8,b)
+PokeI($E1C00100+16*8,NetUdpPortOwner(1,51000))
+UdpServiceCloseAll() : NetInit() : NetSetMac(1,?Mac) : NetSetIPv4(1,$C0000201,$FFFFFF00,0)
+NetSetTcp6Hooks(@Assigned,@Resolve) : NetSetTcp6ScopedSelectHook(@SelectSource) : NetSetIPv6InputHook(@Receive)
+NetServiceSetUdpHook(0) : NetServiceSetUdp6Hook(0)
+ticks=1000 : ready=1 : submit=77 : receipt=0 : submissions=0 : resolution=1
+udpControl\cursor=0
+ep\family=6 : ep\kind=1 : ep\port=443
+For j=0 To 15 : ep\address[j]=PeekA(?Peer+j) : Next
+data[0]=97 : data[1]=98 : data[2]=99
+For j=0 To 15 : NetUdpClaim(1,51000+j,99+j) : Next
+rc=NetUdpClaim(1,52000,999)
+PokeI($E1C00100+17*8,rc)
+PokeI($E1C00100+18*8,NetError())
+UdpServiceCloseAll() : NetInit() : NetSetMac(1,?Mac) : NetSetIPv4(1,$C0000201,$FFFFFF00,0)
+NetSetTcp6Hooks(@Assigned,@Resolve) : NetSetTcp6ScopedSelectHook(@SelectSource) : NetSetIPv6InputHook(@Receive)
+NetServiceSetUdpHook(0) : NetServiceSetUdp6Hook(0)
+ticks=1000 : ready=1 : submit=77 : receipt=0 : submissions=0 : resolution=1
+udpControl\cursor=0
+ep\family=6 : ep\kind=1 : ep\port=443
+For j=0 To 15 : ep\address[j]=PeekA(?Peer+j) : Next
+data[0]=97 : data[1]=98 : data[2]=99
+NetUdpBind(1,51000)
+rc=NetUdpClaim(1,51000,99)
+PokeI($E1C00100+19*8,rc)
+PokeI($E1C00100+20*8,NetError())
+UdpServiceCloseAll() : NetInit() : NetSetMac(1,?Mac) : NetSetIPv4(1,$C0000201,$FFFFFF00,0)
+NetSetTcp6Hooks(@Assigned,@Resolve) : NetSetTcp6ScopedSelectHook(@SelectSource) : NetSetIPv6InputHook(@Receive)
+NetServiceSetUdpHook(0) : NetServiceSetUdp6Hook(0)
+ticks=1000 : ready=1 : submit=77 : receipt=0 : submissions=0 : resolution=1
+udpControl\cursor=0
+ep\family=6 : ep\kind=1 : ep\port=443
+For j=0 To 15 : ep\address[j]=PeekA(?Peer+j) : Next
+data[0]=97 : data[1]=98 : data[2]=99
+rc=UdpServiceOpen(6,1,67)
+PokeI($E1C00100+21*8,rc)
+UdpServiceCloseAll() : NetInit() : NetSetMac(1,?Mac) : NetSetIPv4(1,$C0000201,$FFFFFF00,0)
+NetSetTcp6Hooks(@Assigned,@Resolve) : NetSetTcp6ScopedSelectHook(@SelectSource) : NetSetIPv6InputHook(@Receive)
+NetServiceSetUdpHook(0) : NetServiceSetUdp6Hook(0)
+ticks=1000 : ready=1 : submit=77 : receipt=0 : submissions=0 : resolution=1
+udpControl\cursor=0
+ep\family=6 : ep\kind=1 : ep\port=443
+For j=0 To 15 : ep\address[j]=PeekA(?Peer+j) : Next
+data[0]=97 : data[1]=98 : data[2]=99
+rc=UdpServiceOpen(6,1,68)
+PokeI($E1C00100+22*8,rc)
+UdpServiceCloseAll() : NetInit() : NetSetMac(1,?Mac) : NetSetIPv4(1,$C0000201,$FFFFFF00,0)
+NetSetTcp6Hooks(@Assigned,@Resolve) : NetSetTcp6ScopedSelectHook(@SelectSource) : NetSetIPv6InputHook(@Receive)
+NetServiceSetUdpHook(0) : NetServiceSetUdp6Hook(0)
+ticks=1000 : ready=1 : submit=77 : receipt=0 : submissions=0 : resolution=1
+udpControl\cursor=0
+ep\family=6 : ep\kind=1 : ep\port=443
+For j=0 To 15 : ep\address[j]=PeekA(?Peer+j) : Next
+data[0]=97 : data[1]=98 : data[2]=99
+rc=UdpServiceOpen(6,1,5555)
+PokeI($E1C00100+23*8,rc)
+UdpServiceCloseAll() : NetInit() : NetSetMac(1,?Mac) : NetSetIPv4(1,$C0000201,$FFFFFF00,0)
+NetSetTcp6Hooks(@Assigned,@Resolve) : NetSetTcp6ScopedSelectHook(@SelectSource) : NetSetIPv6InputHook(@Receive)
+NetServiceSetUdpHook(0) : NetServiceSetUdp6Hook(0)
+ticks=1000 : ready=1 : submit=77 : receipt=0 : submissions=0 : resolution=1
+udpControl\cursor=0
+ep\family=6 : ep\kind=1 : ep\port=443
+For j=0 To 15 : ep\address[j]=PeekA(?Peer+j) : Next
+data[0]=97 : data[1]=98 : data[2]=99
+rc=UdpServiceOpen(6,1,49200)
+PokeI($E1C00100+24*8,rc)
+UdpServiceCloseAll() : NetInit() : NetSetMac(1,?Mac) : NetSetIPv4(1,$C0000201,$FFFFFF00,0)
+NetSetTcp6Hooks(@Assigned,@Resolve) : NetSetTcp6ScopedSelectHook(@SelectSource) : NetSetIPv6InputHook(@Receive)
+NetServiceSetUdpHook(0) : NetServiceSetUdp6Hook(0)
+ticks=1000 : ready=1 : submit=77 : receipt=0 : submissions=0 : resolution=1
+udpControl\cursor=0
+ep\family=6 : ep\kind=1 : ep\port=443
+For j=0 To 15 : ep\address[j]=PeekA(?Peer+j) : Next
+data[0]=97 : data[1]=98 : data[2]=99
+rc=UdpServiceOpen(6,1,49240)
+PokeI($E1C00100+25*8,rc)
+UdpServiceCloseAll() : NetInit() : NetSetMac(1,?Mac) : NetSetIPv4(1,$C0000201,$FFFFFF00,0)
+NetSetTcp6Hooks(@Assigned,@Resolve) : NetSetTcp6ScopedSelectHook(@SelectSource) : NetSetIPv6InputHook(@Receive)
+NetServiceSetUdpHook(0) : NetServiceSetUdp6Hook(0)
+ticks=1000 : ready=1 : submit=77 : receipt=0 : submissions=0 : resolution=1
+udpControl\cursor=0
+ep\family=6 : ep\kind=1 : ep\port=443
+For j=0 To 15 : ep\address[j]=PeekA(?Peer+j) : Next
+data[0]=97 : data[1]=98 : data[2]=99
+rc=UdpServiceOpen(6,1,49263)
+PokeI($E1C00100+26*8,rc)
+UdpServiceCloseAll() : NetInit() : NetSetMac(1,?Mac) : NetSetIPv4(1,$C0000201,$FFFFFF00,0)
+NetSetTcp6Hooks(@Assigned,@Resolve) : NetSetTcp6ScopedSelectHook(@SelectSource) : NetSetIPv6InputHook(@Receive)
+NetServiceSetUdpHook(0) : NetServiceSetUdp6Hook(0)
+ticks=1000 : ready=1 : submit=77 : receipt=0 : submissions=0 : resolution=1
+udpControl\cursor=0
+ep\family=6 : ep\kind=1 : ep\port=443
+For j=0 To 15 : ep\address[j]=PeekA(?Peer+j) : Next
+data[0]=97 : data[1]=98 : data[2]=99
+h=UdpServiceOpen(6,1,50001)
+rc=UdpServiceStatus(h,@status)
+PokeI($E1C00100+27*8,rc)
+PokeI($E1C00100+28*8,status\family)
+PokeI($E1C00100+29*8,status\kind)
+PokeI($E1C00100+30*8,status\port)
+PokeI($E1C00100+31*8,status\maxSend)
+UdpServiceCloseAll() : NetInit() : NetSetMac(1,?Mac) : NetSetIPv4(1,$C0000201,$FFFFFF00,0)
+NetSetTcp6Hooks(@Assigned,@Resolve) : NetSetTcp6ScopedSelectHook(@SelectSource) : NetSetIPv6InputHook(@Receive)
+NetServiceSetUdpHook(0) : NetServiceSetUdp6Hook(0)
+ticks=1000 : ready=1 : submit=77 : receipt=0 : submissions=0 : resolution=1
+udpControl\cursor=0
+ep\family=6 : ep\kind=1 : ep\port=443
+For j=0 To 15 : ep\address[j]=PeekA(?Peer+j) : Next
+data[0]=97 : data[1]=98 : data[2]=99
+h=UdpServiceOpen(6,1,50001)
+rc=UdpServiceOpen(4,1,50001)
+PokeI($E1C00100+32*8,rc)
+UdpServiceCloseAll() : NetInit() : NetSetMac(1,?Mac) : NetSetIPv4(1,$C0000201,$FFFFFF00,0)
+NetSetTcp6Hooks(@Assigned,@Resolve) : NetSetTcp6ScopedSelectHook(@SelectSource) : NetSetIPv6InputHook(@Receive)
+NetServiceSetUdpHook(0) : NetServiceSetUdp6Hook(0)
+ticks=1000 : ready=1 : submit=77 : receipt=0 : submissions=0 : resolution=1
+udpControl\cursor=0
+ep\family=6 : ep\kind=1 : ep\port=443
+For j=0 To 15 : ep\address[j]=PeekA(?Peer+j) : Next
+data[0]=97 : data[1]=98 : data[2]=99
+For j=0 To 3 : h=UdpServiceOpen(6,1,50001+j) : Next
+rc=UdpServiceOpen(6,1,50009)
+PokeI($E1C00100+33*8,rc)
+UdpServiceCloseAll() : NetInit() : NetSetMac(1,?Mac) : NetSetIPv4(1,$C0000201,$FFFFFF00,0)
+NetSetTcp6Hooks(@Assigned,@Resolve) : NetSetTcp6ScopedSelectHook(@SelectSource) : NetSetIPv6InputHook(@Receive)
+NetServiceSetUdpHook(0) : NetServiceSetUdp6Hook(0)
+ticks=1000 : ready=1 : submit=77 : receipt=0 : submissions=0 : resolution=1
+udpControl\cursor=0
+ep\family=6 : ep\kind=1 : ep\port=443
+For j=0 To 15 : ep\address[j]=PeekA(?Peer+j) : Next
+data[0]=97 : data[1]=98 : data[2]=99
+h=UdpServiceOpen(6,1,50001)
+UdpServiceClose(h)
+h2=UdpServiceOpen(6,1,50001)
+rc=UdpServiceClose(h)
+a=UdpServiceStatus(h2,@status)
+PokeI($E1C00100+34*8,rc)
+PokeI($E1C00100+35*8,a)
+PokeI($E1C00100+36*8,h=h2)
+UdpServiceCloseAll() : NetInit() : NetSetMac(1,?Mac) : NetSetIPv4(1,$C0000201,$FFFFFF00,0)
+NetSetTcp6Hooks(@Assigned,@Resolve) : NetSetTcp6ScopedSelectHook(@SelectSource) : NetSetIPv6InputHook(@Receive)
+NetServiceSetUdpHook(0) : NetServiceSetUdp6Hook(0)
+ticks=1000 : ready=1 : submit=77 : receipt=0 : submissions=0 : resolution=1
+udpControl\cursor=0
+ep\family=6 : ep\kind=1 : ep\port=443
+For j=0 To 15 : ep\address[j]=PeekA(?Peer+j) : Next
+data[0]=97 : data[1]=98 : data[2]=99
+h=UdpServiceOpen(6,1,50001)
+UdpServiceCloseAll()
+rc=UdpServiceStatus(h,@status)
+PokeI($E1C00100+37*8,rc)
+PokeI($E1C00100+38*8,NetUdpPortOwner(1,50001))
+UdpServiceCloseAll() : NetInit() : NetSetMac(1,?Mac) : NetSetIPv4(1,$C0000201,$FFFFFF00,0)
+NetSetTcp6Hooks(@Assigned,@Resolve) : NetSetTcp6ScopedSelectHook(@SelectSource) : NetSetIPv6InputHook(@Receive)
+NetServiceSetUdpHook(0) : NetServiceSetUdp6Hook(0)
+ticks=1000 : ready=1 : submit=77 : receipt=0 : submissions=0 : resolution=1
+udpControl\cursor=0
+ep\family=6 : ep\kind=1 : ep\port=443
+For j=0 To 15 : ep\address[j]=PeekA(?Peer+j) : Next
+data[0]=97 : data[1]=98 : data[2]=99
+h=UdpServiceOpen(6,1,50001)
+rc=NetInput(1,?Packet,65) : rc=NetServiceInput(1,0,rc)
+rc=UdpServiceReceive(h,@info,@data[0],16)
+PokeI($E1C00100+39*8,rc)
+PokeI($E1C00100+40*8,info\family)
+PokeI($E1C00100+41*8,info\kind)
+PokeI($E1C00100+42*8,info\localPort)
+PokeI($E1C00100+43*8,info\peerPort)
+PokeI($E1C00100+44*8,info\receivedUs)
+PokeI($E1C00100+45*8,data[0])
+PokeI($E1C00100+46*8,data[2])
+UdpServiceCloseAll() : NetInit() : NetSetMac(1,?Mac) : NetSetIPv4(1,$C0000201,$FFFFFF00,0)
+NetSetTcp6Hooks(@Assigned,@Resolve) : NetSetTcp6ScopedSelectHook(@SelectSource) : NetSetIPv6InputHook(@Receive)
+NetServiceSetUdpHook(0) : NetServiceSetUdp6Hook(0)
+ticks=1000 : ready=1 : submit=77 : receipt=0 : submissions=0 : resolution=1
+udpControl\cursor=0
+ep\family=6 : ep\kind=1 : ep\port=443
+For j=0 To 15 : ep\address[j]=PeekA(?Peer+j) : Next
+data[0]=97 : data[1]=98 : data[2]=99
+h=UdpServiceOpen(6,1,50001)
+rc=NetInput(1,?Packet,65) : rc=NetServiceInput(1,0,rc)
+data[0]=88
+rc=UdpServiceReceive(h,@info,@data[0],2)
+a=UdpServicePeek(h,@info)
+UdpServiceStatus(h,@status)
+PokeI($E1C00100+47*8,rc)
+PokeI($E1C00100+48*8,a)
+PokeI($E1C00100+49*8,info\bytes)
+PokeI($E1C00100+50*8,data[0])
+PokeI($E1C00100+51*8,status\rxQueued)
+UdpServiceCloseAll() : NetInit() : NetSetMac(1,?Mac) : NetSetIPv4(1,$C0000201,$FFFFFF00,0)
+NetSetTcp6Hooks(@Assigned,@Resolve) : NetSetTcp6ScopedSelectHook(@SelectSource) : NetSetIPv6InputHook(@Receive)
+NetServiceSetUdpHook(0) : NetServiceSetUdp6Hook(0)
+ticks=1000 : ready=1 : submit=77 : receipt=0 : submissions=0 : resolution=1
+udpControl\cursor=0
+ep\family=6 : ep\kind=1 : ep\port=443
+For j=0 To 15 : ep\address[j]=PeekA(?Peer+j) : Next
+data[0]=97 : data[1]=98 : data[2]=99
+h=UdpServiceOpen(6,1,50001)
+rc=UdpServiceReceive(h,@info,@data[0],16)
+PokeI($E1C00100+52*8,rc)
+UdpServiceCloseAll() : NetInit() : NetSetMac(1,?Mac) : NetSetIPv4(1,$C0000201,$FFFFFF00,0)
+NetSetTcp6Hooks(@Assigned,@Resolve) : NetSetTcp6ScopedSelectHook(@SelectSource) : NetSetIPv6InputHook(@Receive)
+NetServiceSetUdpHook(0) : NetServiceSetUdp6Hook(0)
+ticks=1000 : ready=1 : submit=77 : receipt=0 : submissions=0 : resolution=1
+udpControl\cursor=0
+ep\family=6 : ep\kind=1 : ep\port=443
+For j=0 To 15 : ep\address[j]=PeekA(?Peer+j) : Next
+data[0]=97 : data[1]=98 : data[2]=99
+h=UdpServiceOpen(6,1,50001)
+rc=NetInput(1,?Empty,62) : rc=NetServiceInput(1,0,rc)
+rc=UdpServiceReceive(h,@info,0,0)
+PokeI($E1C00100+53*8,rc)
+PokeI($E1C00100+54*8,info\bytes)
+UdpServiceCloseAll() : NetInit() : NetSetMac(1,?Mac) : NetSetIPv4(1,$C0000201,$FFFFFF00,0)
+NetSetTcp6Hooks(@Assigned,@Resolve) : NetSetTcp6ScopedSelectHook(@SelectSource) : NetSetIPv6InputHook(@Receive)
+NetServiceSetUdpHook(0) : NetServiceSetUdp6Hook(0)
+ticks=1000 : ready=1 : submit=77 : receipt=0 : submissions=0 : resolution=1
+udpControl\cursor=0
+ep\family=6 : ep\kind=1 : ep\port=443
+For j=0 To 15 : ep\address[j]=PeekA(?Peer+j) : Next
+data[0]=97 : data[1]=98 : data[2]=99
+h=UdpServiceOpen(6,1,50001)
+For j=0 To 9
+rc=NetInput(1,?Packet,65) : rc=NetServiceInput(1,0,rc)
+Next
+UdpServiceStatus(h,@status)
+rc=UdpServiceDiscard(h)
+UdpServicePeek(h,@info)
+PokeI($E1C00100+55*8,rc)
+PokeI($E1C00100+56*8,status\rxQueued)
+PokeI($E1C00100+57*8,status\rxDropped)
+PokeI($E1C00100+58*8,info\bytes)
+UdpServiceCloseAll() : NetInit() : NetSetMac(1,?Mac) : NetSetIPv4(1,$C0000201,$FFFFFF00,0)
+NetSetTcp6Hooks(@Assigned,@Resolve) : NetSetTcp6ScopedSelectHook(@SelectSource) : NetSetIPv6InputHook(@Receive)
+NetServiceSetUdpHook(0) : NetServiceSetUdp6Hook(0)
+ticks=1000 : ready=1 : submit=77 : receipt=0 : submissions=0 : resolution=1
+udpControl\cursor=0
+ep\family=6 : ep\kind=1 : ep\port=443
+For j=0 To 15 : ep\address[j]=PeekA(?Peer+j) : Next
+data[0]=97 : data[1]=98 : data[2]=99
+h=UdpServiceOpen(6,1,50001)
+rc=NetInput(1,?Packet,65) : rc=NetServiceInput(1,0,rc)
+rc=UdpServiceReceive(h,@info,@info,80)
+UdpServiceStatus(h,@status)
+PokeI($E1C00100+59*8,rc)
+PokeI($E1C00100+60*8,status\rxQueued)
+UdpServiceCloseAll() : NetInit() : NetSetMac(1,?Mac) : NetSetIPv4(1,$C0000201,$FFFFFF00,0)
+NetSetTcp6Hooks(@Assigned,@Resolve) : NetSetTcp6ScopedSelectHook(@SelectSource) : NetSetIPv6InputHook(@Receive)
+NetServiceSetUdpHook(0) : NetServiceSetUdp6Hook(0)
+ticks=1000 : ready=1 : submit=77 : receipt=0 : submissions=0 : resolution=1
+udpControl\cursor=0
+ep\family=6 : ep\kind=1 : ep\port=443
+For j=0 To 15 : ep\address[j]=PeekA(?Peer+j) : Next
+data[0]=97 : data[1]=98 : data[2]=99
+h=UdpServiceOpen(6,1,50001)
+rc=UdpServiceStatus(h,@udpControl)
+PokeI($E1C00100+61*8,rc)
+UdpServiceCloseAll() : NetInit() : NetSetMac(1,?Mac) : NetSetIPv4(1,$C0000201,$FFFFFF00,0)
+NetSetTcp6Hooks(@Assigned,@Resolve) : NetSetTcp6ScopedSelectHook(@SelectSource) : NetSetIPv6InputHook(@Receive)
+NetServiceSetUdpHook(0) : NetServiceSetUdp6Hook(0)
+ticks=1000 : ready=1 : submit=77 : receipt=0 : submissions=0 : resolution=1
+udpControl\cursor=0
+ep\family=6 : ep\kind=1 : ep\port=443
+For j=0 To 15 : ep\address[j]=PeekA(?Peer+j) : Next
+data[0]=97 : data[1]=98 : data[2]=99
+h=UdpServiceOpen(6,1,50001)
+rc=UdpServiceSendTo(h,@ep,@data[0],3)
+data[0]=88
+ep\port=444
+For j=0 To 3 : UdpServiceAdvance() : Next
+UdpServiceStatus(h,@status)
+PokeI($E1C00100+62*8,rc)
+PokeI($E1C00100+63*8,submissions)
+PokeI($E1C00100+64*8,status\txState)
+PokeI($E1C00100+65*8,status\txTicket)
+PokeI($E1C00100+66*8,PeekA(@sent[62]))
+PokeI($E1C00100+67*8,PeekA(@sent[57]))
+UdpServiceCloseAll() : NetInit() : NetSetMac(1,?Mac) : NetSetIPv4(1,$C0000201,$FFFFFF00,0)
+NetSetTcp6Hooks(@Assigned,@Resolve) : NetSetTcp6ScopedSelectHook(@SelectSource) : NetSetIPv6InputHook(@Receive)
+NetServiceSetUdpHook(0) : NetServiceSetUdp6Hook(0)
+ticks=1000 : ready=1 : submit=77 : receipt=0 : submissions=0 : resolution=1
+udpControl\cursor=0
+ep\family=6 : ep\kind=1 : ep\port=443
+For j=0 To 15 : ep\address[j]=PeekA(?Peer+j) : Next
+data[0]=97 : data[1]=98 : data[2]=99
+h=UdpServiceOpen(6,1,50001)
+rc=UdpServiceSendTo(h,@ep,@data[0],3)
+rc=UdpServiceSendTo(h,@ep,@data[0],3)
+PokeI($E1C00100+68*8,rc)
+UdpServiceCloseAll() : NetInit() : NetSetMac(1,?Mac) : NetSetIPv4(1,$C0000201,$FFFFFF00,0)
+NetSetTcp6Hooks(@Assigned,@Resolve) : NetSetTcp6ScopedSelectHook(@SelectSource) : NetSetIPv6InputHook(@Receive)
+NetServiceSetUdpHook(0) : NetServiceSetUdp6Hook(0)
+ticks=1000 : ready=1 : submit=77 : receipt=0 : submissions=0 : resolution=1
+udpControl\cursor=0
+ep\family=6 : ep\kind=1 : ep\port=443
+For j=0 To 15 : ep\address[j]=PeekA(?Peer+j) : Next
+data[0]=97 : data[1]=98 : data[2]=99
+h=UdpServiceOpen(6,1,50001)
+rc=UdpServiceSendTo(h,@ep,@data[0],3)
+For j=0 To 3 : UdpServiceAdvance() : Next
+receipt=1
+For j=0 To 3 : UdpServiceAdvance() : Next
+UdpServiceStatus(h,@status)
+PokeI($E1C00100+69*8,submissions)
+PokeI($E1C00100+70*8,status\txState)
+PokeI($E1C00100+71*8,status\txError)
+UdpServiceCloseAll() : NetInit() : NetSetMac(1,?Mac) : NetSetIPv4(1,$C0000201,$FFFFFF00,0)
+NetSetTcp6Hooks(@Assigned,@Resolve) : NetSetTcp6ScopedSelectHook(@SelectSource) : NetSetIPv6InputHook(@Receive)
+NetServiceSetUdpHook(0) : NetServiceSetUdp6Hook(0)
+ticks=1000 : ready=1 : submit=77 : receipt=0 : submissions=0 : resolution=1
+udpControl\cursor=0
+ep\family=6 : ep\kind=1 : ep\port=443
+For j=0 To 15 : ep\address[j]=PeekA(?Peer+j) : Next
+data[0]=97 : data[1]=98 : data[2]=99
+h=UdpServiceOpen(6,1,50001)
+rc=UdpServiceSendTo(h,@ep,@data[0],3)
+For j=0 To 3 : UdpServiceAdvance() : Next
+receipt=-2
+For j=0 To 3 : UdpServiceAdvance() : Next
+For j=0 To 3 : UdpServiceAdvance() : Next
+UdpServiceStatus(h,@status)
+PokeI($E1C00100+72*8,submissions)
+PokeI($E1C00100+73*8,status\txState)
+PokeI($E1C00100+74*8,status\txError)
+UdpServiceCloseAll() : NetInit() : NetSetMac(1,?Mac) : NetSetIPv4(1,$C0000201,$FFFFFF00,0)
+NetSetTcp6Hooks(@Assigned,@Resolve) : NetSetTcp6ScopedSelectHook(@SelectSource) : NetSetIPv6InputHook(@Receive)
+NetServiceSetUdpHook(0) : NetServiceSetUdp6Hook(0)
+ticks=1000 : ready=1 : submit=77 : receipt=0 : submissions=0 : resolution=1
+udpControl\cursor=0
+ep\family=6 : ep\kind=1 : ep\port=443
+For j=0 To 15 : ep\address[j]=PeekA(?Peer+j) : Next
+data[0]=97 : data[1]=98 : data[2]=99
+h=UdpServiceOpen(6,1,50001)
+rc=UdpServiceSendTo(h,@ep,@data[0],3)
+For j=0 To 3 : UdpServiceAdvance() : Next
+ticks=6001000
+For j=0 To 3 : UdpServiceAdvance() : Next
+UdpServiceStatus(h,@status)
+PokeI($E1C00100+75*8,submissions)
+PokeI($E1C00100+76*8,status\txState)
+PokeI($E1C00100+77*8,status\txError)
+UdpServiceCloseAll() : NetInit() : NetSetMac(1,?Mac) : NetSetIPv4(1,$C0000201,$FFFFFF00,0)
+NetSetTcp6Hooks(@Assigned,@Resolve) : NetSetTcp6ScopedSelectHook(@SelectSource) : NetSetIPv6InputHook(@Receive)
+NetServiceSetUdpHook(0) : NetServiceSetUdp6Hook(0)
+ticks=1000 : ready=1 : submit=77 : receipt=0 : submissions=0 : resolution=1
+udpControl\cursor=0
+ep\family=6 : ep\kind=1 : ep\port=443
+For j=0 To 15 : ep\address[j]=PeekA(?Peer+j) : Next
+data[0]=97 : data[1]=98 : data[2]=99
+h=UdpServiceOpen(6,1,50001)
+submit=0
+rc=UdpServiceSendTo(h,@ep,@data[0],3)
+For j=0 To 3 : UdpServiceAdvance() : Next
+submit=78
+For j=0 To 3 : UdpServiceAdvance() : Next
+UdpServiceStatus(h,@status)
+PokeI($E1C00100+78*8,submissions)
+PokeI($E1C00100+79*8,status\txState)
+UdpServiceCloseAll() : NetInit() : NetSetMac(1,?Mac) : NetSetIPv4(1,$C0000201,$FFFFFF00,0)
+NetSetTcp6Hooks(@Assigned,@Resolve) : NetSetTcp6ScopedSelectHook(@SelectSource) : NetSetIPv6InputHook(@Receive)
+NetServiceSetUdpHook(0) : NetServiceSetUdp6Hook(0)
+ticks=1000 : ready=1 : submit=77 : receipt=0 : submissions=0 : resolution=1
+udpControl\cursor=0
+ep\family=6 : ep\kind=1 : ep\port=443
+For j=0 To 15 : ep\address[j]=PeekA(?Peer+j) : Next
+data[0]=97 : data[1]=98 : data[2]=99
+h=UdpServiceOpen(6,1,50001)
+submit=-2
+rc=UdpServiceSendTo(h,@ep,@data[0],3)
+For j=0 To 3 : UdpServiceAdvance() : Next
+UdpServiceStatus(h,@status)
+PokeI($E1C00100+80*8,submissions)
+PokeI($E1C00100+81*8,status\txState)
+PokeI($E1C00100+82*8,status\txError)
+UdpServiceCloseAll() : NetInit() : NetSetMac(1,?Mac) : NetSetIPv4(1,$C0000201,$FFFFFF00,0)
+NetSetTcp6Hooks(@Assigned,@Resolve) : NetSetTcp6ScopedSelectHook(@SelectSource) : NetSetIPv6InputHook(@Receive)
+NetServiceSetUdpHook(0) : NetServiceSetUdp6Hook(0)
+ticks=1000 : ready=1 : submit=77 : receipt=0 : submissions=0 : resolution=1
+udpControl\cursor=0
+ep\family=6 : ep\kind=1 : ep\port=443
+For j=0 To 15 : ep\address[j]=PeekA(?Peer+j) : Next
+data[0]=97 : data[1]=98 : data[2]=99
+h=UdpServiceOpen(6,1,50001)
+resolution=0
+rc=UdpServiceSendTo(h,@ep,@data[0],3)
+For j=0 To 3 : UdpServiceAdvance() : Next
+UdpServiceStatus(h,@status)
+PokeI($E1C00100+83*8,submissions)
+PokeI($E1C00100+84*8,status\txState)
+UdpServiceCloseAll() : NetInit() : NetSetMac(1,?Mac) : NetSetIPv4(1,$C0000201,$FFFFFF00,0)
+NetSetTcp6Hooks(@Assigned,@Resolve) : NetSetTcp6ScopedSelectHook(@SelectSource) : NetSetIPv6InputHook(@Receive)
+NetServiceSetUdpHook(0) : NetServiceSetUdp6Hook(0)
+ticks=1000 : ready=1 : submit=77 : receipt=0 : submissions=0 : resolution=1
+udpControl\cursor=0
+ep\family=6 : ep\kind=1 : ep\port=443
+For j=0 To 15 : ep\address[j]=PeekA(?Peer+j) : Next
+data[0]=97 : data[1]=98 : data[2]=99
+h=UdpServiceOpen(6,1,50001)
+rc=UdpServiceSendTo(h,@ep,@data[0],3)
+ready=0
+For j=0 To 3 : UdpServiceAdvance() : Next
+UdpServiceStatus(h,@status)
+PokeI($E1C00100+85*8,submissions)
+PokeI($E1C00100+86*8,status\txState)
+PokeI($E1C00100+87*8,status\txError)
+UdpServiceCloseAll() : NetInit() : NetSetMac(1,?Mac) : NetSetIPv4(1,$C0000201,$FFFFFF00,0)
+NetSetTcp6Hooks(@Assigned,@Resolve) : NetSetTcp6ScopedSelectHook(@SelectSource) : NetSetIPv6InputHook(@Receive)
+NetServiceSetUdpHook(0) : NetServiceSetUdp6Hook(0)
+ticks=1000 : ready=1 : submit=77 : receipt=0 : submissions=0 : resolution=1
+udpControl\cursor=0
+ep\family=6 : ep\kind=1 : ep\port=443
+For j=0 To 15 : ep\address[j]=PeekA(?Peer+j) : Next
+data[0]=97 : data[1]=98 : data[2]=99
+h=UdpServiceOpen(6,1,50001)
+rc=UdpServiceSendTo(h,@ep,@data[0],3)
+UdpServiceClose(h)
+For j=0 To 3 : UdpServiceAdvance() : Next
+
+PokeI($E1C00100+88*8,submissions)
+PokeI($E1C00100+89*8,NetUdpPortOwner(1,50001))
+UdpServiceCloseAll() : NetInit() : NetSetMac(1,?Mac) : NetSetIPv4(1,$C0000201,$FFFFFF00,0)
+NetSetTcp6Hooks(@Assigned,@Resolve) : NetSetTcp6ScopedSelectHook(@SelectSource) : NetSetIPv6InputHook(@Receive)
+NetServiceSetUdpHook(0) : NetServiceSetUdp6Hook(0)
+ticks=1000 : ready=1 : submit=77 : receipt=0 : submissions=0 : resolution=1
+udpControl\cursor=0
+ep\family=6 : ep\kind=1 : ep\port=443
+For j=0 To 15 : ep\address[j]=PeekA(?Peer+j) : Next
+data[0]=97 : data[1]=98 : data[2]=99
+h=UdpServiceOpen(6,1,50001)
+ep\kind=2
+rc=UdpServiceSendTo(h,@ep,@data[0],3)
+
+PokeI($E1C00100+90*8,rc)
+UdpServiceCloseAll() : NetInit() : NetSetMac(1,?Mac) : NetSetIPv4(1,$C0000201,$FFFFFF00,0)
+NetSetTcp6Hooks(@Assigned,@Resolve) : NetSetTcp6ScopedSelectHook(@SelectSource) : NetSetIPv6InputHook(@Receive)
+NetServiceSetUdpHook(0) : NetServiceSetUdp6Hook(0)
+ticks=1000 : ready=1 : submit=77 : receipt=0 : submissions=0 : resolution=1
+udpControl\cursor=0
+ep\family=6 : ep\kind=1 : ep\port=443
+For j=0 To 15 : ep\address[j]=PeekA(?Peer+j) : Next
+data[0]=97 : data[1]=98 : data[2]=99
+h=UdpServiceOpen(6,1,50001)
+rc=UdpServiceSendTo(h,@ep,@data[0],1233)
+PokeI($E1C00100+91*8,rc)
+UdpServiceCloseAll() : NetInit() : NetSetMac(1,?Mac) : NetSetIPv4(1,$C0000201,$FFFFFF00,0)
+NetSetTcp6Hooks(@Assigned,@Resolve) : NetSetTcp6ScopedSelectHook(@SelectSource) : NetSetIPv6InputHook(@Receive)
+NetServiceSetUdpHook(0) : NetServiceSetUdp6Hook(0)
+ticks=1000 : ready=1 : submit=77 : receipt=0 : submissions=0 : resolution=1
+udpControl\cursor=0
+ep\family=6 : ep\kind=1 : ep\port=443
+For j=0 To 15 : ep\address[j]=PeekA(?Peer+j) : Next
+data[0]=97 : data[1]=98 : data[2]=99
+h=UdpServiceOpen(4,1,50001)
+ep\family=4
+For j=0 To 15 : ep\address[j]=0 : Next
+NetWriteBE32(@ep\address,$C0000202)
+rc=UdpServiceSendTo(h,@ep,@data[0],3)
+For j=0 To 3 : UdpServiceAdvance() : Next
+UdpServiceStatus(h,@status)
+PokeI($E1C00100+92*8,submissions)
+PokeI($E1C00100+93*8,status\txState)
+PokeI($E1C00100+94*8,PeekA(@sent[12]))
+PokeI($E1C00100+95*8,PeekA(@sent[13]))
+PokeI($E1C00008,96)
+MmuDisableCachedFlushed()
+ProcedureReturn 0
+EndProcedure
+DataSection
+Local:
+ Data.a 254,128,0,0,0,0,0,0,0,0,0,0,0,0,18,52
+Peer:
+ Data.a 254,128,0,0,0,0,0,0,0,0,0,0,0,0,86,120
+Mac:
+ Data.a 2,1,2,3,4,5
+RemoteMac:
+ Data.a 2,9,8,7,6,5
+Packet:
+ Data.a 2,1,2,3,4,5,2,9,8,7,6,5,134,221,96,0,0,0,0,11,17,64,254,128
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,86,120,254,128,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,18,52,1,187,195,81,0,11,16,187,97,98,99
+Empty:
+ Data.a 2,1,2,3,4,5,2,9,8,7,6,5,134,221,96,0,0,0,0,8,17,64,254,128
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,86,120,254,128,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,18,52,1,187,195,81,0,8,213,35
+EndDataSection

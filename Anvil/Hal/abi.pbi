@@ -341,28 +341,7 @@ XIncludeFile "Anvil/Hal/random_service.pbi"
 ;  the deliberate act a pattern match would have hidden.
 ; ----------------------------------------------------------------------
 #SVC_OK        =    0
-#SVC_ENOSYS    = -100    ; this slot is not implemented in this Anvil
-#SVC_ENOCAP    = -101    ; the board does not offer this capability group
-#SVC_EARG      = -102    ; a bad argument
-#SVC_EBUSY     = -103    ; the resource is in use
-#SVC_ETIMEOUT  = -104    ; the operation did not complete in its bound
-#SVC_EIO       = -105    ; the hardware answered, and answered badly
-#SVC_EPERM     = -106    ; refused on purpose - see the note it comes with
-#SVC_EFLAG     = -107    ; the container did not declare the flag this needs
-#SVC_ESTATE    = -108    ; called in the wrong order
-#SVC_EABI      = -109    ; this table is OLDER than the payload was built
-                         ; against - see the version gate below
-#SVC_EAGAIN    = -110    ; NEW AT 1.5. Not finished yet, and not failed:
-                         ; the operation was started and a later call with
-                         ; the same arguments carries on with it. Only the
-                         ; net group answers it (a name being resolved, a
-                         ; link still being given an address), because only
-                         ; the net group starts work that outlives one call.
-
-; The bounds the gate checks. Stated as constants so the gate reads them
-; rather than transcribing them, and so a reader sees the reservation.
-#SVC_ERR_LO    = -199    ; the #SVC_* range is -100 .. -199 inclusive
-#SVC_ERR_HI    = -100
+XIncludeFile "Anvil/Hal/service_errors.pbi"
 #HW_ERR_FLOOR  =  -99    ; no #HW_* ERROR code may be below this; the
                          ; named value sentinels above are exempt from
                          ; the floor and not from the range
@@ -2102,6 +2081,65 @@ EndProcedure
 ; composition that declares #ANVIL_PAYLOAD_NET = 0 compiles none of this,
 ; and BuildServiceTable leaves 72..95 at SvcUnimplemented there - the
 ; honest #SVC_ENOSYS, "this monitor has no code for that slot".
+; Appended ABI1.15 datagram group. Independent of the TCP/TLS composition.
+CompilerIf #CAP_NET = 1
+Procedure.i SvcUdpReady()
+ gSvcDetail=0
+ ProcedureReturn SvcRequireCap(#CAP_NET,"net","this board has no network interface Anvil can reach")
+EndProcedure
+Procedure.i SvcUdpResult(rc.i)
+ If rc<0 : gSvcDetail="UDP operation refused or pending; inspect its result code and socket status" : EndIf
+ ProcedureReturn rc
+EndProcedure
+Procedure.i SvcUdpOpen(family.i,kind.i,port.i)
+ If SvcUdpReady()=0 : ProcedureReturn #SVC_ENOCAP : EndIf
+ ProcedureReturn SvcUdpResult(UdpServiceOpen(family,kind,port))
+EndProcedure
+Procedure.i SvcUdpSendTo(handle.i,peer.i,data.i,bytes.i)
+ If SvcUdpReady()=0 : ProcedureReturn #SVC_ENOCAP : EndIf
+ ProcedureReturn SvcUdpResult(UdpServiceSendTo(handle,peer,data,bytes))
+EndProcedure
+Procedure.i SvcUdpReceive(handle.i,info.i,data.i,capacity.i)
+ If SvcUdpReady()=0 : ProcedureReturn #SVC_ENOCAP : EndIf
+ ProcedureReturn SvcUdpResult(UdpServiceReceive(handle,info,data,capacity))
+EndProcedure
+Procedure.i SvcUdpPeek(handle.i,info.i)
+ If SvcUdpReady()=0 : ProcedureReturn #SVC_ENOCAP : EndIf
+ ProcedureReturn SvcUdpResult(UdpServicePeek(handle,info))
+EndProcedure
+Procedure.i SvcUdpStatus(handle.i,status.i)
+ If SvcUdpReady()=0 : ProcedureReturn #SVC_ENOCAP : EndIf
+ ProcedureReturn SvcUdpResult(UdpServiceStatus(handle,status))
+EndProcedure
+Procedure.i SvcUdpClose(handle.i)
+ If SvcUdpReady()=0 : ProcedureReturn #SVC_ENOCAP : EndIf
+ ProcedureReturn SvcUdpResult(UdpServiceClose(handle))
+EndProcedure
+Procedure.i SvcUdpService()
+ Define before.i
+ If SvcUdpReady()=0 : ProcedureReturn #SVC_ENOCAP : EndIf
+ CompilerIf #ANVIL_PAYLOAD_NET = 1
+  ProcedureReturn PayNetService(0)
+ CompilerElse
+  before=LinkRxFrames()
+  UartMessageBegin()
+  WifiMaintenanceTick()
+  NetDhcpTick()
+  NtpServiceTick()
+  NetConsoleRearm()
+  NetConsolePump()
+  NetConsoleLlTick()
+  UdpServiceAdvance()
+  UartMessageEnd()
+  ProcedureReturn LinkRxFrames()-before
+ CompilerEndIf
+EndProcedure
+Procedure.i SvcUdpDiscard(handle.i)
+ If SvcUdpReady()=0 : ProcedureReturn #SVC_ENOCAP : EndIf
+ ProcedureReturn SvcUdpResult(UdpServiceDiscard(handle))
+EndProcedure
+CompilerEndIf
+
 CompilerIf #ANVIL_PAYLOAD_NET = 1
 
 Procedure.i SvcNetUp()
@@ -2968,6 +3006,17 @@ Procedure BuildServiceTable()
   gSvcTab[#SVC_HDR_WORDS + #SVC_BASE_NET + 18] = @SvcTlsOpenAlpn
   gSvcTab[#SVC_HDR_WORDS + #SVC_BASE_NET + 19] = @SvcTlsAlpn
   gSvcTab[#SVC_HDR_WORDS + #SVC_BASE_NET + 20] = @SvcTlsDrain
+  CompilerEndIf
+
+  CompilerIf #CAP_NET = 1
+  gSvcTab[#SVC_HDR_WORDS + 200] = @SvcUdpOpen
+  gSvcTab[#SVC_HDR_WORDS + 201] = @SvcUdpSendTo
+  gSvcTab[#SVC_HDR_WORDS + 202] = @SvcUdpReceive
+  gSvcTab[#SVC_HDR_WORDS + 203] = @SvcUdpPeek
+  gSvcTab[#SVC_HDR_WORDS + 204] = @SvcUdpStatus
+  gSvcTab[#SVC_HDR_WORDS + 205] = @SvcUdpClose
+  gSvcTab[#SVC_HDR_WORDS + 206] = @SvcUdpService
+  gSvcTab[#SVC_HDR_WORDS + 207] = @SvcUdpDiscard
   CompilerEndIf
 
   ; --- usb, base 96 ---------------------------------------------------
