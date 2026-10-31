@@ -1,0 +1,485 @@
+XIncludeFile "Anvil/Network/quic_handshake_sent.pbi"
+Global s.QuicHandshakeSent,job.QuicHandshakeSentAck,other.QuicHandshakeSentAck,frame.QuicHandshakeFrame
+Global Dim storage.a[131104]
+Global Dim wire.a[1100]
+Global events.i,byteSum.i,flightSum.i,cookieSum.i,timeSum.i,eventHash.i
+Procedure.i Hash(p.i,n.i)
+ Define i.i,h.i
+ h=2166136261
+ For i=0 To n-1 : h=((h ! PeekA(p+i))*16777619)&$FFFFFFFF : Next
+ ProcedureReturn h
+EndProcedure
+Procedure.i RunAck(stopAfter.i)
+ Define rc.i,n.i,i.i,v.i,k.i
+ events=0 : byteSum=0 : flightSum=0 : cookieSum=0 : timeSum=0 : eventHash=2166136261
+ For n=0 To 19999
+  rc=QuicHandshakeSentAckStep(@job)
+  If rc=1
+   events=events+1 : byteSum=byteSum+job\packetBytes : flightSum=flightSum+job\inFlightBytes
+   cookieSum=cookieSum+job\cookie : timeSum=timeSum+job\sentAt
+   For i=0 To 5
+    v=PeekI(@job\number+i*8)
+    For k=0 To 7 : eventHash=((eventHash ! ((v>>(k*8))&255))*16777619)&$FFFFFFFF : Next
+   Next
+   If stopAfter<>0 And events=stopAfter : ProcedureReturn rc : EndIf
+  ElseIf rc<>0
+   ProcedureReturn rc
+  EndIf
+ Next
+ ProcedureReturn -9999
+EndProcedure
+Procedure.i Main()
+ Define rc.i,i.i
+ For i=0 To 65535 : PokeA($04000000+i,$A5) : Next
+ PokeI($04000000,$55445331)
+If s\phase=1 : rc=QuicHandshakeSentDiscard(@s) : EndIf
+For i=0 To 131103 : storage[i]=$A5 : Next
+PokeI($04000100+0,QuicHandshakeSentInit(@s,0,@storage[16],8))
+PokeI($04000100+8,QuicHandshakeSentReserve(@s))
+PokeI($04000100+16,QuicHandshakeSentCommit(@s,0,1200,100,1,0,70))
+PokeI($04000100+24,QuicHandshakeSentReserve(@s))
+PokeI($04000100+32,QuicHandshakeSentReserve(@s))
+PokeI($04000100+40,QuicHandshakeSentCommit(@s,2,100,102,0,0,72))
+PokeI($04000100+48,QuicHandshakeSentReserve(@s))
+PokeI($04000100+56,QuicHandshakeSentCommit(@s,3,500,103,0,1,73))
+PokeI($04000100+64,QuicHandshakeSentLost(@s,3))
+For i=0 To 1099 : wire[i]=0 : Next
+wire[0]=3
+wire[1]=3
+wire[2]=0
+wire[3]=1
+wire[4]=1
+wire[5]=0
+wire[6]=0
+wire[7]=64
+wire[8]=100
+wire[9]=2
+wire[10]=1
+PokeI($04000100+72,QuicHandshakeFrameRead(@wire[0],11,0,@frame))
+PokeI($04000100+80,QuicHandshakeSentAckBegin(@job,@s,0,@frame))
+rc=RunAck(0)
+PokeI($04000100+88,rc)
+PokeI($04000100+96,events)
+PokeI($04000100+104,byteSum)
+PokeI($04000100+112,flightSum)
+PokeI($04000100+120,cookieSum)
+PokeI($04000100+128,timeSum)
+PokeI($04000100+136,eventHash)
+PokeI($04000100+144,s\busy)
+PokeI($04000100+152,s\issued)
+PokeI($04000100+160,s\lastSent)
+PokeI($04000100+168,s\lastTime)
+PokeI($04000100+176,s\acked)
+PokeI($04000100+184,s\largestAcked)
+PokeI($04000100+192,s\inFlight)
+PokeI($04000100+200,s\level)
+PokeI($04000100+208,s\capacity)
+PokeI($04000100+216,Hash(@storage[16],s\issued*32))
+PokeI($04000100+224,Hash(@storage[0],16))
+PokeI($04000100+232,Hash(@storage[272],16))
+For i=0 To 1099 : wire[i]=0 : Next
+wire[0]=2
+wire[1]=3
+wire[2]=0
+wire[3]=1
+wire[4]=1
+wire[5]=0
+wire[6]=0
+PokeI($04000100+240,QuicHandshakeFrameRead(@wire[0],7,0,@frame))
+PokeI($04000100+248,QuicHandshakeSentAckBegin(@job,@s,0,@frame))
+rc=RunAck(0)
+PokeI($04000100+256,rc)
+PokeI($04000100+264,events)
+PokeI($04000100+272,byteSum)
+PokeI($04000100+280,flightSum)
+PokeI($04000100+288,cookieSum)
+PokeI($04000100+296,timeSum)
+PokeI($04000100+304,eventHash)
+PokeI($04000100+312,s\busy)
+PokeI($04000100+320,s\issued)
+PokeI($04000100+328,s\lastSent)
+PokeI($04000100+336,s\lastTime)
+PokeI($04000100+344,s\acked)
+PokeI($04000100+352,s\largestAcked)
+PokeI($04000100+360,s\inFlight)
+PokeI($04000100+368,s\level)
+PokeI($04000100+376,s\capacity)
+PokeI($04000100+384,Hash(@storage[16],s\issued*32))
+PokeI($04000100+392,Hash(@storage[0],16))
+PokeI($04000100+400,Hash(@storage[272],16))
+PokeI($04000100+408,QuicHandshakeSentLost(@s,3))
+PokeI($04000100+416,QuicHandshakeSentReserve(@s))
+PokeI($04000100+424,QuicHandshakeSentCommit(@s,4,1200,104,1,0,74))
+PokeI($04000100+432,QuicHandshakeSentReserve(@s))
+PokeI($04000100+440,QuicHandshakeSentCommit(@s,5,1200,105,1,0,75))
+For i=0 To 1099 : wire[i]=0 : Next
+wire[0]=2
+wire[1]=5
+wire[2]=0
+wire[3]=1
+wire[4]=1
+wire[5]=1
+wire[6]=0
+PokeI($04000100+448,QuicHandshakeFrameRead(@wire[0],7,0,@frame))
+PokeI($04000100+456,QuicHandshakeSentAckBegin(@job,@s,0,@frame))
+rc=RunAck(0)
+PokeI($04000100+464,rc)
+PokeI($04000100+472,events)
+PokeI($04000100+480,byteSum)
+PokeI($04000100+488,flightSum)
+PokeI($04000100+496,cookieSum)
+PokeI($04000100+504,timeSum)
+PokeI($04000100+512,eventHash)
+PokeI($04000100+520,s\busy)
+PokeI($04000100+528,s\issued)
+PokeI($04000100+536,s\lastSent)
+PokeI($04000100+544,s\lastTime)
+PokeI($04000100+552,s\acked)
+PokeI($04000100+560,s\largestAcked)
+PokeI($04000100+568,s\inFlight)
+PokeI($04000100+576,s\level)
+PokeI($04000100+584,s\capacity)
+PokeI($04000100+592,Hash(@storage[16],s\issued*32))
+PokeI($04000100+600,Hash(@storage[0],16))
+PokeI($04000100+608,Hash(@storage[272],16))
+For i=0 To 1099 : wire[i]=0 : Next
+wire[0]=2
+wire[1]=7
+wire[2]=0
+wire[3]=0
+wire[4]=0
+PokeI($04000100+616,QuicHandshakeFrameRead(@wire[0],5,0,@frame))
+PokeI($04000100+624,QuicHandshakeSentAckBegin(@job,@s,0,@frame))
+rc=RunAck(0)
+PokeI($04000100+632,rc)
+PokeI($04000100+640,events)
+PokeI($04000100+648,byteSum)
+PokeI($04000100+656,flightSum)
+PokeI($04000100+664,cookieSum)
+PokeI($04000100+672,timeSum)
+PokeI($04000100+680,eventHash)
+PokeI($04000100+688,s\busy)
+PokeI($04000100+696,s\issued)
+PokeI($04000100+704,s\lastSent)
+PokeI($04000100+712,s\lastTime)
+PokeI($04000100+720,s\acked)
+PokeI($04000100+728,s\largestAcked)
+PokeI($04000100+736,s\inFlight)
+PokeI($04000100+744,s\level)
+PokeI($04000100+752,s\capacity)
+PokeI($04000100+760,Hash(@storage[16],s\issued*32))
+PokeI($04000100+768,Hash(@storage[0],16))
+PokeI($04000100+776,Hash(@storage[272],16))
+For i=0 To 1099 : wire[i]=0 : Next
+wire[0]=2
+wire[1]=255
+wire[2]=255
+wire[3]=255
+wire[4]=255
+wire[5]=255
+wire[6]=255
+wire[7]=255
+wire[8]=255
+wire[9]=0
+wire[10]=0
+wire[11]=0
+PokeI($04000100+784,QuicHandshakeFrameRead(@wire[0],12,0,@frame))
+PokeI($04000100+792,QuicHandshakeSentAckBegin(@job,@s,0,@frame))
+rc=RunAck(0)
+PokeI($04000100+800,rc)
+PokeI($04000100+808,events)
+PokeI($04000100+816,byteSum)
+PokeI($04000100+824,flightSum)
+PokeI($04000100+832,cookieSum)
+PokeI($04000100+840,timeSum)
+PokeI($04000100+848,eventHash)
+PokeI($04000100+856,s\busy)
+PokeI($04000100+864,s\issued)
+PokeI($04000100+872,s\lastSent)
+PokeI($04000100+880,s\lastTime)
+PokeI($04000100+888,s\acked)
+PokeI($04000100+896,s\largestAcked)
+PokeI($04000100+904,s\inFlight)
+PokeI($04000100+912,s\level)
+PokeI($04000100+920,s\capacity)
+PokeI($04000100+928,Hash(@storage[16],s\issued*32))
+PokeI($04000100+936,Hash(@storage[0],16))
+PokeI($04000100+944,Hash(@storage[272],16))
+PokeI($04000100+952,QuicHandshakeSentReserve(@s))
+PokeI($04000100+960,QuicHandshakeSentReserve(@s))
+PokeI($04000100+968,QuicHandshakeSentCommit(@s,7,1200,107,1,0,77))
+PokeI($04000100+976,QuicHandshakeSentCommit(@s,6,1200,106,1,0,76))
+PokeI($04000100+984,QuicHandshakeSentReserve(@s))
+PokeI($04000100+992,QuicHandshakeSentCommit(@s,8,1200,108,1,0,78))
+PokeI($04000100+1000,QuicHandshakeSentCommit(@s,7,1200,107,1,0,77))
+PokeI($04000100+1008,QuicHandshakeSentCommit(@s,6,1200,1,1,0,76))
+PokeI($04000100+1016,QuicHandshakeSentCommit(@s,6,0,106,1,0,76))
+PokeI($04000100+1024,QuicHandshakeSentLost(@s,6))
+PokeI($04000100+1032,s\issued)
+PokeI($04000100+1040,s\lastSent)
+PokeI($04000100+1048,s\lastTime)
+PokeI($04000100+1056,s\acked)
+PokeI($04000100+1064,s\largestAcked)
+PokeI($04000100+1072,s\inFlight)
+PokeI($04000100+1080,s\level)
+PokeI($04000100+1088,s\capacity)
+PokeI($04000100+1096,Hash(@storage[16],s\issued*32))
+PokeI($04000100+1104,Hash(@storage[0],16))
+PokeI($04000100+1112,Hash(@storage[272],16))
+If s\phase=1 : rc=QuicHandshakeSentDiscard(@s) : EndIf
+For i=0 To 131103 : storage[i]=$A5 : Next
+PokeI($04000100+1120,QuicHandshakeSentInit(@s,2,@storage[16],128))
+For i=0 To 127
+ rc=QuicHandshakeSentReserve(@s)
+ If i>0 : rc=QuicHandshakeSentCommit(@s,i,1200,100+i,1,0,70+i) : EndIf
+Next
+For i=0 To 1099 : wire[i]=0 : Next
+wire[0]=2
+wire[1]=64
+wire[2]=127
+wire[3]=0
+wire[4]=0
+wire[5]=64
+wire[6]=127
+PokeI($04000100+1128,QuicHandshakeFrameRead(@wire[0],7,2,@frame))
+PokeI($04000100+1136,QuicHandshakeSentAckBegin(@job,@s,2,@frame))
+PokeI($04000100+1144,QuicHandshakeSentAckStep(@job))
+PokeI($04000100+1152,s\acked)
+PokeI($04000100+1160,QuicHandshakeSentReserve(@s))
+PokeI($04000100+1168,QuicHandshakeSentLost(@s,127))
+PokeI($04000100+1176,QuicHandshakeSentDiscard(@s))
+PokeI($04000100+1184,QuicHandshakeSentCommit(@s,0,1200,999,1,0,70))
+PokeI($04000100+1192,QuicHandshakeSentAckBegin(@other,@s,2,@frame))
+rc=RunAck(0)
+PokeI($04000100+1200,rc)
+PokeI($04000100+1208,events)
+PokeI($04000100+1216,s\issued)
+PokeI($04000100+1224,s\lastSent)
+PokeI($04000100+1232,s\lastTime)
+PokeI($04000100+1240,s\acked)
+PokeI($04000100+1248,s\largestAcked)
+PokeI($04000100+1256,s\inFlight)
+PokeI($04000100+1264,s\level)
+PokeI($04000100+1272,s\capacity)
+PokeI($04000100+1280,Hash(@storage[16],s\issued*32))
+PokeI($04000100+1288,Hash(@storage[0],16))
+PokeI($04000100+1296,Hash(@storage[4112],16))
+For i=0 To 1099 : wire[i]=0 : Next
+wire[0]=2
+wire[1]=64
+wire[2]=127
+wire[3]=0
+wire[4]=0
+wire[5]=0
+PokeI($04000100+1304,QuicHandshakeFrameRead(@wire[0],6,2,@frame))
+PokeI($04000100+1312,QuicHandshakeSentAckBegin(@job,@s,2,@frame))
+PokeI($04000100+1320,QuicHandshakeSentAckCancel(@job))
+PokeI($04000100+1328,QuicHandshakeSentAckStep(@job))
+PokeI($04000100+1336,s\issued)
+PokeI($04000100+1344,s\lastSent)
+PokeI($04000100+1352,s\lastTime)
+PokeI($04000100+1360,s\acked)
+PokeI($04000100+1368,s\largestAcked)
+PokeI($04000100+1376,s\inFlight)
+PokeI($04000100+1384,s\level)
+PokeI($04000100+1392,s\capacity)
+PokeI($04000100+1400,Hash(@storage[16],s\issued*32))
+PokeI($04000100+1408,Hash(@storage[0],16))
+PokeI($04000100+1416,Hash(@storage[4112],16))
+For i=0 To 1099 : wire[i]=0 : Next
+wire[0]=2
+wire[1]=64
+wire[2]=127
+wire[3]=0
+wire[4]=0
+wire[5]=64
+wire[6]=126
+PokeI($04000100+1424,QuicHandshakeFrameRead(@wire[0],7,2,@frame))
+PokeI($04000100+1432,QuicHandshakeSentAckBegin(@job,@s,2,@frame))
+rc=RunAck(1)
+PokeI($04000100+1440,rc)
+PokeI($04000100+1448,events)
+PokeI($04000100+1456,byteSum)
+PokeI($04000100+1464,flightSum)
+PokeI($04000100+1472,cookieSum)
+PokeI($04000100+1480,timeSum)
+PokeI($04000100+1488,eventHash)
+PokeI($04000100+1496,QuicHandshakeSentAckCancel(@job))
+PokeI($04000100+1504,s\issued)
+PokeI($04000100+1512,s\lastSent)
+PokeI($04000100+1520,s\lastTime)
+PokeI($04000100+1528,s\acked)
+PokeI($04000100+1536,s\largestAcked)
+PokeI($04000100+1544,s\inFlight)
+PokeI($04000100+1552,s\level)
+PokeI($04000100+1560,s\capacity)
+PokeI($04000100+1568,Hash(@storage[16],s\issued*32))
+PokeI($04000100+1576,Hash(@storage[0],16))
+PokeI($04000100+1584,Hash(@storage[4112],16))
+For i=0 To 1099 : wire[i]=0 : Next
+wire[0]=2
+wire[1]=64
+wire[2]=127
+wire[3]=0
+wire[4]=0
+wire[5]=64
+wire[6]=126
+PokeI($04000100+1592,QuicHandshakeFrameRead(@wire[0],7,2,@frame))
+frame\count=frame\count+1
+PokeI($04000100+1600,QuicHandshakeSentAckBegin(@job,@s,2,@frame))
+rc=RunAck(0)
+PokeI($04000100+1608,rc)
+PokeI($04000100+1616,events)
+PokeI($04000100+1624,byteSum)
+PokeI($04000100+1632,flightSum)
+PokeI($04000100+1640,cookieSum)
+PokeI($04000100+1648,timeSum)
+PokeI($04000100+1656,eventHash)
+PokeI($04000100+1664,s\busy)
+PokeI($04000100+1672,s\issued)
+PokeI($04000100+1680,s\lastSent)
+PokeI($04000100+1688,s\lastTime)
+PokeI($04000100+1696,s\acked)
+PokeI($04000100+1704,s\largestAcked)
+PokeI($04000100+1712,s\inFlight)
+PokeI($04000100+1720,s\level)
+PokeI($04000100+1728,s\capacity)
+PokeI($04000100+1736,Hash(@storage[16],s\issued*32))
+PokeI($04000100+1744,Hash(@storage[0],16))
+PokeI($04000100+1752,Hash(@storage[4112],16))
+For i=0 To 1099 : wire[i]=0 : Next
+wire[0]=2
+wire[1]=64
+wire[2]=127
+wire[3]=0
+wire[4]=0
+wire[5]=0
+PokeI($04000100+1760,QuicHandshakeFrameRead(@wire[0],6,2,@frame))
+frame\rangeBytes=frame\rangeBytes+1
+PokeI($04000100+1768,QuicHandshakeSentAckBegin(@job,@s,2,@frame))
+rc=RunAck(0)
+PokeI($04000100+1776,rc)
+PokeI($04000100+1784,events)
+PokeI($04000100+1792,byteSum)
+PokeI($04000100+1800,flightSum)
+PokeI($04000100+1808,cookieSum)
+PokeI($04000100+1816,timeSum)
+PokeI($04000100+1824,eventHash)
+PokeI($04000100+1832,s\busy)
+PokeI($04000100+1840,s\issued)
+PokeI($04000100+1848,s\lastSent)
+PokeI($04000100+1856,s\lastTime)
+PokeI($04000100+1864,s\acked)
+PokeI($04000100+1872,s\largestAcked)
+PokeI($04000100+1880,s\inFlight)
+PokeI($04000100+1888,s\level)
+PokeI($04000100+1896,s\capacity)
+PokeI($04000100+1904,Hash(@storage[16],s\issued*32))
+PokeI($04000100+1912,Hash(@storage[0],16))
+PokeI($04000100+1920,Hash(@storage[4112],16))
+For i=0 To 1099 : wire[i]=0 : Next
+wire[0]=2
+wire[1]=64
+wire[2]=127
+wire[3]=0
+wire[4]=0
+wire[5]=0
+PokeI($04000100+1928,QuicHandshakeFrameRead(@wire[0],6,2,@frame))
+PokeA(frame\ranges,255)
+PokeI($04000100+1936,QuicHandshakeSentAckBegin(@job,@s,2,@frame))
+rc=RunAck(0)
+PokeI($04000100+1944,rc)
+PokeI($04000100+1952,events)
+PokeI($04000100+1960,byteSum)
+PokeI($04000100+1968,flightSum)
+PokeI($04000100+1976,cookieSum)
+PokeI($04000100+1984,timeSum)
+PokeI($04000100+1992,eventHash)
+PokeI($04000100+2000,s\busy)
+PokeI($04000100+2008,s\issued)
+PokeI($04000100+2016,s\lastSent)
+PokeI($04000100+2024,s\lastTime)
+PokeI($04000100+2032,s\acked)
+PokeI($04000100+2040,s\largestAcked)
+PokeI($04000100+2048,s\inFlight)
+PokeI($04000100+2056,s\level)
+PokeI($04000100+2064,s\capacity)
+PokeI($04000100+2072,Hash(@storage[16],s\issued*32))
+PokeI($04000100+2080,Hash(@storage[0],16))
+PokeI($04000100+2088,Hash(@storage[4112],16))
+PokeI($04000100+2096,QuicHandshakeSentInit(@s,1,@storage[16],128))
+PokeI($04000100+2104,QuicHandshakeSentInit(@s,0,@storage[16],4097))
+PokeI($04000100+2112,QuicHandshakeSentInit(@s,0,@s,1))
+PokeI($04000100+2120,QuicHandshakeSentAckBegin(@other,@s,0,@frame))
+PokeI($04000100+2128,QuicHandshakeSentInit(@s,2,@storage[16],128))
+If s\phase=1 : rc=QuicHandshakeSentDiscard(@s) : EndIf
+For i=0 To 131103 : storage[i]=$A5 : Next
+PokeI($04000100+2136,QuicHandshakeSentInit(@s,0,@storage[16],4096))
+For i=0 To 4095
+ rc=QuicHandshakeSentReserve(@s)
+ rc=QuicHandshakeSentCommit(@s,i,1200,100+i,1,0,70+i)
+Next
+PokeI($04000100+2144,QuicHandshakeSentReserve(@s))
+For i=0 To 1099 : wire[i]=0 : Next
+wire[0]=2
+wire[1]=79
+wire[2]=255
+wire[3]=0
+wire[4]=0
+wire[5]=79
+wire[6]=255
+PokeI($04000100+2152,QuicHandshakeFrameRead(@wire[0],7,0,@frame))
+PokeI($04000100+2160,QuicHandshakeSentAckBegin(@job,@s,0,@frame))
+rc=RunAck(0)
+PokeI($04000100+2168,rc)
+PokeI($04000100+2176,events)
+PokeI($04000100+2184,byteSum)
+PokeI($04000100+2192,flightSum)
+PokeI($04000100+2200,cookieSum)
+PokeI($04000100+2208,timeSum)
+PokeI($04000100+2216,eventHash)
+PokeI($04000100+2224,s\busy)
+PokeI($04000100+2232,s\issued)
+PokeI($04000100+2240,s\lastSent)
+PokeI($04000100+2248,s\lastTime)
+PokeI($04000100+2256,s\acked)
+PokeI($04000100+2264,s\largestAcked)
+PokeI($04000100+2272,s\inFlight)
+PokeI($04000100+2280,s\level)
+PokeI($04000100+2288,s\capacity)
+PokeI($04000100+2296,Hash(@storage[16],s\issued*32))
+PokeI($04000100+2304,Hash(@storage[0],16))
+PokeI($04000100+2312,Hash(@storage[131088],16))
+For i=0 To 1099 : wire[i]=0 : Next
+wire[0]=2
+wire[1]=79
+wire[2]=255
+wire[3]=0
+wire[4]=0
+wire[5]=79
+wire[6]=255
+PokeI($04000100+2320,QuicHandshakeFrameRead(@wire[0],7,0,@frame))
+PokeI($04000100+2328,QuicHandshakeSentAckBegin(@job,@s,0,@frame))
+rc=RunAck(0)
+PokeI($04000100+2336,rc)
+PokeI($04000100+2344,events)
+PokeI($04000100+2352,byteSum)
+PokeI($04000100+2360,flightSum)
+PokeI($04000100+2368,cookieSum)
+PokeI($04000100+2376,timeSum)
+PokeI($04000100+2384,eventHash)
+PokeI($04000100+2392,s\busy)
+PokeI($04000100+2400,s\issued)
+PokeI($04000100+2408,s\lastSent)
+PokeI($04000100+2416,s\lastTime)
+PokeI($04000100+2424,s\acked)
+PokeI($04000100+2432,s\largestAcked)
+PokeI($04000100+2440,s\inFlight)
+PokeI($04000100+2448,s\level)
+PokeI($04000100+2456,s\capacity)
+PokeI($04000100+2464,Hash(@storage[16],s\issued*32))
+PokeI($04000100+2472,Hash(@storage[0],16))
+PokeI($04000100+2480,Hash(@storage[131088],16))
+PokeI($04000008,311)
+ProcedureReturn 0
+EndProcedure

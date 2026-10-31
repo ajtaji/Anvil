@@ -4089,3 +4089,59 @@ byte setup datagram is test coordination, not QUIC. It supplies no reusable
 connection owner or general packet-number allocator; outgoing CRYPTO, sent-packet
 history, retransmission, loss/congestion/flow handling, streams and QPACK remain
 open. Earlier TLS and public off-link IPv6 qualification items are also open.
+
+
+### Handshake sent-packet history and ACK application
+
+`quic_handshake_sent.pbi` supplies separate Initial/Handshake ledgers. Reserve
+allocates a monotonic packet number before encryption; abandoned numbers remain
+unsent and cannot be reused. Commit records transport acceptance once, in
+increasing packet-number/time order. Reservation or successful encryption alone
+is not sending. Padded or ACK-eliciting packets enter the per-space in-flight
+byte count. Loss removes in-flight bytes without erasing sent history, so late
+ACKs remain valid. Connection/key epochs, transport submission and global
+congestion accounting still belong to the caller.
+
+Each ledger uses 1 through 4096 caller-owned 32-byte slots, retained until space
+discard. Exhaustion is a loud local LIMIT, not an invalid-peer finding, and is
+not permission to reset packet numbers. Init requires a zeroed or discarded
+context; restarting numbering requires a new connection/key epoch. It must not
+be used to restart numbers on Retry. Discard does not implement key erasure or
+connection-wide congestion updates. Calls and borrowed storage must be serialized
+by the owner; the busy field prevents cooperative interleaving, not CPU races.
+
+A decoded, authenticated ACK starts a job against its matching number space.
+The job validates the complete ACK against actual sent slots before any packet
+state changes. Each step visits at most 64 slots. Only after validation does it
+emit newly acknowledged packet events, carrying packet number, byte count,
+send time, cookie, previous flags and removed in-flight bytes. Repeated ACKs
+emit no new events. A late ACK of a lost packet does not subtract bytes twice.
+The ledger refuses public writes while the job owns it. Range bytes remain
+immutable until completion; ECN validation and RTT/delay interpretation remain
+external. Cancel during validation leaves packet state unchanged; cancelling
+application may leave acknowledged packets and requires connection termination,
+not rollback. Accept the receive processor's pending ACK only after this job
+reports DONE; otherwise reject/close.
+
+Capture 256 passed 311 report assertions against an independent packet ledger,
+including exact slot contents, event metadata/order, skipped/unsent numbers,
+late invalid ranges, duplicate and post-loss ACKs, cancellation, ownership,
+malformed range views, capacity refusal and a full 4096-packet history. The full
+fixture compiled for Pi 3 without a physical execution claim.
+
+Capture 257 integrates the ledger into the live UDP fixture. After independently
+checking the Pi's protected ACK, the desktop sends a fresh protected ACK-only
+Initial acknowledging Pi packet zero. The Pi validates that event against its
+actual transport submission, applies it before accepting the receive event,
+clears its in-flight bytes and emits no ACK loop. All 20 board assertions and
+independent peer checks passed. Cores/fonts/Vulkan remained healthy and watchdog
+was off. Evidence is `docs/evidence/anvil-ipv6-20261030/quic-sent488`; installed
+Anvil remains 488. The earlier compile-only UDP draft was corrected to translate
+successful Accept (zero) back to the receiver loop's MORE result before running.
+
+This adds sent-history validation and a live integration example, not a full
+connection/recovery implementation. Outgoing CRYPTO ownership, timer/retransmission
+policy, RTT/ECN/congestion/flow handling, streams/QPACK and a certificate-verified
+HTTP/3 request remain open, along with earlier TLS/public off-link IPv6 work.
+Protocol references: [RFC 9000](https://www.rfc-editor.org/rfc/rfc9000.html#section-13.1)
+and [RFC 9002](https://www.rfc-editor.org/rfc/rfc9002.html#section-6.4).

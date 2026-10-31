@@ -47,6 +47,13 @@ class Peer:
      plain=AESGCM(key).decrypt(iv,wire[26:],bytes(header))
      assert plain==b'\x02\x01\x00\x00\x00'+bytes(1153)
      self.acks+=1
+     # ACK the Pi's padded Initial, using a fresh server packet number. This
+     # ACK-only packet must not start an acknowledgment response loop.
+     reply=b'\x02\x00\x00\x00\x00'+bytes(1153)
+     header=long(0,dcid=b'abcdefgh',scid=b'WXYZ',pn=2,pnbytes=4,cipher=1174)
+     packet=protect(header,reply,2,keys(CID,1))
+     assert self.socket.sendto(packet,address)==1200
+     self.events.append(dict(direction='send',name='acknowledge Pi packet zero',wire=packet.hex(),time=time.time()))
   except Exception as e:self.errors.append(repr(e))
  def check(self):
   assert not self.errors,self.errors
