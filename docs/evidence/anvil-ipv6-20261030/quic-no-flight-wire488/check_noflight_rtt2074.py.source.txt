@@ -1,0 +1,47 @@
+import struct
+
+def check(raw,peer):
+    read=lambda off:struct.unpack_from('<q',raw,off)[0]
+    assert read(0x390)==0
+    count=read(0x398);assert count==1
+    samples=[struct.unpack_from('<8q',raw,0x400+64*i) for i in range(count)]
+    assert samples[0][0]==0
+    assert [x[0] for x in samples]==sorted({x[0] for x in samples})
+    frames=[f for t in peer['qlog']['traces'] for e in t['events']
+            if e['name']=='transport:packet_sent' and e['data']['header']['packet_type']=='1RTT'
+            for f in e['data']['frames'] if f['frame_type']=='ack']
+    minimum=smoothed=variation=None
+    count_hs=read(0x600);assert 1<=count_hs<=16
+    handshake=[struct.unpack_from('<5q',raw,0x620+40*i) for i in range(count_hs)]
+    for pn,received,sent,delay,level in handshake:
+        assert received>sent>=0 and level in (0,2)
+        kind='initial' if level==0 else 'handshake'
+        assert any(e['data']['header']['packet_type']==kind and any(f['frame_type']=='ack' and max(hi for lo,hi in f['acked_ranges'])==pn for f in e['data']['frames']) for t in peer['qlog']['traces'] for e in t['events'] if e['name']=='transport:packet_sent')
+        latest=received-sent
+        if minimum is None:minimum=smoothed=latest;variation=latest//2
+        else:
+            minimum=min(minimum,latest)
+            variation=(3*variation+abs(smoothed-latest))//4
+            smoothed=(7*smoothed+latest)//8
+    first_pto=None
+    for pn,received,sent,delay,exponent,cap,level,confirmed in samples:
+        assert pn in (0,2,3,4) and received>sent>=0
+        assert (exponent,cap,level,confirmed)==(3,25000,4,1)
+        assert any(max(hi for lo,hi in f['acked_ranges'])==pn
+                   and -0.000001<=f['ack_delay']*1000-delay*(1<<exponent)<(1<<exponent)+0.000001
+                   for f in frames),(pn,delay)
+        latest=received-sent
+        if minimum is None:
+            minimum=smoothed=latest;variation=latest//2
+        else:
+            minimum=min(minimum,latest)
+            adjusted=latest-min(delay*(1<<exponent),cap)
+            if adjusted<minimum:adjusted=latest
+            variation=(3*variation+abs(smoothed-adjusted))//4
+            smoothed=(7*smoothed+adjusted)//8
+        if first_pto is None:first_pto=smoothed+max(4*variation,1000)+25000
+    values=[latest,minimum,smoothed,variation,max(1000,(9*max(latest,smoothed)+7)//8),smoothed+max(4*variation,1000)+25000]
+    assert [read(0x3a0+8*i) for i in range(6)]==values
+    assert read(0x908)==0 and read(0x900)==8297
+    assert read(0x5a0)==0 and read(0x5a8)==104 and read(0x5c0)==1
+    return dict(handshake_samples=handshake,samples=samples,latest=latest,minimum=minimum,smoothed=smoothed,variation=variation,loss_delay=values[4],pto=values[5],crypto_retry_unit_checks=8297)

@@ -1,0 +1,128 @@
+LAYERING GATE
+  tracked sources        1411
+  procedure names        13129
+  seam names declared    391, plus 26 Hw* families
+
+RULE 1  no downward call
+  shared files reaching down   25
+  call sites                   275
+  distinct board names called  152
+  top 20 shared files:
+       75  Anvil/Core/wifi_cmd.pbi                                 65 names
+       44  Anvil/Core/net_cmd.pbi                                  31 names
+       23  Anvil/Core/memrange.pbi                                 10 names
+       23  Anvil/Services/Http/Tests/queued_http_body.pi4          6 names
+       11  Anvil/Core/auto.pbi                                     4 names
+       11  Anvil/Core/mod_cmd.pbi                                  8 names
+       10  Anvil/Core/mod_arena.pbi                                10 names
+        7  Anvil/Core/bootfile_cmd.pbi                             1 names
+        7  Anvil/Core/help.pbi                                     5 names
+        7  Anvil/Core/memcmd.pbi                                   3 names
+        7  Anvil/Core/parse.pbi                                    6 names
+        7  Anvil/Core/xfer.pbi                                     3 names
+        6  Anvil/Kernel/Scheduler/timer_el3.pbi                    6 names
+        5  Anvil/Core/mod_lifecycle.pbi                            5 names
+        5  Anvil/Core/pmfboot.pbi                                  2 names
+        5  Anvil/Hal/abi.pbi                                       5 names
+        5  Anvil/Kernel/Scheduler/binding_pi4.pbi                  3 names
+        4  Anvil/Core/fs_cmd.pbi                                   1 names
+        4  Anvil/Core/netrecv_cmd.pbi                              2 names
+        2  Anvil/Core/boot_cmd.pbi                                 2 names
+  by defining board folder (a name on two boards counts on both):
+      116  ArduinoQ
+      172  RaspberryPi3
+      432  RaspberryPi4
+       23  other
+
+RULE 2  no downward include, no board extension under Anvil/
+  downward includes            1
+    Anvil/Kernel/Scheduler/Tests/timer_el3.pi4 -> RaspberryPi4/Lib/interrupts.pi4 (1)
+  board-extension files        14
+
+RULE 3  no second implementation of a protocol
+  crc32-polynomial                  5 sites in  5 files   owner: Anvil/Core/crc.pbi
+         1  Anvil/Storage/exfat.pbi
+         1  RaspberryPi4/Examples/Diagnostics/pi4WifiJoin.pi4
+         1  RaspberryPi4/Examples/Diagnostics/pi4WifiKey.pi4
+         1  RaspberryPi4/Examples/Diagnostics/pi4WifiScan.pi4
+         1  RaspberryPi4/Examples/Diagnostics/pi4WifiUp.pi4
+  sha256-constants                  0 sites in  0 files   owner: Anvil/Core/sha256.pbi
+  sha512-constants                  0 sites in  0 files   owner: Anvil/Crypto/sha512.pbi
+  videocore-mailbox-registers       5 sites in  2 files   owner: NONE YET
+         1  RaspberryPi3/Lib/mailbox.pbi
+         4  RaspberryPi4/Lib/mailbox.pi4
+  videocore-mailbox-request         1 sites in  1 files   owner: NONE YET
+         1  RaspberryPi3/Lib/mailbox.pbi
+  dtb-magic                         1 sites in  1 files   owner: Anvil/Core/fdt.pbi, Anvil/Core/boot_cmd.pbi
+         1  RockPi4C/Lib/boot_contract.pbi
+  fat-dirent-longname               0 sites in  0 files   owner: Anvil/Storage/fat32.pbi
+  pmfboot-container-magic           2 sites in  1 files   owner: Anvil/Core/pmfboot.pbi, Anvil/Storage/ab_record.pbi
+         2  RaspberryPi3/Lib/update_ab.pbi
+  generic-timer-read               45 sites in 24 files   owner: Anvil/Hal/aarch64_counter.pbi
+         1  Anvil/Kernel/Scheduler/Tests/preempt.pi4
+         1  Anvil/Kernel/Scheduler/timer_el3.pbi
+         2  Anvil/Net/cyw43.pbi
+         2  Anvil/Network/net.pbi
+         2  ArduinoQ/Board/hwtimer_q.unoq
+         2  ArduinoQ/Examples/Diagnostics/anvilqprobe.unoq
+         1  RaspberryPi3/Lib/interrupt_timer.pbi
+         2  RaspberryPi4/Board/el3_acceptance.pi4
+         2  RaspberryPi4/Examples/Diagnostics/NotBuilding/pi4HdmiAudioTone.pi4
+         2  RaspberryPi4/Examples/Diagnostics/pi4I2cScl.pi4
+         2  RaspberryPi4/Examples/Diagnostics/pi4SilentReturn.pi4
+         2  RaspberryPi4/Examples/Diagnostics/pi4WifiJoin.pi4
+         2  RaspberryPi4/Lib/core_accept.pi4
+         2  RaspberryPi4/Lib/dma.pi4
+         2  RaspberryPi4/Lib/emmc.pi4
+         2  RaspberryPi4/Lib/genet.pi4
+         2  RaspberryPi4/Lib/hid.pi4
+         2  RaspberryPi4/Lib/i2c.pi4
+         2  RaspberryPi4/Lib/mailbox.pi4
+         2  RaspberryPi4/Lib/pcie.pi4
+         2  RaspberryPi4/Lib/safety.pi4
+         2  RaspberryPi4/Lib/sdio.pi4
+         2  RaspberryPi4/Lib/v3d.pi4
+         2  RaspberryPi4/Lib/xhci.pi4
+  aarch64-mmu-attributes            5 sites in  1 files   owner: RaspberryPi4/Lib/mmu.pi4
+         5  RaspberryPi3/Lib/mmu.pi3
+
+RULE 4  no private-namespace crossing
+  crossing sites               267 in 25 files
+       67  RaspberryPi4/Tests/exfat_emitted_gate.pi4               exfat_Copy, exfat_Crc32Update, exfat_Put16, exfat_Put32
+       27  RaspberryPi3/Board/usb_diagnostic.pbi                   pi3ut_End, pi3ut_Match, pi3ut_WriteByte, pi3ut_WriteInt
+       20  Anvil/Network/dhcp.pbi                                  net_GetBE32, net_PutBE16, net_PutBE32
+       17  RaspberryPi4/Tests/cyw43_rx_glom_transport_emitted_gate.pi4 cyw43_Poll, cyw43_RxFrame, cyw43_RxqCanPoll, cyw43_RxqPush
+       16  RaspberryPi4/Tests/neon_orientation_compile.pi4         neon_F32Ratio, neon_Rect, neon_SyncClip, neon_TexVertex
+       15  RaspberryPi3/Board/ethernet_update.pbi                  pi3ut_WriteByte, pi3ut_WriteDec, pi3ut_WriteLine, pi3ut_WriteText
+       12  RaspberryPi4/Tests/wifi_bus_telemetry_emitted_gate.pi4  cyw43_Poll, cyw43_PollEvent, cyw43_RxFrame
+       10  RaspberryPi3/Board/update_boot_support.pbi              pi3ut_WriteByte, pi3ut_WriteDec, pi3ut_WriteText
+       10  RaspberryPi4/Examples/Diagnostics/pi4V3dAtlas.pi4       v3d_ClU8
+       10  RaspberryPi4/Examples/Diagnostics/pi4V3dTex.pi4         v3d_ClU8
+       10  RaspberryPi4/Lib/usbmsc.pi4                             xh_Trace
+        9  RaspberryPi4/Tests/screen_capture_console_compile.pi4   uart_MirrorPut
+        7  RaspberryPi4/Tests/cyw43_f2_fifo_emitted_gate.pi4       cyw43_F2Xfer
+        6  RaspberryPi4/Tests/cyw43_rx_readiness_emitted_gate.pi4  cyw43_Poll, cyw43_RxFrame, cyw43_RxIrqObserve, cyw43_RxqPush
+        6  RaspberryPi4/Tests/net_pin_identity_emitted_gate.pi4    net_PinApply
+        5  RaspberryPi4/Lib/neon.pi4                               v3d_ClU8
+        4  RaspberryPi4/Examples/Diagnostics/pi4WifiJoin.pi4       cyw43_DelayUs
+        3  RaspberryPi3/Board/updater.pi3                          pi3ut_WriteLine
+        3  RaspberryPi4/Tests/dhcp_emitted_gate.pi4                dhcpd_Alloc, dhcpd_Build
+        2  Anvil/Storage/filesystem.pbi                            exfat_U32
+
+RULE 5  one definition per name
+  names defined more than once 13
+    HwDirIsDir                   Anvil/Storage/hwfile.pbi  ArduinoQ/Board/hw_file_q.unoq
+    HwDirName                    Anvil/Storage/hwfile.pbi  ArduinoQ/Board/hw_file_q.unoq
+    HwDirNameUtf8                Anvil/Storage/hwfile.pbi  ArduinoQ/Board/hw_file_q.unoq
+    HwDirNext                    Anvil/Storage/hwfile.pbi  ArduinoQ/Board/hw_file_q.unoq
+    HwDirOpen                    Anvil/Storage/hwfile.pbi  ArduinoQ/Board/hw_file_q.unoq
+    HwDirRewind                  Anvil/Storage/hwfile.pbi  ArduinoQ/Board/hw_file_q.unoq
+    HwDirSize                    Anvil/Storage/hwfile.pbi  ArduinoQ/Board/hw_file_q.unoq
+    NetConsoleClaimLocal         Anvil/Core/netconsole.pbi  ArduinoQ/Board/qstubs_q.unoq
+    NetConsoleGetc               Anvil/Core/netconsole.pbi  ArduinoQ/Board/qstubs_q.unoq
+    NetConsoleLlTick             Anvil/Core/netconsole.pbi  ArduinoQ/Board/qstubs_q.unoq
+    NetConsolePump               Anvil/Core/netconsole.pbi  ArduinoQ/Board/qstubs_q.unoq
+    NetConsoleRearm              Anvil/Core/netconsole.pbi  ArduinoQ/Board/qstubs_q.unoq
+    NetDhcpTick                  Anvil/Core/netconsole.pbi  ArduinoQ/Board/qstubs_q.unoq
+
+LAYERING GATE PASSED. Nothing new, nothing grown.

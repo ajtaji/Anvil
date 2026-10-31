@@ -1,0 +1,31 @@
+import struct
+from check_noflight_rtt2074 import check as previous
+
+def check(raw,peer):
+ out=previous(raw,peer)
+ read=lambda off:struct.unpack_from('<q',raw,off)[0]
+ assert read(0x9b0)==0 and read(0x9b8)==1,(read(0x9b0),read(0x9b8))
+ anchor,due,fired,flight=[read(x) for x in [0x9c0,0x9c8,0x9d0,0x9d8]]
+ assert 0<anchor<due<=fired and flight==0
+ pn,received,sent,delay,level=out['handshake_samples'][0]
+ assert pn==0 and level==0 and received<=anchor
+ rtt=received-sent
+ assert due==anchor+rtt+max(4*(rtt//2),1000),(anchor,due,rtt)
+ hold=peer['no_flight'];assert hold['held_crypto_calls']>0 and hold['released'] and hold['release_time']>0
+ assert read(0x970)==0 and read(0x978)==3
+ assert read(0x990)==0 and read(0x998)==1200
+ assert read(0x9a8)==read(0x9a0)+1200
+ events=[e for t in peer['qlog']['traces'] for e in t['events']]
+ for kind,off in [('initial',0x980),('handshake',0x988)]:
+  matches=[e['data'] for e in events if e['name']=='transport:packet_received' and e['data']['header']['packet_type']==kind and int(e['data']['header']['packet_number'])==read(off)]
+  assert len(matches)==1,(kind,read(off),matches)
+  packet=matches[0];frames=[f['frame_type'] for f in packet['frames']]
+  assert frames.count('ping')==1 and 'crypto' not in frames and 'padding' in frames and packet['raw']['length']==1200,packet
+ assert read(0x980)==1
+ pings=[i for i,e in enumerate(events) if e['name']=='transport:packet_received' and e['data']['header']['packet_type']=='initial' and any(f['frame_type']=='ping' for f in e['data']['frames'])]
+ cryptos=[i for i,e in enumerate(events) if e['name']=='transport:packet_sent' and any(f['frame_type']=='crypto' for f in e['data']['frames'])]
+ assert pings and cryptos and min(cryptos)>min(pings),(pings,cryptos)
+ before=events[:min(pings)]
+ assert any(e['name']=='transport:packet_sent' and e['data']['header']['packet_type']=='initial' and any(f['frame_type']=='ack' and f['acked_ranges']==[[0,0]] for f in e['data']['frames']) for e in before)
+ out.update(no_flight_anchor=anchor,no_flight_due=due,no_flight_fired=fired,no_flight_lateness=fired-due,held_crypto_calls=hold['held_crypto_calls'])
+ return out

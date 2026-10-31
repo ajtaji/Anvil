@@ -15,6 +15,7 @@ Global Dim retryData.a[4096]
 Global Dim retryStates.a[1024]
 Global Dim retrySource.a[600]
 Global Dim retryMeta.i[16]
+Global noFlightFault.i,noFlightChecked.i,noFlightAnchor.i,noFlightDue.i,noFlightFired.i,noFlightBefore.i
 Global fallbackFault.i,fallbackMask.i,fallbackInitial.i,fallbackHandshake.i
 Global fallbackInitialBefore.i,fallbackInitialAfter.i,fallbackHandshakeBefore.i,fallbackHandshakeAfter.i
 Global handshakeRttCount.i,datagramReceivedAt.i
@@ -249,6 +250,25 @@ Procedure.i SendFallback(*s.QuicConnectionSpace)
   fallbackHandshake=number : fallbackHandshakeBefore=before : fallbackHandshakeAfter=*s\history\inFlight : fallbackMask=fallbackMask|2
  EndIf
  ProcedureReturn 0
+EndProcedure
+Procedure.i NoFlightTick()
+ Define rc.i,now.i
+ If noFlightChecked Or connection\initial\history\acked=0 Or connection\initial\history\elicitingInFlight<>0 : ProcedureReturn 0 : EndIf
+ now=HwMicros() : rc=QuicConnectionRecoveryPoll(@connection,now)
+ If noFlightAnchor=0 And connection\recoveryWaitPhase=1
+  noFlightAnchor=connection\recoveryWaitAnchor : noFlightDue=connection\recoveryTimer\deadline
+ EndIf
+ If rc=0
+  If noFlightAnchor<>0 And connection\recoveryTimer\deadline<>noFlightDue : noFlightFault=1 : EndIf
+  ProcedureReturn 0
+ EndIf
+ If rc<>1 : ProcedureReturn -9510 : EndIf
+ noFlightFired=now : noFlightBefore=connection\initial\history\inFlight
+ If noFlightAnchor=0 Or now<noFlightDue Or connection\recoveryWaitPhase<>2 Or connection\recoveryLevel<>0 : noFlightFault=2 : EndIf
+ If noFlightBefore<>0 Or connection\handshake\history\inFlight<>0 Or connection\applicationHistory\inFlight<>0 : noFlightFault=3 : EndIf
+ rc=SendFallback(@connection\initial) : If rc<>0 : ProcedureReturn rc : EndIf
+ If connection\recoveryWaitPhase<>0 Or connection\recoveryTimer\armed<>1 Or connection\recoveryTimer\backoff<>1 : noFlightFault=4 : EndIf
+ noFlightChecked=1 : ProcedureReturn 0
 EndProcedure
 ; Force an otherwise-due poll while a real ledger job holds its lock.
 ; This is a lifecycle refusal test, not a simulated wire timeout.
@@ -564,7 +584,7 @@ Procedure.i PacketOne(p.i,bytes.i)
  peerBytes=connection\peerIdBytes
  If connection\peerIdKnown<>1 Or peerBytes<>connection\header\sourceBytes : cidFault=4 : EndIf
  rc=FeedTls(*s) : If rc<>0 : ProcedureReturn rc : EndIf
- If #INITIAL_PROBE_TEST And *s\level=2 And (fallbackMask&2)=0 And *s\writeKeys\ready=1
+ If (#INITIAL_PROBE_TEST Or #NO_FLIGHT_TEST) And *s\level=2 And (fallbackMask&2)=0 And *s\writeKeys\ready=1
   rc=SendFallback(*s) : If rc<>0 : ProcedureReturn rc : EndIf
  EndIf
  rc=SendSpace(*s) : If rc<>0 : ProcedureReturn rc : EndIf
@@ -1191,6 +1211,7 @@ Procedure.i Run()
  stage=4
  While appAuthenticated=0
   rc=Pump() : If rc<0 : ProcedureReturn rc : EndIf
+  If #NO_FLIGHT_TEST : rc=NoFlightTick() : If rc<>0 : ProcedureReturn rc : EndIf : EndIf
   n=UdpPayloadReceive(handle,@info,@packet[0],1472)
   If n<>#SVC_EAGAIN
    If n<1 : ProcedureReturn n : EndIf
@@ -1745,6 +1766,9 @@ Procedure.i Main()
  PokeI($E1C00980,fallbackInitial) : PokeI($E1C00988,fallbackHandshake)
  PokeI($E1C00990,fallbackInitialBefore) : PokeI($E1C00998,fallbackInitialAfter)
  PokeI($E1C009A0,fallbackHandshakeBefore) : PokeI($E1C009A8,fallbackHandshakeAfter)
+ PokeI($E1C009B0,noFlightFault) : PokeI($E1C009B8,noFlightChecked)
+ PokeI($E1C009C0,noFlightAnchor) : PokeI($E1C009C8,noFlightDue)
+ PokeI($E1C009D0,noFlightFired) : PokeI($E1C009D8,noFlightBefore)
  PokeI($E1C00900,retryChecks) : PokeI($E1C00908,retryFault)
  PokeI($E1C00910,retryActual) : PokeI($E1C00918,retryWanted)
  PokeI($E1C00600,handshakeRttCount)

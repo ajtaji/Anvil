@@ -17,7 +17,7 @@ from aioquic.quic.connection import QuicConnection
 from aioquic.quic.events import HandshakeCompleted, ConnectionTerminated, ProtocolNegotiated
 from aioquic.quic.logger import QuicLogger
 from aioquic.quic.packet import pull_quic_header, QuicPacketType
-from aioquic.tls import CipherSuite
+from aioquic.tls import CipherSuite, Epoch
 
 def prepare(directory):
     directory.mkdir(parents=True, exist_ok=False)
@@ -70,6 +70,25 @@ def prepare_bad_signature(source, destination):
         invalid_leaf_sha256=broken.fingerprint(hashes.SHA256()).hex(),signature_independently_rejected=True),indent=2),encoding='utf8')
 
 class FixtureConnection(QuicConnection):
+    def __init__(self, *args, hold_crypto=False, **kwargs):
+        self.hold_crypto=hold_crypto
+        self.held_crypto_calls=0
+        self.crypto_release_time=None
+        super().__init__(*args, **kwargs)
+
+    def _write_crypto_frame(self, builder, space, stream):
+        # Leave queued TLS bytes untouched; ACK generation remains independent.
+        if self.hold_crypto:
+            self.held_crypto_calls+=1
+            return False
+        return super()._write_crypto_frame(builder,space,stream)
+
+    def _handle_ping_frame(self, context, frame_type, buf):
+        super()._handle_ping_frame(context,frame_type,buf)
+        if self.hold_crypto and context.epoch==Epoch.INITIAL:
+            self.hold_crypto=False
+            self.crypto_release_time=context.time
+
     def _replenish_connection_ids(self):
         # aioquic 1.7.0 otherwise emits invalid empty NEW_CONNECTION_ID frames.
         # Zero-ID fixtures keep their single ID; all TLS/crypto is unchanged.
@@ -77,8 +96,10 @@ class FixtureConnection(QuicConnection):
             super()._replenish_connection_ids()
 
 class Peer:
-    def __init__(self, directory, report, host='192.168.1.104', port=55442, allowed='192.168.1.114', connection_id_length=8, drop_probe=False, repeat_probe=False, initial_probe=False):
+    def __init__(self, directory, report, host='192.168.1.104', port=55442, allowed='192.168.1.114', connection_id_length=8, drop_probe=False, repeat_probe=False, initial_probe=False, no_flight=False):
         assert 0 <= connection_id_length <= 20
+        assert not (initial_probe and no_flight)
+        self.no_flight=no_flight
         self.directory, self.report, self.allowed = directory, report, allowed
         self.sock=socket.socket(socket.AF_INET,socket.SOCK_DGRAM)
         self.sock.bind((host,port)); self.sock.settimeout(.02)
@@ -117,7 +138,7 @@ class Peer:
                             assert len(packets)==2 and number==1
                             assert packets[0]['payload_sha256']==packets[1]['payload_sha256']
                             assert packets[0]['sha256']!=packets[1]['sha256']
-                        self.connection=FixtureConnection(configuration=self.config,original_destination_connection_id=header.destination_cid)
+                        self.connection=FixtureConnection(configuration=self.config,original_destination_connection_id=header.destination_cid,hold_crypto=self.no_flight)
                     if data and not (data[0]&0x80):
                         self.short_packets+=1
                         if self.drop_probe and 2<=self.short_packets<=1+self.drop_count:
@@ -146,6 +167,8 @@ class Peer:
     def __exit__(self,*args):
         self.stop.set();self.thread.join(3);assert not self.thread.is_alive()
         self.sock.close()
+        if self.no_flight and self.connection:
+            self.result['no_flight']=dict(held_crypto_calls=self.connection.held_crypto_calls,release_time=self.connection.crypto_release_time,released=not self.connection.hold_crypto)
         self.result['qlog']=self.logger.to_dict()
         self.report.write_text(json.dumps(self.result,indent=2),encoding='utf8')
 
