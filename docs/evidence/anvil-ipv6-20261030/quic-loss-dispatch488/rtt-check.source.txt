@@ -1,0 +1,12 @@
+import struct
+from check_priority1959 import check as previous
+
+def check(raw,peer):
+ out=previous(raw,peer)
+ read=lambda off:struct.unpack_from('<q',raw,off)[0]
+ assert read(0x5c8)==1
+ start,end=read(0x5d0),read(0x5d8)
+ assert out['samples'][-1][1]<=start<=end
+ out['live_loss_dispatch_at']=start
+ out['live_loss_dispatch_done']=end
+ return out
