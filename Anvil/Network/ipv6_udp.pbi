@@ -17,7 +17,7 @@ Structure IPv6UdpView
  data.i
  dataBytes.i
 EndStructure
-Procedure.i ipv6udp_Span(p.i,n.i)
+Procedure.i IPv6UdpSpanValid(p.i,n.i)
  If p<=0 Or n<0 Or p>$7FFFFFFFFFFFFFFF-n : ProcedureReturn 0 : EndIf
  ProcedureReturn 1
 EndProcedure
@@ -28,7 +28,7 @@ EndProcedure
 Procedure.i IPv6UdpBuild(out.i,capacity.i,source.i,destination.i,datagramBytes.i,hops.i)
  Define rc.i
  If capacity<48 Or capacity>65575 Or datagramBytes<8 Or datagramBytes>capacity-40 Or hops<1 Or hops>255 : ProcedureReturn #IPV6_UDP_ARGUMENT : EndIf
- If ipv6udp_Span(out,capacity)=0 Or ipv6udp_Span(source,16)=0 Or ipv6udp_Span(destination,16)=0 : ProcedureReturn #IPV6_UDP_ARGUMENT : EndIf
+ If IPv6UdpSpanValid(out,capacity)=0 Or IPv6UdpSpanValid(source,16)=0 Or IPv6UdpSpanValid(destination,16)=0 : ProcedureReturn #IPV6_UDP_ARGUMENT : EndIf
  If (out<source+16 And source<out+capacity) Or (out<destination+16 And destination<out+capacity) : ProcedureReturn #IPV6_UDP_ARGUMENT : EndIf
  rc=IPv6PacketHeader(out,capacity,source,destination,datagramBytes,17,hops,0,0)
  If rc<>40 : ProcedureReturn rc : EndIf
@@ -44,7 +44,7 @@ EndProcedure
 ; and do not enter its checksum. Non-atomic fragments need reassembly first.
 Procedure.i IPv6UdpParse(packet.i,bytes.i,*view.IPv6UdpView)
  Define ip.IPv6PacketView,n.i,rc.i
- If bytes<0 Or bytes>65575 Or ipv6udp_Span(packet,bytes)=0 Or ipv6udp_Span(*view,SizeOf(IPv6UdpView))=0 : ProcedureReturn #IPV6_UDP_ARGUMENT : EndIf
+ If bytes<0 Or bytes>65575 Or IPv6UdpSpanValid(packet,bytes)=0 Or IPv6UdpSpanValid(*view,SizeOf(IPv6UdpView))=0 : ProcedureReturn #IPV6_UDP_ARGUMENT : EndIf
  If *view<packet+bytes And packet<*view+SizeOf(IPv6UdpView) : ProcedureReturn #IPV6_UDP_ARGUMENT : EndIf
  rc=IPv6PacketParse(packet,bytes,@ip)
  If rc<>0 : ProcedureReturn rc : EndIf

@@ -1,6 +1,7 @@
 XIncludeFile "Anvil/Network/internet_checksum.pbi"
 XIncludeFile "Anvil/Network/byte_order.pbi"
 XIncludeFile "Anvil/Network/ipv6_tcp.pbi"
+XIncludeFile "Anvil/Network/ipv6_udp.pbi"
 ; ======================================================================
 ;  net.pbi - target-neutral Ethernet II, ARP, IPv4, ICMP echo and UDP.
 ; ======================================================================
@@ -966,6 +967,7 @@ Global net_rxKind.i
 Global net_rxTo.i
 
 Global net_udpRxFrom.i
+Global net_udpRxFamily.i,net_udpRxFrom6.i,net_udpRxTo6.i
 Global net_udpRxPort.i
 Global net_udpRxDstPort.i
 Global net_udpRxLen.i
@@ -3009,6 +3011,66 @@ Procedure.i NetTcp6Input(kind.i,frame.i,bytes.i)
  ProcedureReturn #NET_IN_TCP
 EndProcedure
 
+; UDP uses the same assigned-source and neighbor/route hooks as TCP. They
+; belong to IPv6Service; no second route cache or neighbor worker is created.
+; This endpoint emits unicast within the IPv6 minimum MTU (1232 data bytes).
+; Return 0 with NetError()=0 while neighbor resolution is still pending.
+Procedure.i NetUdp6BuildFrom(kind.i,source.i,destination.i,dstPort.i,srcPort.i,payload.i,bytes.i)
+ Define rc.i,out.i
+ net_outLen=0 : net_err=#NET_E_NONE : out=@net_out[0]
+ If kind<1 Or kind>=#NET_IF_KINDS Or bytes<0 Or bytes>1232 Or dstPort<1 Or dstPort>65535 Or srcPort<1 Or srcPort>65535
+  net_err=#NET_E_ARG : ProcedureReturn 0
+ EndIf
+ If IPv6UdpSpanValid(source,16)=0 Or IPv6UdpSpanValid(destination,16)=0
+  net_err=#NET_E_ARG : ProcedureReturn 0
+ EndIf
+ If (out<source+16 And source<out+1514) Or (out<destination+16 And destination<out+1514)
+  net_err=#NET_E_ARG : ProcedureReturn 0
+ EndIf
+ If bytes>0
+  If IPv6UdpSpanValid(payload,bytes)=0 : net_err=#NET_E_ARG : ProcedureReturn 0 : EndIf
+  If out<payload+bytes And payload<out+1514 : net_err=#NET_E_ARG : ProcedureReturn 0 : EndIf
+ EndIf
+ If IPv6UnicastAddress(destination)=0 : net_err=#NET_E_ARG : ProcedureReturn 0 : EndIf
+ rc=NetTcp6Resolve(kind,source,destination,@net_scratchMac[0])
+ If rc<>1 : net_err=rc : ProcedureReturn 0 : EndIf
+ net_PutBE16(out+54,srcPort) : net_PutBE16(out+56,dstPort)
+ If bytes>0 : net_Copy(out+62,payload,bytes) : EndIf
+ rc=IPv6UdpBuild(out+14,1280,source,destination,bytes+8,64)
+ If rc<0 : net_err=rc : ProcedureReturn 0 : EndIf
+ net_BeginFrame(kind,@net_scratchMac[0],$86DD)
+ ProcedureReturn net_Finish(14+rc)
+EndProcedure
+Procedure.i NetUdpRxFamily()
+ If net_udpRxFamily=6 : ProcedureReturn 6 : EndIf
+ ProcedureReturn 4
+EndProcedure
+Procedure.i NetUdpRxFrom6()
+ ProcedureReturn net_udpRxFrom6
+EndProcedure
+Procedure.i NetUdpRxTo6()
+ ProcedureReturn net_udpRxTo6
+EndProcedure
+; The IPv6 owner calls this while the Ethernet receive span lives. Address
+; pointers borrow that span; datagram data uses the existing UDP scratch.
+; Multicast socket delivery is not enabled by this unicast endpoint.
+Procedure.i NetUdp6Input(kind.i,frame.i,bytes.i)
+ Define view.IPv6UdpView,rc.i
+ If kind<1 Or kind>=#NET_IF_KINDS Or bytes<62 Or bytes>1514 Or IPv6UdpSpanValid(frame,bytes)=0 : ProcedureReturn #NET_E_ARG : EndIf
+ If net_GetBE16(frame+12)<>$86DD Or net_Same(frame,net_IfMacPtr(kind),6)=0 : ProcedureReturn #NET_IN_IGNORED : EndIf
+ rc=IPv6UdpParse(frame+14,bytes-14,@view) : If rc<>0 : ProcedureReturn rc : EndIf
+ If IPv6UnicastAddress(view\source)=0 Or NetTcp6SourceValid(kind,view\destination)<>1 : ProcedureReturn #NET_IN_IGNORED : EndIf
+ If net_udpBound[kind]<>0 And view\destinationPort<>net_udpBound[kind]
+  If NetUdpListening(kind,view\destinationPort)=0 : ProcedureReturn #NET_IN_IGNORED : EndIf
+ EndIf
+ net_rxKind=kind : net_rxTo=0
+ net_udpRxFamily=6 : net_udpRxFrom=0
+ net_udpRxFrom6=view\source : net_udpRxTo6=view\destination
+ net_udpRxPort=view\sourcePort : net_udpRxDstPort=view\destinationPort : net_udpRxLen=view\dataBytes
+ If view\dataBytes>0 : net_Copy(@net_udpRx[0],view\data,view\dataBytes) : EndIf
+ ProcedureReturn #NET_IN_UDP
+EndProcedure
+
 Procedure.i NetTcpSegBuf()
   ProcedureReturn @net_out[#NET_ETH_HDR + #NET_IP_HDR]
 EndProcedure
@@ -3573,6 +3635,7 @@ Procedure.i net_RecvUdp(kind.i, *p, n.i, srcIp.i, dstIp.i)
     net_Copy(@net_udpRx[0], *p + #NET_UDP_HDR, plen)
   EndIf
   net_udpRxFrom    = srcIp
+  net_udpRxFamily=4 : net_udpRxFrom6=0 : net_udpRxTo6=0
   net_udpRxPort    = sport
   net_udpRxDstPort = dport
   net_udpRxLen     = plen
@@ -4064,9 +4127,11 @@ Procedure.i NetInput(kind.i, *frame, length.i)
       EndIf
     EndIf
     net_ipv6InputBusy = 1
+    net_udpRxFamily=4 : net_udpRxFrom6=0 : net_udpRxTo6=0
     r = net_ipv6InputHook(kind,*frame,length,@net_out[0],1514)
     net_ipv6InputBusy = 0
     If r = #NET_IN_TCP And net_tcpRxFamily=6 : ProcedureReturn #NET_IN_TCP : EndIf
+    If r = #NET_IN_UDP And net_udpRxFamily=6 : ProcedureReturn #NET_IN_UDP : EndIf
     If r = 0 : ProcedureReturn #NET_IN_IGNORED : EndIf
     If r > 0
       If r < 54 Or r > 1514
@@ -4202,6 +4267,7 @@ Procedure NetReset()
   net_ipId = 0
   net_outLen = 0
   net_udpRxFrom = 0
+  net_udpRxFamily=4 : net_udpRxFrom6=0 : net_udpRxTo6=0
   net_udpRxPort = 0
   net_udpRxDstPort = 0
   net_udpRxLen = 0

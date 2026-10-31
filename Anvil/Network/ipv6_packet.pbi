@@ -28,6 +28,18 @@ Structure IPv6PacketView
  fragmented.i
 EndStructure
 
+; Shared address-class check for unicast transport endpoints. This is not
+; an assigned-source or interface-scope check; those belong to the owner.
+Procedure.i IPv6UnicastAddress(address.i)
+ Define i.i,any.i
+ If address=0 : ProcedureReturn 0 : EndIf
+ If PeekA(address)=255 : ProcedureReturn 0 : EndIf
+ any=0
+ For i=0 To 15 : any=any|PeekA(address+i) : Next
+ If any=0 : ProcedureReturn 0 : EndIf
+ ProcedureReturn 1
+EndProcedure
+
 ; Returns 0 or a negative reason. Only errorOffset/optionAction are usable
 ; after failure. Unknown options expose their required discard/ICMP action
 ; to the endpoint; they are never silently accepted. At most eight extensions.

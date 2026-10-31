@@ -937,9 +937,15 @@ EndProcedure
 ; packet while this receive scratch is live, and answers 1 when the
 ; datagram was its own.
 Global *gNetUdpSvcHook = 0
+Global *gNetUdp6SvcHook = 0
 
 Procedure NetServiceSetUdpHook(*fn)
   *gNetUdpSvcHook = *fn
+EndProcedure
+; IPv6 datagrams must never enter the IPv4 DHCP/NTP/DNS/console owners.
+; Like the IPv4 callback, this may inspect/copy only; it must not pump RX.
+Procedure NetServiceSetUdp6Hook(*fn)
+  *gNetUdp6SvcHook = *fn
 EndProcedure
 
 ; One automatic protocol dispatcher for every hardware consumer. ARP and
@@ -956,6 +962,12 @@ Procedure.i NetServiceInput(kind.i, *frame, rc.i)
     ProcedureReturn 1
   EndIf
   If rc = #NET_IN_UDP
+    If NetUdpRxFamily()=6
+      If *gNetUdp6SvcHook<>0
+        If gNetUdp6SvcHook(kind)<>0 : ProcedureReturn 1 : EndIf
+      EndIf
+      ProcedureReturn 0
+    EndIf
     ; Port 68 belongs to the per-interface DHCP client while that row has
     ; an active transaction or lease. Parse it here, in the one dispatcher,
     ; then leave only an action value behind: the CYW43 receive pointer is

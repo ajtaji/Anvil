@@ -3709,5 +3709,53 @@ initial refusal is retained. There is no physical Pi 3 claim.
 Evidence: `docs/evidence/anvil-ipv6-20261030/ipv6-udp485`.
 
 This is packet support, not a live UDP socket or HTTP/3 request. Existing IPv6
-DNS currently uses TCP. The generic payload datagram API, IPv6 UDP dispatch,
-QUIC connection ownership/recovery and QPACK remain to be integrated.
+DNS currently uses TCP. The generic payload datagram API, QUIC connection
+ownership/recovery and QPACK remain to be integrated.
+
+### IPv6 UDP stack integration
+
+The shared stack now uses `NetUdp6BuildFrom` for unicast emission through the
+existing assigned-source, route and neighbor hooks. It returns 1 with a frame
+in `NetOutBuf`/`NetOutLen`, or 0 with `NetError` (zero means a pending neighbor).
+Datagrams are limited to 1232 data bytes until path-MTU discovery is integrated.
+No alternate route/neighbor implementation or synchronous wait is introduced.
+
+IPv6 ingress validates the checksum and assigned local address, observes port
+bindings/listeners, and exposes the tuple with `NetUdpRxFamily`, `NetUdpRxFrom6`
+and `NetUdpRxTo6`. Address pointers borrow the current receive frame; payload
+bytes use the existing UDP scratch. `NetServiceSetUdp6Hook` registers a separate
+resident consumer. IPv6 never enters the IPv4 DHCP/NTP/DNS/console handlers.
+The callback must copy what it retains and must not pump another receive.
+The unicast endpoint does not yet enable multicast socket delivery.
+
+Physical capture 232 passed 31 cases using the real shared stack and extracted
+dispatcher, with controlled source/neighbor and protocol-owner callbacks. They
+cover family isolation, legacy DHCP dispatch, stale hook results, listeners,
+invalid sources/checksums, exact emitted frames and pending/error resolution.
+The first harness used `NetDefaults` instead of the complete `NetInit` reset
+and expected a byte count from a Boolean builder; its refused report is retained.
+The corrected expectations and setup passed without changing production code.
+Full Pi 4 build 486 and Pi 3 build 100 compiled. This controlled packet test is
+not a live UDP exchange or physical Pi 3 qualification.
+
+Pi 4 build 486 was then installed with a verified 485 rollback, a single
+restart and a 90-second quiet boot interval. Capture 233 completed two real
+certificate-verified HTTPS/HTTP/2 streams (70,053 bytes), including resident TLS
+draining and graceful close. This run took 1.265 seconds; maximum observed
+client step/service costs were 2,525/2,723 microseconds. These observations are
+not worst-case latency guarantees. Cores/fonts/Vulkan stayed healthy and the
+watchdog was off. Evidence: `docs/evidence/anvil-ipv6-20261030/udp6-ingress486`.
+Generic payload UDP sockets and live QUIC/HTTP/3 remain open.
+
+The final module-boundary correction exposes shared `IPv6UnicastAddress` and
+`IPv6UdpSpanValid` checks instead of cross-file private calls. The layering
+gate refused the intermediate form; that refusal and source snapshots are
+retained. Capture 234 passed the 31 integration cases again, and capture 235
+passed 28 IPv6 TCP cases. Recompiling the 40-case UDP wire fixture produced a
+byte-identical PMF container to capture 230; the equivalence is recorded.
+Final full monitors are Pi 4 build 487 and Pi 3 build 101.
+Build 487 was installed and its running-image SHA verified after the full boot
+interval, retaining verified 486 and 485 candidates as rollbacks. Capture 236
+repeated the two live verified HTTPS/HTTP/2 responses and graceful drain/close:
+70,053 bytes in 1.078 seconds, maximum observed step/service 2,532/2,362
+microseconds. Board health passed and the watchdog was off.

@@ -662,6 +662,9 @@ Procedure.i IPv6ServiceInput(kind.i,frame.i,bytes.i,out.i,capacity.i)
      If rc<0 : ProcedureReturn rc : EndIf
      ProcedureReturn 0
     EndIf
+    If rc=0 And ip\protocol=17
+     ProcedureReturn NetUdp6Input(kind,frame,bytes)
+    EndIf
     If rc=0 And ip\protocol=58 And ip\payloadBytes>=1
      If PeekA(ip\payload)=134
       local=ipv6svc_RaLocal(kind,now,ip\destination)

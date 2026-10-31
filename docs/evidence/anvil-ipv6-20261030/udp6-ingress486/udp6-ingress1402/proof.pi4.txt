@@ -1,0 +1,584 @@
+#HW_LINK_NONE=0
+#HW_LINK_WIRED=1
+#HW_LINK_FILE=5
+#DHCP_PORT_SERVER=67
+#DHCP_PORT_CLIENT=68
+#DHCPC_INIT=0
+XIncludeFile "RaspberryPi4/Lib/mmu.pi4"
+XIncludeFile "Anvil/Network/net.pbi"
+
+Global legacy.i,owner.i,resolves.i,resolution.i,consume.i,mode.i
+Procedure.i millis()
+ ProcedureReturn 0
+EndProcedure
+Procedure netcon_SendStaged(kind.i)
+ legacy=legacy+1
+EndProcedure
+Procedure TcpInput()
+ legacy=legacy+1
+EndProcedure
+Procedure.i DhcpClientState(kind.i)
+ legacy=legacy+1 : ProcedureReturn 1
+EndProcedure
+Procedure DhcpClientInput(kind.i,p.i,n.i,t.i)
+ legacy=legacy+1
+EndProcedure
+Procedure.i NtpServiceInput(kind.i)
+ legacy=legacy+1 : ProcedureReturn 0
+EndProcedure
+Procedure.i NetConsoleOfferUdp(frame.i,kind.i)
+ legacy=legacy+1 : ProcedureReturn 0
+EndProcedure
+Procedure.i LegacyOwner(kind.i)
+ legacy=legacy+1 : ProcedureReturn 1
+EndProcedure
+Procedure.i UdpOwner(kind.i)
+ owner=owner+1 : ProcedureReturn consume
+EndProcedure
+Procedure.i Assigned(kind.i,source.i)
+ If kind<>1 : ProcedureReturn 0 : EndIf
+ ProcedureReturn net_Same(source,?Local,16)
+EndProcedure
+Procedure.i Resolve(kind.i,source.i,destination.i,mac.i)
+ Define i.i
+ resolves=resolves+1
+ If resolution=1
+  For i=0 To 5 : PokeA(mac+i,PeekA(?RemoteMac+i)) : Next
+ EndIf
+ ProcedureReturn resolution
+EndProcedure
+Procedure.i Receive(kind.i,frame.i,n.i,out.i,capacity.i)
+ If mode=1 : ProcedureReturn #NET_IN_UDP : EndIf
+ ProcedureReturn NetUdp6Input(kind,frame,n)
+EndProcedure
+Global *gNetUdpSvcHook,*gNetUdp6SvcHook
+Procedure NetServiceSetUdpHook(*fn)
+  *gNetUdpSvcHook = *fn
+EndProcedure
+Procedure NetServiceSetUdp6Hook(*fn)
+  *gNetUdp6SvcHook = *fn
+EndProcedure
+Procedure.i NetServiceInput(kind.i, *frame, rc.i)
+  Define own.i
+  If rc = #NET_IN_REPLY
+    netcon_SendStaged(kind)
+    ProcedureReturn 1
+  EndIf
+  If rc = #NET_IN_TCP
+    TcpInput()
+    ProcedureReturn 1
+  EndIf
+  If rc = #NET_IN_UDP
+    If NetUdpRxFamily()=6
+      If *gNetUdp6SvcHook<>0
+        If gNetUdp6SvcHook(kind)<>0 : ProcedureReturn 1 : EndIf
+      EndIf
+      ProcedureReturn 0
+    EndIf
+    ; Port 68 belongs to the per-interface DHCP client while that row has
+    ; an active transaction or lease. Parse it here, in the one dispatcher,
+    ; then leave only an action value behind: the CYW43 receive pointer is
+    ; invalidated by the next read and must never be queued itself.
+    If NetUdpRxPort() = #DHCP_PORT_SERVER And NetUdpRxDstPort() = #DHCP_PORT_CLIENT
+      If DhcpClientState(kind) <> #DHCPC_INIT
+        DhcpClientInput(kind, NetUdpRxData(), NetUdpRxLen(), millis())
+        ProcedureReturn 1
+      EndIf
+    EndIf
+    ; DNS/SNTP ownership is exact-interface and exact-tuple. This callback
+    ; validates and copies bounded state only; packet construction and sends
+    ; remain in NtpServiceTick after receive scratch is no longer live.
+    If NtpServiceInput(kind) <> 0
+      ProcedureReturn 1
+    EndIf
+    If *gNetUdpSvcHook <> 0
+      If gNetUdpSvcHook(kind) <> 0
+        ProcedureReturn 1
+      EndIf
+    EndIf
+    own = NetConsoleOfferUdp(*frame, kind)
+    If own = 2
+      netcon_SendStaged(kind)
+    EndIf
+    If own <> 0
+      ProcedureReturn 1
+    EndIf
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+Procedure Save(index.i,rc.i,dis.i)
+ Define p.i,i.i,n.i
+ p=$E1C00100+index*2048
+ PokeI(p,rc) : PokeI(p+8,NetOutLen()) : PokeI(p+16,NetError()) : PokeI(p+24,dis)
+ PokeI(p+32,owner) : PokeI(p+40,legacy) : PokeI(p+48,resolves)
+ For i=0 To 3 : PokeI(p+56+i*8,-1) : Next
+ If rc=#NET_IN_UDP
+  PokeI(p+56,NetUdpRxFamily()) : PokeI(p+64,NetUdpRxPort())
+  PokeI(p+72,NetUdpRxDstPort()) : PokeI(p+80,NetUdpRxLen())
+  If NetUdpRxFamily()=6
+   For i=0 To 15
+    PokeA(p+1648+i,PeekA(NetUdpRxFrom6()+i)) : PokeA(p+1664+i,PeekA(NetUdpRxTo6()+i))
+   Next
+  EndIf
+  n=NetUdpRxLen() : If n>256 : n=256 : EndIf
+  If n>0
+   For i=0 To n-1 : PokeA(p+1680+i,PeekA(NetUdpRxData()+i)) : Next
+  EndIf
+ EndIf
+ n=NetOutLen()
+ If n>0
+  For i=0 To n-1 : PokeA(p+128+i,PeekA(NetOutBuf()+i)) : Next
+ EndIf
+EndProcedure
+Procedure.i Main()
+ Define rc.i,i.i,dis.i
+ For i=0 To 131071 : PokeA($E1C00000+i,$A5) : Next
+ PokeI($E1C00000,$55444936)
+ MmuClearNc() : MmuAddNc($08A00000,$09200000) : MmuAddNc($08100000,$08180000)
+ rc=MmuBuildTables($4F80000) : If rc<>0 : ProcedureReturn 2 : EndIf
+ MmuEnableCached()
+NetInit() : NetSetMac(1,?Mac) : NetSetIPv4(1,$C0000201,$FFFFFF00,0)
+NetSetTcp6Hooks(@Assigned,@Resolve) : NetSetIPv6InputHook(@Receive)
+NetServiceSetUdpHook(@LegacyOwner) : NetServiceSetUdp6Hook(@UdpOwner)
+legacy=0 : owner=0 : resolves=0 : consume=1 : resolution=1 : mode=0 : dis=-1
+rc=NetInput(1,?V0,65)
+If rc=#NET_IN_UDP : dis=NetServiceInput(1,0,rc) : EndIf
+Save(0,rc,dis)
+NetInit() : NetSetMac(1,?Mac) : NetSetIPv4(1,$C0000201,$FFFFFF00,0)
+NetSetTcp6Hooks(@Assigned,@Resolve) : NetSetIPv6InputHook(@Receive)
+NetServiceSetUdpHook(@LegacyOwner) : NetServiceSetUdp6Hook(@UdpOwner)
+legacy=0 : owner=0 : resolves=0 : consume=1 : resolution=1 : mode=0 : dis=-1
+rc=NetInput(1,?V1,62)
+If rc=#NET_IN_UDP : dis=NetServiceInput(1,0,rc) : EndIf
+Save(1,rc,dis)
+NetInit() : NetSetMac(1,?Mac) : NetSetIPv4(1,$C0000201,$FFFFFF00,0)
+NetSetTcp6Hooks(@Assigned,@Resolve) : NetSetIPv6InputHook(@Receive)
+NetServiceSetUdpHook(@LegacyOwner) : NetServiceSetUdp6Hook(@UdpOwner)
+legacy=0 : owner=0 : resolves=0 : consume=1 : resolution=1 : mode=0 : dis=-1
+rc=NetInput(1,?V2,1294)
+If rc=#NET_IN_UDP : dis=NetServiceInput(1,0,rc) : EndIf
+Save(2,rc,dis)
+NetInit() : NetSetMac(1,?Mac) : NetSetIPv4(1,$C0000201,$FFFFFF00,0)
+NetSetTcp6Hooks(@Assigned,@Resolve) : NetSetIPv6InputHook(@Receive)
+NetServiceSetUdpHook(@LegacyOwner) : NetServiceSetUdp6Hook(@UdpOwner)
+legacy=0 : owner=0 : resolves=0 : consume=1 : resolution=1 : mode=0 : dis=-1
+rc=NetInput(1,?V3,65)
+If rc=#NET_IN_UDP : dis=NetServiceInput(1,0,rc) : EndIf
+Save(3,rc,dis)
+NetInit() : NetSetMac(1,?Mac) : NetSetIPv4(1,$C0000201,$FFFFFF00,0)
+NetSetTcp6Hooks(@Assigned,@Resolve) : NetSetIPv6InputHook(@Receive)
+NetServiceSetUdpHook(@LegacyOwner) : NetServiceSetUdp6Hook(@UdpOwner)
+legacy=0 : owner=0 : resolves=0 : consume=1 : resolution=1 : mode=0 : dis=-1
+rc=NetInput(1,?V4,65)
+If rc=#NET_IN_UDP : dis=NetServiceInput(1,0,rc) : EndIf
+Save(4,rc,dis)
+NetInit() : NetSetMac(1,?Mac) : NetSetIPv4(1,$C0000201,$FFFFFF00,0)
+NetSetTcp6Hooks(@Assigned,@Resolve) : NetSetIPv6InputHook(@Receive)
+NetServiceSetUdpHook(@LegacyOwner) : NetServiceSetUdp6Hook(@UdpOwner)
+legacy=0 : owner=0 : resolves=0 : consume=1 : resolution=1 : mode=0 : dis=-1
+rc=NetInput(1,?V5,65)
+If rc=#NET_IN_UDP : dis=NetServiceInput(1,0,rc) : EndIf
+Save(5,rc,dis)
+NetInit() : NetSetMac(1,?Mac) : NetSetIPv4(1,$C0000201,$FFFFFF00,0)
+NetSetTcp6Hooks(@Assigned,@Resolve) : NetSetIPv6InputHook(@Receive)
+NetServiceSetUdpHook(@LegacyOwner) : NetServiceSetUdp6Hook(@UdpOwner)
+legacy=0 : owner=0 : resolves=0 : consume=1 : resolution=1 : mode=0 : dis=-1
+NetServiceSetUdp6Hook(0)
+rc=NetInput(1,?V6,65)
+If rc=#NET_IN_UDP : dis=NetServiceInput(1,0,rc) : EndIf
+Save(6,rc,dis)
+NetInit() : NetSetMac(1,?Mac) : NetSetIPv4(1,$C0000201,$FFFFFF00,0)
+NetSetTcp6Hooks(@Assigned,@Resolve) : NetSetIPv6InputHook(@Receive)
+NetServiceSetUdpHook(@LegacyOwner) : NetServiceSetUdp6Hook(@UdpOwner)
+legacy=0 : owner=0 : resolves=0 : consume=1 : resolution=1 : mode=0 : dis=-1
+consume=0
+rc=NetInput(1,?V7,65)
+If rc=#NET_IN_UDP : dis=NetServiceInput(1,0,rc) : EndIf
+Save(7,rc,dis)
+NetInit() : NetSetMac(1,?Mac) : NetSetIPv4(1,$C0000201,$FFFFFF00,0)
+NetSetTcp6Hooks(@Assigned,@Resolve) : NetSetIPv6InputHook(@Receive)
+NetServiceSetUdpHook(@LegacyOwner) : NetServiceSetUdp6Hook(@UdpOwner)
+legacy=0 : owner=0 : resolves=0 : consume=1 : resolution=1 : mode=0 : dis=-1
+rc=NetInput(1,?V8,65)
+If rc=#NET_IN_UDP : dis=NetServiceInput(1,0,rc) : EndIf
+Save(8,rc,dis)
+NetInit() : NetSetMac(1,?Mac) : NetSetIPv4(1,$C0000201,$FFFFFF00,0)
+NetSetTcp6Hooks(@Assigned,@Resolve) : NetSetIPv6InputHook(@Receive)
+NetServiceSetUdpHook(@LegacyOwner) : NetServiceSetUdp6Hook(@UdpOwner)
+legacy=0 : owner=0 : resolves=0 : consume=1 : resolution=1 : mode=0 : dis=-1
+rc=NetInput(1,?V9,65)
+If rc=#NET_IN_UDP : dis=NetServiceInput(1,0,rc) : EndIf
+Save(9,rc,dis)
+NetInit() : NetSetMac(1,?Mac) : NetSetIPv4(1,$C0000201,$FFFFFF00,0)
+NetSetTcp6Hooks(@Assigned,@Resolve) : NetSetIPv6InputHook(@Receive)
+NetServiceSetUdpHook(@LegacyOwner) : NetServiceSetUdp6Hook(@UdpOwner)
+legacy=0 : owner=0 : resolves=0 : consume=1 : resolution=1 : mode=0 : dis=-1
+rc=NetInput(1,?V10,65)
+If rc=#NET_IN_UDP : dis=NetServiceInput(1,0,rc) : EndIf
+Save(10,rc,dis)
+NetInit() : NetSetMac(1,?Mac) : NetSetIPv4(1,$C0000201,$FFFFFF00,0)
+NetSetTcp6Hooks(@Assigned,@Resolve) : NetSetIPv6InputHook(@Receive)
+NetServiceSetUdpHook(@LegacyOwner) : NetServiceSetUdp6Hook(@UdpOwner)
+legacy=0 : owner=0 : resolves=0 : consume=1 : resolution=1 : mode=0 : dis=-1
+rc=NetInput(1,?V11,65)
+If rc=#NET_IN_UDP : dis=NetServiceInput(1,0,rc) : EndIf
+Save(11,rc,dis)
+NetInit() : NetSetMac(1,?Mac) : NetSetIPv4(1,$C0000201,$FFFFFF00,0)
+NetSetTcp6Hooks(@Assigned,@Resolve) : NetSetIPv6InputHook(@Receive)
+NetServiceSetUdpHook(@LegacyOwner) : NetServiceSetUdp6Hook(@UdpOwner)
+legacy=0 : owner=0 : resolves=0 : consume=1 : resolution=1 : mode=0 : dis=-1
+rc=NetInput(1,?V12,65)
+If rc=#NET_IN_UDP : dis=NetServiceInput(1,0,rc) : EndIf
+Save(12,rc,dis)
+NetInit() : NetSetMac(1,?Mac) : NetSetIPv4(1,$C0000201,$FFFFFF00,0)
+NetSetTcp6Hooks(@Assigned,@Resolve) : NetSetIPv6InputHook(@Receive)
+NetServiceSetUdpHook(@LegacyOwner) : NetServiceSetUdp6Hook(@UdpOwner)
+legacy=0 : owner=0 : resolves=0 : consume=1 : resolution=1 : mode=0 : dis=-1
+NetUdpBind(1,40000)
+rc=NetInput(1,?V13,65)
+If rc=#NET_IN_UDP : dis=NetServiceInput(1,0,rc) : EndIf
+Save(13,rc,dis)
+NetInit() : NetSetMac(1,?Mac) : NetSetIPv4(1,$C0000201,$FFFFFF00,0)
+NetSetTcp6Hooks(@Assigned,@Resolve) : NetSetIPv6InputHook(@Receive)
+NetServiceSetUdpHook(@LegacyOwner) : NetServiceSetUdp6Hook(@UdpOwner)
+legacy=0 : owner=0 : resolves=0 : consume=1 : resolution=1 : mode=0 : dis=-1
+NetUdpBind(1,40000)
+NetUdpListen(1,49152,1)
+rc=NetInput(1,?V14,65)
+If rc=#NET_IN_UDP : dis=NetServiceInput(1,0,rc) : EndIf
+Save(14,rc,dis)
+NetInit() : NetSetMac(1,?Mac) : NetSetIPv4(1,$C0000201,$FFFFFF00,0)
+NetSetTcp6Hooks(@Assigned,@Resolve) : NetSetIPv6InputHook(@Receive)
+NetServiceSetUdpHook(@LegacyOwner) : NetServiceSetUdp6Hook(@UdpOwner)
+legacy=0 : owner=0 : resolves=0 : consume=1 : resolution=1 : mode=0 : dis=-1
+rc=NetInput(1,?V15,44)
+If rc=#NET_IN_UDP : dis=NetServiceInput(1,0,rc) : EndIf
+Save(15,rc,dis)
+NetInit() : NetSetMac(1,?Mac) : NetSetIPv4(1,$C0000201,$FFFFFF00,0)
+NetSetTcp6Hooks(@Assigned,@Resolve) : NetSetIPv6InputHook(@Receive)
+NetServiceSetUdpHook(@LegacyOwner) : NetServiceSetUdp6Hook(@UdpOwner)
+legacy=0 : owner=0 : resolves=0 : consume=1 : resolution=1 : mode=0 : dis=-1
+rc=NetInput(1,?V16,44)
+If rc=#NET_IN_UDP : dis=NetServiceInput(1,0,rc) : EndIf
+Save(16,rc,dis)
+NetInit() : NetSetMac(1,?Mac) : NetSetIPv4(1,$C0000201,$FFFFFF00,0)
+NetSetTcp6Hooks(@Assigned,@Resolve) : NetSetIPv6InputHook(@Receive)
+NetServiceSetUdpHook(@LegacyOwner) : NetServiceSetUdp6Hook(@UdpOwner)
+legacy=0 : owner=0 : resolves=0 : consume=1 : resolution=1 : mode=0 : dis=-1
+rc=NetInput(1,?V17,65)
+rc=NetInput(1,?V18,44)
+If rc=#NET_IN_UDP : dis=NetServiceInput(1,0,rc) : EndIf
+Save(17,rc,dis)
+NetInit() : NetSetMac(1,?Mac) : NetSetIPv4(1,$C0000201,$FFFFFF00,0)
+NetSetTcp6Hooks(@Assigned,@Resolve) : NetSetIPv6InputHook(@Receive)
+NetServiceSetUdpHook(@LegacyOwner) : NetServiceSetUdp6Hook(@UdpOwner)
+legacy=0 : owner=0 : resolves=0 : consume=1 : resolution=1 : mode=0 : dis=-1
+rc=NetInput(1,?V17,65)
+mode=1
+rc=NetInput(1,?V19,65)
+If rc=#NET_IN_UDP : dis=NetServiceInput(1,0,rc) : EndIf
+Save(18,rc,dis)
+NetInit() : NetSetMac(1,?Mac) : NetSetIPv4(1,$C0000201,$FFFFFF00,0)
+NetSetTcp6Hooks(@Assigned,@Resolve) : NetSetIPv6InputHook(@Receive)
+NetServiceSetUdpHook(@LegacyOwner) : NetServiceSetUdp6Hook(@UdpOwner)
+legacy=0 : owner=0 : resolves=0 : consume=1 : resolution=1 : mode=0 : dis=-1
+
+rc=NetUdp6BuildFrom(1,?Local,?Peer,443,49152,?V20,3)
+Save(19,rc,dis)
+NetInit() : NetSetMac(1,?Mac) : NetSetIPv4(1,$C0000201,$FFFFFF00,0)
+NetSetTcp6Hooks(@Assigned,@Resolve) : NetSetIPv6InputHook(@Receive)
+NetServiceSetUdpHook(@LegacyOwner) : NetServiceSetUdp6Hook(@UdpOwner)
+legacy=0 : owner=0 : resolves=0 : consume=1 : resolution=1 : mode=0 : dis=-1
+
+rc=NetUdp6BuildFrom(1,?Local,?Peer,443,49152,?V21,0)
+Save(20,rc,dis)
+NetInit() : NetSetMac(1,?Mac) : NetSetIPv4(1,$C0000201,$FFFFFF00,0)
+NetSetTcp6Hooks(@Assigned,@Resolve) : NetSetIPv6InputHook(@Receive)
+NetServiceSetUdpHook(@LegacyOwner) : NetServiceSetUdp6Hook(@UdpOwner)
+legacy=0 : owner=0 : resolves=0 : consume=1 : resolution=1 : mode=0 : dis=-1
+
+rc=NetUdp6BuildFrom(1,?Local,?Peer,443,49152,?V22,1232)
+Save(21,rc,dis)
+NetInit() : NetSetMac(1,?Mac) : NetSetIPv4(1,$C0000201,$FFFFFF00,0)
+NetSetTcp6Hooks(@Assigned,@Resolve) : NetSetIPv6InputHook(@Receive)
+NetServiceSetUdpHook(@LegacyOwner) : NetServiceSetUdp6Hook(@UdpOwner)
+legacy=0 : owner=0 : resolves=0 : consume=1 : resolution=1 : mode=0 : dis=-1
+resolution=0
+rc=NetUdp6BuildFrom(1,?Local,?Peer,443,49152,?V23,3)
+Save(22,rc,dis)
+NetInit() : NetSetMac(1,?Mac) : NetSetIPv4(1,$C0000201,$FFFFFF00,0)
+NetSetTcp6Hooks(@Assigned,@Resolve) : NetSetIPv6InputHook(@Receive)
+NetServiceSetUdpHook(@LegacyOwner) : NetServiceSetUdp6Hook(@UdpOwner)
+legacy=0 : owner=0 : resolves=0 : consume=1 : resolution=1 : mode=0 : dis=-1
+resolution=-888
+rc=NetUdp6BuildFrom(1,?Local,?Peer,443,49152,?V24,3)
+Save(23,rc,dis)
+NetInit() : NetSetMac(1,?Mac) : NetSetIPv4(1,$C0000201,$FFFFFF00,0)
+NetSetTcp6Hooks(@Assigned,@Resolve) : NetSetIPv6InputHook(@Receive)
+NetServiceSetUdpHook(@LegacyOwner) : NetServiceSetUdp6Hook(@UdpOwner)
+legacy=0 : owner=0 : resolves=0 : consume=1 : resolution=1 : mode=0 : dis=-1
+
+rc=NetUdp6BuildFrom(1,?Peer,?Peer,443,49152,0,0)
+Save(24,rc,dis)
+NetInit() : NetSetMac(1,?Mac) : NetSetIPv4(1,$C0000201,$FFFFFF00,0)
+NetSetTcp6Hooks(@Assigned,@Resolve) : NetSetIPv6InputHook(@Receive)
+NetServiceSetUdpHook(@LegacyOwner) : NetServiceSetUdp6Hook(@UdpOwner)
+legacy=0 : owner=0 : resolves=0 : consume=1 : resolution=1 : mode=0 : dis=-1
+
+rc=NetUdp6BuildFrom(1,?Local,?Group,443,49152,0,0)
+Save(25,rc,dis)
+NetInit() : NetSetMac(1,?Mac) : NetSetIPv4(1,$C0000201,$FFFFFF00,0)
+NetSetTcp6Hooks(@Assigned,@Resolve) : NetSetIPv6InputHook(@Receive)
+NetServiceSetUdpHook(@LegacyOwner) : NetServiceSetUdp6Hook(@UdpOwner)
+legacy=0 : owner=0 : resolves=0 : consume=1 : resolution=1 : mode=0 : dis=-1
+
+rc=NetUdp6BuildFrom(1,?Local,?Peer,443,49152,?Local,1233)
+Save(26,rc,dis)
+NetInit() : NetSetMac(1,?Mac) : NetSetIPv4(1,$C0000201,$FFFFFF00,0)
+NetSetTcp6Hooks(@Assigned,@Resolve) : NetSetIPv6InputHook(@Receive)
+NetServiceSetUdpHook(@LegacyOwner) : NetServiceSetUdp6Hook(@UdpOwner)
+legacy=0 : owner=0 : resolves=0 : consume=1 : resolution=1 : mode=0 : dis=-1
+
+rc=NetUdp6BuildFrom(1,?Local,?Peer,443,49152,NetOutBuf(),1)
+Save(27,rc,dis)
+NetInit() : NetSetMac(1,?Mac) : NetSetIPv4(1,$C0000201,$FFFFFF00,0)
+NetSetTcp6Hooks(@Assigned,@Resolve) : NetSetIPv6InputHook(@Receive)
+NetServiceSetUdpHook(@LegacyOwner) : NetServiceSetUdp6Hook(@UdpOwner)
+legacy=0 : owner=0 : resolves=0 : consume=1 : resolution=1 : mode=0 : dis=-1
+
+rc=NetUdp6BuildFrom(1,NetOutBuf(),?Peer,443,49152,0,0)
+Save(28,rc,dis)
+NetInit() : NetSetMac(1,?Mac) : NetSetIPv4(1,$C0000201,$FFFFFF00,0)
+NetSetTcp6Hooks(@Assigned,@Resolve) : NetSetIPv6InputHook(@Receive)
+NetServiceSetUdpHook(@LegacyOwner) : NetServiceSetUdp6Hook(@UdpOwner)
+legacy=0 : owner=0 : resolves=0 : consume=1 : resolution=1 : mode=0 : dis=-1
+
+rc=NetUdp6BuildFrom(1,?Local,?Peer,0,49152,0,0)
+Save(29,rc,dis)
+NetInit() : NetSetMac(1,?Mac) : NetSetIPv4(1,$C0000201,$FFFFFF00,0)
+NetSetTcp6Hooks(@Assigned,@Resolve) : NetSetIPv6InputHook(@Receive)
+NetServiceSetUdpHook(@LegacyOwner) : NetServiceSetUdp6Hook(@UdpOwner)
+legacy=0 : owner=0 : resolves=0 : consume=1 : resolution=1 : mode=0 : dis=-1
+
+rc=NetUdp6BuildFrom(0,?Local,?Peer,443,49152,0,0)
+Save(30,rc,dis)
+PokeI($E1C00008,31)
+MmuDisableCachedFlushed()
+ProcedureReturn 0
+EndProcedure
+DataSection
+Local:
+ Data.a 254,128,0,0,0,0,0,0,0,0,0,0,0,0,18,52
+Peer:
+ Data.a 254,128,0,0,0,0,0,0,0,0,0,0,0,0,86,120
+Mac:
+ Data.a 2,1,2,3,4,5
+RemoteMac:
+ Data.a 2,9,8,7,6,5
+Group:
+ Data.a 255,2,0,0,0,0,0,0,0,0,0,0,0,0,0,1
+V0:
+ Data.a 2,1,2,3,4,5,2,9,8,7,6,5,134,221,96,0,0,0,0,11,17,64,254,128
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,86,120,254,128,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,18,52,1,187,192,0,0,11,20,12,97,98,99
+V1:
+ Data.a 2,1,2,3,4,5,2,9,8,7,6,5,134,221,96,0,0,0,0,8,17,64,254,128
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,86,120,254,128,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,18,52,1,187,192,0,0,8,216,116
+V2:
+ Data.a 2,1,2,3,4,5,2,9,8,7,6,5,134,221,96,0,0,0,4,216,17,64,254,128
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,86,120,254,128,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,18,52,1,187,192,0,4,216,206,212,0,0,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+V3:
+ Data.a 2,1,2,3,4,5,2,9,8,7,6,5,134,221,96,0,0,0,0,11,17,64,254,128
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,86,120,254,128,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,18,52,0,67,0,68,0,11,213,64,97,98,99
+V4:
+ Data.a 2,1,2,3,4,5,2,9,8,7,6,5,134,221,96,0,0,0,0,11,17,64,254,128
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,86,120,254,128,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,18,52,0,123,0,123,0,11,212,209,97,98,99
+V5:
+ Data.a 2,1,2,3,4,5,2,9,8,7,6,5,134,221,96,0,0,0,0,11,17,64,254,128
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,86,120,254,128,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,18,52,0,53,21,179,0,11,191,223,97,98,99
+V6:
+ Data.a 2,1,2,3,4,5,2,9,8,7,6,5,134,221,96,0,0,0,0,11,17,64,254,128
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,86,120,254,128,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,18,52,1,187,192,0,0,11,20,12,97,98,99
+V7:
+ Data.a 2,1,2,3,4,5,2,9,8,7,6,5,134,221,96,0,0,0,0,11,17,64,254,128
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,86,120,254,128,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,18,52,1,187,192,0,0,11,20,12,97,98,99
+V8:
+ Data.a 2,1,2,3,4,5,2,9,8,7,6,5,134,221,96,0,0,0,0,11,17,64,254,128
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,86,120,254,128,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,18,52,1,187,192,0,0,11,20,12,97,98,98
+V9:
+ Data.a 2,1,2,3,4,5,2,9,8,7,6,5,134,221,96,0,0,0,0,11,17,64,254,128
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,86,120,254,128,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,153,153,1,187,192,0,0,11,140,166,97,98,99
+V10:
+ Data.a 2,1,2,3,4,5,2,9,8,7,6,5,134,221,96,0,0,0,0,11,17,64,255,2
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,0,1,254,128,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,18,52,1,187,192,0,0,11,106,1,97,98,99
+V11:
+ Data.a 2,1,2,3,4,5,2,9,8,7,6,5,134,221,96,0,0,0,0,11,17,64,0,0
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,0,0,254,128,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,18,52,1,187,192,0,0,11,105,5,97,98,99
+V12:
+ Data.a 2,0,0,0,0,153,2,9,8,7,6,5,134,221,96,0,0,0,0,11,17,64,254,128
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,86,120,254,128,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,18,52,1,187,192,0,0,11,20,12,97,98,99
+V13:
+ Data.a 2,1,2,3,4,5,2,9,8,7,6,5,134,221,96,0,0,0,0,11,17,64,254,128
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,86,120,254,128,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,18,52,1,187,192,0,0,11,20,12,97,98,99
+V14:
+ Data.a 2,1,2,3,4,5,2,9,8,7,6,5,134,221,96,0,0,0,0,11,17,64,254,128
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,86,120,254,128,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,18,52,1,187,192,0,0,11,20,12,97,98,99
+V15:
+ Data.a 2,1,2,3,4,5,2,9,8,7,6,5,8,0,69,0,0,30,0,1,0,0,64,17
+ Data.a 246,202,192,0,2,2,192,0,2,1,1,187,192,0,0,10,0,0,118,52
+V16:
+ Data.a 2,1,2,3,4,5,2,9,8,7,6,5,8,0,69,0,0,30,0,1,0,0,64,17
+ Data.a 246,202,192,0,2,2,192,0,2,1,0,67,0,68,0,10,0,0,118,52
+V17:
+ Data.a 2,1,2,3,4,5,2,9,8,7,6,5,134,221,96,0,0,0,0,11,17,64,254,128
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,86,120,254,128,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,18,52,1,187,192,0,0,11,20,12,97,98,99
+V18:
+ Data.a 2,1,2,3,4,5,2,9,8,7,6,5,8,0,69,0,0,30,0,1,0,0,64,17
+ Data.a 246,202,192,0,2,2,192,0,2,1,1,187,192,0,0,10,0,0,118,52
+V19:
+ Data.a 2,1,2,3,4,5,2,9,8,7,6,5,134,221,96,0,0,0,0,11,17,64,254,128
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,86,120,254,128,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,18,52,1,187,192,0,0,11,20,12,97,98,99
+V20:
+ Data.a 97,98,99
+V21:
+ Data.a 0
+V22:
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,0,0,0,0
+V23:
+ Data.a 97,98,99
+V24:
+ Data.a 97,98,99
+V25:
+ Data.a 97,98,99
+V26:
+ Data.a 97,98,99
+V27:
+ Data.a 97,98,99
+V28:
+ Data.a 97,98,99
+V29:
+ Data.a 97,98,99
+V30:
+ Data.a 97,98,99
+V31:
+ Data.a 97,98,99
+EndDataSection

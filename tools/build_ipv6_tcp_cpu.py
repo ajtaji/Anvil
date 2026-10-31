@@ -85,7 +85,8 @@ Procedure.i Main()
  Define rc.i,i.i,base.i
  For i=0 To 131071 : PokeA($E1C00000+i,$A5) : Next
  PokeI($E1C00000,$54435036)
- MmuClearNc() : rc=MmuBuildTables($4F80000) : If rc<>0 : ProcedureReturn 2 : EndIf
+ MmuClearNc() : MmuAddNc($08A00000,$09200000) : MmuAddNc($08100000,$08180000)
+ rc=MmuBuildTables($4F80000) : If rc<>0 : ProcedureReturn 2 : EndIf
  MmuEnableCached()
 '''
  for k,code in enumerate(steps):

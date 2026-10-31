@@ -19,13 +19,7 @@ Structure IPv6TcpView
 EndStructure
 
 Procedure.i ipv6tcp_Unicast(address.i)
- Define i.i,any.i
- If address=0 : ProcedureReturn 0 : EndIf
- If PeekA(address)=255 : ProcedureReturn 0 : EndIf
- any=0
- For i=0 To 15 : any=any|PeekA(address+i) : Next
- If any=0 : ProcedureReturn 0 : EndIf
- ProcedureReturn 1
+ ProcedureReturn IPv6UnicastAddress(address)
 EndProcedure
 
 ; Addresses must be separate from the complete writable packet. The caller
