@@ -144,6 +144,9 @@ Structure QuicConnection
  recoveryRetryRemaining.i
  recoveryRetryLevel.i
  probe.QuicConnectionProbe
+ recoveryWaitPhase.i ; 0 inactive,1 waiting,2 expiry delivered
+ recoveryWaitAnchor.i
+ recoveryWaitLevel.i
 EndStructure
 ; Span table order: RX data/bits,TX data/bits,ACK ranges,sent slots/metadata,
 ; TLS snapshot,handshake/receive/output/config,local/peer parameters/entries,
@@ -226,13 +229,16 @@ EndProcedure
 ; and consumes each loss event before Step. Recovery cannot run during close.
 ; Rearm normal PTO from owned, usable spaces. resetBackoff is supplied only
 ; after fresh validated ACKs or packet-space retirement. No-flight client
-; anti-deadlock policy and time-threshold loss priority remain dispatch duties.
+; waiting is armed by Poll or RearmAt with a current clock. Loss has priority.
 ; Refusals preserve the old timer, including its backoff. All clocks are us.
-Procedure.i QuicConnectionRecoveryRearm(*c.QuicConnection,resetBackoff.i)
+Procedure.i QuicConnectionRecoveryRearmAt(*c.QuicConnection,resetBackoff.i,now.i)
  Define initial.i,handshake.i,application.i,delay.i,rc.i,i.i,*parameter.QuicParameter
- Define candidate.QuicProbeTimer
- If qconn_Span(*c,SizeOf(QuicConnection))=0 Or resetBackoff<0 Or resetBackoff>1 : ProcedureReturn #QUIC_CONNECTION_ARGUMENT : EndIf
+ Define candidate.QuicProbeTimer,waitPhase.i,waitAnchor.i,waitLevel.i,preferred.i
+ If qconn_Span(*c,SizeOf(QuicConnection))=0 Or resetBackoff<0 Or resetBackoff>1 Or now< -1 : ProcedureReturn #QUIC_CONNECTION_ARGUMENT : EndIf
  If *c\phase<>1 : ProcedureReturn #QUIC_CONNECTION_STATE : EndIf
+ If *c\initial\history\busy<>0 Or *c\handshake\history\busy<>0 Or *c\applicationHistory\busy<>0 : ProcedureReturn #QUIC_SENT_BUSY : EndIf
+ waitPhase=*c\recoveryWaitPhase : waitAnchor=*c\recoveryWaitAnchor : waitLevel=*c\recoveryWaitLevel
+ If waitPhase<0 Or waitPhase>2 : ProcedureReturn #QUIC_CONNECTION_STATE : EndIf
  initial=-1 : handshake=-1 : application=-1 : delay=25000
  If *c\initial\history\phase=1 And *c\initial\writeKeys\ready=1
   initial=QuicHandshakeSentProbeTime(@*c\initial\history) : If initial< -1 : ProcedureReturn initial : EndIf
@@ -249,12 +255,35 @@ Procedure.i QuicConnectionRecoveryRearm(*c.QuicConnection,resetBackoff.i)
    delay=*parameter\value*1000
   EndIf
  EndIf
+ If initial>=0 Or handshake>=0 Or application>=0
+  waitPhase=0
+ Else
+  preferred=-1
+  If *c\handshakeConfirmed=0 And *c\handshake\history\acked=0
+   If *c\initial\history\phase=1 And *c\initial\writeKeys\ready=1 : preferred=0 : EndIf
+   If *c\handshake\history\phase=1 And *c\handshake\writeKeys\ready=1 : preferred=2 : EndIf
+  EndIf
+  If preferred<0
+   waitPhase=0
+  Else
+   If waitPhase=0 And now>=0 : waitPhase=1 : waitAnchor=now : EndIf
+   If waitPhase=1
+    waitLevel=preferred
+    If preferred=0 : initial=waitAnchor : Else : handshake=waitAnchor : EndIf
+   EndIf
+  EndIf
+ EndIf
  For i=0 To SizeOf(QuicProbeTimer)-1 : PokeA(@candidate+i,PeekA(@*c\recoveryTimer+i)) : Next
  If resetBackoff : candidate\backoff=0 : EndIf
  rc=QuicProbeTimerArm(@candidate,@*c\recoveryRtt,*c\handshakeConfirmed,delay,initial,handshake,application)
  If rc<0 : ProcedureReturn rc : EndIf
  For i=0 To SizeOf(QuicProbeTimer)-1 : PokeA(@*c\recoveryTimer+i,PeekA(@candidate+i)) : Next
+ *c\recoveryWaitPhase=waitPhase : *c\recoveryWaitAnchor=waitAnchor : *c\recoveryWaitLevel=waitLevel
  ProcedureReturn rc
+EndProcedure
+; Legacy callers have no new timestamp: preserve an existing wait anchor.
+Procedure.i QuicConnectionRecoveryRearm(*c.QuicConnection,resetBackoff.i)
+ ProcedureReturn QuicConnectionRecoveryRearmAt(*c,resetBackoff,-1)
 EndProcedure
 ; 0 idle,1 probe,2 run a bounded loss scan; recoveryLevel is valid on1/2.
 ; A stale scan requests work immediately. Any pending loss deadline suppresses
@@ -262,7 +291,7 @@ EndProcedure
 ; After2, use current RTT loss delay/threshold3, consume each scan event, then
 ; poll again. Requests repeat until serviced; only a PTO advances backoff.
 Procedure.i QuicConnectionRecoveryPoll(*c.QuicConnection,now.i)
- Define delay.i,level.i,history.i,stamp.i,unknown.i,selected.i,best.i,rc.i
+ Define delay.i,level.i,history.i,stamp.i,unknown.i,selected.i,best.i,rc.i,initial.i,handshake.i
  If qconn_Span(*c,SizeOf(QuicConnection))=0 Or now<0 : ProcedureReturn #QUIC_CONNECTION_ARGUMENT : EndIf
  If *c\phase<>1 : ProcedureReturn #QUIC_CONNECTION_STATE : EndIf
  If *c\recoveryRetryRemaining<>0 Or *c\initial\history\busy<>0 Or *c\handshake\history\busy<>0 Or *c\applicationHistory\busy<>0 : ProcedureReturn #QUIC_SENT_BUSY : EndIf
@@ -293,8 +322,26 @@ Procedure.i QuicConnectionRecoveryPoll(*c.QuicConnection,now.i)
   If now>=best : *c\recoveryLevel=selected : ProcedureReturn #QUIC_RECOVERY_LOSS : EndIf
   ProcedureReturn 0
  EndIf
+ ; Start a client no-flight episode once, never move its anchor on polling.
+ initial=-1 : handshake=-1
+ If *c\handshakeConfirmed=0 And *c\handshake\history\acked=0
+  If *c\initial\history\phase=1 And *c\initial\writeKeys\ready=1
+   initial=QuicHandshakeSentProbeTime(@*c\initial\history) : If initial< -1 : ProcedureReturn initial : EndIf
+  EndIf
+  If *c\handshake\history\phase=1 And *c\handshake\writeKeys\ready=1
+   handshake=QuicHandshakeSentProbeTime(@*c\handshake\history) : If handshake< -1 : ProcedureReturn handshake : EndIf
+  EndIf
+  If initial=-1 And handshake=-1
+   rc=QuicConnectionRecoveryRearmAt(*c,0,now) : If rc<0 : ProcedureReturn rc : EndIf
+  EndIf
+ ElseIf *c\recoveryWaitPhase<>0
+  rc=QuicConnectionRecoveryRearmAt(*c,0,now) : If rc<0 : ProcedureReturn rc : EndIf
+ EndIf
  rc=QuicProbeTimerPoll(@*c\recoveryTimer,now)
- If rc=1 : *c\recoveryLevel=*c\recoveryTimer\level : EndIf
+ If rc=1
+  *c\recoveryLevel=*c\recoveryTimer\level
+  If *c\recoveryWaitPhase=1 : *c\recoveryWaitPhase=2 : EndIf
+ EndIf
  ProcedureReturn rc
 EndProcedure
 ; Prepare retained CRYPTO from one selected packet for a fresh PTO probe.

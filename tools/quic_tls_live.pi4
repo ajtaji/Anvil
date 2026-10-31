@@ -1073,6 +1073,77 @@ Procedure CheckAutoProbe(level.i,mode.i)
  For i=0 To 383 : PokeA(@prioritySlots[0]+i,0) : Next
 EndProcedure
 
+Procedure CheckWaitRecovery()
+ Define i.i,rc.i,loss.QuicHandshakeSentLoss,job.QuicHandshakeSentAck,f.QuicHandshakeFrame,range.i
+ priorityContext\phase=1
+ RetryAssert(QuicRttInit(@priorityContext\recoveryRtt,1000,1),0)
+ RetryAssert(QuicProbeTimerInit(@priorityContext\recoveryTimer),0)
+ RetryAssert(QuicHandshakeSentInit(@priorityContext\initial\history,0,@prioritySlots[0],4),0)
+ RetryAssert(QuicHandshakeSentInit(@priorityContext\handshake\history,2,@prioritySlots[16],4),0)
+ RetryAssert(QuicConnectionRecoveryPoll(@priorityContext,100),0)
+ RetryAssert(priorityContext\recoveryTimer\armed,0)
+ priorityContext\initial\writeKeys\ready=1
+ RetryAssert(QuicHandshakeSentReserve(@priorityContext\initial\history),0)
+ RetryAssert(QuicHandshakeSentCommit(@priorityContext\initial\history,0,20,150,0,1,0),0)
+ RetryAssert(QuicConnectionRecoveryPoll(@priorityContext,200),0)
+ RetryAssert(priorityContext\recoveryWaitPhase,1)
+ RetryAssert(priorityContext\recoveryWaitAnchor,200)
+ RetryAssert(priorityContext\recoveryTimer\deadline,3200)
+ RetryAssert(priorityContext\recoveryTimer\level,0)
+ RetryAssert(QuicHandshakeSentLossBegin(@loss,@priorityContext\initial\history,300,100,3),0)
+ RetryAssert(QuicConnectionRecoveryPoll(@priorityContext,300),#QUIC_SENT_BUSY)
+ RetryAssert(QuicConnectionRecoveryRearmAt(@priorityContext,0,300),#QUIC_SENT_BUSY)
+ RetryAssert(priorityContext\recoveryTimer\deadline,3200)
+ RetryAssert(QuicHandshakeSentLossCancel(@loss),#QUIC_SENT_CANCELLED)
+ priorityContext\handshake\writeKeys\ready=1
+ RetryAssert(QuicConnectionRecoveryPoll(@priorityContext,400),0)
+ RetryAssert(priorityContext\recoveryTimer\level,2)
+ RetryAssert(priorityContext\recoveryTimer\deadline,3200)
+ RetryAssert(priorityContext\recoveryWaitAnchor,200)
+ priorityContext\initial\writeKeys\ready=0 : priorityContext\handshake\writeKeys\ready=0
+ RetryAssert(QuicConnectionRecoveryPoll(@priorityContext,500),0)
+ RetryAssert(priorityContext\recoveryTimer\armed,0)
+ RetryAssert(priorityContext\recoveryWaitPhase,0)
+ priorityContext\initial\writeKeys\ready=1
+ RetryAssert(QuicConnectionRecoveryPoll(@priorityContext,600),0)
+ RetryAssert(priorityContext\recoveryTimer\deadline,3600)
+ priorityContext\handshake\writeKeys\ready=1
+ RetryAssert(QuicConnectionRecoveryPoll(@priorityContext,700),0)
+ RetryAssert(priorityContext\recoveryTimer\level,2)
+ RetryAssert(QuicConnectionRecoveryRearm(@priorityContext,0),1)
+ RetryAssert(priorityContext\recoveryTimer\deadline,3600)
+ RetryAssert(QuicConnectionRecoveryRearmAt(@priorityContext,0,-2),#QUIC_CONNECTION_ARGUMENT)
+ RetryAssert(priorityContext\recoveryTimer\deadline,3600)
+ RetryAssert(QuicConnectionRecoveryPoll(@priorityContext,3599),0)
+ RetryAssert(QuicConnectionRecoveryPoll(@priorityContext,3600),1)
+ RetryAssert(priorityContext\recoveryLevel,2)
+ RetryAssert(priorityContext\recoveryWaitPhase,2)
+ RetryAssert(priorityContext\recoveryTimer\backoff,1)
+ RetryAssert(QuicConnectionRecoveryPoll(@priorityContext,3601),0)
+ RetryAssert(QuicConnectionRecoveryRearm(@priorityContext,0),0)
+ RetryAssert(priorityContext\recoveryTimer\armed,0)
+ RetryAssert(priorityContext\recoveryTimer\backoff,1)
+ RetryAssert(QuicHandshakeSentReserve(@priorityContext\handshake\history),0)
+ RetryAssert(QuicHandshakeSentCommit(@priorityContext\handshake\history,0,32,3700,1,0,0),0)
+ RetryAssert(QuicConnectionRecoveryRearm(@priorityContext,0),1)
+ RetryAssert(priorityContext\recoveryWaitPhase,0)
+ RetryAssert(priorityContext\recoveryTimer\deadline,9700)
+ RetryAssert(QuicConnectionRecoveryPoll(@priorityContext,9699),0)
+ f\kind=2 : f\count=1 : f\rangeBytes=1 : f\ranges=@range : f\largest=0
+ RetryAssert(QuicHandshakeSentAckBegin(@job,@priorityContext\handshake\history,2,@f),0)
+ For i=0 To 7 : rc=QuicHandshakeSentAckStep(@job) : If rc=2 Or rc<0 : Break : EndIf : Next
+ RetryAssert(rc,2)
+ RetryAssert(QuicConnectionRecoveryRearm(@priorityContext,1),0)
+ RetryAssert(priorityContext\recoveryTimer\backoff,0)
+ RetryAssert(QuicConnectionRecoveryPoll(@priorityContext,20000),0)
+ RetryAssert(priorityContext\recoveryTimer\armed,0)
+ RetryAssert(QuicConnectionClose(@priorityContext,0),0)
+ RetryAssert(QuicConnectionRecoveryPoll(@priorityContext,20001),#QUIC_CONNECTION_STATE)
+ RetryAssert(priorityContext\recoveryTimer\phase,0)
+ For i=0 To SizeOf(QuicConnection)-1 : PokeA(@priorityContext+i,0) : Next
+ For i=0 To 383 : PokeA(@prioritySlots[0]+i,0) : Next
+EndProcedure
+
 Procedure.i InitialProbe()
  Define rc.i,n.i,offset.i,bytes.i
  initialProbeBefore=connection\initial\history\inFlight
@@ -1594,6 +1665,7 @@ Procedure.i Main()
  CheckCryptoRetry(0,2) : CheckCryptoRetry(2,2)
  CheckCryptoRetry(0,3) : CheckCryptoRetry(2,3)
  For i=0 To 7 : CheckAutoProbe(0,i) : CheckAutoProbe(2,i) : Next
+ CheckWaitRecovery()
  ep\family=4 : ep\kind=0 : ep\port=55442
  For i=0 To 15 : PokeA(@ep\address+i,PeekA(?Peer+i)) : Next
  handle=UdpPayloadOpen(4,0,55013)

@@ -1,0 +1,10 @@
+import struct
+from check_hsrtt1976 import check as previous
+
+def check(raw,peer):
+ out=previous(raw,peer)
+ read=lambda off:struct.unpack_from('<q',raw,off)[0]
+ assert read(0x908)==0,(read(0x908),read(0x910),read(0x918))
+ assert read(0x900)==8297,read(0x900)
+ out['crypto_retry_unit_checks']=read(0x900)
+ return out
