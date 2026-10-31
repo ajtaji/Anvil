@@ -1,0 +1,171 @@
+; SPDX-License-Identifier: MIT
+; Independent RFC9000 sections13.3/19.6 and RFC9001 section4.1.3.
+; Retained outgoing CRYPTO bytes, one context per encryption level. The caller
+; serializes access and owns packet numbers, transport acceptance and timers.
+XIncludeFile "Anvil/Network/quic_crypto_stream.pbi"
+#QUIC_TX_ARGUMENT=-3481
+#QUIC_TX_STATE=-3482
+#QUIC_TX_LIMIT=-3483
+#QUIC_TX_RANGE=-3484
+#QUIC_TX_CAPACITY=-3485
+Structure QuicCryptoTx
+ phase.i
+ level.i
+ data.i
+ states.i
+ capacity.i
+ base.i
+ tail.i
+ head.i
+EndStructure
+Procedure.i quictx_Span(p.i,n.i)
+ If p<=0 Or n<0 Or p>$7FFFFFFFFFFFFFFF-n : ProcedureReturn 0 : EndIf
+ ProcedureReturn 1
+EndProcedure
+Procedure.i quictx_Overlap(a.i,n.i,b.i,m.i)
+ If n>0 And m>0 And a<b+m And b<a+n : ProcedureReturn 1 : EndIf
+ ProcedureReturn 0
+EndProcedure
+Procedure.i quictx_Ready(*s.QuicCryptoTx)
+ If quictx_Span(*s,SizeOf(QuicCryptoTx))=0 : ProcedureReturn #QUIC_TX_ARGUMENT : EndIf
+ If *s\phase<>1 Or (*s\level<>0 And *s\level<>2 And *s\level<>3) : ProcedureReturn #QUIC_TX_STATE : EndIf
+ ProcedureReturn 0
+EndProcedure
+; Connection close makes all retained output unusable. Caller first stops any
+; execution borrowing these buffers; no packet or transcript state is undone.
+Procedure.i QuicCryptoTxAbandon(*s.QuicCryptoTx)
+ If quictx_Span(*s,SizeOf(QuicCryptoTx))=0 : ProcedureReturn #QUIC_TX_ARGUMENT : EndIf
+ If *s\phase<>1 And *s\phase<>3 : ProcedureReturn #QUIC_TX_STATE : EndIf
+ *s\phase=3
+ ProcedureReturn 0
+EndProcedure
+Procedure.i quictx_External(*s.QuicCryptoTx,p.i,n.i)
+ If quictx_Span(p,n)=0 : ProcedureReturn 0 : EndIf
+ If quictx_Overlap(p,n,*s,SizeOf(QuicCryptoTx)) Or quictx_Overlap(p,n,*s\data,*s\capacity) Or quictx_Overlap(p,n,*s\states,*s\capacity/4) : ProcedureReturn 0 : EndIf
+ ProcedureReturn 1
+EndProcedure
+Procedure.i quictx_Index(*s.QuicCryptoTx,offset.i)
+ ProcedureReturn (*s\head+offset-*s\base)%*s\capacity
+EndProcedure
+Procedure.i quictx_Get(*s.QuicCryptoTx,index.i)
+ ProcedureReturn (PeekA(*s\states+index/4)>>((index&3)*2))&3
+EndProcedure
+Procedure quictx_Set(*s.QuicCryptoTx,index.i,value.i)
+ Define p.i,shift.i
+ p=*s\states+index/4 : shift=(index&3)*2
+ PokeA(p,(PeekA(p)&(~(3<<shift)))|(value<<shift))
+EndProcedure
+; Two bits/byte:0 fresh,1 transmitted,2 retry-ready,3 acknowledged.
+; Init is only for a new encryption-level stream, never a way to reset a live
+; stream's offsets. Storage is caller-owned, disjoint and exclusively held.
+Procedure.i QuicCryptoTxInit(*s.QuicCryptoTx,level.i,data.i,capacity.i,states.i,stateBytes.i)
+ If quictx_Span(*s,SizeOf(QuicCryptoTx))=0 Or (level<>0 And level<>2 And level<>3) Or capacity<4096 Or capacity>262144 Or (capacity&3)<>0 Or stateBytes<capacity/4 : ProcedureReturn #QUIC_TX_ARGUMENT : EndIf
+ If quictx_Span(data,capacity)=0 Or quictx_Span(states,capacity/4)=0 : ProcedureReturn #QUIC_TX_ARGUMENT : EndIf
+ If quictx_Overlap(*s,SizeOf(QuicCryptoTx),data,capacity) Or quictx_Overlap(*s,SizeOf(QuicCryptoTx),states,capacity/4) Or quictx_Overlap(data,capacity,states,capacity/4) : ProcedureReturn #QUIC_TX_ARGUMENT : EndIf
+ *s\phase=1 : *s\level=level : *s\data=data : *s\states=states : *s\capacity=capacity
+ *s\base=0 : *s\tail=0 : *s\head=0
+ ; No unbounded clear: Append initializes each new slot before exposing it.
+ ProcedureReturn 0
+EndProcedure
+; Copies<=16384 bytes; return count or refusal with state/data unchanged.
+Procedure.i QuicCryptoTxAppend(*s.QuicCryptoTx,source.i,bytes.i)
+ Define rc.i,i.i,p.i
+ rc=quictx_Ready(*s) : If rc<0 : ProcedureReturn rc : EndIf
+ If bytes<0 Or bytes>16384 : ProcedureReturn #QUIC_TX_ARGUMENT : EndIf
+ If bytes=0 : ProcedureReturn 0 : EndIf
+ If quictx_External(*s,source,bytes)=0 : ProcedureReturn #QUIC_TX_ARGUMENT : EndIf
+ If bytes>#QUIC_INTEGER_MAX-*s\tail : ProcedureReturn #QUIC_TX_RANGE : EndIf
+ If bytes>*s\capacity-(*s\tail-*s\base) : ProcedureReturn #QUIC_TX_LIMIT : EndIf
+ For i=0 To bytes-1
+  p=quictx_Index(*s,*s\tail+i) : PokeA(*s\data+p,PeekA(source+i)) : quictx_Set(*s,p,0)
+ Next
+ *s\tail=*s\tail+bytes : ProcedureReturn bytes
+EndProcedure
+; Scan<=budget(1..4096) retained bytes. Return1 borrows a contiguous ready
+; segment;0 gives the next scan offset (end means no more currently retained).
+; Do not reclaim/reuse that storage until the packet owner has copied it.
+Procedure.i QuicCryptoTxFind(*s.QuicCryptoTx,from.i,budget.i,*v.QuicCryptoSlice)
+ Define rc.i,p.i,n.i,stop.i,value.i,start.i
+ rc=quictx_Ready(*s) : If rc<0 : ProcedureReturn rc : EndIf
+ If from<0 Or from>*s\tail Or budget<1 Or budget>4096 Or quictx_External(*s,*v,SizeOf(QuicCryptoSlice))=0 : ProcedureReturn #QUIC_TX_ARGUMENT : EndIf
+ If from<*s\base : from=*s\base : EndIf
+ stop=from+budget : If budget>*s\tail-from : stop=*s\tail : EndIf
+ While from<stop
+  p=quictx_Index(*s,from) : value=quictx_Get(*s,p)
+  If value=0 Or value=2
+   start=from : n=0
+   While from<stop And p+n<*s\capacity
+    value=quictx_Get(*s,p+n)
+    If value<>0 And value<>2 : Break : EndIf
+    n=n+1 : from=from+1
+   Wend
+   *v\offset=start : *v\data=*s\data+p : *v\bytes=n : ProcedureReturn 1
+  EndIf
+  from=from+1
+ Wend
+ *v\offset=from : *v\data=0 : *v\bytes=0 : ProcedureReturn 0
+EndProcedure
+Procedure.i quictx_Range(*s.QuicCryptoTx,offset.i,bytes.i)
+ If offset<0 Or bytes<0 Or bytes>16384 Or offset>#QUIC_INTEGER_MAX-bytes : ProcedureReturn #QUIC_TX_RANGE : EndIf
+ If offset+bytes>*s\tail : ProcedureReturn #QUIC_TX_RANGE : EndIf
+ ProcedureReturn 0
+EndProcedure
+; mode1=transport accepted,2=retry requested,3=validated packet ACK. ACK/Retry
+; refuse any never-transmitted byte atomically. Retired prefixes are no-ops.
+; New transmissions never resurrect ACKed bytes, even if an older copy's ACK
+; arrived while a retransmission was being prepared. Packet metadata and fresh
+; packet numbers still belong to the sent-packet owner, not this byte store.
+Procedure.i quictx_Mark(*s.QuicCryptoTx,offset.i,bytes.i,mode.i)
+ Define rc.i,i.i,p.i,value.i,finish.i
+ rc=quictx_Ready(*s) : If rc<0 : ProcedureReturn rc : EndIf
+ rc=quictx_Range(*s,offset,bytes) : If rc<0 : ProcedureReturn rc : EndIf
+ finish=offset+bytes : If offset<*s\base : offset=*s\base : EndIf
+ If offset>=finish : ProcedureReturn 0 : EndIf
+ If mode<>1
+  For i=offset To finish-1
+   If quictx_Get(*s,quictx_Index(*s,i))=0 : ProcedureReturn #QUIC_TX_STATE : EndIf
+  Next
+ EndIf
+ For i=offset To finish-1
+  p=quictx_Index(*s,i) : value=quictx_Get(*s,p)
+  If value<>3 : quictx_Set(*s,p,mode) : EndIf
+ Next
+ ProcedureReturn 0
+EndProcedure
+Procedure.i QuicCryptoTxSent(*s.QuicCryptoTx,offset.i,bytes.i)
+ ProcedureReturn quictx_Mark(*s,offset,bytes,1)
+EndProcedure
+Procedure.i QuicCryptoTxRetry(*s.QuicCryptoTx,offset.i,bytes.i)
+ ProcedureReturn quictx_Mark(*s,offset,bytes,2)
+EndProcedure
+Procedure.i QuicCryptoTxAck(*s.QuicCryptoTx,offset.i,bytes.i)
+ ProcedureReturn quictx_Mark(*s,offset,bytes,3)
+EndProcedure
+; Reclaims only a contiguous ACKed prefix, <=budget(1..16384) bytes/call.
+; Bytes remain physically present until overwritten; this is not secret wiping.
+Procedure.i QuicCryptoTxReclaim(*s.QuicCryptoTx,budget.i)
+ Define rc.i,n.i
+ rc=quictx_Ready(*s) : If rc<0 : ProcedureReturn rc : EndIf
+ If budget<1 Or budget>16384 : ProcedureReturn #QUIC_TX_ARGUMENT : EndIf
+ n=0
+ While n<budget And *s\base<*s\tail
+  If quictx_Get(*s,*s\head)<>3 : Break : EndIf
+  *s\base=*s\base+1 : *s\head=(*s\head+1)%*s\capacity : n=n+1
+ Wend
+ ProcedureReturn n
+EndProcedure
+; Copy a retained range into a complete CRYPTO frame, including across wrap.
+; Writing/protecting a frame does NOT mark it sent. capacity failures write none.
+Procedure.i QuicCryptoTxFrame(*s.QuicCryptoTx,offset.i,bytes.i,dst.i,capacity.i)
+ Define rc.i,need.i,n.i,i.i
+ rc=quictx_Ready(*s) : If rc<0 : ProcedureReturn rc : EndIf
+ rc=quictx_Range(*s,offset,bytes) : If rc<0 : ProcedureReturn rc : EndIf
+ If bytes=0 Or offset<*s\base Or capacity<0 Or quictx_External(*s,dst,capacity)=0 : ProcedureReturn #QUIC_TX_ARGUMENT : EndIf
+ need=1+QuicIntegerSize(offset)+QuicIntegerSize(bytes)+bytes
+ If capacity<need : ProcedureReturn #QUIC_TX_CAPACITY : EndIf
+ PokeA(dst,6) : n=1
+ n=n+QuicIntegerWrite(offset,0,dst+n,capacity-n)
+ n=n+QuicIntegerWrite(bytes,0,dst+n,capacity-n)
+ For i=0 To bytes-1 : PokeA(dst+n+i,PeekA(*s\data+quictx_Index(*s,offset+i))) : Next
+ ProcedureReturn need
+EndProcedure

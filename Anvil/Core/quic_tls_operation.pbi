@@ -11,7 +11,7 @@
 Structure QuicTlsOperation
  context.TlsContextWorkerJob
  phase.i ; 0 fresh, 1 pending, 2 completed, -1 terminal abandonment
- kind.i ; 1 key share, 2 output Begin, 3 receive feed, 4 QUIC traffic keys
+ kind.i ; 1 key share, 2 output Begin, 3 receive feed, 4 traffic keys, 5 prepared keys
  result.i
  started.i
  timeout.i
@@ -47,6 +47,12 @@ Procedure.i quicop_Entry()
     If rc=0 : TlsWorkerCheckpoint() : EndIf
    Wend
    *op\result=rc
+  Case 5
+   Repeat
+    rc=QuicKeyJobStep(*op\stream)
+    If rc=0 : TlsWorkerCheckpoint() : EndIf
+   Until rc<>0
+   *op\result=rc
   Default : *op\result=#QUIC_OP_STATE
  EndSelect
  ProcedureReturn 1
@@ -54,7 +60,7 @@ EndProcedure
 ; Admission refuses without changing the operation, snapshot or TLS globals.
 ; Success reserves the shared worker; no cryptographic operation runs yet.
 Procedure.i QuicTlsOperationBegin(*op.QuicTlsOperation,snapshot.i,size.i,kind.i,stream.i,outputJob.i,output.i,capacity.i,timeoutUs.i)
- Define rc.i,*rx.QuicCryptoRx,*tx.QuicCryptoTx
+ Define rc.i,*rx.QuicCryptoRx,*tx.QuicCryptoTx,*key.QuicKeyJob
  If quicop_Span(*op,SizeOf(QuicTlsOperation))=0 Or quicop_Span(snapshot,size)=0 Or size<#TLS13_CONTEXT_SIZE Or timeoutUs<=0 : ProcedureReturn #QUIC_OP_STATE : EndIf
  If quicop_Overlap(*op,SizeOf(QuicTlsOperation),snapshot,size) Or (*op\phase<>0 And *op\phase<>2) : ProcedureReturn #QUIC_OP_STATE : EndIf
  Select kind
@@ -73,6 +79,15 @@ Procedure.i QuicTlsOperationBegin(*op.QuicTlsOperation,snapshot.i,size.i,kind.i,
    If capacity<>32 Or quicop_Span(output,32)=0 : ProcedureReturn #QUIC_OP_STATE : EndIf
    If quicop_Storage(*op,snapshot,size,stream,SizeOf(QuicKeyJob))=0 Or quicop_Storage(*op,snapshot,size,outputJob,SizeOf(QuicKeys))=0 : ProcedureReturn #QUIC_OP_STATE : EndIf
    If quicop_Overlap(stream,SizeOf(QuicKeyJob),outputJob,SizeOf(QuicKeys)) Or quicop_Overlap(output,32,stream,SizeOf(QuicKeyJob)) Or quicop_Overlap(output,32,outputJob,SizeOf(QuicKeys)) Or quicop_Overlap(output,32,*op,SizeOf(QuicTlsOperation)) : ProcedureReturn #QUIC_OP_STATE : EndIf
+  Case 5
+   ; The caller prepares Initial or traffic keys without doing arithmetic.
+   ; Admission adopts the pending job only after reserving the common worker.
+   ; On refusal the caller still owns the job and may retry or cancel it.
+   If output<>0 Or capacity<>0 : ProcedureReturn #QUIC_OP_STATE : EndIf
+   If quicop_Storage(*op,snapshot,size,stream,SizeOf(QuicKeyJob))=0 Or quicop_Storage(*op,snapshot,size,outputJob,SizeOf(QuicKeys))=0 : ProcedureReturn #QUIC_OP_STATE : EndIf
+   If quicop_Overlap(stream,SizeOf(QuicKeyJob),outputJob,SizeOf(QuicKeys)) : ProcedureReturn #QUIC_OP_STATE : EndIf
+   *key=stream
+   If (*key\phase<>1 And *key\phase<>3) Or *key\keys<>outputJob : ProcedureReturn #QUIC_OP_STATE : EndIf
   Default : ProcedureReturn #QUIC_OP_STATE
  EndSelect
  rc=TlsContextWorkerBegin(@*op\context,snapshot,size,@quicop_Entry,*op)
@@ -98,7 +113,7 @@ Procedure.i quicop_Abandon(*op.QuicTlsOperation,reason.i)
   rc=QuicCryptoTxAbandon(*tx)
  ElseIf *op\kind=3
   rc=QuicCryptoTlsAbandon(*op\stream)
- ElseIf *op\kind=4
+ ElseIf *op\kind=4 Or *op\kind=5
   QuicKeyJobCancel(*op\stream) : QuicKeysWipe(*op\outputJob)
  EndIf
  *op\phase=-1 : *op\result=reason

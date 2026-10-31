@@ -4943,3 +4943,45 @@ Anvil488 is unchanged. Retry, version negotiation, migration/application CID
 management, shared initialization, application packet processing, recovery,
 congestion/flow, streams/QPACK and real HTTP/3 remain, as do the earlier IPv6
 and TLS compatibility/device-blocking items.
+
+### Prepared Initial keys under cooperative ownership — 2026-10-31
+
+`QuicTlsOperationBegin` kind 5 adopts a prepared `QuicKeyJob` and its exact
+`QuicKeys` output owner. Supply the job as `stream`, keys as `outputJob`, and
+zero `output`/`capacity`. The caller first uses `QuicInitialKeysBegin` or
+`QuicTrafficKeysBegin`; these prepare storage without doing key arithmetic.
+Admission accepts phase 1 or 3, checks matching output ownership and nonoverlap,
+and reserves the common context worker before adopting either object. A
+refusal leaves the pending job with the caller, who must retain it for retry
+or cancel it. The snapshot, job, keys and referenced storage remain exclusive
+until completion or cancellation. Kind 4 remains the traffic-secret convenience
+path. This change adds no target-specific implementation.
+
+Kind 5 runs key steps through the common cooperative worker and its TLS context
+save/restore. Checkpoints separate pending key steps. Cancellation and timeout
+stop execution before wiping the job, output keys and connection snapshot.
+Per-operation timeouts do not replace the caller's connection deadline, fair
+dispatch or network service. No UDP calls or foreground wait loops are added
+to the shared operation module.
+
+The live fixture now uses this path for both Initial key directions, including
+its packet/receive cancellation setups, instead of calling key arithmetic
+directly from the foreground. Its fifth operation probe rejects a mismatched
+key owner before admission, forces a suspended Initial-key operation, cancels
+it, and checks key/snapshot wipe and unchanged foreground TLS context. Eight
+additional context checks now supplement the per-slice and original checks.
+
+Physical evidence: `docs/evidence/anvil-ipv6-20261030/quic-prepared-keys488/`.
+The same positive binary passed 36 checks with both zero- and eight-byte peer
+IDs; independent peers verified Finished and h3. The bad-signature case still
+refused the certificate. Retained reports verify all extra lifecycle/context
+checks. Pi 3 compilation uses its actual timer/RNG adapter; it is not an
+execution claim. Installed Anvil 488 was unchanged, with healthy cores, fonts
+and Vulkan and watchdog off after every returning RAM run.
+
+This closes direct foreground Initial-key arithmetic in the tested startup
+path. Complete connection startup composition is still pending: the fixture
+still configures TLS, entropy, IDs and parameters and orchestrates key share
+and ClientHello output. Application frame processing/HANDSHAKE_DONE, recovery,
+streams/QPACK, real HTTP/3, off-link IPv6 and remaining TLS/device work are
+also unfinished. These results are not a full networking or latency claim.

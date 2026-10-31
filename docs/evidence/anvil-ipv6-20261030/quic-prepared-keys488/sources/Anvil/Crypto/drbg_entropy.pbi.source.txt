@@ -1,0 +1,145 @@
+; Shared DRBG automatic seeding over the hardware entropy contract.
+; Include Anvil/Crypto/drbg.pbi first and supply HwEntropyAvailable/Read.
+; Security/provenance discussion retained in RaspberryPi4/Lib/drbg.pi4.
+; ----------------------------------------------------------------------
+;  The auto-seed staging buffer, and the last thing entropy.pi4 said.
+;
+;  secDrbgSeed is SECRET while it is full and is wiped the moment
+;  DrbgInit has consumed it - see the header. drbgEntStatus is the
+;  entropy library's own return code, kept so that a caller who got
+;  #DRBG_ERR_ENTROPY can find out WHICH failure it was without a second
+;  run: a timeout, a health bit, or a block that would not start are
+;  three different repairs.
+; ----------------------------------------------------------------------
+Global Dim secDrbgSeed.a[48]
+Global drbgEntStatus.i
+
+; ----------------------------------------------------------------------
+;  DrbgEntropyAvailable() - can this library obtain entropy by itself?
+;
+;  IT IS A STATEMENT ABOUT THE LIBRARY, NOT ABOUT THE SILICON. It says
+;  "a hardware entropy path is compiled in and DrbgAutoSeed will try
+;  it". It does NOT say the block answered - that is DrbgAutoSeed's
+;  return value, and it can still fail. A caller writing "seed from
+;  hardware if you can, otherwise refuse to start the TLS stack" needs
+;  to branch on BOTH: this one to know the path exists, and the
+;  auto-seed's own result to know it worked.
+; ----------------------------------------------------------------------
+Procedure.i DrbgEntropyAvailable()
+  ProcedureReturn HwEntropyAvailable()
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  drbg_GatherWipe() - zero the staging buffer.
+;
+;  INTERNAL. Called on every exit from the two auto routines, the
+;  failures included: a partly-filled buffer is still whatever the
+;  hardware produced before it stopped, and leaving that lying in BSS
+;  because the call did not succeed is the sort of thing nobody looks
+;  for afterwards.
+; ----------------------------------------------------------------------
+Procedure drbg_GatherWipe()
+  Protected i.i
+  i = 0
+  While i < #DRBG_AUTOSEED_BYTES
+    secDrbgSeed[i] = 0
+    i = i + 1
+  Wend
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  drbg_Gather(n) - n bytes of hardware entropy into secDrbgSeed.
+;
+;  INTERNAL. Returns #DRBG_OK or #DRBG_ERR_ENTROPY, leaving the entropy
+;  library's own code in drbgEntStatus either way.
+;
+;  HwEntropyRead owns hardware initialization, bounded warm-up and collection.
+;  A short read is never accepted. The staging buffer is wiped by the caller
+;  on every collection exit, including hardware errors and short reads.
+; ----------------------------------------------------------------------
+Procedure.i drbg_Gather(n.i)
+  drbgEntStatus = HwEntropyRead(@secDrbgSeed[0], n)
+  If drbgEntStatus <> n
+    ProcedureReturn #DRBG_ERR_ENTROPY
+  EndIf
+  ProcedureReturn #DRBG_OK
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  DrbgAutoSeed() - instantiate from the hardware entropy provider.
+;
+;  Returns whatever DrbgInit returned - #DRBG_OK, or one of its
+;  refusals - or #DRBG_ERR_ENTROPY if the hardware never produced the
+;  48 bytes. It does not touch the DRBG state unless it has all 48.
+;
+;  #DRBG_ERR_CONSTSEED IS THE INTERESTING FAILURE and it is the reason
+;  this routine can be as short as it is. A dead block, a block held in
+;  reset, a base address off by a page and a FIFO read that is really
+;  reading some other register all produce the same 48 bytes over and
+;  over, and DrbgSeedUsable refuses a constant seed BY NAME before
+;  anything is instantiated. See WHAT AUTO-SEEDING DOES NOT CHECK in
+;  the header for what that does and does not cover.
+;
+;  RE-SEEDING AN ALREADY-SEEDED DRBG through this entry point is
+;  allowed and is a full re-instantiate: K and V go back to their
+;  starting constants. If what you wanted was to ADD entropy to a
+;  running generator, that is DrbgAutoReseed().
+; ----------------------------------------------------------------------
+Procedure.i DrbgAutoSeed()
+  Protected st.i
+
+  st = drbg_Gather(#DRBG_AUTOSEED_BYTES)
+  If st < 0
+    drbg_GatherWipe()
+    ProcedureReturn st
+  EndIf
+
+  st = DrbgInit(@secDrbgSeed[0], #DRBG_AUTOSEED_BYTES)
+  drbg_GatherWipe()
+  ProcedureReturn st
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  DrbgAutoReseed() - add 32 fresh hardware bytes to a running DRBG.
+;
+;  SP 800-90A section 10.1.2.4. A reseed needs security_strength bits
+;  of entropy input and NO nonce - the nonce exists to make two
+;  instantiations of the same device different, and a reseed is not an
+;  instantiation.
+;
+;  Refuses with #DRBG_ERR_UNSEEDED if there is nothing to reseed, which
+;  is DrbgReseed's own rule and is not weakened here: quietly promoting
+;  a reseed to an instantiate would let a program that never called
+;  DrbgAutoSeed look like it had.
+; ----------------------------------------------------------------------
+Procedure.i DrbgAutoReseed()
+  Protected st.i
+
+  If DrbgSeeded() = 0
+    ProcedureReturn #DRBG_ERR_UNSEEDED
+  EndIf
+
+  st = drbg_Gather(#DRBG_RESEED_BYTES)
+  If st < 0
+    drbg_GatherWipe()
+    ProcedureReturn st
+  EndIf
+
+  st = DrbgReseed(@secDrbgSeed[0], #DRBG_RESEED_BYTES)
+  drbg_GatherWipe()
+  ProcedureReturn st
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  DrbgEntropyStatus() - the entropy provider's own last word.
+;
+;  The value of the LAST entropy call either auto routine made, so a
+;  #DRBG_ERR_ENTROPY can be attributed without a second run:
+;  #ENTROPY_ERR_TIMEOUT means the block never produced,
+;  #ENTROPY_ERR_HEALTH means it condemned its own output, and a
+;  positive number smaller than the byte count means it stopped part
+;  way. 0 before either has run.
+; ----------------------------------------------------------------------
+Procedure.i DrbgEntropyStatus()
+  ProcedureReturn drbgEntStatus
+EndProcedure
