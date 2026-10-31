@@ -3560,3 +3560,56 @@ congestion/flow control, UDP ownership, QPACK and live verified HTTP/3 traffic
 remain, along with remaining TLS/device blocking and compatibility and public
 off-link IPv6/RDNSS web qualification. Retry integrity alone is not a QUIC
 connection or an authenticated web request.
+
+### QUIC transport-parameter validation (2026-10-30)
+
+`Anvil/Network/quic_parameters.pbi` adds bounded parsing and connection-ID
+binding for the v1 transport parameters described in
+[RFC 9000 sections 7.3 and 18.2](https://www.rfc-editor.org/rfc/rfc9000.html#section-18.2).
+It shares the existing checked QUIC integer decoder and contains no driver,
+socket, allocation or cryptographic state. The existing TLS handshake remains
+unchanged; its QUIC extension/CRYPTO integration is still to be implemented.
+
+Zero-initialize `QuicParameters`, then call `QuicParametersBegin` with immutable
+input, peer role and separate caller-owned `QuicParameter` entry storage.
+`QuicParametersStep` handles one parameter per call, returning pending (0),
+complete (1), or a latched negative error. Local resource policy permits at most
+16384 input bytes and 64 parameters, including unknown parameters. Each step
+performs at most 64 duplicate comparisons. Capacity exhaustion is explicit;
+input is not silently truncated. Unknown extensions and legal nonminimal
+integer encodings are accepted, while duplicate IDs are refused. Begin validates
+buffer ranges and overlap before mutation.
+
+Validation covers integer encoding/length, UDP payload minimum, stream-count
+limits, ACK exponent/delay, active connection-ID minimum, connection-ID lengths,
+reset-token length, migration-flag emptiness and preferred-address structure.
+Client-supplied server-only parameters are refused. Required Initial connection
+IDs and the server's original destination ID must be present. A preferred
+address cannot accompany a zero-length Initial source ID. Entries contain raw
+input offsets/lengths and decoded values for known integer fields; absence and
+protocol defaults remain distinguishable for the connection owner.
+
+`QuicParametersFind` exposes no entries while pending, after failure or after
+`QuicParametersCancel`. After completion, `QuicParametersCheckIds` compares the
+received parameters with the IDs actually used in Initial/Retry packets. It
+checks required or forbidden Retry-ID presence as well as byte-for-byte matches.
+Only apply limits after parsing, ID binding and TLS peer authentication all
+succeed. Keep input, job and entry storage alive and unchanged while consuming
+the returned spans. This module alone establishes no TLS identity or connection.
+
+Physical Pi 4 capture 226 under Anvil 485 passed all 64 cases. Independent
+expectations compare full entry IDs, offsets, lengths and numeric values, with
+input preservation, buffer guards, pending/failed lookup refusal, cancellation,
+role checks, malformed lengths, known/unknown duplicates, numeric boundaries,
+preferred-address constraints, Initial/Retry ID mismatches and the 64-entry
+capacity boundary. The largest observed step was 93 us in this fixture, which
+does not change the monitor's cache state; it is not a worst-case guarantee.
+The same shared fixture compiled for Pi 3 without a physical Pi 3 claim. The
+Pi returned normally, cores/fonts/Vulkan healthy and watchdog off. No firmware
+or boot image update was needed.
+
+Evidence: `docs/evidence/anvil-ipv6-20261030/quic-parameters485`.
+TLS extension/CRYPTO integration, frame/stream handling, recovery/congestion/flow
+control, UDP ownership, QPACK and live verified HTTP/3 remain. Remaining TLS
+blocking/compatibility and public off-link IPv6/RDNSS web qualification remain
+open; these parameter tests do not establish any live web-traffic result.
