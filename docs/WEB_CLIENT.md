@@ -4265,3 +4265,80 @@ watchdog off; installed Anvil remains 488. This is TLS-to-buffer integration,
 not a live QUIC handshake. Actual connection/TLS packet scheduling, production
 recovery, RTT/ECN/congestion/flow handling, streams/QPACK and certificate-verified
 HTTP/3 remain open, alongside earlier TLS and public off-link IPv6 qualification.
+
+
+### Live certificate-verified QUIC/TLS interoperability
+
+The physical integration fixture now composes the shared TLS output/receive,
+CRYPTO retention/reassembly, packet protection, ACK history and UDP APIs against
+an independent aioquic 1.7.0 server. It generates fresh connection IDs and X25519
+material from the board's entropy-seeded DRBG. The server uses a disposable
+P-256 certificate chain. The test CA is passed explicitly to the payload; no
+operating-system trust store changes or verification bypasses are used. The
+validity clock is a recent build-host timestamp, not qualification of a public
+clock-bootstrap mechanism. Rebuild for a new test session.
+
+The client checks the peer address and connection IDs, authenticates packets,
+validates ACKs against sent history, and hands accepted CRYPTO bytes to ordinary
+TLS certificate, hostname, CertificateVerify and Finished validation. It checks
+the peer's transport parameters against the observed server Initial source ID
+and original destination ID. ClientHello and client Finished use retained output.
+Initial keys and their sent-history flight accounting are discarded when the
+first Handshake packet is sent. The server independently verifies client Finished
+and records a non-resumed, non-early-data handshake with ALPN h3. The client also
+authenticates a subsequent protected 1-RTT packet.
+
+The first instrumented composition had a 97.011 ms maximum gap between network
+service calls. Connecting the existing P-256 ECDSA and X25519 jobs, with exclusive
+scratch ownership and service calls between arithmetic units, reduced that
+measured gap to 1.477 ms in capture 270. X509 parsing also uses its pause hook.
+The P-256-only verifier belongs to this controlled certificate fixture, not a
+replacement for the wider-curve production verifier. No cryptographic algorithm
+or verification requirement was weakened. The shared crypto and network libraries
+remain target-independent; the test's MMU/entropy composition is explicitly Pi 4.
+
+The largest complete TLS receive call still took 126.594 ms while servicing the
+network internally. This is cooperative service within the call, not a claim
+that its outer API returns in 1.477 ms or that all networking is nonblocking.
+That run's complete fixture time was 1.403 seconds, including transport waits.
+Individual run times are observations, not handshake latency guarantees.
+
+Physical results on unchanged Anvil 488:
+
+- Capture 270: all 12 positive checks; independent server Finished verification.
+- Capture 268: wrong hostname refused with TLS chain-invalid and X509 verdict 56;
+  the peer never completed the handshake. This preceded the arithmetic hooks.
+- Capture 271: a one-bit leaf-signature mutation was rejected with X509 verdict
+  52 through the cooperative verifier; the peer never completed the handshake.
+  The mutated signature was independently rejected before the physical test.
+- Capture 269 supplies the synchronous-verification timing baseline. Capture 267
+  completed the handshake but its original checker incorrectly expected X509
+  success to be zero; the documented success value is 32. The unchanged report
+  passes the corrected oracle. Both original and corrected evidence are retained.
+- Capture 266 stopped before network traffic because the initial harness expected
+  the wrong DRBG success value. Two earlier compile refusals are retained too.
+
+All completed board sequences returned x0=0 and left cores, fonts and Vulkan
+healthy with watchdog off. No monitor image was replaced or reset. Evidence is
+`docs/evidence/anvil-ipv6-20261030/quic-live488`, including peer qlogs, raw reports,
+source/payload identities, public certificates, dependency download hashes,
+and the independently verified host-loopback baseline. Private server keys are
+excluded. Source snapshots distinguish earlier harnesses from the final one.
+
+Reproduction entry points are `tools/quic_tls_live_peer.py` (prepare disposable
+credentials, validate the peer locally, start/stop the independent server) and
+`tools/build_quic_tls_live.py --compiler ... --out ... --public ...`. Negative
+build modes are `--wrong-name` and `--bad-signature`; the latter requires the
+peer's separately prepared invalid-signature chain. Install aioquic 1.7.0 into
+an isolated host dependency directory. The peer and payload use the explicitly
+configured lab addresses and ports; use the normal leased, range-checked RAM
+runner and verify both the board report and the peer result.
+
+This is a real TLS handshake over protected QUIC packets, not an HTTP/3 request.
+The final 1-RTT packet's application frames are not interpreted; HANDSHAKE_DONE,
+application packet-number space/ACK handling, production connection scheduling,
+Retry and recovery timers, RTT/ECN/congestion/flow control, streams/QPACK and a
+certificate-verified HTTP/3 request remain open. Fixture teardown closes its
+UDP socket and stops the disposable peer; it is not a production QUIC close
+state machine. Earlier TLS compatibility/device blocking and public off-link
+IPv6/RDNSS qualification also remain open.

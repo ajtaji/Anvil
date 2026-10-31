@@ -1,0 +1,131 @@
+"""Independent aioquic 1.7.0 peer for the physical TLS/QUIC handshake proof.
+
+No certificate bypass, session key logging, fixed traffic keys or TLS mocking.
+The disposable CA is trusted only by this test, never by the operating system.
+Private keys stay in the caller's work directory, outside published evidence.
+"""
+from pathlib import Path
+import datetime, hashlib, json, socket, threading, time
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.x509.oid import NameOID, ExtendedKeyUsageOID
+from aioquic.buffer import Buffer
+from aioquic.quic.configuration import QuicConfiguration
+from aioquic.quic.connection import QuicConnection
+from aioquic.quic.events import HandshakeCompleted, ConnectionTerminated, ProtocolNegotiated
+from aioquic.quic.logger import QuicLogger
+from aioquic.quic.packet import pull_quic_header, QuicPacketType
+from aioquic.tls import CipherSuite
+
+def prepare(directory):
+    directory.mkdir(parents=True, exist_ok=False)
+    now = datetime.datetime.now(datetime.timezone.utc)
+    root_key = ec.generate_private_key(ec.SECP256R1())
+    root_name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, 'Anvil QUIC test root')])
+    root = (x509.CertificateBuilder().subject_name(root_name).issuer_name(root_name)
+            .public_key(root_key.public_key()).serial_number(x509.random_serial_number())
+            .not_valid_before(now-datetime.timedelta(days=1)).not_valid_after(now+datetime.timedelta(days=7))
+            .add_extension(x509.BasicConstraints(ca=True, path_length=0), True)
+            .add_extension(x509.KeyUsage(False,False,False,False,False,True,True,None,None), True)
+            .sign(root_key, hashes.SHA256()))
+    key = ec.generate_private_key(ec.SECP256R1())
+    leaf = (x509.CertificateBuilder().subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME,'quic-test.local')]))
+            .issuer_name(root_name).public_key(key.public_key()).serial_number(x509.random_serial_number())
+            .not_valid_before(now-datetime.timedelta(days=1)).not_valid_after(now+datetime.timedelta(days=7))
+            .add_extension(x509.BasicConstraints(ca=False, path_length=None), True)
+            .add_extension(x509.SubjectAlternativeName([x509.DNSName('quic-test.local')]), False)
+            .add_extension(x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH]), False)
+            .add_extension(x509.KeyUsage(True,False,False,False,False,False,False,None,None), True)
+            .sign(root_key, hashes.SHA256()))
+    pem = serialization.Encoding.PEM
+    (directory/'root.pem').write_bytes(root.public_bytes(pem))
+    (directory/'chain.pem').write_bytes(leaf.public_bytes(pem)+root.public_bytes(pem))
+    (directory/'key.pem').write_bytes(key.private_bytes(pem,serialization.PrivateFormat.PKCS8,serialization.NoEncryption()))
+    public = dict(unix_time=int(now.timestamp()), hostname='quic-test.local',
+                  root_dn=root_name.public_bytes().hex(),
+                  root_key=root_key.public_key().public_bytes(serialization.Encoding.X962,serialization.PublicFormat.UncompressedPoint).hex(),
+                  root_sha256=root.fingerprint(hashes.SHA256()).hex(),
+                  leaf_sha256=leaf.fingerprint(hashes.SHA256()).hex())
+    (directory/'public.json').write_text(json.dumps(public,indent=2),encoding='utf8')
+    return public
+
+class Peer:
+    def __init__(self, directory, report, host='192.168.1.104', port=55442, allowed='192.168.1.114'):
+        self.directory, self.report, self.allowed = directory, report, allowed
+        self.sock=socket.socket(socket.AF_INET,socket.SOCK_DGRAM)
+        self.sock.bind((host,port)); self.sock.settimeout(.02)
+        self.logger=QuicLogger()
+        self.config=QuicConfiguration(is_client=False,alpn_protocols=['h3'],connection_id_length=8,
+                  cipher_suites=[CipherSuite.AES_128_GCM_SHA256],quic_logger=self.logger,idle_timeout=30)
+        self.config.load_cert_chain(str(directory/'chain.pem'),str(directory/'key.pem'))
+        self.connection=None;self.stop=threading.Event();self.thread=None
+        self.result=dict(implementation='aioquic 1.7.0',received=[],sent=[],events=[],complete=False,error=None)
+
+    def __enter__(self):
+        self.thread=threading.Thread(target=self.run,daemon=True);self.thread.start();return self
+
+    def run(self):
+        try:
+            while not self.stop.is_set():
+                try: data,addr=self.sock.recvfrom(65535)
+                except socket.timeout: data=None
+                now=time.monotonic()
+                if data is not None:
+                    if addr[0]!=self.allowed: continue
+                    self.result['received'].append(dict(bytes=len(data),sha256=hashlib.sha256(data).hexdigest()))
+                    if self.connection is None:
+                        header=pull_quic_header(Buffer(data=data),host_cid_length=8)
+                        assert header.packet_type==QuicPacketType.INITIAL and header.version==1 and len(data)>=1200
+                        self.connection=QuicConnection(configuration=self.config,original_destination_connection_id=header.destination_cid)
+                    self.connection.receive_datagram(data,addr,now)
+                if self.connection:
+                    deadline=self.connection.get_timer()
+                    if deadline is not None and deadline<=now: self.connection.handle_timer(now)
+                    for packet,addr in self.connection.datagrams_to_send(now):
+                        self.sock.sendto(packet,addr)
+                        self.result['sent'].append(dict(bytes=len(packet),sha256=hashlib.sha256(packet).hexdigest()))
+                    while (event:=self.connection.next_event()) is not None:
+                        self.result['events'].append(repr(event))
+                        if isinstance(event,HandshakeCompleted):
+                            assert event.alpn_protocol=='h3' and not event.early_data_accepted and not event.session_resumed
+                            self.result['complete']=True
+                        if isinstance(event,ConnectionTerminated) and event.error_code:
+                            raise AssertionError(repr(event))
+        except Exception as exc:
+            self.result['error']=repr(exc)
+
+    def __exit__(self,*args):
+        self.stop.set();self.thread.join(3);assert not self.thread.is_alive()
+        self.sock.close()
+        self.result['qlog']=self.logger.to_dict()
+        self.report.write_text(json.dumps(self.result,indent=2),encoding='utf8')
+
+    def check(self):
+        assert self.result['error'] is None,self.result['error']
+        assert self.result['complete'],self.result['events']
+
+def selftest(directory, report):
+    """Verify this exact test CA/chain with a normal independent local client."""
+    with Peer(directory,report,host='127.0.0.1',port=0,allowed='127.0.0.1') as peer:
+        config=QuicConfiguration(is_client=True,alpn_protocols=['h3'],server_name='quic-test.local')
+        config.load_verify_locations(cafile=str(directory/'root.pem'))
+        client=QuicConnection(configuration=config)
+        with socket.socket(socket.AF_INET,socket.SOCK_DGRAM) as sock:
+            sock.bind(('127.0.0.1',0));sock.settimeout(.02)
+            client.connect(peer.sock.getsockname(),time.monotonic())
+            end=time.monotonic()+5;complete=False
+            while time.monotonic()<end and not (complete and peer.result['complete']):
+                now=time.monotonic()
+                for data,addr in client.datagrams_to_send(now):sock.sendto(data,addr)
+                try:data,addr=sock.recvfrom(65535)
+                except socket.timeout:data=None
+                now=time.monotonic()
+                if data:client.receive_datagram(data,addr,now)
+                deadline=client.get_timer()
+                if deadline is not None and deadline<=now:client.handle_timer(now)
+                while (event:=client.next_event()) is not None:
+                    if isinstance(event,HandshakeCompleted):complete=True
+                    if isinstance(event,ConnectionTerminated):raise AssertionError(repr(event))
+            assert complete
+            peer.check()
