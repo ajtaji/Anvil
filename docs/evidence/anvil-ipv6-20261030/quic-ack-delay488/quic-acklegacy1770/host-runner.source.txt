@@ -1,0 +1,75 @@
+from pathlib import Path
+import json,hashlib,re
+from run_current_anvil_cpu import WORK,ROOT,lease_row,save_json,br,coretest,require_coretest_healthy
+from board_model_run import command as raw_command
+def command(console,line,seconds):
+ if line in ("version","map","shot status","last run","info","net","font info","vkstat","deadman"):
+  return br.read_only_command_with_recovery(console,line,seconds,preserve_console=True)[1]
+ return raw_command(console,line,seconds)
+import sys
+sys.path.insert(0,str(ROOT/"tools"))
+sys.path.insert(0,str(WORK/'hpack-oracle1091'))
+import udp_service_cpu_check as oracle
+d=WORK/'anvil-ipv6-20261030/quic-acklegacy1770'
+j=json.loads((d/'identity.json').read_text(encoding='utf8'));payload=d/'proof.img.pmf'
+assert hashlib.sha256(payload.read_bytes()).hexdigest()==j['sha256']
+for n,h in j['source_hashes'].items():assert hashlib.sha256((ROOT/n).read_bytes()).hexdigest()==h,n
+out=d/'board488';out.mkdir(exist_ok=False)
+override=False
+c=None;lane='Anvil488 QUIC legacy ACK compatibility CPU';state='QUIC legacy ACK compatibility CPU proof incomplete; inspect journal'
+lease_row(True,state,'QUIC legacy ACK compatibility CPU proof;no input actuation/storage/reset/Bluetooth',lane)
+try:
+ c=br.NetConsole('192.168.1.114');assert c.at_prompt(timeout=60)
+ v=command(c,'version',20);assert 'build 488' in v;save_json(out/'version.json',v)
+ h=coretest(c);require_coretest_healthy(h);save_json(out/'health-before.json',h)
+ save_json(out/'info-before.json',command(c,'info',20))
+ m=command(c,'map',20);save_json(out/'map.json',m)
+ reserved=[tuple(int(x,16) for x in p) for p in re.findall(r'(?mi)^\s*reserved\s+([0-9a-f]+)\s+to\s+([0-9a-f]+)',m)]
+ windows=[tuple(int(x,16) for x in p) for p in re.findall(r'(?mi)^\s*the (?:low|high) window\s+([0-9a-f]+)\s+to\s+([0-9a-f]+)',m)]
+ assert len(reserved)>=8 and len(windows)==2
+ ranges={n:tuple(int(v,16) for v in p) for n,p in j['checked_ranges'].items()}
+ for n,(first,last) in ranges.items():
+  assert any(a<=first<=last<=b for a,b in windows),n
+  assert all(last<a or b<first for a,b in reserved),n
+ save_json(out/'range-validation.json',dict(ranges=ranges,reserved=reserved,windows=windows))
+ save_json(out/'vkstat-before.json',command(c,'vkstat',20))
+ save_json(out/'font-before.json',command(c,'font info',20))
+ c.close();c=None
+ rc=br.main([str(payload),'--console-ip','192.168.1.114','--addr','0x1000000','--deadman','15','--timeout','90','--expect-x0','0','--out',str(out),'--name','record'])
+ rec=json.loads((out/'record.json').read_text(encoding='utf8'))
+ assert rec.get('x0') is not None,'No confirmed return; stop board access and inspect journal'
+ c=br.NetConsole('192.168.1.114');assert c.at_prompt(timeout=60)
+ report,stats=br.read_range(c,0xe1c00000,65536,chunk_bytes=1024,seconds=60,progress=None)
+ (out/'report.bin').write_bytes(report);save_json(out/'readback.json',stats)
+ result=None;error=None
+ try:result=oracle.check(report,j['cases'])
+ except (AssertionError,ValueError) as e:error=str(e)
+ save_json(out/'check.json',dict(passed=error is None and rc==0,result=result,error=error))
+ h=coretest(c);require_coretest_healthy(h);save_json(out/'health-after.json',h)
+ save_json(out/'info-after.json',command(c,'info',20))
+ save_json(out/'network-after.json',command(c,'net',30))
+ vk=command(c,'vkstat',20);save_json(out/'vkstat-after.json',vk)
+ dm=command(c,'deadman',10);save_json(out/'deadman.json',dm);assert 'watchdog is off' in dm
+ fonts=command(c,'font info',20);save_json(out/'font-after.json',fonts)
+ assert 'slot 0: selected, 656568 bytes, generation 1' in fonts
+ for slot in range(1,4):assert f'slot {slot}: empty' in fonts
+ assert 'not the active renderer' not in vk and 'timeouts 0' in vk
+ assert re.search(r'last Vulkan failure: stage 0, console 0, Chrome 0',vk)
+ state='QUIC legacy ACK compatibility CPU proof '+('PASS' if error is None and rc==0 else 'REFUSED')+';no physical input claim;cores/font/Vulkan healthy;deadmanoff'
+ print(state,flush=True)
+ assert error is None and rc==0,(error,rec.get('x0'))
+finally:
+ if c:
+  if override:
+   assert 'Removed net.dns.' in command(c,'settings remove net.dns',30)
+   save_json(out/'dns-restored.json',command(c,'net',30))
+  save_json(out/'transcript.json',c.transcript);c.close()
+ lease_row(False,state,'QUIC legacy ACK compatibility CPU qualification;no input actuation/storage/reset/Bluetooth',lane)
+
+
+
+
+
+
+
+

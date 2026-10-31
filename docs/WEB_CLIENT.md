@@ -5141,3 +5141,50 @@ congestion/flow control, streams/QPACK and real HTTP/3 remain open. Earlier
 negative certificate results remain historical; this change's new negative
 test concerns application authentication. Remaining IPv6/TLS/device work is
 also unfinished.
+
+### Shared application ACK range encoding — 2026-10-31
+
+`Anvil/Network/quic_packet_ack.pbi` provides `QuicPacketAck` and
+`QuicPacketAckInit/Seen/Record/Write/WriteDelay/Sent`. Its level values are0
+(Initial),2 (Handshake), and4 (application packet-number space). Range storage
+is caller-owned, disjoint from the descriptor, and holds1..64 inclusive
+low/high pairs of native integers at16-byte strides. All calls are bounded by
+that capacity. There is no pruning: exhaustion returns a resource refusal.
+
+`WriteDelay(state,dst,capacity,token,delay)` writes an ACK type2 with the supplied
+encoded delay. Delay is the wire integer, already scaled using the advertised
+ACK-delay exponent; this API does not measure time or select an ACK schedule.
+The caller measures intentional delay for the largest acknowledged packet,
+following [RFC 9000 sections13.2.5 and19.3](https://www.rfc-editor.org/rfc/rfc9000.html#section-13.2.5).
+Initial/Handshake spaces reject nonzero delay. `Write` retains the zero-delay
+convenience interface. Invalid delay, insufficient output capacity and aliasing
+refuse before writing output or the demand token.
+
+`Seen` is a read-only duplicate lookup. `Record` is called only after packet
+authentication and successful processing of every frame; it does not itself
+authorize receipt or suppress repeated frame effects. Duplicate eliciting
+packets request another ACK. Non-eliciting receipt does not create demand.
+`Sent` uses the captured demand token so a stale completion cannot clear newer
+demand. The caller owns send/retry timing, packet protection and transport I/O.
+
+The old `QuicHandshakeAck` descriptor retains its field layout and public
+interface as a thin facade over the common implementation. Its initialization
+still accepts only Initial and Handshake. No second range algorithm is copied.
+
+Physical evidence is in
+`docs/evidence/anvil-ipv6-20261030/quic-ack-delay488/`. The new application suite
+passed5,794 checks against an independent packet-number set and wire encoder,
+covering sparse/merged/duplicate ranges, capacity, stale demand completions,
+all four integer widths for ACK delay, boundary values, exact bytes, output
+guards and invalid-delay immutability. The unchanged legacy cases passed5,535
+checks through the compatibility facade. The live encrypted regression passed
+the36 existing checks plus lifecycle/startup/application assertions; the
+independent peer verified Finished/h3 and client 1-RTT PING after the refactor.
+This live regression does not yet send an application ACK.
+
+All three Pi4 runs returned with cores, fonts and Vulkan healthy, watchdog off,
+and resident488 unchanged. The shared composition also compiled using the real
+Pi3 adapter; no Pi3 execution is claimed. Application ACK transmission still
+needs connection-owned receipt tracking and frame effects. Handshake
+confirmation/key retirement, recovery, congestion/flow control, streams/QPACK,
+real HTTP/3 and remaining IPv6/TLS/device work remain open.

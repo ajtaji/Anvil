@@ -6,7 +6,7 @@ from build_quic_handshake_frames_cpu import vi
 
 def build(compiler,out):
  root=Path(__file__).resolve().parents[1];out.mkdir(parents=True,exist_ok=False)
- names=['Anvil/Network/quic_handshake_ack.pbi','Anvil/Network/quic_handshake_frames.pbi','Anvil/Network/quic_crypto_stream.pbi','Anvil/Network/quic_wire.pbi','Anvil/Network/byte_order.pbi','RaspberryPi4/Lib/mmu.pi4']
+ names=['tools/build_quic_handshake_ack_cpu.py','Anvil/Network/quic_packet_ack.pbi','Anvil/Network/quic_handshake_ack.pbi','Anvil/Network/quic_handshake_frames.pbi','Anvil/Network/quic_crypto_stream.pbi','Anvil/Network/quic_wire.pbi','Anvil/Network/byte_order.pbi','RaspberryPi4/Lib/mmu.pi4']
  cases=[];steps=[];received=set();demand=0;pending=0;capacity=64;token=0
  def code(s):steps.append(s)
  def check(name,expr,want):code(f'PokeI($E1C00100+{len(cases)*8},{expr})');cases.append(dict(name=name,expected=want))

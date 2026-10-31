@@ -1,0 +1,315 @@
+; Shared ownership for a QUIC handshake connection and its mutable storage.
+; Compose TLS, quic_tls_operation, packet/key/ACK jobs and parameter parsing.
+; This owns resources/deadline/close, not packet dispatch, recovery or HTTP/3.
+; Caller transfers one open UDP handle on successful Begin. The 20 input spans
+; are exclusive, disjoint and alive until CloseStep returns1. Extra capacity
+; beyond BufferBytes is not owned or wiped. Immutable host/trust inputs remain
+; borrowed. Serialized dispatcher only; no I/O or wait loops are hidden here.
+; Child jobs use only this owner's storage. Start no work once closing begins,
+; and honor the shared worker's crypto exclusion across suspended execution.
+XIncludeFile "Anvil/Core/quic_application_packet.pbi"
+#QUIC_CONNECTION_ARGUMENT=-3511
+#QUIC_CONNECTION_TIMEOUT=-3512
+#QUIC_CONNECTION_STATE=-3513
+#QUIC_CONNECTION_IO=-3514
+#QUIC_CONNECTION_BUFFERS=20
+Structure QuicConnectionSpace
+ level.i
+ largest.i
+ readKeys.QuicKeys
+ writeKeys.QuicKeys
+ rx.QuicCryptoRx
+ tx.QuicCryptoTx
+ ack.QuicHandshakeAck
+ history.QuicHandshakeSent
+ metadata.i
+EndStructure
+Structure QuicConnectionSend
+ phase.i ; 0 fresh,1 scan,2 frame,3 encrypt,4 submit,5 transport,6 done,-1 failed
+ result.i
+ level.i
+ peerBytes.i
+ cursor.i
+ found.i
+ view.QuicCryptoSlice
+ number.i
+ token.i
+ copied.i
+ bytes.i
+ encryptStarted.i
+ cryptoResult.i
+ worker.TlsWorkerJob
+EndStructure
+Structure QuicConnectionAck
+ phase.i ; 0 fresh,1 ledger,2 mark bytes,3 reclaim,4 accept,5 done,-1 failed
+ result.i
+ level.i
+ offset.i
+ remaining.i
+ events.i
+EndStructure
+Structure QuicConnectionReceive
+ phase.i ; 0 fresh,1 admission,2 crypto,3 frames,4 done,6 drop,-1 failed
+ result.i
+ level.i
+ packet.i
+ bytes.i
+ sourceOffset.i
+ sourceBytes.i
+ worker.TlsWorkerJob
+EndStructure
+Structure QuicConnectionTls
+ phase.i ; 0 fresh,1..11 dispatch,12 complete,-1 failed
+ result.i
+ level.i
+ peerBytes.i
+ timeout.i
+ keyTarget.i
+ parametersReady.i
+EndStructure
+Structure QuicConnectionStart
+ phase.i ; 0 fresh,1..8 dispatch,9 complete,-1 failed
+ result.i
+ timeout.i
+ keyTarget.i
+EndStructure
+Structure QuicConnection
+ phase.i ; 0 fresh,1 active,2 closing,3 closed
+ result.i
+ socket.i
+ started.i
+ timeout.i
+ closeStage.i
+ wipeIndex.i
+ wipeOffset.i
+ buffers.i[20]
+ initial.QuicConnectionSpace
+ handshake.QuicConnectionSpace
+ keyjob.QuicKeyJob
+ receive.QuicHandshakeReceive
+ sendJob.QuicPacketJob
+ ackJob.QuicHandshakeSentAck
+ tlsOutput.QuicTlsOutput
+ appRead.QuicKeys
+ appWrite.QuicKeys
+ params.QuicParameters
+ spec.QuicLongPacketSpec
+ header.QuicPacketHeader
+ tlsOp.QuicTlsOperation
+ outgoing.QuicConnectionSend
+ initialRetired.i
+ acknowledge.QuicConnectionAck
+ incoming.QuicConnectionReceive
+ feed.QuicConnectionTls
+ peerIdKnown.i
+ peerIdBytes.i
+ startup.QuicConnectionStart
+ application.QuicApplicationPacket
+EndStructure
+; Span table order: RX data/bits,TX data/bits,ACK ranges,sent slots/metadata,
+; TLS snapshot,handshake/receive/output/config,local/peer parameters/entries,
+; input/output datagrams,original/client/peer connection IDs.
+Procedure.i QuicConnectionBufferBytes(index.i)
+ Select index
+  Case 0 : ProcedureReturn 65536
+  Case 1 : ProcedureReturn 8192
+  Case 2 : ProcedureReturn 8192
+  Case 5 : ProcedureReturn 8192
+  Case 3 : ProcedureReturn 2048
+  Case 4 : ProcedureReturn 2048
+  Case 10 : ProcedureReturn 2048
+  Case 14 : ProcedureReturn 2048
+  Case 6 : ProcedureReturn 4096
+  Case 13 : ProcedureReturn 4096
+  Case 7 : ProcedureReturn #TLS13_CONTEXT_SIZE
+  Case 8 : ProcedureReturn 32768
+  Case 9 : ProcedureReturn 16645
+  Case 11 : ProcedureReturn 48
+  Case 12 : ProcedureReturn 128
+  Case 15 : ProcedureReturn 1472
+  Case 16 : ProcedureReturn 1472
+  Case 17 : ProcedureReturn 8
+  Case 18 : ProcedureReturn 8
+  Case 19 : ProcedureReturn 20
+ EndSelect
+ ProcedureReturn 0
+EndProcedure
+Procedure.i qconn_Span(p.i,n.i)
+ If p<=0 Or n<0 Or p>$7FFFFFFFFFFFFFFF-n : ProcedureReturn 0 : EndIf
+ ProcedureReturn 1
+EndProcedure
+Procedure.i qconn_Overlap(a.i,n.i,b.i,m.i)
+ ProcedureReturn Bool(a<b+m And b<a+n)
+EndProcedure
+Procedure.i QuicConnectionBuffer(*c.QuicConnection,index.i)
+ If qconn_Span(*c,SizeOf(QuicConnection))=0 Or index<0 Or index>=#QUIC_CONNECTION_BUFFERS : ProcedureReturn 0 : EndIf
+ ProcedureReturn PeekI(@*c\buffers+index*8)
+EndProcedure
+Procedure.i qconn_Space(*c.QuicConnection,*s.QuicConnectionSpace,level.i,slot.i)
+ Define rc.i
+ *s\level=level : *s\largest=-1 : *s\metadata=QuicConnectionBuffer(*c,6)+slot*2048
+ rc=QuicCryptoRxInit(@*s\rx,level,QuicConnectionBuffer(*c,0)+slot*32768,32768,QuicConnectionBuffer(*c,1)+slot*4096,4096) : If rc<>0 : ProcedureReturn rc : EndIf
+ rc=QuicCryptoTxInit(@*s\tx,level,QuicConnectionBuffer(*c,2)+slot*4096,4096,QuicConnectionBuffer(*c,3)+slot*1024,1024) : If rc<>0 : ProcedureReturn rc : EndIf
+ rc=QuicHandshakeAckInit(@*s\ack,level,QuicConnectionBuffer(*c,4)+slot*1024,64) : If rc<>0 : ProcedureReturn rc : EndIf
+ ProcedureReturn QuicHandshakeSentInit(@*s\history,level,QuicConnectionBuffer(*c,5)+slot*4096,128)
+EndProcedure
+; spans points to 20 (address,capacity) pairs. All validation precedes mutation.
+; The table is copied, not retained; it must not alias the descriptor or spans.
+; Child initialization failure leaves closing resources, but does not adopt UDP.
+Procedure.i QuicConnectionBegin(*c.QuicConnection,spans.i,socket.i,now.i,timeoutUs.i)
+ Define i.i,j.i,p.i,n.i,other.i,m.i,rc.i
+ If qconn_Span(*c,SizeOf(QuicConnection))=0 Or qconn_Span(spans,320)=0 Or socket<=0 Or now<0 Or timeoutUs<=0 : ProcedureReturn #QUIC_CONNECTION_ARGUMENT : EndIf
+ If *c\phase<>0 And *c\phase<>3 : ProcedureReturn #QUIC_CONNECTION_STATE : EndIf
+ If qconn_Overlap(*c,SizeOf(QuicConnection),spans,320) : ProcedureReturn #QUIC_CONNECTION_ARGUMENT : EndIf
+ For i=0 To 19
+  p=PeekI(spans+i*16) : n=QuicConnectionBufferBytes(i)
+  If PeekI(spans+i*16+8)<n Or qconn_Span(p,n)=0 : ProcedureReturn #QUIC_CONNECTION_ARGUMENT : EndIf
+  If qconn_Overlap(p,n,*c,SizeOf(QuicConnection)) Or qconn_Overlap(p,n,spans,320) : ProcedureReturn #QUIC_CONNECTION_ARGUMENT : EndIf
+  For j=0 To i-1
+   other=PeekI(spans+j*16) : m=QuicConnectionBufferBytes(j)
+   If qconn_Overlap(p,n,other,m) : ProcedureReturn #QUIC_CONNECTION_ARGUMENT : EndIf
+  Next
+ Next
+ For i=0 To SizeOf(QuicConnection)-1 : PokeA(*c+i,0) : Next
+ For i=0 To 19 : PokeI(@*c\buffers+i*8,PeekI(spans+i*16)) : Next
+ *c\phase=1 : *c\started=now : *c\timeout=timeoutUs
+ rc=qconn_Space(*c,@*c\initial,0,0)
+ If rc=0 : rc=qconn_Space(*c,@*c\handshake,2,1) : EndIf
+ If rc<>0 : *c\phase=2 : *c\result=rc : ProcedureReturn rc : EndIf
+ *c\socket=socket
+ ProcedureReturn 0
+EndProcedure
+Procedure.i QuicConnectionClose(*c.QuicConnection,reason.i)
+ If qconn_Span(*c,SizeOf(QuicConnection))=0 : ProcedureReturn #QUIC_CONNECTION_ARGUMENT : EndIf
+ If *c\phase=3 : ProcedureReturn 1 : EndIf
+ If *c\phase=2 : ProcedureReturn 0 : EndIf
+ If *c\phase<>1 : ProcedureReturn #QUIC_CONNECTION_STATE : EndIf
+ *c\phase=2 : *c\result=reason : *c\closeStage=0
+ ProcedureReturn 0
+EndProcedure
+; An overall deadline, independent of each TLS operation's budget. The caller
+; checks this from its dispatcher even when waiting for packets or crypto.
+Procedure.i QuicConnectionCheckDeadline(*c.QuicConnection,now.i)
+ Define rc.i
+ If qconn_Span(*c,SizeOf(QuicConnection))=0 Or now<0 : ProcedureReturn #QUIC_CONNECTION_ARGUMENT : EndIf
+ If *c\phase<>1 : ProcedureReturn #QUIC_CONNECTION_STATE : EndIf
+ If *c\timeout>0 And now-*c\started>=*c\timeout
+  rc=QuicConnectionClose(*c,#QUIC_CONNECTION_TIMEOUT)
+  ProcedureReturn #QUIC_CONNECTION_TIMEOUT
+ EndIf
+ ProcedureReturn 0
+EndProcedure
+; Clear only after the protocol owner has verified handshake confirmation.
+; TLS Finished alone is not QUIC HANDSHAKE_DONE. No such claim is made here.
+Procedure.i QuicConnectionClearDeadline(*c.QuicConnection)
+ If qconn_Span(*c,SizeOf(QuicConnection))=0 : ProcedureReturn #QUIC_CONNECTION_ARGUMENT : EndIf
+ If *c\phase<>1 : ProcedureReturn #QUIC_CONNECTION_STATE : EndIf
+ *c\timeout=0 : ProcedureReturn 0
+EndProcedure
+; CloseStep returns2 until the dispatcher closes exactly this UDP handle.
+; Confirm only a successful real close. I/O failure retains socket ownership.
+Procedure.i QuicConnectionSocketClosed(*c.QuicConnection,socket.i,result.i)
+ If qconn_Span(*c,SizeOf(QuicConnection))=0 : ProcedureReturn #QUIC_CONNECTION_ARGUMENT : EndIf
+ If *c\phase<>2 Or *c\closeStage<>2 Or socket<=0 Or socket<>*c\socket : ProcedureReturn #QUIC_CONNECTION_STATE : EndIf
+ If result<>0 : ProcedureReturn #QUIC_CONNECTION_IO : EndIf
+ *c\socket=0 : ProcedureReturn 0
+EndProcedure
+; 0 pending,1 closed,2 needs UDP close,negative refusal/fault. Never release
+; storage before1. Only owned jobs are cancelled; no global crypto wipe occurs.
+; Buffer erasure is at most4096 bytes/call plus fixed-size descriptor cleanup.
+Procedure.i QuicConnectionCloseStep(*c.QuicConnection)
+ Define rc.i,i.i,n.i,p.i,budget.i,reason.i
+ If qconn_Span(*c,SizeOf(QuicConnection))=0 : ProcedureReturn #QUIC_CONNECTION_ARGUMENT : EndIf
+ If *c\phase=3 : ProcedureReturn 1 : EndIf
+ If *c\phase<>2 : ProcedureReturn #QUIC_CONNECTION_STATE : EndIf
+ ; Another suspended TLS operation retains shared arithmetic scratch. Defer
+ ; cleanup instead of allowing a packet cancellation to reset its GCM job.
+ If TlsWorkerBusy()<>0 And TlsWorkerOwns(@*c\tlsOp\context\worker)=0 And TlsWorkerOwns(@*c\outgoing\worker)=0 And TlsWorkerOwns(@*c\incoming\worker)=0 And TlsWorkerOwns(@*c\application\worker)=0 : ProcedureReturn #TLSWORK_BUSY : EndIf
+ If *c\closeStage=0
+  If *c\application\phase=1
+   rc=QuicApplicationPacketCancel(@*c\application)
+   If rc<>#QUIC_APP_PACKET_CANCELLED : ProcedureReturn rc : EndIf
+  EndIf
+  If *c\tlsOp\phase=1
+   rc=QuicTlsOperationCancel(@*c\tlsOp)
+   If rc<>#QUIC_OP_CANCELLED : ProcedureReturn rc : EndIf
+  EndIf
+  If *c\outgoing\worker\phase=1
+   rc=TlsWorkerCancel(@*c\outgoing\worker)
+   If rc<>1 : ProcedureReturn rc : EndIf
+  EndIf
+  If *c\incoming\worker\phase=1
+   rc=TlsWorkerCancel(@*c\incoming\worker)
+   If rc<>1 : ProcedureReturn rc : EndIf
+  EndIf
+  If *c\ackJob\phase=1 Or *c\ackJob\phase=2
+   rc=QuicHandshakeSentAckCancel(@*c\ackJob)
+   If rc<>#QUIC_SENT_CANCELLED : ProcedureReturn rc : EndIf
+  EndIf
+  If *c\receive\phase=1 Or *c\receive\phase=2
+   rc=QuicHandshakeReceiveCancel(@*c\receive)
+   If rc<>#QUIC_CRYPTO_CANCELLED : ProcedureReturn rc : EndIf
+  EndIf
+  If *c\receive\crypto\phase<>0
+   rc=QuicPacketJobCancel(@*c\receive\crypto)
+   If rc<>#QUIC_CRYPTO_CANCELLED : ProcedureReturn rc : EndIf
+  EndIf
+  If *c\sendJob\phase<>0
+   rc=QuicPacketJobCancel(@*c\sendJob)
+   If rc<>#QUIC_CRYPTO_CANCELLED : ProcedureReturn rc : EndIf
+  EndIf
+  QuicKeyJobCancel(@*c\keyjob)
+  If *c\tlsOutput\phase=1 Or *c\tlsOutput\phase=3
+   rc=QuicTlsOutputAbandon(@*c\tlsOutput) : If rc<>#QUIC_OUTPUT_CANCELLED : ProcedureReturn rc : EndIf
+  EndIf
+  If *c\initial\rx\phase<>0
+   rc=QuicCryptoTlsAbandon(@*c\initial\rx) : If rc<>0 : ProcedureReturn rc : EndIf
+  EndIf
+  If *c\handshake\rx\phase<>0
+   rc=QuicCryptoTlsAbandon(@*c\handshake\rx) : If rc<>0 : ProcedureReturn rc : EndIf
+  EndIf
+  If *c\initial\tx\phase<>0
+   rc=QuicCryptoTxAbandon(@*c\initial\tx) : If rc<>0 : ProcedureReturn rc : EndIf
+  EndIf
+  If *c\handshake\tx\phase<>0
+   rc=QuicCryptoTxAbandon(@*c\handshake\tx) : If rc<>0 : ProcedureReturn rc : EndIf
+  EndIf
+  If *c\initial\history\phase=1
+   rc=QuicHandshakeSentDiscard(@*c\initial\history) : If rc<>0 : ProcedureReturn rc : EndIf
+  EndIf
+  If *c\handshake\history\phase=1
+   rc=QuicHandshakeSentDiscard(@*c\handshake\history) : If rc<>0 : ProcedureReturn rc : EndIf
+  EndIf
+  QuicKeysWipe(@*c\initial\readKeys) : QuicKeysWipe(@*c\initial\writeKeys)
+  QuicKeysWipe(@*c\handshake\readKeys) : QuicKeysWipe(@*c\handshake\writeKeys)
+  QuicKeysWipe(@*c\appRead) : QuicKeysWipe(@*c\appWrite)
+  *c\closeStage=1 : ProcedureReturn 0
+ EndIf
+ If *c\closeStage=1
+  rc=Tls13ContextWipe(QuicConnectionBuffer(*c,7),#TLS13_CONTEXT_SIZE)
+  ; Clear working secrets only if this connection is currently selected.
+  ; Another selected connection's metadata and crypto scratch stay untouched.
+  If TlsHsAddr=QuicConnectionBuffer(*c,8) And TlsRecvAddr=QuicConnectionBuffer(*c,9)
+   rc=Tls13ContextRestore(QuicConnectionBuffer(*c,7),#TLS13_CONTEXT_SIZE)
+  EndIf
+  *c\closeStage=2 : ProcedureReturn 0
+ EndIf
+ If *c\closeStage=2
+  If *c\socket<>0 : ProcedureReturn 2 : EndIf
+  *c\closeStage=3
+ EndIf
+ budget=4096
+ While budget>0 And *c\wipeIndex<20
+  n=QuicConnectionBufferBytes(*c\wipeIndex)-*c\wipeOffset
+  If n>budget : n=budget : EndIf
+  p=QuicConnectionBuffer(*c,*c\wipeIndex)+*c\wipeOffset
+  For i=0 To n-1 : PokeA(p+i,0) : Next
+  *c\wipeOffset=*c\wipeOffset+n : budget=budget-n
+  If *c\wipeOffset=QuicConnectionBufferBytes(*c\wipeIndex) : *c\wipeIndex=*c\wipeIndex+1 : *c\wipeOffset=0 : EndIf
+ Wend
+ If *c\wipeIndex<20 : ProcedureReturn 0 : EndIf
+ reason=*c\result
+ For i=0 To SizeOf(QuicConnection)-1 : PokeA(*c+i,0) : Next
+ *c\phase=3 : *c\result=reason
+ ProcedureReturn 1
+EndProcedure
