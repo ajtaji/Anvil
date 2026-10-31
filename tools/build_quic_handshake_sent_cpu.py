@@ -149,6 +149,7 @@ def build(compiler,out):
   digest=fnv(b''.join(struct.pack('<6q',*row) for row in rows))
   values=[len(rows),sum(r[1] for r in rows),sum(r[5] for r in rows),sum(r[3] for r in rows),sum(r[2] for r in rows),digest]
   check('begin loss scan',f'QuicHandshakeSentLossBegin(@lossJob,@s,{now},{delay},{threshold})',0)
+  check('pending loss cache refused',f'QuicHandshakeSentLossTime(@s,{delay},{threshold})',-3464)
   code(f'rc=RunLoss({stop_after})');check('loss terminal','rc',1 if stop_after and rows else 2)
   for f,v in zip(['events','byteSum','flightSum','cookieSum','timeSum','eventHash'],values):check('loss events '+f,f,v)
   for n in victims:slots[n][0]=(slots[n][0]|32)&~8
@@ -158,6 +159,8 @@ def build(compiler,out):
   else:
    check('loss next deadline','lossJob\\nextTime',min(deadlines,default=0))
    check('loss terminal repeat','QuicHandshakeSentLossStep(@lossJob)',2)
+  want=-1 if stop_after and rows and any(x[0]&8 for x in slots) and newest>=first else (min(deadlines,default=0) if not(stop_after and rows) else 0)
+  check('completed loss deadline',f'QuicHandshakeSentLossTime(@s,{delay},{threshold})',want)
   check('loss unlocked','s\\busy',0);observe('loss ledger')
  init(8,4)
  for _ in range(6):reserve();commit(len(slots)-1)
@@ -199,6 +202,29 @@ def build(compiler,out):
  check('discard clears time','s\\lastEliciting',-1)
  check('discarded query refused','QuicHandshakeSentProbeTime(@s)',-3462)
  init(4,2);observe('reinit resets eligibility')
+
+ # Completed loss deadlines are versioned by mutations and policy.
+ init(4,4);reserve();commit(0,time=100);reserve();commit(1,time=200);ack({1})
+ check('new ACK needs scan','QuicHandshakeSentLossTime(@s,1000,3)',-1)
+ loss_scan(200)
+ check('changed delay needs scan','QuicHandshakeSentLossTime(@s,999,3)',-1)
+ check('changed threshold needs scan','QuicHandshakeSentLossTime(@s,1000,4)',-1)
+ check('query preserves old policy','QuicHandshakeSentLossTime(@s,1000,3)',1100)
+ ack({1});check('duplicate ACK preserves deadline','QuicHandshakeSentLossTime(@s,1000,3)',1100)
+ prepare({0});check('partial ACK query refused','QuicHandshakeSentLossTime(@s,1000,3)',-3464)
+ check('cancel validation no mutation','QuicHandshakeSentAckCancel(@job)',-3467)
+ check('cancelled ACK preserves deadline','QuicHandshakeSentLossTime(@s,1000,3)',1100)
+ check('admit rescan','QuicHandshakeSentLossBegin(@lossJob,@s,200,1000,3)',0)
+ check('cancel rescan','QuicHandshakeSentLossCancel(@lossJob)',-3467)
+ check('cancelled scan is unknown','QuicHandshakeSentLossTime(@s,1000,3)',-1)
+ loss_scan(200);reserve();commit(2,time=300)
+ check('new tail preserves deadline','QuicHandshakeSentLossTime(@s,1000,3)',1100)
+ lost(0);check('explicit loss invalidates','QuicHandshakeSentLossTime(@s,1000,3)',-1)
+ loss_scan(300);check('unACKed tail has no loss deadline','QuicHandshakeSentLossTime(@s,1000,3)',0)
+ ack({0});check('fresh late ACK invalidates','QuicHandshakeSentLossTime(@s,1000,3)',-1)
+ loss_scan(300);ack({2});check('no flight no loss deadline','QuicHandshakeSentLossTime(@s,1000,3)',0)
+ check('invalid deadline delay','QuicHandshakeSentLossTime(@s,0,3)',-3461)
+ check('invalid deadline threshold','QuicHandshakeSentLossTime(@s,1000,2)',-3461)
 
  # Independent arbitrary-precision oracle for path RTT and timer arithmetic.
  import random

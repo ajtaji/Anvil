@@ -26,6 +26,10 @@ Structure QuicHandshakeSent
  inFlight.i
  elicitingInFlight.i
  lastEliciting.i
+ lossKnown.i
+ lossTime.i
+ lossDelay.i
+ lossThreshold.i
 EndStructure
 Structure QuicHandshakeSentAck
  phase.i
@@ -121,6 +125,7 @@ Procedure.i QuicHandshakeSentLost(*s.QuicHandshakeSent,number.i)
  p=*s\entries+(number % *s\capacity)*32 : flags=PeekI(p)
  If (flags&2)=0 : ProcedureReturn #QUIC_SENT_UNSENT : EndIf
  If flags&48 : ProcedureReturn 0 : EndIf
+ *s\lossKnown=0
  If (flags&12)=12 : *s\elicitingInFlight=*s\elicitingInFlight-1 : EndIf
  If flags&8 : *s\inFlight=*s\inFlight-PeekI(p+8) : EndIf
  PokeI(p,(flags|32)&(~8)) : ProcedureReturn 1
@@ -158,6 +163,7 @@ Procedure.i QuicHandshakeSentDiscard(*s.QuicHandshakeSent)
  Define rc.i
  rc=quics_Ready(*s) : If rc<0 : ProcedureReturn rc : EndIf
  If *s\busy<>0 : ProcedureReturn #QUIC_SENT_BUSY : EndIf
+ *s\lossKnown=0 : *s\lossTime=0 : *s\lossDelay=0 : *s\lossThreshold=0
  *s\phase=2 : *s\inFlight=0 : *s\elicitingInFlight=0 : *s\lastEliciting=-1 : ProcedureReturn 0
 EndProcedure
 Procedure.i quics_End(*j.QuicHandshakeSentAck,rc.i)
@@ -243,6 +249,7 @@ Procedure.i QuicHandshakeSentAckStep(*j.QuicHandshakeSentAck)
   If (flags&2)=0 : ProcedureReturn quics_End(*j,#QUIC_SENT_UNSENT) : EndIf
   *j\current=*j\current-1
   If *j\phase=2 And (flags&16)=0
+   *s\lossKnown=0
    *j\number=*j\current+1 : *j\packetBytes=PeekI(p+8) : *j\sentAt=PeekI(p+16)
    *j\cookie=PeekI(p+24) : *j\flags=flags : *j\inFlightBytes=0
    If *j\number=*j\largest : *j\rttLargestNew=1 : *j\rttSentAt=*j\sentAt : EndIf
@@ -294,7 +301,7 @@ Procedure.i QuicHandshakeSentLossBegin(*j.QuicHandshakeSentLoss,*s.QuicHandshake
  For i=0 To SizeOf(QuicHandshakeSentLoss)-1 : PokeA(*j+i,0) : Next
  *j\phase=1 : *j\owner=*s : *j\cursor=*s\first
  *j\now=now : *j\delay=delay : *j\threshold=threshold
- *s\busy=*j : ProcedureReturn 0
+ *s\lossKnown=0 : *s\busy=*j : ProcedureReturn 0
 EndProcedure
 ; 0 more,1 newly lost packet event,2 done. Consume each event before Step.
 ; At most64 slots visited per call; nextTime is valid only at DONE,0 if none.
@@ -310,6 +317,7 @@ Procedure.i QuicHandshakeSentLossStep(*j.QuicHandshakeSentLoss)
  If *s\busy<>*j : ProcedureReturn #QUIC_SENT_STATE : EndIf
  For i=0 To 63
   If *j\cursor>=*s\issued Or *j\cursor>=*s\largestAcked
+   *s\lossTime=*j\nextTime : *s\lossDelay=*j\delay : *s\lossThreshold=*j\threshold : *s\lossKnown=1
    *j\phase=2 : *s\busy=0 : ProcedureReturn 2
   EndIf
   number=*j\cursor : *j\cursor=number+1
@@ -329,6 +337,20 @@ Procedure.i QuicHandshakeSentLossStep(*j.QuicHandshakeSentLoss)
   EndIf
  Next
  ProcedureReturn 0
+EndProcedure
+; Query a completed scan for the CURRENT policy. 0 means no loss deadline,
+; -1 requires a fresh bounded scan; errors are below -1. Busy jobs refuse.
+; ACK-only/padded flight still matters for loss, unlike PTO eligibility.
+; A later accepted packet cannot precede largestAcked, so it preserves a valid
+; scan. Fresh ACKs, explicit loss and admitted new scans invalidate the cache.
+Procedure.i QuicHandshakeSentLossTime(*s.QuicHandshakeSent,delay.i,threshold.i)
+ Define rc.i
+ rc=quics_Ready(*s) : If rc<0 : ProcedureReturn rc : EndIf
+ If delay<1 Or threshold<3 Or threshold>#QUIC_INTEGER_MAX : ProcedureReturn #QUIC_SENT_ARGUMENT : EndIf
+ If *s\busy<>0 : ProcedureReturn #QUIC_SENT_BUSY : EndIf
+ If *s\inFlight=0 Or *s\largestAcked<*s\first : ProcedureReturn 0 : EndIf
+ If *s\lossKnown<>1 Or *s\lossDelay<>delay Or *s\lossThreshold<>threshold : ProcedureReturn -1 : EndIf
+ ProcedureReturn *s\lossTime
 EndProcedure
 ; Cancellation preserves loss events already delivered. Consume/requeue their
 ; frames or close; never roll back loss flags or free borrowed metadata early.
