@@ -1,0 +1,33 @@
+import struct
+from check_autoprobeunits2042 import check as previous
+
+def check(raw,peer):
+ out=previous(raw,peer)
+ read=lambda off:struct.unpack_from('<q',raw,off)[0]
+ assert read(0x940)==1 and read(0x950)>=read(0x948)>0
+ assert read(0x958)==1200 and read(0x960)==2400
+ packets=peer['initial_probe_packets']
+ assert [x['number'] for x in packets]==[0,1]
+ assert packets[0]['payload_sha256']==packets[1]['payload_sha256']
+ assert packets[0]['sha256']!=packets[1]['sha256']
+ assert all(p['bytes']==1200 and p['payload_bytes']>0 for p in packets)
+ received=[e['data'] for t in peer['qlog']['traces'] for e in t['events'] if e['name']=='transport:packet_received' and e['data']['header']['packet_type']=='initial']
+ assert 1 in [int(x['header']['packet_number']) for x in received]
+ assert 0 not in [int(x['header']['packet_number']) for x in received]
+ assert out['handshake_samples'][0][0]==1
+ assert read(0x950)<=out['handshake_samples'][0][2]
+ out['initial_probe_due']=read(0x948);out['initial_probe_fired']=read(0x950)
+ assert read(0x970)==0 and read(0x978)==3,(read(0x970),read(0x978))
+ assert read(0x998)==read(0x990)+1200
+ assert read(0x9a8)==read(0x9a0)+1200
+ all_packets=[e['data'] for t in peer['qlog']['traces'] for e in t['events'] if e['name']=='transport:packet_received']
+ for kind,offset in [('initial',0x980),('handshake',0x988)]:
+  pn=read(offset)
+  matches=[p for p in all_packets if p['header']['packet_type']==kind and int(p['header']['packet_number'])==pn]
+  assert len(matches)==1,(kind,pn,matches)
+  packet=matches[0];frames=[f['frame_type'] for f in packet['frames']]
+  assert frames.count('ping')==1 and 'crypto' not in frames and 'padding' in frames,packet
+  assert packet['raw']['length']==1200,packet
+ out['initial_fallback_pn']=read(0x980);out['handshake_fallback_pn']=read(0x988)
+ assert any(sample[4]==2 for sample in out["handshake_samples"]),out["handshake_samples"]
+ return out

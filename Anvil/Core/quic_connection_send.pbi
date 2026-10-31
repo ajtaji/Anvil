@@ -69,6 +69,14 @@ Procedure.i QuicConnectionSendBegin(*c.QuicConnection,level.i,peerBytes.i)
  *c\outgoing\phase=1 : *c\outgoing\level=level : *c\outgoing\peerBytes=peerBytes : *c\outgoing\cursor=*s\tx\base
  ProcedureReturn 0
 EndProcedure
+; Explicit Initial/Handshake PING probe. Use when recovery has no data to send.
+; Same immutable output, fresh PN, cooperative encryption and acceptance path.
+; The caller chooses timeout/address-validation policy; no hidden I/O or wait.
+Procedure.i QuicConnectionSendProbeBegin(*c.QuicConnection,level.i,peerBytes.i)
+ Define rc.i
+ rc=QuicConnectionSendBegin(*c,level,peerBytes) : If rc<>0 : ProcedureReturn rc : EndIf
+ *c\outgoing\ping=1 : ProcedureReturn 0
+EndProcedure
 ; 0 pending,1 finished/no work,2 immutable datagram ready for submission,
 ; 3 awaiting transport completion,negative terminal failure/refusal.
 ; One bounded scan/frame/copy phase or cooperative crypto slice per call.
@@ -81,6 +89,7 @@ Procedure.i QuicConnectionSendStep(*c.QuicConnection)
  If *c\outgoing\phase=5 : ProcedureReturn 3 : EndIf
  *s=quiccs_Space(*c) : output=QuicConnectionBuffer(*c,16)
  If *c\outgoing\phase=1
+  If *c\outgoing\ping=1 : *c\outgoing\phase=2 : ProcedureReturn 0 : EndIf
   rc=QuicCryptoTxFind(@*s\tx,*c\outgoing\cursor,1024,@*c\outgoing\view)
   If rc<0 : ProcedureReturn quiccs_Fail(*c,rc) : EndIf
   *c\outgoing\found=rc : *c\outgoing\cursor=*c\outgoing\view\offset
@@ -109,6 +118,10 @@ Procedure.i QuicConnectionSendStep(*c.QuicConnection)
    rc=QuicHandshakeAckWrite(@*s\ack,output+n,room,@*c\outgoing\token)
    If rc<0 : ProcedureReturn quiccs_Fail(*c,rc) : EndIf
    n=n+rc : room=room-rc
+  EndIf
+  If *c\outgoing\ping=1
+   If room<1 : ProcedureReturn quiccs_Fail(*c,#QUIC_SEND_OUTPUT) : EndIf
+   PokeA(output+n,1) : n=n+1 : room=room-1
   EndIf
   If *c\outgoing\found=1
    *c\outgoing\copied=*c\outgoing\view\bytes
@@ -147,7 +160,7 @@ Procedure.i QuicConnectionSendAccepted(*c.QuicConnection,bytes.i,now.i)
  If *s\history\capacity<1 Or *c\outgoing\number<*s\history\first Or *c\outgoing\number>=*s\history\issued : ProcedureReturn quiccs_Fail(*c,#QUIC_SEND_STATE) : EndIf
  meta=*s\metadata+(*c\outgoing\number % *s\history\capacity)*16
  PokeI(meta,*c\outgoing\view\offset) : PokeI(meta+8,*c\outgoing\copied)
- rc=QuicHandshakeSentCommit(@*s\history,*c\outgoing\number,bytes,now,Bool(*c\outgoing\copied>0),1,meta)
+ rc=QuicHandshakeSentCommit(@*s\history,*c\outgoing\number,bytes,now,Bool(*c\outgoing\copied>0 Or *c\outgoing\ping=1),1,meta)
  If rc<>0 : ProcedureReturn quiccs_Fail(*c,rc) : EndIf
  If *c\outgoing\copied>0
   rc=QuicCryptoTxSent(@*s\tx,*c\outgoing\view\offset,*c\outgoing\copied)

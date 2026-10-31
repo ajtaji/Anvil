@@ -44,6 +44,7 @@ Structure QuicConnectionSend
  encryptStarted.i
  cryptoResult.i
  worker.TlsWorkerJob
+ ping.i
 EndStructure
 Structure QuicConnectionAck
  phase.i ; 0 fresh,1 ledger,2 mark bytes,3 reclaim,4 accept,5 done,-1 failed

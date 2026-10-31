@@ -15,6 +15,8 @@ Global Dim retryData.a[4096]
 Global Dim retryStates.a[1024]
 Global Dim retrySource.a[600]
 Global Dim retryMeta.i[16]
+Global fallbackFault.i,fallbackMask.i,fallbackInitial.i,fallbackHandshake.i
+Global fallbackInitialBefore.i,fallbackInitialAfter.i,fallbackHandshakeBefore.i,fallbackHandshakeAfter.i
 Global handshakeRttCount.i,datagramReceivedAt.i
 Global Dim handshakeRttTrace.i[80]
 Global lossDispatchChecked.i,lossDispatchAt.i,lossDispatchDone.i
@@ -177,9 +179,9 @@ Procedure.i StartHandshake()
  n=Tls13ContextRestore(@ownerSnapshot[0],#TLS13_CONTEXT_SIZE)
  ProcedureReturn 0
 EndProcedure
-Procedure.i SendSpace(*s.QuicConnectionSpace)
+Procedure.i SendSpaceMode(*s.QuicConnectionSpace,ping.i)
  Define rc.i,n.i,t.i,cost.i,held.i,i.i,number.i,inFlight.i
- rc=QuicConnectionSendBegin(@connection,*s\level,peerBytes)
+ If ping : rc=QuicConnectionSendProbeBegin(@connection,*s\level,peerBytes) : Else : rc=QuicConnectionSendBegin(@connection,*s\level,peerBytes) : EndIf
  If rc<>0 : ProcedureReturn rc : EndIf
  Repeat
   n=Pump() : If n<0 : ProcedureReturn n : EndIf
@@ -220,6 +222,32 @@ Procedure.i SendSpace(*s.QuicConnectionSpace)
   EndIf
   If rc<0 : ProcedureReturn rc : EndIf
  Until rc=1
+ ProcedureReturn 0
+EndProcedure
+Procedure.i SendSpace(*s.QuicConnectionSpace)
+ ProcedureReturn SendSpaceMode(*s,0)
+EndProcedure
+; Direct wire exercise of the fallback path; this does not simulate a PTO.
+Procedure.i SendFallback(*s.QuicConnectionSpace)
+ Define rc.i,n.i,before.i,base.i,tail.i,number.i,flags.i,attempts.i
+ If *s\level=0
+  rc=QuicConnectionProbeBegin(@connection,0,-1) : If rc<>0 : ProcedureReturn rc : EndIf
+  Repeat
+   rc=QuicConnectionProbeStep(@connection) : n=Service() : If n<0 : ProcedureReturn n : EndIf
+   attempts=attempts+1 : If attempts>512 : ProcedureReturn -9501 : EndIf
+  Until rc<>0
+  If rc<>2 : fallbackFault=1 : ProcedureReturn -9502 : EndIf
+ EndIf
+ before=*s\history\inFlight : base=*s\tx\base : tail=*s\tx\tail
+ rc=SendSpaceMode(*s,1) : If rc<>0 : ProcedureReturn rc : EndIf
+ number=connection\outgoing\number : flags=PeekI(*s\history\entries+(number % *s\history\capacity)*32)
+ If connection\outgoing\copied<>0 Or connection\outgoing\bytes<>1200 Or flags<>14 : fallbackFault=2 : EndIf
+ If *s\history\inFlight<>before+1200 Or base<>*s\tx\base Or tail<>*s\tx\tail : fallbackFault=3 : EndIf
+ If *s\level=0
+  fallbackInitial=number : fallbackInitialBefore=before : fallbackInitialAfter=*s\history\inFlight : fallbackMask=fallbackMask|1
+ Else
+  fallbackHandshake=number : fallbackHandshakeBefore=before : fallbackHandshakeAfter=*s\history\inFlight : fallbackMask=fallbackMask|2
+ EndIf
  ProcedureReturn 0
 EndProcedure
 ; Force an otherwise-due poll while a real ledger job holds its lock.
@@ -536,7 +564,14 @@ Procedure.i PacketOne(p.i,bytes.i)
  peerBytes=connection\peerIdBytes
  If connection\peerIdKnown<>1 Or peerBytes<>connection\header\sourceBytes : cidFault=4 : EndIf
  rc=FeedTls(*s) : If rc<>0 : ProcedureReturn rc : EndIf
- ProcedureReturn SendSpace(*s)
+ If #INITIAL_PROBE_TEST And *s\level=2 And (fallbackMask&2)=0 And *s\writeKeys\ready=1
+  rc=SendFallback(*s) : If rc<>0 : ProcedureReturn rc : EndIf
+ EndIf
+ rc=SendSpace(*s) : If rc<>0 : ProcedureReturn rc : EndIf
+ If #INITIAL_PROBE_TEST And *s\level=0 And (fallbackMask&1)=0 And *s\tx\base=*s\tx\tail
+  rc=SendFallback(*s) : If rc<>0 : ProcedureReturn rc : EndIf
+ EndIf
+ ProcedureReturn 0
 EndProcedure
 
 
@@ -1634,6 +1669,10 @@ Procedure.i Main()
  PokeI($E1C005B0,priorityActual) : PokeI($E1C005B8,priorityWanted)
  PokeI($E1C00940,initialProbeChecked) : PokeI($E1C00948,initialProbeDue)
  PokeI($E1C00950,initialProbeFired) : PokeI($E1C00958,initialProbeBefore) : PokeI($E1C00960,initialProbeAfter)
+ PokeI($E1C00970,fallbackFault) : PokeI($E1C00978,fallbackMask)
+ PokeI($E1C00980,fallbackInitial) : PokeI($E1C00988,fallbackHandshake)
+ PokeI($E1C00990,fallbackInitialBefore) : PokeI($E1C00998,fallbackInitialAfter)
+ PokeI($E1C009A0,fallbackHandshakeBefore) : PokeI($E1C009A8,fallbackHandshakeAfter)
  PokeI($E1C00900,retryChecks) : PokeI($E1C00908,retryFault)
  PokeI($E1C00910,retryActual) : PokeI($E1C00918,retryWanted)
  PokeI($E1C00600,handshakeRttCount)
