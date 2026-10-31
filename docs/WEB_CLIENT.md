@@ -4895,3 +4895,51 @@ Connection initialization and the first protected1RTT check remain fixture
 code. Application packet space/frames, HANDSHAKE_DONE, recovery, congestion/
 flow, streams/QPACK and real HTTP/3 remain, along with the earlier IPv6 and
 TLS compatibility/device-blocking work.
+
+
+### Zero-length peer IDs and datagram-tail discard
+
+The receiver now accepts peer source IDs of zero to20 bytes while retaining
+the explicit peer-ID-known flag. Sender admission distinguishes an unknown
+peer (first Initial uses the original DCID) from a learned empty ID (subsequent
+Initial/Handshake packets use a zero-length DCID). Handshake output requires
+a known peer, and supplied lengths must match the learned length. TLS feed
+admission applies the same binding; transport-parameter checks accept the
+authenticated empty source-ID parameter. The local ID remains eight bytes.
+
+The first physical zero-ID trial completed TLS but exposed a fixture error:
+it treated an unparseable datagram tail as a connection failure. The peer's
+1200-byte datagram contained 135-byte Initial and1046-byte Handshake packets,
+plus19 trailing bytes added by its datagram builder. The fixture now discards
+the unparseable remainder while retaining authenticated packet effects, then
+continues receiving. The packet parser itself still reports malformed input;
+no padding is passed off as authenticated frames. The failed trial is not a
+passing qualification.
+
+The independent aioquic1.7.0 peer also needed an explicit test-profile change:
+its zero-ID configuration automatically replenished IDs and emitted invalid
+empty NEW_CONNECTION_ID frames after TLS. The fixture subclass suppresses
+additional ID issuance only when configured for zero-length IDs. Nonzero mode
+delegates unchanged to aioquic; no TLS/certificate/crypto behavior is replaced.
+The local-client self-test now detects pending transport-close errors and runs
+for at least250ms after both sides complete, rather than stopping at Finished.
+Both zero-ID and eight-byte-ID local checks passed this extended test.
+
+Final physical qualification on installed Anvil488 comprises:
+- zero-ID handshake and protected first application packet,36 checks;
+- eight-byte-ID regression handshake,36 checks;
+- zero-ID bad-certificate signature refusal, plus all extra lifecycle checks.
+Independent peers verified Finished/h3 for the positive cases and no TLS
+completion for the signature refusal. Raw reports independently confirm peer
+ID lengths0,8,0. All previous context, cancellation, ID-rejection and ownership
+checks remain enabled. The short packet's frames still are not interpreted;
+this does not claim HANDSHAKE_DONE processing or an HTTP/3 exchange.
+
+Exact final source, peer self-tests, reports and payloads are retained in
+`docs/evidence/anvil-ipv6-20261030/quic-zero-cid488`. The fixture compiled for
+Pi3 with its real timer/RNG adapter; it was not executed there. Final physical
+runs returned with cores/fonts/Vulkan healthy and watchdog off. Installed
+Anvil488 is unchanged. Retry, version negotiation, migration/application CID
+management, shared initialization, application packet processing, recovery,
+congestion/flow, streams/QPACK and real HTTP/3 remain, as do the earlier IPv6
+and TLS compatibility/device-blocking items.

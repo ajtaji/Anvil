@@ -230,7 +230,7 @@ Procedure.i PacketOne(p.i,bytes.i)
  rc=QuicConnectionReceivePacketBegin(@connection,p,connection\header\packetBytes)
  PokeA(p+connection\header\destinationOffset,old)
  If rc<>6 Or connection\peerIdKnown<>known Or connection\peerIdBytes<>count : cidFault=1 : EndIf
- If known<>0
+ If known<>0 And count>0
   old=PeekA(p+connection\header\sourceOffset)
   PokeA(p+connection\header\sourceOffset,old!1)
   rc=QuicConnectionReceivePacketBegin(@connection,p,connection\header\packetBytes)
@@ -292,7 +292,9 @@ Procedure.i Run()
    For i=0 To 15 : If PeekA(@info\peerAddress+i)<>PeekA(@ep\address+i) : ProcedureReturn -9323 : EndIf : Next
    received=received+1 : p=0
    While p<n
-    rc=QuicPacketRead(@connection\header,@packet[p],n-p,8) : If rc<>1 : ProcedureReturn -9324 : EndIf
+    ; An unparseable datagram remainder is discarded, not a connection error.
+    ; Already authenticated coalesced packets retain their effects.
+    rc=QuicPacketRead(@connection\header,@packet[p],n-p,8) : If rc<>1 : Break : EndIf
     packetBytes=connection\header\packetBytes
     rc=PacketOne(@packet[p],packetBytes) : If rc<>0 : ProcedureReturn rc : EndIf
     p=p+packetBytes
@@ -679,6 +681,7 @@ Procedure.i Main()
   rc=handle : closed=-1
  EndIf
  PokeI($E1C00100,rc) : PokeI($E1C00108,tlsState) : PokeI($E1C00110,tlsError)
+ PokeI($E1C00220,peerBytes)
  PokeI($E1C00118,x509Error) : PokeI($E1C00120,paramsReady) : PokeI($E1C00128,appAuthenticated)
  PokeI($E1C00130,initialDiscarded) : PokeI($E1C00138,Bool(certCount>=1)) : PokeI($E1C00140,Bool(ackEvents>0))
  PokeI($E1C00148,closed) : PokeI($E1C00150,GcmJobBusy()) : PokeI($E1C00158,Bool(sent>=2 And received>=1))

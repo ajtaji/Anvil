@@ -68,17 +68,25 @@ def prepare_bad_signature(source, destination):
     (destination/'mutation.json').write_text(json.dumps(dict(valid_leaf_sha256=leaf.fingerprint(hashes.SHA256()).hex(),
         invalid_leaf_sha256=broken.fingerprint(hashes.SHA256()).hex(),signature_independently_rejected=True),indent=2),encoding='utf8')
 
+class FixtureConnection(QuicConnection):
+    def _replenish_connection_ids(self):
+        # aioquic 1.7.0 otherwise emits invalid empty NEW_CONNECTION_ID frames.
+        # Zero-ID fixtures keep their single ID; all TLS/crypto is unchanged.
+        if self._configuration.connection_id_length:
+            super()._replenish_connection_ids()
+
 class Peer:
-    def __init__(self, directory, report, host='192.168.1.104', port=55442, allowed='192.168.1.114'):
+    def __init__(self, directory, report, host='192.168.1.104', port=55442, allowed='192.168.1.114', connection_id_length=8):
+        assert 0 <= connection_id_length <= 20
         self.directory, self.report, self.allowed = directory, report, allowed
         self.sock=socket.socket(socket.AF_INET,socket.SOCK_DGRAM)
         self.sock.bind((host,port)); self.sock.settimeout(.02)
         self.logger=QuicLogger()
-        self.config=QuicConfiguration(is_client=False,alpn_protocols=['h3'],connection_id_length=8,
+        self.config=QuicConfiguration(is_client=False,alpn_protocols=['h3'],connection_id_length=connection_id_length,
                   cipher_suites=[CipherSuite.AES_128_GCM_SHA256],quic_logger=self.logger,idle_timeout=30)
         self.config.load_cert_chain(str(directory/'chain.pem'),str(directory/'key.pem'))
         self.connection=None;self.stop=threading.Event();self.thread=None
-        self.result=dict(implementation='aioquic 1.7.0',received=[],sent=[],events=[],complete=False,error=None)
+        self.result=dict(implementation='aioquic 1.7.0',connection_id_length=connection_id_length,received=[],sent=[],events=[],complete=False,error=None)
 
     def __enter__(self):
         self.thread=threading.Thread(target=self.run,daemon=True);self.thread.start();return self
@@ -95,7 +103,7 @@ class Peer:
                     if self.connection is None:
                         header=pull_quic_header(Buffer(data=data),host_cid_length=8)
                         assert header.packet_type==QuicPacketType.INITIAL and header.version==1 and len(data)>=1200
-                        self.connection=QuicConnection(configuration=self.config,original_destination_connection_id=header.destination_cid)
+                        self.connection=FixtureConnection(configuration=self.config,original_destination_connection_id=header.destination_cid)
                     self.connection.receive_datagram(data,addr,now)
                 if self.connection:
                     deadline=self.connection.get_timer()
@@ -123,27 +131,32 @@ class Peer:
         assert self.result['error'] is None,self.result['error']
         assert self.result['complete'],self.result['events']
 
-def selftest(directory, report):
+def selftest(directory, report, connection_id_length=8):
     """Verify this exact test CA/chain with a normal independent local client."""
-    with Peer(directory,report,host='127.0.0.1',port=0,allowed='127.0.0.1') as peer:
+    with Peer(directory,report,host='127.0.0.1',port=0,allowed='127.0.0.1',connection_id_length=connection_id_length) as peer:
         config=QuicConfiguration(is_client=True,alpn_protocols=['h3'],server_name='quic-test.local')
         config.load_verify_locations(cafile=str(directory/'root.pem'))
         client=QuicConnection(configuration=config)
         with socket.socket(socket.AF_INET,socket.SOCK_DGRAM) as sock:
             sock.bind(('127.0.0.1',0));sock.settimeout(.02)
             client.connect(peer.sock.getsockname(),time.monotonic())
-            end=time.monotonic()+5;complete=False
-            while time.monotonic()<end and not (complete and peer.result['complete']):
+            end=time.monotonic()+5;complete=False;completed_at=None
+            while time.monotonic()<end:
                 now=time.monotonic()
                 for data,addr in client.datagrams_to_send(now):sock.sendto(data,addr)
                 try:data,addr=sock.recvfrom(65535)
                 except socket.timeout:data=None
                 now=time.monotonic()
                 if data:client.receive_datagram(data,addr,now)
+                assert client._close_event is None,client._close_event
                 deadline=client.get_timer()
                 if deadline is not None and deadline<=now:client.handle_timer(now)
                 while (event:=client.next_event()) is not None:
                     if isinstance(event,HandshakeCompleted):complete=True
                     if isinstance(event,ConnectionTerminated):raise AssertionError(repr(event))
+                if complete and peer.result['complete']:
+                    if completed_at is None:completed_at=now
+                    if now-completed_at>=.25:break
             assert complete
+            assert completed_at is not None and time.monotonic()-completed_at>=.25
             peer.check()

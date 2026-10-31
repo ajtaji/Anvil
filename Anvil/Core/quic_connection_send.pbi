@@ -36,7 +36,7 @@ Procedure.i quiccs_Encrypt()
  ProcedureReturn 1
 EndProcedure
 ; Begin returns0 admitted, negative refusal without changing pending output.
-; peerBytes0 selects original DCID for the first Initial. Handshake needs a
+; An unknown peer selects original DCID for the first Initial. Handshake needs a
 ; previously authenticated peer CID. Both IDs use the owner's fixed buffers.
 Procedure.i QuicConnectionSendBegin(*c.QuicConnection,level.i,peerBytes.i)
  Define i.i,*s.QuicConnectionSpace
@@ -45,7 +45,12 @@ Procedure.i QuicConnectionSendBegin(*c.QuicConnection,level.i,peerBytes.i)
  If *c\acknowledge\phase>=1 And *c\acknowledge\phase<=4 : ProcedureReturn #QUIC_SENT_BUSY : EndIf
  If *c\incoming\phase>=1 And *c\incoming\phase<=3 : ProcedureReturn #QUIC_SEND_STATE : EndIf
  If *c\feed\phase>=1 And *c\feed\phase<=11 : ProcedureReturn #QUIC_SEND_STATE : EndIf
- If (level<>0 And level<>2) Or peerBytes<0 Or peerBytes>20 Or (level=2 And peerBytes=0) : ProcedureReturn #QUIC_SEND_ARGUMENT : EndIf
+ If (level<>0 And level<>2) Or peerBytes<0 Or peerBytes>20 : ProcedureReturn #QUIC_SEND_ARGUMENT : EndIf
+ If *c\peerIdKnown=0
+  If peerBytes<>0 Or level=2 : ProcedureReturn #QUIC_SEND_ARGUMENT : EndIf
+ ElseIf peerBytes<>*c\peerIdBytes
+  ProcedureReturn #QUIC_SEND_ARGUMENT
+ EndIf
  If TlsWorkerBusy()<>0 : ProcedureReturn #TLSWORK_BUSY : EndIf
  If level=0
   If *c\initialRetired<>0 : ProcedureReturn #QUIC_SEND_STATE : EndIf
@@ -82,7 +87,7 @@ Procedure.i QuicConnectionSendStep(*c.QuicConnection)
   If rc<0 : ProcedureReturn quiccs_Fail(*c,rc) : EndIf
   *c\outgoing\number=rc
   *c\spec\kind=*s\level : *c\spec\source=QuicConnectionBuffer(*c,18) : *c\spec\sourceBytes=8
-  If *c\outgoing\peerBytes=0
+  If *c\peerIdKnown=0
    *c\spec\destination=QuicConnectionBuffer(*c,17) : *c\spec\destinationBytes=8
   Else
    *c\spec\destination=QuicConnectionBuffer(*c,19) : *c\spec\destinationBytes=*c\outgoing\peerBytes

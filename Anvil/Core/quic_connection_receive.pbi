@@ -1,6 +1,6 @@
 ; Cooperative Initial/Handshake receive for the shared connection owner.
 ; The owned input datagram remains retained through completion. Handshake CID
-; policy currently uses an eight-byte local ID and a nonempty peer source ID.
+; policy uses an eight-byte local ID and a peer source ID of zero to20 bytes.
 ; No I/O or TLS feed here. ACK events stay borrowed until AckStep accepts them.
 #QUIC_RECEIVE_STATE=-3541
 #QUIC_RECEIVE_ARGUMENT=-3542
@@ -49,7 +49,7 @@ Procedure.i QuicConnectionReceiveBegin(*c.QuicConnection,level.i,packet.i,bytes.
  If *s\readKeys\ready<>1 : ProcedureReturn #QUIC_RECEIVE_STATE : EndIf
  rc=QuicPacketRead(@h,packet,bytes,8)
  If rc<>1 : ProcedureReturn 6 : EndIf
- If h\version<>1 Or h\kind<>level Or h\destinationBytes<>8 Or h\sourceBytes<1 Or h\sourceBytes>20 : ProcedureReturn 6 : EndIf
+ If h\version<>1 Or h\kind<>level Or h\destinationBytes<>8 Or h\sourceBytes<0 Or h\sourceBytes>20 : ProcedureReturn 6 : EndIf
  p=QuicConnectionBuffer(*c,18)
  For i=0 To 7 : If PeekA(packet+h\destinationOffset+i)<>PeekA(p+i) : ProcedureReturn 6 : EndIf : Next
  If *c\peerIdKnown<>0
