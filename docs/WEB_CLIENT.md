@@ -4463,3 +4463,48 @@ production connection lifecycle, application packet/ACK processing,
 HANDSHAKE_DONE/key retirement, recovery, congestion/flow control, streams/QPACK
 and real HTTP/3 requests remain. Earlier TLS/device blocking and public
 off-link IPv6/RDNSS limitations also remain open.
+
+
+### Preserve foreground TLS state around cooperative connection slices
+
+`Anvil/Core/tls_context_worker.pbi` adds an explicit TLS snapshot adapter over
+the shared arithmetic worker. `TlsContextWorkerBegin` binds a caller-owned
+descriptor to an initialized TLS snapshot without selecting it. Each Step saves
+the foreground TLS state, restores the operation's connection, runs one worker
+slice, saves the connection and restores the foreground state. Its temporary
+foreground snapshot is wiped before return. The same crypto owner remains
+exclusive across suspension; saving metadata does not permit competing crypto.
+
+Wrong-owner requests and overlapping descriptor/snapshot storage are refused.
+Storage is checked again before Step/Cancel. The descriptor, snapshot and all
+referenced buffers must remain alive and exclusive; snapshot storage must not
+alias TLS working storage or referenced connection buffers. Cancellation first
+stops/reaps the worker, then wipes only that connection's snapshot. The caller
+must abandon/close the affected transport after a partially executed operation.
+This adapter does not implement connection deadlines, transport rollback, QUIC
+stream poisoning or a complete production connection lifecycle.
+
+Capture 279 on Anvil 488 passed all 17 live QUIC checks, and the independent
+server confirmed client Finished and h3 negotiation. Before every slice the
+fixture selected deliberately different foreground TLS metadata. Complete
+2,928-byte snapshots matched after every return, and the temporary foreground
+copy was zero. A suspended key-share operation was cancelled; its snapshot was
+wiped, the foreground was unchanged, and a fresh operation completed normally.
+Overlapping-storage and competing-context begin/step/cancel requests were also
+refused without changing the rejected descriptor. This is one live connection
+with deliberately distinct foreground metadata, not two simultaneous servers.
+
+There were 258 measured worker calls and 260 complete context checks, including
+the preliminary cancellation. Maximum Step time including save/restore was
+1.761 ms; maximum network-service gap was 1.911 ms, service time was 244 us and
+total fixture time was 1.403775 seconds. These are observations, not hard
+real-time guarantees. Capture 280 rejected the corrupted certificate signature;
+the peer did not complete TLS, and ownership/context/wiping checks also passed.
+
+Exact sources, payloads, reports and peer results are published under
+`docs/evidence/anvil-ipv6-20261030/context-worker488`. The full Anvil 491 build
+succeeded and is retained as an uninstalled candidate. The snapshot adapter is
+currently exercised by the RAM QUIC integration fixture; no resident QUIC API
+is claimed. The Pi remains on Anvil 488 with healthy cores, fonts and Vulkan and
+watchdog off. Production operation/lifecycle integration, application packet
+processing and the previously listed HTTP/3, IPv6 and TLS gaps remain open.

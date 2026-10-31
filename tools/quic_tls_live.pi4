@@ -25,7 +25,13 @@ Global ep.UdpEndpoint,info.UdpDatagramInfo,status.UdpSocketStatus
 Global peerBytes.i,hsReady.i,paramsReady.i,initialDiscarded.i
 Global received.i,sent.i,ackEvents.i,appAuthenticated.i,stage.i
 Global lastPump.i,maxPumpGap.i,maxTlsStep.i
-Global liveJob.TlsWorkerJob,otherJob.TlsWorkerJob
+Global liveJob.TlsContextWorkerJob,otherJob.TlsWorkerJob
+Global refusedJob.TlsContextWorkerJob
+Global contextFault.i,contextChecks.i,cancelChecked.i
+Global Dim ownerSnapshot.a[#TLS13_CONTEXT_SIZE]
+Global Dim retrySnapshot.a[#TLS13_CONTEXT_SIZE]
+Global Dim beforeSnapshot.a[#TLS13_CONTEXT_SIZE]
+Global Dim afterSnapshot.a[#TLS13_CONTEXT_SIZE]
 Global liveOperation.i,liveSpace.i
 Global liveResult.i,workerSteps.i,maxWorkerStep.i,ownershipChecks.i,ownershipFault.i
 Procedure.i HooksClear()
@@ -308,19 +314,60 @@ Procedure.i LiveEntry()
  EndSelect
  ProcedureReturn 1
 EndProcedure
+; Compare complete snapshots, not just a few state flags. The foreground
+; deliberately selects unrelated metadata while the real connection is paused.
+Procedure ForeignContext()
+ Tls13State=901 : Tls13Err=902 : TlsNameLen=42 : TlsQuicConfig=0
+ TlsClientRandom[0]=167 : TlsSessionId[0]=89 : TlsGroup=903
+EndProcedure
+Procedure CheckContext()
+ Define i.i,n.i
+ n=Tls13ContextSave(@afterSnapshot[0],#TLS13_CONTEXT_SIZE)
+ For i=0 To #TLS13_CONTEXT_SIZE-1
+  If beforeSnapshot[i]<>afterSnapshot[i] : contextFault=1 : EndIf
+  ; White-box check: the temporary foreground secret snapshot is wiped.
+  If PeekA(@tlsctxw_caller[0]+i)<>0 : contextFault=2 : EndIf
+ Next
+ contextChecks=contextChecks+1
+EndProcedure
 Procedure.i DoTls(operation.i,space.i)
- Define rc.i,t.i,cost.i
+ Define rc.i,t.i,cost.i,n.i,i.i
  liveOperation=operation : liveSpace=space
  otherJob\result=773
- rc=TlsWorkerBegin(@liveJob,@LiveEntry,0)
+ refusedJob\snapshot=771 : refusedJob\capacity=772 : refusedJob\worker\result=773
+ n=Tls13ContextSave(@ownerSnapshot[0],#TLS13_CONTEXT_SIZE)
+ If TlsContextWorkerBegin(@refusedJob,@refusedJob,#TLS13_CONTEXT_SIZE,@LiveEntry,0)<>#TLSWORK_STATE : contextFault=5 : EndIf
+ If operation=1 And cancelChecked=0
+  For i=0 To #TLS13_CONTEXT_SIZE-1 : retrySnapshot[i]=ownerSnapshot[i] : Next
+  rc=TlsContextWorkerBegin(@liveJob,@ownerSnapshot[0],#TLS13_CONTEXT_SIZE,@LiveEntry,0)
+  If rc<>1 : ProcedureReturn rc : EndIf
+  ForeignContext() : n=Tls13ContextSave(@beforeSnapshot[0],#TLS13_CONTEXT_SIZE)
+  rc=TlsContextWorkerStep(@liveJob) : CheckContext()
+  If rc<>0 : contextFault=3 : ProcedureReturn -9326 : EndIf
+  rc=TlsContextWorkerCancel(@liveJob) : CheckContext()
+  If rc<>1 : ProcedureReturn rc : EndIf
+  For i=0 To #TLS13_CONTEXT_SIZE-1
+   If ownerSnapshot[i]<>0 : contextFault=4 : EndIf
+   ownerSnapshot[i]=retrySnapshot[i]
+  Next
+  n=Tls13ContextRestore(@ownerSnapshot[0],#TLS13_CONTEXT_SIZE)
+  n=Tls13ContextWipe(@retrySnapshot[0],#TLS13_CONTEXT_SIZE)
+  cancelChecked=1
+ EndIf
+ rc=TlsContextWorkerBegin(@liveJob,@ownerSnapshot[0],#TLS13_CONTEXT_SIZE,@LiveEntry,0)
  If rc<>1 : ProcedureReturn rc : EndIf
  Repeat
   If TlsWorkerBegin(@otherJob,@LiveEntry,0)<>#TLSWORK_BUSY : ownershipFault=1 : EndIf
   If TlsWorkerStep(@otherJob)<>#TLSWORK_OWNER Or TlsWorkerCancel(@otherJob)<>#TLSWORK_OWNER : ownershipFault=2 : EndIf
   If otherJob\task<>0 Or otherJob\phase<>0 Or otherJob\result<>773 : ownershipFault=3 : EndIf
   If HooksClear()<>1 Or TlsWorkerBusy()<>1 : ownershipFault=4 : EndIf
+  If TlsContextWorkerBegin(@refusedJob,@ownerSnapshot[0],#TLS13_CONTEXT_SIZE,@LiveEntry,0)<>#TLSWORK_BUSY : contextFault=6 : EndIf
+  If TlsContextWorkerStep(@refusedJob)<>#TLSWORK_OWNER Or TlsContextWorkerCancel(@refusedJob)<>#TLSWORK_OWNER : contextFault=7 : EndIf
+  If refusedJob\snapshot<>771 Or refusedJob\capacity<>772 Or refusedJob\worker\result<>773 Or refusedJob\worker\task<>0 : contextFault=8 : EndIf
   ownershipChecks=ownershipChecks+1
-  t=HwMicros() : rc=TlsWorkerStep(@liveJob) : cost=HwMicros()-t
+  ForeignContext() : n=Tls13ContextSave(@beforeSnapshot[0],#TLS13_CONTEXT_SIZE)
+  t=HwMicros() : rc=TlsContextWorkerStep(@liveJob) : cost=HwMicros()-t
+  CheckContext()
   If cost>maxWorkerStep : maxWorkerStep=cost : EndIf
   workerSteps=workerSteps+1
   If HooksClear()<>1 : ownershipFault=5 : EndIf
@@ -328,8 +375,11 @@ Procedure.i DoTls(operation.i,space.i)
   ; Foreground network service executes after the context has actually yielded.
   rc=Service() : If rc<0 : Break : EndIf
  ForEver
- If rc=1 : ProcedureReturn liveResult : EndIf
- If liveJob\task<>0 : TlsWorkerCancel(@liveJob) : EndIf
+ If rc=1
+  n=Tls13ContextRestore(@ownerSnapshot[0],#TLS13_CONTEXT_SIZE)
+  ProcedureReturn liveResult
+ EndIf
+ If liveJob\worker\task<>0 : TlsContextWorkerCancel(@liveJob) : EndIf
  ProcedureReturn rc
 EndProcedure
 Procedure.i Main()
@@ -360,6 +410,10 @@ Procedure.i Main()
  PokeI($E1C00088,maxWorkerStep) : PokeI($E1C00090,workerSteps) : PokeI($E1C00098,ownershipChecks)
  PokeI($E1C00160,ownershipFault) : PokeI($E1C00168,Bool(workerSteps>1 And ownershipChecks=workerSteps))
  PokeI($E1C00170,Bool(TlsWorkerBusy()=0 And TlsWorkerFaulted()=0 And HooksClear()=1 And unexpectedProfile=0))
+ PokeI($E1C00178,contextFault) : PokeI($E1C00180,cancelChecked) : PokeI($E1C000A0,contextChecks)
+ cleanup=Tls13ContextWipe(@ownerSnapshot[0],#TLS13_CONTEXT_SIZE)
+ cleanup=Tls13ContextWipe(@beforeSnapshot[0],#TLS13_CONTEXT_SIZE)
+ cleanup=Tls13ContextWipe(@afterSnapshot[0],#TLS13_CONTEXT_SIZE)
  QuicKeysWipe(@initial\readKeys) : QuicKeysWipe(@initial\writeKeys)
  QuicKeysWipe(@handshake\readKeys) : QuicKeysWipe(@handshake\writeKeys) : QuicKeysWipe(@appRead)
  Tls13PauseHook=0 : Tls13SetupPauseHook=0 : QuicCipherInvalidateHook=0

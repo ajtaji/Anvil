@@ -192,6 +192,9 @@ EndProcedure
 Procedure.i TlsWorkerBusy()
  ProcedureReturn Bool(tlsjob_active<>0)
 EndProcedure
+Procedure.i TlsWorkerOwns(*job.TlsWorkerJob)
+ ProcedureReturn Bool(*job<>0 And tlsjob_active=*job)
+EndProcedure
 Procedure.i TlsWorkerFaulted()
  ProcedureReturn tlsjob_fault
 EndProcedure
