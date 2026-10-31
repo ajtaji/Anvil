@@ -1,0 +1,12 @@
+# Connection probe rearming proof
+
+
+### Connection probe rearming (2026-10-31)
+
+`QuicConnectionRecoveryRearm(c,resetBackoff)` now selects eligible owned packet-number spaces with usable write keys. Confirmed application traffic uses the validated peer max_ack_delay, converted from milliseconds to microseconds; absent values default to 25ms. It computes into a temporary timer and publishes only after successful admission. Locked ledgers and closing connections refuse rearming. The reset argument is a dispatcher policy input for fresh validated ACKs or packet-space retirement, not proof of an authenticated packet by itself.
+
+Shared Initial/Handshake and application control send acceptance rearm the timer automatically. Completed handshake ACK processing rearms it, resetting backoff for fresh Handshake ACKs (or confirmation). Initial and Handshake key retirement reset and reselect the timer. Completion of an owned loss scan rearms/disarms it from remaining eligible flight. The live application ACK dispatcher explicitly calls the same helper after RTT sampling, with freshness computed from the ledger ACK count. The fixture no longer manually arms the timer before its missing-packet wait or after completing loss processing.
+
+Physical resident488 Pi 4 cases with eight-byte and zero-byte peer IDs passed, captures360/361. Independent trace checking verifies that accepting probe PN2 rearms at its send time plus twice the previous PTO, then ACK2 resets/recomputes the deadline from the updated RTT. Idle loss completion disarms; a pending owned loss scan refuses rearming, and close cancellation remains verified. Both cases also passed primary/extended/peer authentication, loss, ownership and healthy core/font/Vulkan/watchdog-off checks. BCM2837 compiled with its real adapter, not executed. No resident image update or reset. Evidence: `docs/evidence/anvil-ipv6-20261030/quic-rearm488/`.
+
+This is normal PTO integration, not a complete recovery controller. Application ACK dispatch and RTT sampling remain caller-driven; handshake RTT integration, time-threshold loss timer priority, no-flight client address-validation probes, repeated wire-loss handling, reliable frame requeue/reclamation, congestion/flow control and HTTP/3 request streams remain open. Off-link IPv6 and remaining TLS/device blocking are also unfinished. Captures show monitor launch state; record.json establishes the current return, not the older LASTRUN text in screenshots.

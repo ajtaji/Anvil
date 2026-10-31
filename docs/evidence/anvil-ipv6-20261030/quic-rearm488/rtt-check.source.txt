@@ -1,0 +1,14 @@
+import struct
+from check_pto_trace1897 import check as previous
+
+def check(raw,peer):
+ out=previous(raw,peer)
+ value=lambda off:struct.unpack_from('<q',raw,off)[0]
+ assert value(0x540)==0 and value(0x548)==2
+ sent=out['samples'][1][2]
+ first_pto=out['timer_due']-out['timer_base']
+ assert value(0x550)==sent+2*first_pto,(value(0x550),sent,first_pto)
+ assert value(0x558)==sent+out['pto'],(value(0x558),sent,out['pto'])
+ out['probe_rearm_due']=value(0x550)
+ out['ack_rearm_due']=value(0x558)
+ return out

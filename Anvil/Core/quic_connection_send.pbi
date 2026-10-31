@@ -151,6 +151,7 @@ Procedure.i QuicConnectionSendAccepted(*c.QuicConnection,bytes.i,now.i)
   rc=QuicCryptoTxSent(@*s\tx,*c\outgoing\view\offset,*c\outgoing\copied)
   If rc<>0 : ProcedureReturn quiccs_Fail(*c,rc) : EndIf
  EndIf
+ rc=QuicConnectionRecoveryRearm(*c,0) : If rc<0 : ProcedureReturn quiccs_Fail(*c,rc) : EndIf
  *c\outgoing\phase=5 : ProcedureReturn 0
 EndProcedure
 ; result0 means the accepted datagram actually completed transmission. A
@@ -171,6 +172,7 @@ Procedure.i QuicConnectionSendCompleted(*c.QuicConnection,result.i)
   rc=QuicHandshakeSentDiscard(@*c\initial\history)
   If rc<>0 : ProcedureReturn quiccs_Fail(*c,rc) : EndIf
   *c\initialRetired=1
+  rc=QuicConnectionRecoveryRearm(*c,1) : If rc<0 : ProcedureReturn quiccs_Fail(*c,rc) : EndIf
  EndIf
  *c\outgoing\phase=6 : ProcedureReturn 1
 EndProcedure

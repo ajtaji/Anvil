@@ -2,7 +2,7 @@
 ; Include quic_connection first. Caller drives transport and serializes all
 ; application crypto against this operation, including raw application APIs.
 ; Uses owned output buffer16; bytes are immutable from Step=2 through Completed.
-; No I/O, ACK scheduling, recovery timer or congestion policy is hidden here.
+; Accepted output rearms owned PTO; no I/O, ACK scheduling or congestion policy.
 #QUIC_CONTROL_ARGUMENT=-3611
 #QUIC_CONTROL_STATE=-3612
 Procedure.i quicco_Span(p.i,n.i)
@@ -73,6 +73,7 @@ Procedure.i QuicConnectionControlAccepted(*c.QuicConnection,now.i)
  If *c\phase<>1 Or *c\controlPhase<>2 : ProcedureReturn #QUIC_CONTROL_STATE : EndIf
  rc=QuicHandshakeSentCommit(@*c\applicationHistory,*c\controlNumber,*c\controlBytes,now,*c\controlEliciting,0,0)
  If rc<>0 : ProcedureReturn quicco_Fail(*c,rc) : EndIf
+ rc=QuicConnectionRecoveryRearm(*c,0) : If rc<0 : ProcedureReturn quicco_Fail(*c,rc) : EndIf
  *c\controlPhase=3 : ProcedureReturn 0
 EndProcedure
 ; result=0 means actual successful transmission, not mere queue acceptance.

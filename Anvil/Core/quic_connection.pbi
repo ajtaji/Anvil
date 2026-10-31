@@ -203,6 +203,38 @@ Procedure.i QuicConnectionBegin(*c.QuicConnection,spans.i,socket.i,now.i,timeout
 EndProcedure
 ; Connection-owned recovery operations. Caller still supplies scheduling policy
 ; and consumes each loss event before Step. Recovery cannot run during close.
+; Rearm normal PTO from owned, usable spaces. resetBackoff is supplied only
+; after fresh validated ACKs or packet-space retirement. No-flight client
+; anti-deadlock policy and time-threshold loss priority remain dispatch duties.
+; Refusals preserve the old timer, including its backoff. All clocks are us.
+Procedure.i QuicConnectionRecoveryRearm(*c.QuicConnection,resetBackoff.i)
+ Define initial.i,handshake.i,application.i,delay.i,rc.i,i.i,*parameter.QuicParameter
+ Define candidate.QuicProbeTimer
+ If qconn_Span(*c,SizeOf(QuicConnection))=0 Or resetBackoff<0 Or resetBackoff>1 : ProcedureReturn #QUIC_CONNECTION_ARGUMENT : EndIf
+ If *c\phase<>1 : ProcedureReturn #QUIC_CONNECTION_STATE : EndIf
+ initial=-1 : handshake=-1 : application=-1 : delay=25000
+ If *c\initial\history\phase=1 And *c\initial\writeKeys\ready=1
+  initial=QuicHandshakeSentProbeTime(@*c\initial\history) : If initial< -1 : ProcedureReturn initial : EndIf
+ EndIf
+ If *c\handshake\history\phase=1 And *c\handshake\writeKeys\ready=1
+  handshake=QuicHandshakeSentProbeTime(@*c\handshake\history) : If handshake< -1 : ProcedureReturn handshake : EndIf
+ EndIf
+ If *c\handshakeConfirmed=1 And *c\appWrite\ready=1
+  application=QuicHandshakeSentProbeTime(@*c\applicationHistory) : If application< -1 : ProcedureReturn application : EndIf
+  If *c\feed\parametersReady<>1 Or *c\params\phase<>0 Or *c\params\result<>1 : ProcedureReturn #QUIC_CONNECTION_STATE : EndIf
+  *parameter=QuicParametersFind(@*c\params,11)
+  If *parameter
+   If *parameter\value<0 Or *parameter\value>=16384 : ProcedureReturn #QUIC_CONNECTION_STATE : EndIf
+   delay=*parameter\value*1000
+  EndIf
+ EndIf
+ For i=0 To SizeOf(QuicProbeTimer)-1 : PokeA(@candidate+i,PeekA(@*c\recoveryTimer+i)) : Next
+ If resetBackoff : candidate\backoff=0 : EndIf
+ rc=QuicProbeTimerArm(@candidate,@*c\recoveryRtt,*c\handshakeConfirmed,delay,initial,handshake,application)
+ If rc<0 : ProcedureReturn rc : EndIf
+ For i=0 To SizeOf(QuicProbeTimer)-1 : PokeA(@*c\recoveryTimer+i,PeekA(@candidate+i)) : Next
+ ProcedureReturn rc
+EndProcedure
 Procedure.i QuicConnectionRecoveryPoll(*c.QuicConnection,now.i)
  If qconn_Span(*c,SizeOf(QuicConnection))=0 : ProcedureReturn #QUIC_CONNECTION_ARGUMENT : EndIf
  If *c\phase<>1 : ProcedureReturn #QUIC_CONNECTION_STATE : EndIf
@@ -226,9 +258,14 @@ Procedure.i QuicConnectionLossBegin(*c.QuicConnection,level.i,now.i,delay.i,thre
  ProcedureReturn QuicHandshakeSentLossBegin(@*c\recoveryLoss,history,now,delay,threshold)
 EndProcedure
 Procedure.i QuicConnectionLossStep(*c.QuicConnection)
+ Define rc.i,n.i
  If qconn_Span(*c,SizeOf(QuicConnection))=0 : ProcedureReturn #QUIC_CONNECTION_ARGUMENT : EndIf
  If *c\phase<>1 Or qconn_LossOwned(*c)=0 : ProcedureReturn #QUIC_CONNECTION_STATE : EndIf
- ProcedureReturn QuicHandshakeSentLossStep(@*c\recoveryLoss)
+ rc=QuicHandshakeSentLossStep(@*c\recoveryLoss)
+ If rc=2
+  n=QuicConnectionRecoveryRearm(*c,0) : If n<0 : ProcedureReturn n : EndIf
+ EndIf
+ ProcedureReturn rc
 EndProcedure
 Procedure.i QuicConnectionClose(*c.QuicConnection,reason.i)
  Define rc.i
@@ -326,6 +363,7 @@ Procedure.i QuicConnectionHandshakeDone(*c.QuicConnection)
  rc=QuicCryptoTlsAbandon(@*c\handshake\rx)
  rc=QuicCryptoTxAbandon(@*c\handshake\tx)
  *c\handshakeConfirmed=1 : *c\timeout=0
+ rc=QuicConnectionRecoveryRearm(*c,1) : If rc<0 : ProcedureReturn rc : EndIf
  ProcedureReturn 1
 EndProcedure
 ; CloseStep returns2 until the dispatcher closes exactly this UDP handle.
