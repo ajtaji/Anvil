@@ -9,6 +9,7 @@
 ; and honor the shared worker's crypto exclusion across suspended execution.
 XIncludeFile "Anvil/Core/quic_application_packet.pbi"
 XIncludeFile "Anvil/Network/quic_application_state.pbi"
+XIncludeFile "Anvil/Network/quic_peer_ids.pbi"
 #QUIC_CONNECTION_ARGUMENT=-3511
 #QUIC_CONNECTION_TIMEOUT=-3512
 #QUIC_CONNECTION_STATE=-3513
@@ -108,6 +109,8 @@ Structure QuicConnection
  startup.QuicConnectionStart
  application.QuicApplicationPacket
  applicationState.QuicApplicationState
+ peerIds.QuicPeerIds
+ peerIdRecords.i[72]
 EndStructure
 ; Span table order: RX data/bits,TX data/bits,ACK ranges,sent slots/metadata,
 ; TLS snapshot,handshake/receive/output/config,local/peer parameters/entries,
@@ -209,6 +212,36 @@ Procedure.i QuicConnectionClearDeadline(*c.QuicConnection)
  If qconn_Span(*c,SizeOf(QuicConnection))=0 : ProcedureReturn #QUIC_CONNECTION_ARGUMENT : EndIf
  If *c\phase<>1 : ProcedureReturn #QUIC_CONNECTION_STATE : EndIf
  *c\timeout=0 : ProcedureReturn 0
+EndProcedure
+; Initialize after authenticated TLS parameters. limit MUST equal our advertised
+; active_connection_id_limit (not the peer's). Eight storage slots include
+; pending retirement obligations; exhausted storage is an explicit local error.
+Procedure.i QuicConnectionPeerIdsInit(*c.QuicConnection,limit.i)
+ Define token.i,*e.QuicParameter
+ If qconn_Span(*c,SizeOf(QuicConnection))=0 : ProcedureReturn #QUIC_CONNECTION_ARGUMENT : EndIf
+ If *c\phase<>1 Or *c\feed\parametersReady<>1 Or *c\peerIdKnown<>1 : ProcedureReturn #QUIC_CONNECTION_STATE : EndIf
+ If TlsWorkerBusy()<>0 : ProcedureReturn #TLSWORK_BUSY : EndIf
+ If Tls13ContextState(QuicConnectionBuffer(*c,7),#TLS13_CONTEXT_SIZE)<>#TLS13_ST_CONNECTED : ProcedureReturn #QUIC_CONNECTION_STATE : EndIf
+ *e=QuicParametersFind(@*c\params,2)
+ If *e<>0 : token=*c\params\source+*e\offset : EndIf
+ ProcedureReturn QuicPeerIdsInit(@*c\peerIds,@*c\peerIdRecords,8,limit,QuicConnectionBuffer(*c,19),*c\peerIdBytes,token)
+EndProcedure
+; Apply a decoded NEW_CONNECTION_ID from the current authenticated packet.
+; Caller serializes transport output; no outstanding ciphertext may use a CID
+; being retired. Does not send RETIRE_CONNECTION_ID or ACK the received packet.
+Procedure.i QuicConnectionPeerIdAdd(*c.QuicConnection,sequence.i,retire.i,id.i,bytes.i,token.i)
+ Define rc.i,p.i,dst.i,i.i
+ If qconn_Span(*c,SizeOf(QuicConnection))=0 : ProcedureReturn #QUIC_CONNECTION_ARGUMENT : EndIf
+ If *c\phase<>1 Or *c\application\phase<>2 Or *c\application\result<>1 Or *c\application\encrypt<>0 Or *c\application\keys<>@*c\appRead : ProcedureReturn #QUIC_CONNECTION_STATE : EndIf
+ If TlsWorkerBusy()<>0 : ProcedureReturn #TLSWORK_BUSY : EndIf
+ If *c\outgoing\phase<>0 And *c\outgoing\phase<>6 : ProcedureReturn #QUIC_CONNECTION_STATE : EndIf
+ rc=QuicPeerIdsAdd(@*c\peerIds,sequence,retire,id,bytes,token)
+ If rc<0 : ProcedureReturn rc : EndIf
+ p=QuicPeerIdsFind(@*c\peerIds,*c\peerIds\selected)
+ dst=QuicConnectionBuffer(*c,19) : *c\peerIdBytes=PeekI(p+8)
+ For i=0 To 19 : PokeA(dst+i,0) : Next
+ For i=0 To *c\peerIdBytes-1 : PokeA(dst+i,PeekA(p+32+i)) : Next
+ ProcedureReturn rc
 EndProcedure
 ; Client-side HANDSHAKE_DONE effect. Caller has decoded this frame from the
 ; current authenticated application packet; syntax alone never authenticates it.

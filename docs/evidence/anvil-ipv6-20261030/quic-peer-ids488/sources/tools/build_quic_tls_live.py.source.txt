@@ -1,0 +1,58 @@
+"""Build a physical certificate-verified QUIC/TLS interoperability fixture.
+
+--public is ONLY the public JSON from quic_tls_live_peer.prepare(). Never copy
+the private server key into source, payloads, identity records or evidence.
+"""
+from pathlib import Path
+import argparse,hashlib,json,os,re,subprocess
+from pmf_compiler import resolve_compiler
+from build_quic_handshake_frames_cpu import vi
+
+def build(compiler,out,public,wrong_name=False,bad_signature=False):
+    assert not (wrong_name and bad_signature)
+    root=Path(__file__).resolve().parents[1];out.mkdir(parents=True,exist_ok=False)
+    trust=json.loads(public.read_text(encoding='utf8'))
+    names=re.findall(r';     XIncludeFile "([^"]+)"',(root/'Anvil/Crypto/tls13_hs.pbi').read_text(encoding='utf8'))
+    names+=['Anvil/Crypto/gcm_job.pbi','Anvil/Crypto/bignum_job.pbi','Anvil/Crypto/ecdsa_job.pbi',
+            'Anvil/Crypto/x25519_job.pbi','Anvil/Crypto/ecp_job.pbi','Anvil/Crypto/rsa_job.pbi',
+            'Anvil/Crypto/tls13_context.pbi','Anvil/Hal/aarch64_counter.pbi','Anvil/Kernel/Scheduler/scheduler.pbi','Anvil/Kernel/Scheduler/cooperative_a64.pbi','RaspberryPi4/Lib/mmu.pi4','Anvil/Network/udp_payload.pbi',
+            'Anvil/Network/quic_handshake_receive.pbi','Anvil/Network/quic_handshake_sent.pbi',
+            'Anvil/Network/quic_tls_receive.pbi','Anvil/Network/quic_tls_send.pbi','Anvil/Network/quic_parameters.pbi','Anvil/Network/quic_application_frames.pbi']
+    params=b'\x0f\x08'+bytes(8)
+    for key,value in [(1,15000),(3,1200),(4,65536),(5,16384),(6,16384),(7,16384),(8,1),(9,3),(14,2)]:
+        data=vi(value);params+=vi(key)+vi(len(data))+data
+    params+=b'\x0c\x00'
+    dn=bytes.fromhex(trust['root_dn']);key=bytes.fromhex(trust['root_key'])
+    assert len(key)==65 and trust['hostname']=='quic-test.local' and len(params)<=128
+    source='#X509_SIG_LINKED=1\n'+ '\n'.join('XIncludeFile "'+n+'"' for n in names)
+    # Explicit fixture CA; file-backed root loading is outside this proof.
+    source+='\nGlobal *TlsRootsPauseHook\nGlobal unexpectedProfile.i\nProcedure str_print_at(address.i)\n unexpectedProfile=unexpectedProfile+1\nEndProcedure\nProcedure PrintDec(value.i)\n unexpectedProfile=unexpectedProfile+1\nEndProcedure\nProcedure PrintNl()\n unexpectedProfile=unexpectedProfile+1\nEndProcedure\nProcedure.i HwMicros()\n ProcedureReturn A64CounterReadOrdered()/(A64CounterFrequency()/1000000)\nEndProcedure\nXIncludeFile "Anvil/Core/tls_worker.pbi"\nXIncludeFile "Anvil/Core/tls_context_worker.pbi"\nXIncludeFile "Anvil/Core/quic_tls_operation.pbi"\nXIncludeFile "Anvil/Core/quic_connection.pbi"\nXIncludeFile "Anvil/Core/quic_connection_send.pbi"\nXIncludeFile "Anvil/Core/quic_connection_ack.pbi"\nXIncludeFile "Anvil/Core/quic_connection_receive.pbi"\nXIncludeFile "Anvil/Core/quic_connection_tls.pbi"\nXIncludeFile "Anvil/Core/quic_connection_start.pbi"\n'
+    names+=['Anvil/Core/tls_worker.pbi','Anvil/Core/tls_context_worker.pbi','Anvil/Core/quic_tls_operation.pbi','Anvil/Core/quic_connection.pbi','Anvil/Core/quic_connection_send.pbi','Anvil/Core/quic_connection_ack.pbi','Anvil/Core/quic_connection_receive.pbi','Anvil/Core/quic_connection_tls.pbi','Anvil/Core/quic_connection_start.pbi']
+    source+=f"\n#TEST_UNIX={trust['unix_time']}\n#ROOT_DN_BYTES={len(dn)}\n#LOCAL_PARAMETER_BYTES={len(params)}\n#REPORT_COUNT={4 if wrong_name or bad_signature else 36}\n"
+    source+=(root/'tools/quic_tls_live.pi4').read_text(encoding='utf8')+'\nDataSection\n'
+    for label,data in [('RootDn',dn),('RootKey',key),('HostName',b'quic-fail.local' if wrong_name else b'quic-test.local'),('Alpn',b'\2h3'),
+                       ('LocalTemplate',params),('Peer',bytes([192,168,1,104])+bytes(12))]:
+        source+=label+':\n'
+        for p in range(0,len(data),24):source+=' Data.a '+','.join(str(n) for n in data[p:p+24])+'\n'
+    source+='FixtureImageEnd:\n Data.a 0\nEndDataSection\n'
+    path=out/'proof.pi4';path.write_text(source,encoding='utf8')
+    q=subprocess.run([str(resolve_compiler(compiler)),'--compile',str(path),'-t','pi4','--load-addr','0x1000000','--stack-addr','0x4f00000','--entry-returns','--wants-services','-o',str(out/'proof.img')],env=dict(os.environ,PMF_ROOT=str(root)),capture_output=True,text=True,timeout=180,creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
+    log=q.stdout+q.stderr;(out/'compile.txt').write_text(log,encoding='utf8');print(log[-1400:]);assert q.returncode==0
+    todo=list(names)
+    while todo:
+        name=todo.pop()
+        for dep in re.findall(r'^\s*XIncludeFile\s+"([^"]+)"',(root/name).read_text(encoding='utf8'),re.M):
+            if dep not in names:names.append(dep);todo.append(dep)
+    names+=['tools/quic_tls_live.pi4','tools/build_quic_tls_live.py','tools/quic_tls_live_peer.py']
+    code=re.search(r'occupying \$([0-9A-Fa-f]+)\.\.\$([0-9A-Fa-f]+)',log);bss=re.search(r'bss \$([0-9A-Fa-f]+)\.\.\$([0-9A-Fa-f]+)',log)
+    payload=(out/'proof.img.pmf').read_bytes()
+    ranges={'code':['0x'+x for x in code.groups()],'bss':['0x'+x for x in bss.groups()],'stack':['0x4e00000','0x4efffff'],'report':['0xe1c00000','0xe1c0ffff'],'tables':['0x4f80000','0x4f82fff']}
+    labels=['result','TLS state','TLS error','X509 verdict','parameters bound','application packet authenticated','Initial keys discarded','certificate chain received','ACK events','socket closed','crypto idle','bidirectional traffic','competing owners refused','foreground dispatch resumed','worker and hooks released','foreground TLS state preserved','cancelled snapshot wiped','operation lifecycle verdict','operation probes completed','connection closed','owned buffers wiped','close ownership verdict','storage admission refusals','deadline and close verdict','lifecycle probes completed','packet output verdict','all outputs retained until accepted','packet crypto cancelled','ACK dispatch verdict','ACK dispatch exercised','receive dispatch verdict','receive cancellation exercised','TLS feed verdict','traffic key cancellation exercised','CID policy verdict','CID policy exercised']
+    expected=[-3431,10,64,52] if bad_signature else ([-3431,10,64,56] if wrong_name else [0,8,0,32,1,1,1,1,1,0,0,1,0,1,1,0,1,0,5,3,1,0,1,0,3,0,1,1,0,1,0,1,0,1,0,1])
+    cases=[dict(name=n,expected=v) for n,v in zip(labels,expected)]
+    (out/'identity.json').write_text(json.dumps(dict(bytes=len(payload),sha256=hashlib.sha256(payload).hexdigest(),checked_ranges=ranges,public_trust=trust,wrong_name=wrong_name,bad_signature=bad_signature,source_hashes={n:hashlib.sha256((root/n).read_bytes()).hexdigest() for n in names},cases=cases),indent=2),encoding='utf8')
+
+if __name__=='__main__':
+    ap=argparse.ArgumentParser(description=__doc__);ap.add_argument('--compiler',required=True);ap.add_argument('--out',type=Path,required=True);ap.add_argument('--public',type=Path,required=True)
+    negative=ap.add_mutually_exclusive_group();negative.add_argument('--wrong-name',action='store_true');negative.add_argument('--bad-signature',action='store_true')
+    a=ap.parse_args();build(a.compiler,a.out.resolve(),a.public.resolve(),a.wrong_name,a.bad_signature)

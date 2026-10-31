@@ -1,0 +1,17 @@
+from pathlib import Path
+from run_current_anvil_cpu import WORK,lease_row,save_json,br,coretest,require_coretest_healthy
+import struct
+out=WORK/'anvil-ipv6-20261030/quic-cidslive1800/recovery';out.mkdir()
+lane='Anvil488 CID failure inspection';c=None
+lease_row(True,'Read confirmed recovered prompt after deadman','read-only health and retained report',lane)
+try:
+ c=br.NetConsole('192.168.1.114');assert c.at_prompt(timeout=60)
+ for cmd in ['version','last run','deadman','font info','vkstat']:
+  v=br.read_only_command_with_recovery(c,cmd,60,preserve_console=True)[1];save_json(out/(cmd.replace(' ','-')+'.json'),v)
+ h=coretest(c);require_coretest_healthy(h);save_json(out/'cores.json',h)
+ raw,stats=br.read_range(c,0xe1c00000,65536,chunk_bytes=1024,seconds=60,progress=None)
+ (out/'report.bin').write_bytes(raw);save_json(out/'readback.json',stats)
+ print({hex(i):struct.unpack_from('<q',raw,i)[0] for i in [0,8,0x48,0x100,0x2a0,0x2a8]})
+finally:
+ if c:c.close()
+ lease_row(False,'FREE; recovered prompt inspection retained', 'no reset or storage writes',lane)

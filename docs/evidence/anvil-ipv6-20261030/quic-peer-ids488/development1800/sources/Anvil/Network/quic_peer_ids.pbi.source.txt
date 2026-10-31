@@ -1,0 +1,155 @@
+; SPDX-License-Identifier: MIT
+; Independent RFC9000 sections5.1/19.15 peer CID state. No I/O or allocation.
+; Caller authenticates frames and serializes access; storage stays pinned.
+; Entries: sequence,len,status,tokenKnown (four words),CID20,token16,padding4.
+; Status0 free,1 usable,2 retirement owed until an ACK of RETIRE_CONNECTION_ID.
+; No migration, local CID issuance, reset detection or transmission scheduler.
+#QUIC_CID_ARGUMENT=-3601
+#QUIC_CID_STATE=-3602
+#QUIC_CID_FORMAT=-3603
+#QUIC_CID_CONFLICT=-3604
+#QUIC_CID_LIMIT=-3605
+#QUIC_CID_CAPACITY=-3606
+#QUIC_CID_RECORD_BYTES=72
+Structure QuicPeerIds
+ phase.i
+ records.i
+ capacity.i
+ limit.i
+ floor.i
+ selected.i
+ zero.i
+EndStructure
+Procedure.i qcid_Span(p.i,n.i)
+ ProcedureReturn Bool(p>0 And n>=0 And p<=$7FFFFFFFFFFFFFFF-n)
+EndProcedure
+Procedure.i qcid_Overlap(p.i,n.i,q.i,m.i)
+ ProcedureReturn Bool(p<q+m And q<p+n)
+EndProcedure
+Procedure.i qcid_Ready(*s.QuicPeerIds)
+ If qcid_Span(*s,SizeOf(QuicPeerIds))=0 : ProcedureReturn #QUIC_CID_ARGUMENT : EndIf
+ If *s\phase<>1 Or *s\capacity<2 Or *s\capacity>64 Or *s\limit<2 Or *s\limit>*s\capacity : ProcedureReturn #QUIC_CID_STATE : EndIf
+ ProcedureReturn 0
+EndProcedure
+Procedure.i qcid_External(*s.QuicPeerIds,p.i,n.i)
+ If qcid_Span(p,n)=0 : ProcedureReturn 0 : EndIf
+ If qcid_Overlap(p,n,*s,SizeOf(QuicPeerIds)) Or qcid_Overlap(p,n,*s\records,*s\capacity*72) : ProcedureReturn 0 : EndIf
+ ProcedureReturn 1
+EndProcedure
+Procedure.i qcid_Equal(p.i,q.i,n.i)
+ Define i.i,d.i
+ For i=0 To n-1 : d=d | ((PeekA(p+i)&255) ! (PeekA(q+i)&255)) : Next
+ ProcedureReturn Bool(d=0)
+EndProcedure
+; Fresh owner only. limit is OUR advertised active_connection_id_limit.
+; Sequence0 is the peer's handshake CID. token=0 means not supplied by TLS.
+Procedure.i QuicPeerIdsInit(*s.QuicPeerIds,records.i,capacity.i,limit.i,id.i,bytes.i,token.i)
+ Define i.i
+ If qcid_Span(*s,SizeOf(QuicPeerIds))=0 Or capacity<2 Or capacity>64 Or limit<2 Or limit>capacity Or bytes<0 Or bytes>20 : ProcedureReturn #QUIC_CID_ARGUMENT : EndIf
+ If *s\phase<>0 : ProcedureReturn #QUIC_CID_STATE : EndIf
+ If qcid_Span(records,capacity*72)=0 Or qcid_Overlap(records,capacity*72,*s,SizeOf(QuicPeerIds)) : ProcedureReturn #QUIC_CID_ARGUMENT : EndIf
+ If bytes>0
+  If qcid_Span(id,bytes)=0 : ProcedureReturn #QUIC_CID_ARGUMENT : EndIf
+  If qcid_Overlap(id,bytes,*s,SizeOf(QuicPeerIds)) Or qcid_Overlap(id,bytes,records,capacity*72) : ProcedureReturn #QUIC_CID_ARGUMENT : EndIf
+ EndIf
+ If token<>0
+  If bytes=0 Or qcid_Span(token,16)=0 : ProcedureReturn #QUIC_CID_ARGUMENT : EndIf
+  If qcid_Overlap(token,16,*s,SizeOf(QuicPeerIds)) Or qcid_Overlap(token,16,records,capacity*72) : ProcedureReturn #QUIC_CID_ARGUMENT : EndIf
+ EndIf
+ For i=0 To capacity*72-1 : PokeA(records+i,0) : Next
+ For i=0 To SizeOf(QuicPeerIds)-1 : PokeA(*s+i,0) : Next
+ *s\phase=1 : *s\records=records : *s\capacity=capacity : *s\limit=limit : *s\zero=Bool(bytes=0)
+ PokeI(records+8,bytes) : PokeI(records+16,1)
+ For i=0 To bytes-1 : PokeA(records+32+i,PeekA(id+i)) : Next
+ If token<>0
+  PokeI(records+24,1) : For i=0 To 15 : PokeA(records+52+i,PeekA(token+i)) : Next
+ EndIf
+ ProcedureReturn 0
+EndProcedure
+; Borrowed read-only record,0 absent,negative refusal. Do not retain across Add
+; or RetiredAck. Retired records remain visible but may not be used for packets.
+Procedure.i QuicPeerIdsFind(*s.QuicPeerIds,sequence.i)
+ Define rc.i,i.i,p.i
+ rc=qcid_Ready(*s) : If rc<0 : ProcedureReturn rc : EndIf
+ If sequence<0 Or sequence>$3FFFFFFFFFFFFFFF : ProcedureReturn #QUIC_CID_ARGUMENT : EndIf
+ For i=0 To *s\capacity-1
+  p=*s\records+i*72
+  If PeekI(p+16)<>0 And PeekI(p)=sequence : ProcedureReturn p : EndIf
+ Next
+ ProcedureReturn 0
+EndProcedure
+; 1 newly retained,0 duplicate,negative unchanged refusal. A duplicate can
+; increase the retirement floor. Reordered lower floors never resurrect IDs.
+; Active limit and local storage exhaustion are distinct failures. Spare
+; capacity retains retirement obligations; no silent eviction on exhaustion.
+Procedure.i QuicPeerIdsAdd(*s.QuicPeerIds,sequence.i,retire.i,id.i,bytes.i,token.i)
+ Define rc.i,i.i,p.i,found.i,free.i,floor.i,active.i,selected.i,added.i
+ rc=qcid_Ready(*s) : If rc<0 : ProcedureReturn rc : EndIf
+ If sequence<0 Or sequence>$3FFFFFFFFFFFFFFF Or retire<0 Or retire>sequence Or bytes<1 Or bytes>20 : ProcedureReturn #QUIC_CID_FORMAT : EndIf
+ If qcid_External(*s,id,bytes)=0 Or qcid_External(*s,token,16)=0 : ProcedureReturn #QUIC_CID_ARGUMENT : EndIf
+ If *s\zero : ProcedureReturn #QUIC_CID_CONFLICT : EndIf
+ floor=*s\floor : If retire>floor : floor=retire : EndIf
+ selected=$7FFFFFFFFFFFFFFF
+ For i=0 To *s\capacity-1
+  p=*s\records+i*72
+  If PeekI(p+16)=0
+   If free=0 : free=p : EndIf
+  Else
+   If PeekI(p)=sequence
+    found=p
+    If PeekI(p+8)<>bytes Or qcid_Equal(p+32,id,bytes)=0 : ProcedureReturn #QUIC_CID_CONFLICT : EndIf
+    If PeekI(p+24) And qcid_Equal(p+52,token,16)=0 : ProcedureReturn #QUIC_CID_CONFLICT : EndIf
+   ElseIf PeekI(p+8)=bytes And qcid_Equal(p+32,id,bytes)
+    ProcedureReturn #QUIC_CID_CONFLICT
+   EndIf
+   If PeekI(p+16)=1 And PeekI(p)>=floor
+    active=active+1 : If PeekI(p)<selected : selected=PeekI(p) : EndIf
+   EndIf
+  EndIf
+ Next
+ If found=0 And sequence>=floor
+  active=active+1 : If sequence<selected : selected=sequence : EndIf
+ EndIf
+ If active>*s\limit : ProcedureReturn #QUIC_CID_LIMIT : EndIf
+ If found=0 And free=0 : ProcedureReturn #QUIC_CID_CAPACITY : EndIf
+ ; Validation complete; caller keeps all inputs immutable through this call.
+ If found=0
+  found=free : added=1 : PokeI(found,sequence) : PokeI(found+8,bytes)
+  PokeI(found+16,1) : For i=0 To bytes-1 : PokeA(found+32+i,PeekA(id+i)) : Next
+ EndIf
+ If PeekI(found+24)=0
+  PokeI(found+24,1) : For i=0 To 15 : PokeA(found+52+i,PeekA(token+i)) : Next
+ EndIf
+ For i=0 To *s\capacity-1
+  p=*s\records+i*72
+  If PeekI(p+16)<>0 And PeekI(p)<floor : PokeI(p+16,2) : EndIf
+ Next
+ *s\floor=floor
+ If *s\selected<floor : *s\selected=selected : EndIf
+ ProcedureReturn added
+EndProcedure
+; A retirement obligation is not cleared when serialized or submitted. The
+; connection's reliable control-frame sender retains it through loss/retry.
+; Returns sequence>=0,-1 if none,other negative refusal.
+Procedure.i QuicPeerIdsRetireNext(*s.QuicPeerIds)
+ Define rc.i,i.i,p.i,sequence.i
+ rc=qcid_Ready(*s) : If rc<0 : ProcedureReturn rc : EndIf
+ sequence=$7FFFFFFFFFFFFFFF
+ For i=0 To *s\capacity-1
+  p=*s\records+i*72
+  If PeekI(p+16)=2 And PeekI(p)<sequence : sequence=PeekI(p) : EndIf
+ Next
+ If sequence=$7FFFFFFFFFFFFFFF : ProcedureReturn -1 : EndIf
+ ProcedureReturn sequence
+EndProcedure
+; Caller has received an authenticated ACK for the RETIRE_CONNECTION_ID frame,
+; not merely for the packet that delivered NEW_CONNECTION_ID. Erases the record
+; and token, allowing reuse. Forgotten old duplicates can create another owed
+; retirement, but the monotonic floor prevents reactivation.
+Procedure.i QuicPeerIdsRetiredAck(*s.QuicPeerIds,sequence.i)
+ Define p.i,i.i
+ p=QuicPeerIdsFind(*s,sequence) : If p<=0 : ProcedureReturn p : EndIf
+ If PeekI(p+16)<>2 : ProcedureReturn #QUIC_CID_STATE : EndIf
+ For i=0 To 71 : PokeA(p+i,0) : Next
+ ProcedureReturn 1
+EndProcedure

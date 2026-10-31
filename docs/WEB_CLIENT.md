@@ -5328,3 +5328,65 @@ compiled; it was not executed. Resident488 and the boot image were unchanged.
 Application frame effects beyond HANDSHAKE_DONE and their ACK transmission,
 recovery/congestion/flow control, streams/QPACK/real HTTP3, key updates,
 Retry/migration and remaining IPv6/TLS/device work remain open.
+
+
+### Peer connection IDs and retirement obligations (2026-10-31)
+
+`Anvil/Network/quic_peer_ids.pbi` owns a caller-supplied bounded peer-ID table.
+Init installs sequence0 from the authenticated handshake, optionally with its
+TLS reset token. Add accepts authenticated NEW_CONNECTION_ID fields, detects
+conflicting reuse, tolerates duplicates/reordering, applies a monotonic retire
+floor and checks the post-retirement active count before mutation. It chooses
+a surviving ID if the selected one is retired. Invalid/overlapping inputs,
+active-limit excess and storage exhaustion leave state unchanged. These are
+separate negative statuses; the connection's close/error policy remains the
+caller's responsibility. A zero-length initial ID rejects subsequent new IDs,
+but can retain a TLS-supplied reset token.
+
+The56-byte owner uses2..64 caller-provided72-byte records, with an advertised
+active limit between2 and capacity. Size storage for active IDs PLUS retirement
+obligations; the default Core integration has8 records and the fixture advertises2.
+Find returns a borrowed read-only record, not a copy. RetireNext reports an owed
+sequence (-1 when empty); it does not clear anything on submission. RetiredAck
+requires the caller to have authenticated an ACK for the RETIRE_CONNECTION_ID
+frame. Only then is the record/token erased and reusable. A delayed old ID can
+recreate a retirement obligation but cannot reactivate below the floor. This is
+state handling, not a reliable sender, migration or stateless-reset detector.
+
+Core QuicConnection embeds the table, closes/wipes it with the owner, initializes
+it from authenticated parameters, and applies decoded NEW_CONNECTION_ID via
+QuicConnectionPeerIdAdd. The caller supplies a validated frame event from the
+current successful owned application decrypt and serializes pending transport
+output. The selected peer CID is copied into the existing outgoing-ID buffer.
+Init's limit must be OUR advertised value, not the peer's advertised limit.
+
+Evidence: `docs/evidence/anvil-ipv6-20261030/quic-peer-ids488/`.
+The final physical state suite passed710 checks (capture330), including exact
+independently generated record images, refusal atomicity, retirement/reclamation,
+limits, duplicates, reorder, one/twenty-byte IDs and zero-ID token retention.
+The identical final live image passed against eight-byte and zero-byte peer IDs
+(captures331/332):36 primary checks each plus application/lifecycle/confirmation/
+peer-ID assertions, exact received ID/token comparisons, duplicate Add and full
+close erasure. The peers verified Finished/h3 and authenticated subsequent
+client1-RTT PING. NEW_CONNECTION_ID effects counted1/0, matching peer traces.
+The real Pi3 composition compiled but was not executed. Final resident488
+was unchanged, watchdogoff and cores/fonts/Vulkan health checks passed.
+Monitor captures are not UI/input/rendering-correctness tests.
+
+One earlier live payload did NOT return: run637 hit the15s deadman and restarted.
+The tool observed the restarted resident and its version reply after its90s
+observation. The peer received no datagrams. Read-only recovery found healthy
+cores and retained report bytes from the prior CPU proof; cached report writes
+mean this does not identify an exact stop point. The exact same failing image
+later passed (capture329). An instrumented run also passed before the final
+zero-ID token correction. This intermittent failure is UNRESOLVED, not fixed by
+adding progress marks. Its image, exact sources, failed journal, peer trace,
+recovery and exact replay are retained in development1800. Fixture progress at
+report0xff00 is now explicitly cache-cleaned, stages1..10; the early services
+slot0xff08 is cleared by report initialization at stage8. This diagnostics change
+is not a runtime fix. Pi3 compile removes Pi4 cache maintenance as usual.
+
+Application receipts/ACK transmission, reliable RETIRE_CONNECTION_ID sending,
+preferred-address IDs, local ID issuance, reset detection, recovery/congestion/
+flow, streams/QPACK/real HTTP3, key updates, Retry/migration and remaining IPv6/
+TLS/device work remain open. No unprocessed packet is acknowledged by this change.

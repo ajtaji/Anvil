@@ -1615,3 +1615,5 @@ text is unchanged; no new board execution or boot claim follows.
 | `Anvil/Network/quic_handshake_receive.pbi` | protocol-facts | ietf-rfc | IETF specification | RFC 9001 section 5.5 and RFC 9000 sections 12.3/13.1; independent protected-packet admission and authenticated processing integration. No implementation copied. |
 | `Anvil/Network/quic_handshake_sent.pbi` | protocol-facts | ietf-rfc | IETF specification | RFC 9000 sections 12.3/13.1/19.3 and RFC 9002 sections 4.1/6.4; independent sent-packet history and bounded ACK validation/application. No implementation copied. |
 | `Anvil/Network/quic_crypto_send.pbi` | protocol-facts | ietf-rfc | IETF specification | RFC 9000 sections 13.3/19.6 and RFC 9001 section 4.1.3; independent outgoing CRYPTO retention and frame writer. No implementation copied. |
+
+| `Anvil/Network/quic_peer_ids.pbi` | protocol-facts | ietf-rfc | IETF specification | RFC9000 sections5.1/19.15; independent peer CID ownership, duplicates, retirement floor and ACK-based record reclamation. No implementation copied. |
