@@ -19,6 +19,9 @@ Global received.i,sent.i,ackEvents.i,appAuthenticated.i,stage.i
 Global lastPump.i,maxPumpGap.i,maxTlsStep.i,maxSendStep.i,sendSteps.i
 Global sendFault.i,sendProbes.i,packetCancelChecked.i
 Global ackFault.i,ackChecks.i,ackSteps.i,maxAckStep.i
+Global receiveFault.i,receiveCancelled.i,receiveSteps.i,maxReceiveStep.i,savedReceiveBytes.i
+Global Dim savedReceive.a[1472]
+Global Dim savedOriginal.a[8]
 Global deadlineOp.QuicTlsOperation,outputOp.QuicTlsOperation,inputOp.QuicTlsOperation
 Global probeTx.QuicCryptoTx,probeRx.QuicCryptoRx,probeOut.QuicTlsOutput
 Global operationFault.i,operationProbes.i,extraContextChecks.i
@@ -201,7 +204,7 @@ Procedure.i FeedTls(*s.QuicConnectionSpace)
  ProcedureReturn 0
 EndProcedure
 Procedure.i PacketOne(p.i,bytes.i)
- Define rc.i,i.i,*s.QuicConnectionSpace
+ Define rc.i,i.i,t.i,cost.i,*s.QuicConnectionSpace
  rc=QuicPacketRead(@connection\header,p,bytes,8) : If rc<>1 : ProcedureReturn -9307 : EndIf
  If connection\header\destinationBytes<>8 : ProcedureReturn -9308 : EndIf
  For i=0 To 7 : If PeekA(p+connection\header\destinationOffset+i)<>clientId[i] : ProcedureReturn -9309 : EndIf : Next
@@ -227,16 +230,26 @@ Procedure.i PacketOne(p.i,bytes.i)
   If hsReady=0 : ProcedureReturn -9315 : EndIf
   *s=@connection\handshake
  EndIf
- rc=QuicHandshakeReceiveBegin(@connection\receive,@*s\readKeys,p,connection\header\packetBytes,*s\level,*s\largest,@*s\rx,@*s\ack)
+ If savedReceiveBytes=0 And *s\level=0
+  savedReceiveBytes=connection\header\packetBytes
+  For i=0 To savedReceiveBytes-1 : savedReceive[i]=PeekA(p+i) : Next
+  For i=0 To 7 : savedOriginal[i]=originalId[i] : Next
+ EndIf
+ rc=QuicConnectionReceiveBegin(@connection,*s\level,p,connection\header\packetBytes)
  If rc<>0 : ProcedureReturn rc : EndIf
  Repeat
   rc=Pump() : If rc<0 : ProcedureReturn rc : EndIf
-  rc=QuicHandshakeReceiveStep(@connection\receive)
+  t=clock() : rc=QuicConnectionReceiveStep(@connection) : cost=clock()-t
+  receiveSteps=receiveSteps+1 : If cost>maxReceiveStep : maxReceiveStep=cost : EndIf
+  If TlsWorkerOwns(@connection\incoming\worker)=1
+   If QuicConnectionReceiveBegin(@connection,*s\level,p,connection\header\packetBytes)<>#QUIC_RECEIVE_STATE : receiveFault=1 : EndIf
+   If QuicConnectionSendBegin(@connection,*s\level,peerBytes)<>#QUIC_SEND_STATE : receiveFault=2 : EndIf
+  EndIf
   If rc=2 : rc=HandleAck(*s) : If rc=0 : rc=1 : EndIf : EndIf
  Until rc<>1
  If rc=6 : ProcedureReturn 0 : EndIf
  If rc<>4 : ProcedureReturn rc : EndIf
- If connection\receive\crypto\number>*s\largest : *s\largest=connection\receive\crypto\number : EndIf
+ If QuicConnectionReceiveStep(@connection)<>4 : receiveFault=3 : EndIf
  If peerBytes=0
   peerBytes=connection\header\sourceBytes
   For i=0 To peerBytes-1 : peerId[i]=PeekA(p+connection\header\sourceOffset+i) : Next
@@ -567,6 +580,40 @@ Procedure CheckPacketCancellation()
  If connection\result<>-9420 Or QuicConnectionSendStep(@connection)<>#QUIC_SEND_STATE Or HooksClear()<>1 : sendFault=17 : EndIf
  packetCancelChecked=1
 EndProcedure
+Procedure CheckReceiveCancellation()
+ Define socket.i,rc.i,n.i,i.i,slice.i
+ socket=UdpPayloadOpen(4,0,55013)
+ If socket<=0 : receiveFault=4 : ProcedureReturn : EndIf
+ rc=QuicConnectionBegin(@connection,@connectionSpans[0],socket,HwMicros(),20000000)
+ If rc<>0 : receiveFault=5 : n=UdpPayloadClose(socket) : ProcedureReturn : EndIf
+ For i=0 To 7 : originalId[i]=savedOriginal[i] : Next
+ For i=0 To savedReceiveBytes-1 : packet[i]=savedReceive[i] : Next
+ rc=KeyDone(QuicInitialKeysBegin(@connection\keyjob,@connection\initial\readKeys,@originalId[0],8,1))
+ If rc<>0 : receiveFault=6 : EndIf
+ rc=QuicConnectionReceiveBegin(@connection,0,@packet[0],savedReceiveBytes)
+ If rc<>0 : receiveFault=7 : EndIf
+ rc=QuicConnectionReceiveStep(@connection)
+ If rc<>1 : receiveFault=8 : EndIf
+ slice=tlsjob_sliceTicks : tlsjob_sliceTicks=1
+ rc=QuicConnectionReceiveStep(@connection)
+ tlsjob_sliceTicks=slice
+ If rc<>1 Or TlsWorkerOwns(@connection\incoming\worker)<>1 : receiveFault=9 : EndIf
+ rc=QuicConnectionClose(@connection,-9430)
+ rc=QuicConnectionCloseStep(@connection)
+ If rc<>0 Or connection\closeStage<>1 Or TlsWorkerBusy()<>0 Or GcmJobBusy()<>0 Or connection\receive\crypto\phase<>0 : receiveFault=10 : EndIf
+ Repeat
+  rc=QuicConnectionCloseStep(@connection)
+  If rc=2
+   n=UdpPayloadClose(socket) : n=QuicConnectionSocketClosed(@connection,socket,n)
+   If n<>0 : receiveFault=11 : ProcedureReturn : EndIf
+  ElseIf rc<0
+   receiveFault=12 : ProcedureReturn
+  EndIf
+  n=Service()
+ Until rc=1
+ If connection\result<>-9430 Or QuicConnectionReceiveStep(@connection)<>#QUIC_RECEIVE_STATE Or HooksClear()<>1 : receiveFault=13 : EndIf
+ receiveCancelled=1
+EndProcedure
 Procedure.i Main()
  CaptureTable()
  Define i.i,rc.i,closed.i,cleanup.i,admit.i,saved.i,tlsState.i,tlsError.i,x509Error.i,certCount.i,alert.i
@@ -621,6 +668,9 @@ Procedure.i Main()
  CheckConnectionLifecycle()
  PokeI($E1C001B8,lifecycleFault) : PokeI($E1C001C0,lifecycleProbes)
  CheckPacketCancellation()
+ CheckReceiveCancellation()
+ PokeI($E1C001F0,receiveFault) : PokeI($E1C001F8,receiveCancelled)
+ PokeI($E1C000E0,maxReceiveStep) : PokeI($E1C000E8,receiveSteps)
  PokeI($E1C001C8,sendFault) : PokeI($E1C001D0,Bool(sendProbes=sent And sent>=1)) : PokeI($E1C001D8,packetCancelChecked)
  cleanup=Tls13ContextWipe(@beforeSnapshot[0],#TLS13_CONTEXT_SIZE)
  cleanup=Tls13ContextWipe(@afterSnapshot[0],#TLS13_CONTEXT_SIZE)

@@ -4745,3 +4745,53 @@ uninstalled. Packet decryption/framing and TLS receive dispatch still live in
 the fixture. Application frames/HANDSHAKE_DONE, recovery, congestion/flow,
 streams/QPACK and real HTTP/3 requests remain, together with the earlier IPv6
 and TLS compatibility/device-blocking work.
+
+
+### Cooperative connection receive crypto
+
+`Anvil/Core/quic_connection_receive.pbi` supplies shared
+`QuicConnectionReceiveBegin/Step` for Initial/Handshake packets. Admission
+requires an available packet space, a subspan of the owned input buffer and
+no pending sender or ACK application. Decryption runs through the same
+exclusive cooperative worker used by TLS and outgoing encryption. Each Step
+performs one worker slice or frame-parser step. ACK events remain borrowed
+until the ACK driver accepts them. Authenticated packet-number state advances
+only after packet processing completes; terminal completion is idempotent.
+
+Connection close recognizes its incoming worker, stops it before cancelling
+the underlying packet job and releasing storage, and still defers to foreign
+worker ownership. An underlying receive crypto job is also cancelled if a
+yield occurred during admission before the outer receive phase was assigned.
+Sender admission refuses an active incoming packet. CID selection, peer-ID
+learning and TLS feed remain caller responsibilities; this module does not
+claim an application-packet receiver or complete client scheduler.
+
+The live Pi 4 fixture now uses this driver and checks repeated admission and
+competing sender refusal while crypto is owned, and completion idempotence.
+A separate cancellation check retains the first received Initial ciphertext
+and its original destination ID, starts decryption in a fresh connection,
+forces a one-counter-tick test slice, restores the production slice, then
+closes while the worker is suspended. It verifies worker/GCM release, packet
+job cancellation, terminal connection state, hook cleanup and refusal to
+resume after close. This replay is a local cancellation probe, not new wire
+traffic or an application-data exchange.
+
+Capture 296 passed 32 checks under installed Anvil 488; the independent peer
+verified client Finished and h3. Receive used 23 calls, maximum 1.270 ms.
+The exchange and first close took 1.409660 seconds; sender Step maximum was
+1.232 ms, ACK Step 40 us, TLS operation Step 1.760 ms, foreground gap 1.919 ms
+and service call 326 us. There were 258 TLS worker calls and 264 full context
+checks. These are observed timings, not guarantees. The bad-signature run
+also passed its refusal and lifecycle checks without completing peer TLS.
+
+Exact evidence is in
+`docs/evidence/anvil-ipv6-20261030/quic-connection-receive488`. The final shared
+fixture compiled with the actual Pi 3 timer/RNG adapter, but was not executed
+on Pi 3. Both final physical runs returned with cores/fonts/Vulkan healthy and
+watchdog off. Anvil 488 remains installed; no resident image changed. A prior
+positive trial passed but had a duplicated cancellation-test invocation; only
+the corrected fixture is the final archived qualification. TLS feed, CID
+policy and the initial protected 1-RTT check still live in the fixture.
+HANDSHAKE_DONE, application processing, recovery, congestion/flow control,
+streams/QPACK and real HTTP/3 remain open, as do the earlier IPv6 and TLS
+compatibility/device-blocking items.

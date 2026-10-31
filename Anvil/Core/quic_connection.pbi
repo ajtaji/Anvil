@@ -47,6 +47,14 @@ Structure QuicConnectionAck
  remaining.i
  events.i
 EndStructure
+Structure QuicConnectionReceive
+ phase.i ; 0 fresh,1 admission,2 crypto,3 frames,4 done,6 drop,-1 failed
+ result.i
+ level.i
+ packet.i
+ bytes.i
+ worker.TlsWorkerJob
+EndStructure
 Structure QuicConnection
  phase.i ; 0 fresh,1 active,2 closing,3 closed
  result.i
@@ -73,6 +81,7 @@ Structure QuicConnection
  outgoing.QuicConnectionSend
  initialRetired.i
  acknowledge.QuicConnectionAck
+ incoming.QuicConnectionReceive
 EndStructure
 ; Span table order: RX data/bits,TX data/bits,ACK ranges,sent slots/metadata,
 ; TLS snapshot,handshake/receive/output/config,local/peer parameters/entries,
@@ -192,7 +201,7 @@ Procedure.i QuicConnectionCloseStep(*c.QuicConnection)
  If *c\phase<>2 : ProcedureReturn #QUIC_CONNECTION_STATE : EndIf
  ; Another suspended TLS operation retains shared arithmetic scratch. Defer
  ; cleanup instead of allowing a packet cancellation to reset its GCM job.
- If TlsWorkerBusy()<>0 And TlsWorkerOwns(@*c\tlsOp\context\worker)=0 And TlsWorkerOwns(@*c\outgoing\worker)=0 : ProcedureReturn #TLSWORK_BUSY : EndIf
+ If TlsWorkerBusy()<>0 And TlsWorkerOwns(@*c\tlsOp\context\worker)=0 And TlsWorkerOwns(@*c\outgoing\worker)=0 And TlsWorkerOwns(@*c\incoming\worker)=0 : ProcedureReturn #TLSWORK_BUSY : EndIf
  If *c\closeStage=0
   If *c\tlsOp\phase=1
    rc=QuicTlsOperationCancel(@*c\tlsOp)
@@ -202,12 +211,20 @@ Procedure.i QuicConnectionCloseStep(*c.QuicConnection)
    rc=TlsWorkerCancel(@*c\outgoing\worker)
    If rc<>1 : ProcedureReturn rc : EndIf
   EndIf
+  If *c\incoming\worker\phase=1
+   rc=TlsWorkerCancel(@*c\incoming\worker)
+   If rc<>1 : ProcedureReturn rc : EndIf
+  EndIf
   If *c\ackJob\phase=1 Or *c\ackJob\phase=2
    rc=QuicHandshakeSentAckCancel(@*c\ackJob)
    If rc<>#QUIC_SENT_CANCELLED : ProcedureReturn rc : EndIf
   EndIf
   If *c\receive\phase=1 Or *c\receive\phase=2
    rc=QuicHandshakeReceiveCancel(@*c\receive)
+   If rc<>#QUIC_CRYPTO_CANCELLED : ProcedureReturn rc : EndIf
+  EndIf
+  If *c\receive\crypto\phase<>0
+   rc=QuicPacketJobCancel(@*c\receive\crypto)
    If rc<>#QUIC_CRYPTO_CANCELLED : ProcedureReturn rc : EndIf
   EndIf
   If *c\sendJob\phase<>0
