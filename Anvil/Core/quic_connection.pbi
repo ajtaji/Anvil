@@ -115,6 +115,7 @@ Structure QuicConnection
  controlBytes.i
  controlNumber.i
  controlToken.i
+ controlHasAck.i
  controlEliciting.i
  applicationHistory.QuicHandshakeSent
  applicationAck.QuicHandshakeSentAck

@@ -171,6 +171,22 @@ class Peer:
             assert time.monotonic()<end,'No authenticated application ACK covering HANDSHAKE_DONE'
             self.stop.wait(.01)
 
+    def check_application_probe(self, timeout=2):
+        end=time.monotonic()+timeout
+        while True:
+            self.check()
+            for trace in self.logger.to_dict()['traces']:
+                for e in trace['events']:
+                    if e['name']!='transport:packet_received' or e['data']['header']['packet_type']!='1RTT':continue
+                    p=e['data']
+                    if int(p['header']['packet_number'])!=1:continue
+                    assert [f['frame_type'] for f in p['frames']]==['ping'],p
+                    self.result['application_probe_authenticated']=True
+                    self.result['application_probe_number']=1
+                    return
+            assert time.monotonic()<end,'No authenticated standalone client PING'
+            self.stop.wait(.01)
+
 def selftest(directory, report, connection_id_length=8):
     """Verify this exact test CA/chain with a normal independent local client."""
     with Peer(directory,report,host='127.0.0.1',port=0,allowed='127.0.0.1',connection_id_length=connection_id_length) as peer:
