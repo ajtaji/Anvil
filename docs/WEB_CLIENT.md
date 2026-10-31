@@ -3518,3 +3518,45 @@ recovery/congestion/flow control, UDP ownership, QPACK and interoperable live
 qualification remain. Initial keys are public protocol keys, not peer identity
 verification. Remaining TLS/device blocking and compatibility and public off-link
 IPv6/RDNSS web qualification also remain open.
+
+### QUIC Retry integrity (2026-10-30)
+
+`QuicRetryJobBegin` extends the shared QUIC crypto owner with v1 Retry integrity
+from [RFC 9001 section 5.8](https://www.rfc-editor.org/rfc/rfc9001.html#section-5.8).
+It accepts contiguous caller-owned storage containing one original-destination-ID
+length byte, that ID (0-20 bytes), and the full Retry packet including its 16-byte
+tag. This prefix can occupy receive headroom; it is never sent on the wire.
+Keeping it contiguous avoids copying an entire packet during admission. The
+caller retains this storage until the existing `QuicPacketJobStep` completes or
+`QuicPacketJobCancel` cancels the operation.
+
+With `writeTag=0`, the job checks all tag bytes before returning a result and
+leaves the input unchanged, including on failure. With `writeTag=1`, it writes
+the outgoing tag only on completion. Invalid original-ID lengths, packet kinds
+and versions are refused before mutation. Retry shares the existing GCM job,
+busy-owner refusal, bounded authentication steps and TLS cipher-cache invalidation
+contract. It uses the RFC's fixed v1 key/nonce; those public values provide no
+peer-identity verification. The connection owner still must enforce Retry timing,
+the original connection-ID context, acceptance at most once and connection-ID
+matching before using a token or restarting its Initial exchange.
+
+Physical Pi 4 capture 225 under Anvil 485 passed all 82 cases: the earlier 49
+packet-protection cases plus 33 Retry cases. An independent AESGCM calculation
+reproduces the published Appendix A.4 Retry packet. Checks cover tag generation
+and verification, zero/max-length original IDs, a multi-step 1024-byte token,
+all 16 tag-byte corruptions, changed original ID/header/token, busy owners,
+cancellation, TLS-record interleaving and malformed-input refusal. Entire output
+buffers and guard bytes are compared; secret/job ownership checks also pass.
+
+Retry Begin peaked at 117 us and Retry Step at 122 us in this fixture. Across all
+82 cases, packet Begin peaked at 225 us and Step at 525 us. These are measured
+observations, not worst-case bounds. Shared-module Pi 3 compilation passed without
+a physical Pi 3 claim. The Pi 4 returned normally; cores, fonts and Vulkan stayed
+healthy, watchdog off. No monitor/boot image change was required.
+
+Evidence: `docs/evidence/anvil-ipv6-20261030/quic-retry485`.
+TLS-over-CRYPTO transport parameters, frame/stream handling, ACK/loss recovery,
+congestion/flow control, UDP ownership, QPACK and live verified HTTP/3 traffic
+remain, along with remaining TLS/device blocking and compatibility and public
+off-link IPv6/RDNSS web qualification. Retry integrity alone is not a QUIC
+connection or an authenticated web request.

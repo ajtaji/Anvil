@@ -1,6 +1,6 @@
 ; SPDX-License-Identifier: MIT
 ; Independently implemented QUIC v1 AES-128-GCM protection policy, RFC 9001
-; sections 5.1-5.4: https://www.rfc-editor.org/rfc/rfc9001.html
+; sections 5.1-5.4 and 5.8: https://www.rfc-editor.org/rfc/rfc9001.html
 ; Compose shared SHA256/HMAC/HKDF, AES/GCM and GCM jobs before this module.
 ; No second cipher implementation. Key derivation moves one HKDF operation per
 ; Step; packet jobs move one existing bounded GCM operation per Step.
@@ -204,6 +204,31 @@ Procedure.i QuicPacketJobBegin(*j.QuicPacketJob,*keys.QuicKeys,packet.i,bytes.i,
  quicCryptoOwner=*j : *j\phase=1 : ProcedureReturn 0
 EndProcedure
 
+; Retry uses caller-owned contiguous storage: one ODCID-length byte, that many
+; original destination ID bytes (0..20), then the complete Retry wire packet,
+; including 16 reserved tag bytes. Only the wire packet is transmitted. Keeping
+; this prefix in receive headroom avoids an unbounded packet copy at admission.
+; writeTag=0 verifies without mutation; writeTag=1 creates the outgoing tag.
+; RFC v1 constants are public: this integrity check does NOT verify peer identity.
+Procedure.i QuicRetryJobBegin(*j.QuicPacketJob,pseudo.i,bytes.i,writeTag.i)
+ Define h.QuicPacketHeader,n.i,packet.i,count.i,rc.i,i.i
+ If *j=0 Or pseudo=0 Or bytes<18 Or bytes>#QUIC_CRYPTO_MAX_PACKET+21 Or writeTag<0 Or writeTag>1 : ProcedureReturn #QUIC_CRYPTO_ARGUMENT : EndIf
+ If quicCryptoOwner<>0 Or GcmJobBusy()<>0 : ProcedureReturn #QUIC_CRYPTO_BUSY : EndIf
+ n=PeekA(pseudo)
+ If n>20 Or n>=bytes-1 : ProcedureReturn #QUIC_CRYPTO_ARGUMENT : EndIf
+ packet=pseudo+1+n : count=bytes-1-n
+ If count>#QUIC_CRYPTO_MAX_PACKET : ProcedureReturn #QUIC_CRYPTO_ARGUMENT : EndIf
+ rc=QuicPacketRead(@h,packet,count,0) : If rc<>1 : ProcedureReturn rc : EndIf
+ If h\kind<>#QUIC_PACKET_RETRY : ProcedureReturn #QUIC_CRYPTO_ARGUMENT : EndIf
+ For i=0 To SizeOf(QuicPacketJob)-1 : PokeA(*j+i,0) : Next
+ *j\packet=packet : *j\packetBytes=count : *j\plainOffset=count-16 : *j\encrypt=2+writeTag
+ quicc_Invalidate()
+ rc=GcmJobBeginEncrypt(?quic_v1_retry_key,16,?quic_v1_retry_nonce,pseudo,bytes-16,0,0,0,@*j\mask0)
+ If rc<>0 : ProcedureReturn quicc_Finish(*j,#QUIC_CRYPTO_STATE) : EndIf
+ quicCryptoOwner=*j : *j\phase=2 : ProcedureReturn 0
+EndProcedure
+
+; Shared Step/Cancel for packet protection and Retry integrity jobs.
 Procedure.i QuicPacketJobStep(*j.QuicPacketJob)
  Define rc.i,i.i,mask.i
  If *j=0 : ProcedureReturn #QUIC_CRYPTO_ARGUMENT : EndIf
@@ -221,6 +246,19 @@ Procedure.i QuicPacketJobStep(*j.QuicPacketJob)
   ProcedureReturn 0
  EndIf
  If rc<0 : ProcedureReturn quicc_Finish(*j,#QUIC_CRYPTO_STATE) : EndIf
+ If *j\phase=2
+  If GcmJobResult<>1 : ProcedureReturn quicc_Finish(*j,#QUIC_CRYPTO_STATE) : EndIf
+  rc=0
+  For i=0 To 15
+   If *j\encrypt=3
+    PokeA(*j\packet+*j\packetBytes-16+i,PeekA(@*j\mask0+i))
+   Else
+    rc=rc | (PeekA(*j\packet+*j\packetBytes-16+i) ! PeekA(@*j\mask0+i))
+   EndIf
+  Next
+  If rc<>0 : ProcedureReturn quicc_Finish(*j,#QUIC_CRYPTO_AUTH) : EndIf
+  ProcedureReturn quicc_Finish(*j,1)
+ EndIf
  If GcmJobResult<>1
   quicc_RestoreHeader(*j) : ProcedureReturn quicc_Finish(*j,#QUIC_CRYPTO_AUTH)
  EndIf
@@ -245,4 +283,8 @@ EndProcedure
 DataSection
 quic_v1_salt:
  Data.a $38,$76,$2C,$F7,$F5,$59,$34,$B3,$4D,$17,$9A,$E6,$A4,$C8,$0C,$AD,$CC,$BB,$7F,$0A
+quic_v1_retry_key:
+ Data.a $BE,$0C,$69,$0B,$9F,$66,$57,$5A,$1D,$76,$6B,$54,$E3,$68,$C8,$4E
+quic_v1_retry_nonce:
+ Data.a $46,$15,$99,$D3,$5D,$63,$2B,$F2,$23,$98,$25,$BB
 EndDataSection

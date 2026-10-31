@@ -4,11 +4,13 @@ import struct
 def check(raw,cases):
  assert len(raw)==262144 and struct.unpack_from('<QQ',raw)==(0x51434331,len(cases))
  keymax=beginmax=stepmax=0
+ stride=struct.unpack_from('<q',raw,16)[0] or 4096
+ assert stride in (2048,4096) and 256+len(cases)*stride<=len(raw)
  for index,c in enumerate(cases):
-  p=256+index*4096;r=struct.unpack_from('<16q',raw,p)
+  p=256+index*stride;r=struct.unpack_from('<16q',raw,p)
   assert r[0]==c['rc'],(index,c['name'],r)
   assert r[8]==r[9]==r[12]==r[13]==0,(c['name'],'early write/guard/owner',r)
-  if c['mode'] not in (2,3):assert r[15]==r[0],(c['name'],'terminal result')
+  if c['mode'] not in (2,3):assert r[15]==(-3346 if c.get('begin_error') else r[0]),(c['name'],'terminal result')
   if c['mode']==1:assert r[10]==r[11]==-3342,(c['name'],'owner not protected')
   if c['mode']==2:assert r[11]==1,(c['name'],'foreign owner cancelled')
   assert struct.unpack_from('<3q',raw,p+224)==(0,0,0),(c['name'],'secret retained or TLS record interleave failed')

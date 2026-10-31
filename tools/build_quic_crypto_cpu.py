@@ -6,7 +6,7 @@ from quic_crypto_cases import cases
 
 def build(compiler,out,vectors):
  root=Path(__file__).resolve().parents[1];out.mkdir(parents=True,exist_ok=False)
- rows=cases(json.loads(vectors.read_text()));assert len(rows)<63
+ rows=cases(json.loads(vectors.read_text()));assert len(rows)<127
  names=['Anvil/Core/sha256.pbi','Anvil/Crypto/hmac.pbi','Anvil/Crypto/hkdf.pbi','Anvil/Crypto/aes.pbi','Anvil/Crypto/gcm.pbi','Anvil/Crypto/gcm_job.pbi','Anvil/Crypto/tls13_record.pbi','Anvil/Network/quic_crypto.pbi','RaspberryPi4/Lib/mmu.pi4']
  s='\n'.join('XIncludeFile "'+n+'"' for n in names)+r'''
 Global keys.QuicKeys,kjob.QuicKeyJob,job.QuicPacketJob,other.QuicPacketJob
@@ -40,9 +40,9 @@ Procedure Interleave()
   For i=0 To 15 : If record[5+i]<>0 : interleaveFailure=1 : EndIf : Next
  EndIf
 EndProcedure
-Procedure Run(index.i,bytes.i,seedBytes.i,side.i,traffic.i,encrypt.i,shortId.i,number.i,mode.i,cancelStep.i,wrongKey.i)
+Procedure Run(index.i,bytes.i,seedBytes.i,side.i,traffic.i,encrypt.i,shortId.i,number.i,mode.i,cancelStep.i,wrongKey.i,retry.i)
  Define i.i,rc.i,p.i,steps.i,t.i,cost.i,keyMax.i,stepMax.i,beginCost.i,early.i,verified.i,k.i,busy.i,foreign.i,again.i,guard.i
- p=$E1C00100+index*4096
+ p=$E1C00100+index*2048
  For i=0 To 2047 : packet[i]=$A5 : original[i]=$A5 : Next
  For i=0 To seedBytes-1 : Read.a seed[i] : Next
  For i=0 To bytes-1 : Read.a packet[8+i] : original[8+i]=packet[8+i] : Next
@@ -69,7 +69,10 @@ Procedure Run(index.i,bytes.i,seedBytes.i,side.i,traffic.i,encrypt.i,shortId.i,n
  If mode<>3 And rc=1
   If mode=2 : foreign=GcmJobBeginEncrypt(@keys\key0,16,@keys\iv0,0,0,0,0,0,@dummy[0]) : EndIf
   If encrypt=0 : number=number-1 : EndIf
-  t=clock() : rc=QuicPacketJobBegin(@job,@keys,@packet[8],bytes,shortId,number,encrypt) : beginCost=clock()-t
+  t=clock()
+  If retry : rc=QuicRetryJobBegin(@job,@packet[8],bytes,encrypt)
+  Else : rc=QuicPacketJobBegin(@job,@keys,@packet[8],bytes,shortId,number,encrypt) : EndIf
+  beginCost=clock()-t
   If mode=2
    foreign=GcmJobBusy() : GcmJobCancel()
   Else
@@ -114,6 +117,7 @@ Procedure.i Main()
  *pet=PeekI(table+16+6*8) : *clock=PeekI(table+16+11*8)
  For i=0 To 262143 : PokeA($E1C00000+i,0) : Next
  PokeI($E1C00000,$51434331)
+ PokeI($E1C00010,2048)
  MmuClearNc() : MmuAddNc($08A00000,$09200000) : MmuAddNc($08100000,$08180000)
  rc=MmuBuildTables($4F80000) : If rc<>0 : ProcedureReturn 2 : EndIf
  MmuEnableCached()
@@ -121,7 +125,7 @@ Procedure.i Main()
 '''
  s+=f' PokeI($E1C00008,{len(rows)})\n'
  for i,c in enumerate(rows):
-  params=[i,len(bytes.fromhex(c['input'])),len(bytes.fromhex(c['seed'])),c['side'],int(c['traffic']),c['encrypt'],c['shortid'],c['number'],c['mode'],c['cancel'],int(c['wrong_key'])]
+  params=[i,len(bytes.fromhex(c['input'])),len(bytes.fromhex(c['seed'])),c['side'],int(c['traffic']),c['encrypt'],c['shortid'],c['number'],c['mode'],c['cancel'],int(c['wrong_key']),c.get('retry',0)]
   s+=f' Restore Case{i}\n Run('+','.join(map(str,params))+')\n'
  s+=' MmuDisableCachedFlushed()\n ProcedureReturn 0\nEndProcedure\nDataSection\n'
  for i,c in enumerate(rows):s+=f'Case{i}:\n Data.a '+','.join(map(str,bytes.fromhex(c['seed']+c['input'])))+'\n'

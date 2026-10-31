@@ -74,4 +74,34 @@ def cases(vectors):
     for phase in (0,1,2,3,4):
         rows.append(dict(base,name=f'key-cancel-{phase}',seed=CID.hex(),traffic=False,encrypt=0,input=wire.hex(),output=wire.hex(),rc=-3345,mode=3,cancel=phase))
     rows.extend([dict(rows[0],name='tls-interleave-encrypt',mode=4),dict(rows[1],name='tls-interleave-decrypt',mode=4)])
+    # RFC 9001 Appendix A.4, independently reproduced with AESGCM.
+    retry=bytes.fromhex('ff000000010008f067a5502a4262b5746f6b656e04a265ba2eff4d829058fb3f0f2496ba')
+    retrykey=bytes.fromhex('be0c690b9f66575a1d766b54e368c84e')
+    retrynonce=bytes.fromhex('461599d35d632bf2239825bb')
+    def retry_pair(name,odcid,header):
+        prefix=bytes([len(odcid)])+odcid
+        tag=AESGCM(retrykey).encrypt(retrynonce,b'',prefix+header)
+        wire=prefix+header+tag
+        common=dict(rows[0],name=name,retry=1,number=0,header=header.hex(),plain='')
+        rows.append(dict(common,encrypt=1,input=(prefix+header+b'\0'*16).hex(),output=wire.hex()))
+        rows.append(dict(common,encrypt=0,input=wire.hex(),output=wire.hex()))
+        return rows[-1]
+    sample=retry_pair('rfc-retry',CID,retry[:-16])
+    assert bytes.fromhex(sample['input'])[9:]==retry
+    retry_pair('retry-zero-odcid',b'',retry[:15]+b'x')
+    retry_pair('retry-long-token',bytes(range(20)),retry[:15]+bytes(range(256))*4)
+    for i in range(16):
+        bad=bytearray.fromhex(sample['input']);bad[-1-i]^=1
+        rows.append(dict(sample,name=f'retry-bad-tag-{i}',input=bad.hex(),output=bad.hex(),rc=-3343))
+    for pos in (1,9,25):
+        bad=bytearray.fromhex(sample['input']);bad[pos]^=1
+        rows.append(dict(sample,name=f'retry-bad-id-header-token-{pos}',input=bad.hex(),output=bad.hex(),rc=-3343))
+    rows.append(dict(sample,name='retry-second-owner',mode=1))
+    rows.append(dict(sample,name='retry-foreign-owner',mode=2,rc=-3342))
+    for step in (1,2):rows.append(dict(sample,name=f'retry-cancel-{step}',cancel=step,rc=-3345))
+    rows.extend([dict(sample,name='retry-tls-interleave',mode=4),dict(rows[-2],name='retry-cancel-tls',mode=4)])
+    bad=bytes([21])+bytes.fromhex(sample['input'])[1:]
+    rows.append(dict(sample,name='retry-invalid-odcid-length',input=bad.hex(),output=bad.hex(),rc=-3341,begin_error=True))
+    bad=bytes([8])+CID+bytes.fromhex(rows[1]['input'])
+    rows.append(dict(sample,name='retry-wrong-packet-kind',input=bad.hex(),output=bad.hex(),rc=-3341,begin_error=True))
     return rows
