@@ -43,6 +43,7 @@ Procedure.i QuicConnectionSendBegin(*c.QuicConnection,level.i,peerBytes.i)
  If quiccs_Valid(*c)=0 : ProcedureReturn #QUIC_SEND_ARGUMENT : EndIf
  If *c\phase<>1 Or (*c\outgoing\phase<>0 And *c\outgoing\phase<>6) : ProcedureReturn #QUIC_SEND_STATE : EndIf
  If *c\application\phase=1 : ProcedureReturn #QUIC_SEND_STATE : EndIf
+ If *c\controlPhase>=1 And *c\controlPhase<=3 : ProcedureReturn #QUIC_SEND_STATE : EndIf
  If *c\startup\phase>=1 And *c\startup\phase<=8 : ProcedureReturn #QUIC_SEND_STATE : EndIf
  If *c\acknowledge\phase>=1 And *c\acknowledge\phase<=4 : ProcedureReturn #QUIC_SENT_BUSY : EndIf
  If *c\incoming\phase>=1 And *c\incoming\phase<=3 : ProcedureReturn #QUIC_SEND_STATE : EndIf

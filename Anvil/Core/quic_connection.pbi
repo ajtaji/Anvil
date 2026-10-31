@@ -111,6 +111,10 @@ Structure QuicConnection
  applicationState.QuicApplicationState
  peerIds.QuicPeerIds
  peerIdRecords.i[72]
+ controlPhase.i ; 0 fresh,1 encrypt,2 submit,3 transport,4 complete,-1 failed
+ controlBytes.i
+ controlNumber.i
+ controlToken.i
 EndStructure
 ; Span table order: RX data/bits,TX data/bits,ACK ranges,sent slots/metadata,
 ; TLS snapshot,handshake/receive/output/config,local/peer parameters/entries,
@@ -232,6 +236,7 @@ EndProcedure
 Procedure.i QuicConnectionPeerIdAdd(*c.QuicConnection,sequence.i,retire.i,id.i,bytes.i,token.i)
  Define rc.i,p.i,dst.i,i.i
  If qconn_Span(*c,SizeOf(QuicConnection))=0 : ProcedureReturn #QUIC_CONNECTION_ARGUMENT : EndIf
+ If *c\controlPhase>=1 And *c\controlPhase<=3 : ProcedureReturn #QUIC_CONNECTION_STATE : EndIf
  If *c\phase<>1 Or *c\application\phase<>2 Or *c\application\result<>1 Or *c\application\encrypt<>0 Or *c\application\keys<>@*c\appRead : ProcedureReturn #QUIC_CONNECTION_STATE : EndIf
  If TlsWorkerBusy()<>0 : ProcedureReturn #TLSWORK_BUSY : EndIf
  If *c\outgoing\phase<>0 And *c\outgoing\phase<>6 : ProcedureReturn #QUIC_CONNECTION_STATE : EndIf

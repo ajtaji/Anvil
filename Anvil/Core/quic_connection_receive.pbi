@@ -37,6 +37,7 @@ Procedure.i QuicConnectionReceiveBegin(*c.QuicConnection,level.i,packet.i,bytes.
  If quiccr_Valid(*c)=0 : ProcedureReturn #QUIC_RECEIVE_ARGUMENT : EndIf
  If *c\phase<>1 Or (*c\incoming\phase<>0 And *c\incoming\phase<>4 And *c\incoming\phase<>6) : ProcedureReturn #QUIC_RECEIVE_STATE : EndIf
  If *c\application\phase=1 : ProcedureReturn #QUIC_RECEIVE_STATE : EndIf
+ If *c\controlPhase>=1 And *c\controlPhase<=3 : ProcedureReturn #QUIC_RECEIVE_STATE : EndIf
  If *c\startup\phase>=1 And *c\startup\phase<=8 : ProcedureReturn #QUIC_RECEIVE_STATE : EndIf
  If *c\feed\phase>=1 And *c\feed\phase<=11 : ProcedureReturn #QUIC_RECEIVE_STATE : EndIf
  If *c\outgoing\phase<>0 And *c\outgoing\phase<>6 : ProcedureReturn #QUIC_SENT_BUSY : EndIf

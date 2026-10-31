@@ -5,7 +5,8 @@
 ; No Retry, migration, recovery timer, general application dispatch or HTTP/3 requests.
 ; The first protected 1-RTT packet is authenticated and its frame syntax is
 ; decoded. HANDSHAKE_DONE and NEW_CONNECTION_ID effects run; ACK transmission
-; and other application effects remain open.
+; now produces an application ACK/PING after all supported effects succeed.
+; Other frame kinds are refused without committing an application receipt.
 ; TLS completion is also checked independently by the server.
 Global connection.QuicConnection
 Global Dim connectionSpans.i[40]
@@ -27,6 +28,8 @@ Global keyOp.QuicTlsOperation,probeKey.QuicKeyJob,probeKeys.QuicKeys
 Global preparedKeyOp.QuicTlsOperation
 Global applicationFrame.QuicApplicationFrame,applicationFrames.i,doneSeen.i
 Global retireFault.i,retireChecked.i
+Global Dim controlSaved.a[1472]
+Global controlFault.i,controlChecked.i,controlDelay.i,controlReceipt.i
 Global peerIdsFault.i,peerIdsChecked.i,peerIdsFrames.i
 Global confirmFault.i,confirmChecked.i,confirmForeign.i,confirmSecretPresent.i
 Global applicationStateFault.i
@@ -261,30 +264,41 @@ Procedure.i ApplicationCrypt(packetAddress.i,bytes.i,idBytes.i,number.i,encrypt.
  ProcedureReturn rc
 EndProcedure
 Procedure.i SendApplicationPing()
- Define rc.i,n.i,i.i,header.i,bytes.i,number.i
+ Define rc.i,n.i,t.i,cost.i,i.i
  If applicationPing<>0 Or connection\appWrite\ready<>1 : ProcedureReturn -9441 : EndIf
- number=QuicApplicationNumberReserve(@connection\applicationState)
- If number<>0 Or connection\applicationState\nextNumber<>1 : applicationStateFault=1 : ProcedureReturn -9451 : EndIf
  applicationWriteReady=1
- ; One diagnostic packet, PN0 exactly once under these fresh write keys.
- ; Header: fixed bit, key phase0, spin0, four PN bytes, then PING and tag space.
- PokeA(@output[0],$43)
- For i=0 To peerBytes-1 : output[1+i]=peerId[i] : Next
- NetWriteBE32(@output[0]+1+peerBytes,number & $FFFFFFFF)
- header=1+peerBytes+4 : output[header]=1 : bytes=header+1+16
- rc=ApplicationCrypt(@output[0],bytes,peerBytes,number,1) : If rc<>1 : ProcedureReturn rc : EndIf
+ controlDelay=QuicApplicationAckDelay(@connection\applicationState,HwMicros(),3)
+ rc=QuicConnectionControlBegin(@connection,HwMicros(),3,1) : If rc<>0 : ProcedureReturn rc : EndIf
+ If connection\controlNumber<>0 Or connection\applicationState\nextNumber<>1 : controlFault=1 : EndIf
+ If QuicConnectionControlBegin(@connection,HwMicros(),3,1)<>#QUIC_CONTROL_STATE : controlFault=2 : EndIf
+ If QuicConnectionControlCompleted(@connection,0)<>#QUIC_CONTROL_STATE : controlFault=3 : EndIf
+ Repeat
+  t=HwMicros() : rc=QuicConnectionControlStep(@connection) : cost=HwMicros()-t
+  applicationSteps=applicationSteps+1 : If cost>maxApplicationStep : maxApplicationStep=cost : EndIf
+  n=Service() : If n<0 : ProcedureReturn n : EndIf
+ Until rc<>0
+ If rc<>2 : ProcedureReturn rc : EndIf
+ If QuicConnectionControlStep(@connection)<>2 Or connection\applicationState\ack\pending<>1 : controlFault=4 : EndIf
+ If QuicConnectionSendBegin(@connection,2,peerBytes)<>#QUIC_SEND_STATE : controlFault=5 : EndIf
+ For i=0 To connection\controlBytes-1 : controlSaved[i]=output[i] : Next
  Repeat
   n=Service() : If n<0 : ProcedureReturn n : EndIf
-  rc=UdpPayloadSendTo(handle,@ep,@output[0],bytes)
+  rc=UdpPayloadSendTo(handle,@ep,@output[0],connection\controlBytes)
  Until rc<>#SVC_EAGAIN
  If rc<1 : ProcedureReturn rc : EndIf
+ rc=QuicConnectionControlAccepted(@connection) : If rc<>0 : ProcedureReturn rc : EndIf
+ If QuicConnectionControlStep(@connection)<>3 Or connection\applicationState\ack\pending<>1 : controlFault=6 : EndIf
+ If QuicConnectionControlAccepted(@connection)<>#QUIC_CONTROL_STATE : controlFault=7 : EndIf
  Repeat
   n=Service() : If n<0 : ProcedureReturn n : EndIf
   rc=UdpPayloadStatus(handle,@status) : If rc<>0 : ProcedureReturn rc : EndIf
   If status\txState=#UDP_TX_FAILED : ProcedureReturn status\txError : EndIf
  Until status\txState=#UDP_TX_SENT
- applicationPing=1
- ProcedureReturn 0
+ For i=0 To connection\controlBytes-1 : If controlSaved[i]<>output[i] : controlFault=8 : EndIf : Next
+ rc=QuicConnectionControlCompleted(@connection,0) : If rc<>1 : ProcedureReturn rc : EndIf
+ If QuicConnectionControlStep(@connection)<>1 Or connection\applicationState\ack\pending<>0 : controlFault=9 : EndIf
+ If QuicConnectionControlCompleted(@connection,0)<>#QUIC_CONTROL_STATE : controlFault=10 : EndIf
+ controlChecked=1 : applicationPing=1 : ProcedureReturn 0
 EndProcedure
 Procedure.i ConfirmHandshake()
  Define rc.i,n.i,i.i,expected.i,beforeRead.QuicKeys,beforeWrite.QuicKeys
@@ -334,7 +348,8 @@ Procedure.i ConfirmHandshake()
  confirmChecked=1 : ProcedureReturn 1
 EndProcedure
 Procedure.i PacketOne(p.i,bytes.i)
- Define rc.i,i.i,t.i,cost.i,old.i,known.i,count.i,cursor.i,n.i,*s.QuicConnectionSpace
+ Define rc.i,i.i,t.i,cost.i,old.i,known.i,count.i,cursor.i,n.i,receivedAt.i,eliciting.i,*s.QuicConnectionSpace
+ receivedAt=HwMicros()
  rc=QuicPacketRead(@connection\header,p,bytes,8) : If rc<>1 : ProcedureReturn -9307 : EndIf
  If connection\header\kind=4
   If connection\header\destinationBytes<>8 : ProcedureReturn -9308 : EndIf
@@ -368,6 +383,8 @@ Procedure.i PacketOne(p.i,bytes.i)
    n=QuicApplicationFrameRead(p+connection\application\crypto\plainOffset+cursor,connection\application\crypto\plainBytes-cursor,@applicationFrame)
    If n<1 : ProcedureReturn n : EndIf
    cursor=cursor+n
+   If applicationFrame\base\kind<>0 And applicationFrame\base\kind<>1 And applicationFrame\base\kind<>24 And applicationFrame\base\kind<>30 : ProcedureReturn -9471 : EndIf
+   eliciting=eliciting | applicationFrame\base\eliciting
    If applicationFrame\base\kind<>0 : applicationFrames=applicationFrames+1 : EndIf
    If applicationFrame\base\kind=30
     doneSeen=1 : rc=ConfirmHandshake() : If rc<>1 : ProcedureReturn rc : EndIf
@@ -385,6 +402,9 @@ Procedure.i PacketOne(p.i,bytes.i)
    EndIf
    rc=Pump() : If rc<0 : ProcedureReturn rc : EndIf
   Wend
+  rc=QuicApplicationProcessed(@connection\applicationState,applicationNumber,eliciting,receivedAt)
+  If rc<>1 : ProcedureReturn rc : EndIf
+  controlReceipt=applicationNumber
   appAuthenticated=1 : ProcedureReturn 0
  EndIf
  If connection\header\kind=0 : *s=@connection\initial
@@ -929,6 +949,8 @@ Procedure.i Main()
  PokeI($E1C002C0,confirmFault) : PokeI($E1C002C8,confirmChecked)
  For i=0 To SizeOf(QuicPeerIds)-1 : If PeekA(@connection\peerIds+i)<>0 : peerIdsFault=7 : EndIf : Next
  For i=0 To 575 : If PeekA(@connection\peerIdRecords+i)<>0 : peerIdsFault=8 : EndIf : Next
+ PokeI($E1C00300,controlFault) : PokeI($E1C00308,controlChecked)
+ PokeI($E1C00310,controlDelay) : PokeI($E1C00318,controlReceipt)
  PokeI($E1C002E0,peerIdsFault) : PokeI($E1C002E8,peerIdsChecked) : PokeI($E1C002F0,peerIdsFrames)
  PokeI($E1C002D0,confirmForeign) : PokeI($E1C002D8,confirmSecretPresent)
  PokeI($E1C00100,rc) : PokeI($E1C00108,tlsState) : PokeI($E1C00110,tlsError)

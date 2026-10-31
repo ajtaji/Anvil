@@ -148,6 +148,29 @@ class Peer:
             assert time.monotonic()<end,'No authenticated client application PING'
             self.stop.wait(.01)
 
+    def check_application_ack(self, timeout=2):
+        """Require a decoded client ACK for an actual server HANDSHAKE_DONE packet."""
+        end=time.monotonic()+timeout
+        while True:
+            self.check()
+            events=[event for trace in self.logger.to_dict()['traces'] for event in trace['events']]
+            sent={int(e['data']['header']['packet_number']) for e in events
+                  if e['name']=='transport:packet_sent' and e['data']['header']['packet_type']=='1RTT'
+                  and any(f['frame_type']=='handshake_done' for f in e['data']['frames'])}
+            for e in events:
+                if e['name']!='transport:packet_received' or e['data']['header']['packet_type']!='1RTT':continue
+                for f in e['data']['frames']:
+                    if f['frame_type']=='ack':
+                        ranges=f['acked_ranges']
+                        covered={pn for pn in sent if any(lo<=pn<=hi for lo,hi in ranges)}
+                        if covered:
+                            self.result['application_ack_authenticated']=True
+                            self.result['application_ack_ranges']=ranges
+                            self.result['application_ack_delay']=f.get('ack_delay')
+                            return
+            assert time.monotonic()<end,'No authenticated application ACK covering HANDSHAKE_DONE'
+            self.stop.wait(.01)
+
 def selftest(directory, report, connection_id_length=8):
     """Verify this exact test CA/chain with a normal independent local client."""
     with Peer(directory,report,host='127.0.0.1',port=0,allowed='127.0.0.1',connection_id_length=connection_id_length) as peer:
