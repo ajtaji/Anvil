@@ -83,6 +83,19 @@ Procedure.i QuicHandshakeSentInit(*s.QuicHandshakeSent,level.i,entries.i,capacit
  *s\phase=1 : *s\level=level : *s\entries=entries : *s\capacity=capacity
  *s\lastEliciting=-1 : *s\lastSent=-1 : *s\largestAcked=-1 : ProcedureReturn 0
 EndProcedure
+; Retained metadata for an eliciting, committed, not-yet-ACKed packet.
+; A lost packet can still own useful retry data. This query never declares loss.
+Procedure.i QuicHandshakeSentProbeCookie(*s.QuicHandshakeSent,number.i)
+ Define rc.i,p.i,flags.i
+ rc=quics_Ready(*s) : If rc<0 : ProcedureReturn rc : EndIf
+ If *s\busy<>0 : ProcedureReturn #QUIC_SENT_BUSY : EndIf
+ If number<*s\first Or number>=*s\issued : ProcedureReturn #QUIC_SENT_ARGUMENT : EndIf
+ p=*s\entries+(number % *s\capacity)*32 : flags=PeekI(p)
+ If (flags&2)=0 : ProcedureReturn #QUIC_SENT_UNSENT : EndIf
+ If (flags&4)=0 Or (flags&16)<>0 : ProcedureReturn #QUIC_SENT_STATE : EndIf
+ ProcedureReturn PeekI(p+24)
+EndProcedure
+
 ; Reserve BEFORE encrypting. A failed/cancelled protection/send burns its PN.
 ; Returns PN>=0. Exhaustion is a local limit, never permission to reuse a PN.
 Procedure.i QuicHandshakeSentReserve(*s.QuicHandshakeSent)

@@ -80,6 +80,13 @@ Structure QuicConnectionStart
  timeout.i
  keyTarget.i
 EndStructure
+Structure QuicConnectionProbe
+ phase.i
+ level.i
+ number.i
+ offset.i
+ remaining.i
+EndStructure
 Structure QuicConnection
  phase.i ; 0 fresh,1 active,2 closing,3 closed
  result.i
@@ -132,6 +139,7 @@ Structure QuicConnection
  recoveryRetryOffset.i
  recoveryRetryRemaining.i
  recoveryRetryLevel.i
+ probe.QuicConnectionProbe
 EndStructure
 ; Span table order: RX data/bits,TX data/bits,ACK ranges,sent slots/metadata,
 ; TLS snapshot,handshake/receive/output/config,local/peer parameters/entries,
@@ -285,13 +293,55 @@ Procedure.i QuicConnectionRecoveryPoll(*c.QuicConnection,now.i)
  If rc=1 : *c\recoveryLevel=*c\recoveryTimer\level : EndIf
  ProcedureReturn rc
 EndProcedure
+; Prepare retained CRYPTO from one selected packet for a fresh PTO probe.
+; Caller chooses an eligible packet after a timeout; this does not mark loss,
+; send a packet, pick another packet or implement address-validation policy.
+Procedure.i QuicConnectionProbeBegin(*c.QuicConnection,level.i,number.i)
+ Define p.i,cookie.i,offset.i,bytes.i,*s.QuicConnectionSpace
+ If qconn_Span(*c,SizeOf(QuicConnection))=0 Or (level<>0 And level<>2) : ProcedureReturn #QUIC_CONNECTION_ARGUMENT : EndIf
+ If *c\phase<>1 Or (*c\probe\phase<>0 And *c\probe\phase<>2) Or *c\recoveryRetryRemaining<>0 : ProcedureReturn #QUIC_CONNECTION_STATE : EndIf
+ If *c\outgoing\phase<>0 And *c\outgoing\phase<>6 : ProcedureReturn #QUIC_CONNECTION_STATE : EndIf
+ If *c\controlPhase>=1 And *c\controlPhase<=3 : ProcedureReturn #QUIC_CONNECTION_STATE : EndIf
+ If *c\acknowledge\phase>=1 And *c\acknowledge\phase<=4 : ProcedureReturn #QUIC_CONNECTION_STATE : EndIf
+ If *c\incoming\phase>=1 And *c\incoming\phase<=3 : ProcedureReturn #QUIC_CONNECTION_STATE : EndIf
+ If *c\feed\phase>=1 And *c\feed\phase<=11 : ProcedureReturn #QUIC_CONNECTION_STATE : EndIf
+ If *c\application\phase=1 Or TlsWorkerBusy()<>0 : ProcedureReturn #QUIC_CONNECTION_STATE : EndIf
+ If level=0 : *s=@*c\initial : Else : *s=@*c\handshake : EndIf
+ If *s\writeKeys\ready<>1 Or *s\tx\phase<>1 : ProcedureReturn #QUIC_CONNECTION_STATE : EndIf
+ cookie=QuicHandshakeSentProbeCookie(@*s\history,number) : If cookie<0 : ProcedureReturn cookie : EndIf
+ p=*s\metadata+(number % *s\history\capacity)*16
+ If qconn_Span(p,16)=0 Or cookie<>p : ProcedureReturn #QUIC_CONNECTION_STATE : EndIf
+ offset=PeekI(p) : bytes=PeekI(p+8)
+ If offset<0 Or bytes<1 Or bytes>16384 Or offset>#QUIC_INTEGER_MAX-bytes : ProcedureReturn #QUIC_CONNECTION_STATE : EndIf
+ If offset+bytes>*s\tx\tail : ProcedureReturn #QUIC_CONNECTION_STATE : EndIf
+ *c\probe\phase=1 : *c\probe\level=level : *c\probe\number=number : *c\probe\offset=offset : *c\probe\remaining=bytes
+ *s\history\busy=@*c\probe : ProcedureReturn 0
+EndProcedure
+; 0 pending,1 ready for normal sender,negative refusal/failure. At most256
+; retained bytes per step. Close cancels ownership; no rollback is promised.
+Procedure.i QuicConnectionProbeStep(*c.QuicConnection)
+ Define rc.i,n.i,*s.QuicConnectionSpace
+ If qconn_Span(*c,SizeOf(QuicConnection))=0 : ProcedureReturn #QUIC_CONNECTION_ARGUMENT : EndIf
+ If *c\phase<>1 : ProcedureReturn #QUIC_CONNECTION_STATE : EndIf
+ If *c\probe\phase=2 : ProcedureReturn 1 : EndIf
+ If *c\probe\phase<>1 : ProcedureReturn #QUIC_CONNECTION_STATE : EndIf
+ If *c\probe\level=0 : *s=@*c\initial : Else : *s=@*c\handshake : EndIf
+ If *s\history\busy<>@*c\probe : QuicConnectionClose(*c,#QUIC_CONNECTION_STATE) : ProcedureReturn #QUIC_CONNECTION_STATE : EndIf
+ n=*c\probe\remaining : If n>256 : n=256 : EndIf
+ rc=QuicCryptoTxRetry(@*s\tx,*c\probe\offset,n)
+ If rc<0 : QuicConnectionClose(*c,rc) : ProcedureReturn rc : EndIf
+ *c\probe\offset=*c\probe\offset+n : *c\probe\remaining=*c\probe\remaining-n
+ If *c\probe\remaining>0 : ProcedureReturn 0 : EndIf
+ *s\history\busy=0 : *c\probe\phase=2 : ProcedureReturn 1
+EndProcedure
+
 Procedure.i qconn_LossOwned(*c.QuicConnection)
  ProcedureReturn Bool(*c\recoveryLoss\owner=@*c\initial\history Or *c\recoveryLoss\owner=@*c\handshake\history Or *c\recoveryLoss\owner=@*c\applicationHistory)
 EndProcedure
 Procedure.i QuicConnectionLossBegin(*c.QuicConnection,level.i,now.i,delay.i,threshold.i)
  Define history.i
  If qconn_Span(*c,SizeOf(QuicConnection))=0 : ProcedureReturn #QUIC_CONNECTION_ARGUMENT : EndIf
- If *c\phase<>1 Or *c\recoveryRetryRemaining<>0 : ProcedureReturn #QUIC_CONNECTION_STATE : EndIf
+ If *c\phase<>1 Or *c\recoveryRetryRemaining<>0 Or *c\probe\phase=1 : ProcedureReturn #QUIC_CONNECTION_STATE : EndIf
  If *c\controlPhase>=1 And *c\controlPhase<=3 : ProcedureReturn #QUIC_CONNECTION_STATE : EndIf
  If *c\outgoing\phase<>0 And *c\outgoing\phase<>6 : ProcedureReturn #QUIC_CONNECTION_STATE : EndIf
  Select level
@@ -451,7 +501,7 @@ EndProcedure
 ; storage before1. Only owned jobs are cancelled; no global crypto wipe occurs.
 ; Buffer erasure is at most4096 bytes/call plus fixed-size descriptor cleanup.
 Procedure.i QuicConnectionCloseStep(*c.QuicConnection)
- Define rc.i,i.i,n.i,p.i,budget.i,reason.i
+ Define rc.i,i.i,n.i,p.i,budget.i,reason.i,*probeHistory.QuicHandshakeSent
  If qconn_Span(*c,SizeOf(QuicConnection))=0 : ProcedureReturn #QUIC_CONNECTION_ARGUMENT : EndIf
  If *c\phase=3 : ProcedureReturn 1 : EndIf
  If *c\phase<>2 : ProcedureReturn #QUIC_CONNECTION_STATE : EndIf
@@ -459,6 +509,11 @@ Procedure.i QuicConnectionCloseStep(*c.QuicConnection)
  ; cleanup instead of allowing a packet cancellation to reset its GCM job.
  If TlsWorkerBusy()<>0 And TlsWorkerOwns(@*c\tlsOp\context\worker)=0 And TlsWorkerOwns(@*c\outgoing\worker)=0 And TlsWorkerOwns(@*c\incoming\worker)=0 And TlsWorkerOwns(@*c\application\worker)=0 : ProcedureReturn #TLSWORK_BUSY : EndIf
  If *c\closeStage=0
+  If *c\probe\phase=1
+   If *c\probe\level=0 : *probeHistory=@*c\initial\history : Else : *probeHistory=@*c\handshake\history : EndIf
+   If *probeHistory\busy<>@*c\probe : ProcedureReturn #QUIC_CONNECTION_STATE : EndIf
+   *probeHistory\busy=0 : *c\probe\phase=-1
+  EndIf
   If *c\recoveryLoss\phase=1
    If qconn_LossOwned(*c)=0 : ProcedureReturn #QUIC_CONNECTION_STATE : EndIf
    rc=QuicHandshakeSentLossCancel(@*c\recoveryLoss)

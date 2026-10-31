@@ -20,7 +20,7 @@ Procedure.i QuicConnectionControlBegin(*c.QuicConnection,now.i,exponent.i,ping.i
  Define p.i,header.i,n.i,number.i,token.i,rc.i,i.i
  If quicco_Span(*c,SizeOf(QuicConnection))=0 Or ping<0 Or ping>1 Or now<0 Or exponent<0 Or exponent>20 : ProcedureReturn #QUIC_CONTROL_ARGUMENT : EndIf
  If *c\phase<>1 Or (*c\controlPhase<>0 And *c\controlPhase<>4) : ProcedureReturn #QUIC_CONTROL_STATE : EndIf
- If *c\recoveryRetryRemaining<>0 : ProcedureReturn #QUIC_CONTROL_STATE : EndIf
+ If *c\recoveryRetryRemaining<>0 Or *c\probe\phase=1 : ProcedureReturn #QUIC_CONTROL_STATE : EndIf
  If *c\application\phase=1 Or *c\appWrite\ready<>1 Or *c\peerIdKnown<>1 : ProcedureReturn #QUIC_CONTROL_STATE : EndIf
  If *c\outgoing\phase<>0 And *c\outgoing\phase<>6 : ProcedureReturn #QUIC_CONTROL_STATE : EndIf
  If *c\incoming\phase>=1 And *c\incoming\phase<=3 : ProcedureReturn #QUIC_CONTROL_STATE : EndIf

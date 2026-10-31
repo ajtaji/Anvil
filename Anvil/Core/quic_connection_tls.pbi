@@ -16,6 +16,7 @@ EndProcedure
 Procedure.i QuicConnectionTlsBegin(*c.QuicConnection,level.i,peerBytes.i,timeoutUs.i)
  If quiccf_Valid(*c)=0 Or (level<>0 And level<>2) Or peerBytes<0 Or peerBytes>20 Or timeoutUs<=0 : ProcedureReturn #QUIC_FEED_ARGUMENT : EndIf
  If *c\phase<>1 Or (*c\feed\phase<>0 And *c\feed\phase<>12) : ProcedureReturn #QUIC_FEED_STATE : EndIf
+ If *c\probe\phase=1 : ProcedureReturn #QUIC_SENT_BUSY : EndIf
  If *c\application\phase=1 : ProcedureReturn #QUIC_FEED_STATE : EndIf
  If *c\controlPhase>=1 And *c\controlPhase<=3 : ProcedureReturn #QUIC_FEED_STATE : EndIf
  If *c\handshakeConfirmed<>0 : ProcedureReturn #QUIC_FEED_STATE : EndIf

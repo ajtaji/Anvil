@@ -861,6 +861,43 @@ Procedure CheckCryptoRetry(level.i,cancelled.i)
   rc=QuicHandshakeSentAckStep(@job) : If rc=2 Or rc<0 : Break : EndIf
  Next
  RetryAssert(rc,2)
+ If cancelled>=2
+  RetryAssert(QuicConnectionProbeBegin(@priorityContext,level,-1),#QUIC_SENT_ARGUMENT)
+  RetryAssert(QuicConnectionProbeBegin(@priorityContext,level,1),#QUIC_SENT_STATE)
+  RetryAssert(QuicConnectionProbeBegin(@priorityContext,level,0),0)
+  RetryAssert(QuicConnectionProbeBegin(@priorityContext,level,0),#QUIC_CONNECTION_STATE)
+  RetryAssert(QuicConnectionRecoveryPoll(@priorityContext,3000),#QUIC_SENT_BUSY)
+  RetryAssert(QuicConnectionSendBegin(@priorityContext,level,8),#QUIC_SENT_BUSY)
+  RetryAssert(QuicConnectionSendBegin(@priorityContext,2-level,8),#QUIC_SENT_BUSY)
+  RetryAssert(QuicConnectionReceiveBegin(@priorityContext,level,0,1),#QUIC_SENT_BUSY)
+  RetryAssert(QuicConnectionReceivePacketBegin(@priorityContext,0,1),#QUIC_SENT_BUSY)
+  RetryAssert(QuicConnectionTlsBegin(@priorityContext,level,8,1000),#QUIC_SENT_BUSY)
+  RetryAssert(QuicConnectionProbeStep(@priorityContext),0)
+  RetryAssert(priorityContext\probe\remaining,344)
+  If cancelled=3
+   RetryAssert(QuicConnectionClose(@priorityContext,0),0)
+   RetryAssert(QuicConnectionCloseStep(@priorityContext),0)
+   RetryAssert(priorityContext\probe\phase,-1)
+   RetryAssert(*s\history\busy,0)
+   RetryAssert(*s\history\phase,2)
+   RetryAssert(QuicConnectionProbeStep(@priorityContext),#QUIC_CONNECTION_STATE)
+   RetryAssert(*s\tx\phase,3)
+   RetryAssert(priorityContext\probe\remaining,344)
+  Else
+   RetryAssert(QuicConnectionProbeStep(@priorityContext),0)
+   RetryAssert(priorityContext\probe\remaining,88)
+   RetryAssert(QuicConnectionProbeStep(@priorityContext),1)
+   RetryAssert(priorityContext\probe\remaining,0)
+   RetryAssert(QuicConnectionProbeStep(@priorityContext),1)
+   RetryAssert(*s\history\inFlight,620)
+   RetryAssert(PeekI(@prioritySlots[0])&32,0)
+   RetryAssert(QuicCryptoTxFind(@*s\tx,0,1024,@v),1) : RetryAssert(v\offset,0) : RetryAssert(v\bytes,100)
+   RetryAssert(QuicCryptoTxFind(@*s\tx,100,1024,@v),1) : RetryAssert(v\offset,200) : RetryAssert(v\bytes,400)
+  EndIf
+  For i=0 To SizeOf(QuicConnection)-1 : PokeA(@priorityContext+i,0) : Next
+  For i=0 To 383 : PokeA(@prioritySlots[0]+i,0) : Next
+  ProcedureReturn
+ EndIf
  RetryAssert(QuicConnectionLossBegin(@priorityContext,level,2000,100,3),0)
  RetryAssert(QuicConnectionLossStep(@priorityContext),0)
  RetryAssert(priorityContext\recoveryRetryRemaining,600)
@@ -917,12 +954,12 @@ Procedure.i InitialProbe()
  If rc<>#QUIC_RECOVERY_PROBE Or connection\recoveryLevel<>0 Or connection\recoveryTimer\backoff<>1 : ProcedureReturn -9498 : EndIf
  If connection\initial\history\inFlight<>initialProbeBefore Or connection\initial\history\acked<>0 : ProcedureReturn -9499 : EndIf
  ; A PTO requests a fresh probe, not a declaration of packet loss.
- offset=connection\initial\tx\base
- While offset<connection\initial\tx\tail
-  bytes=connection\initial\tx\tail-offset : If bytes>256 : bytes=256 : EndIf
-  rc=QuicCryptoTxRetry(@connection\initial\tx,offset,bytes) : If rc<>0 : ProcedureReturn rc : EndIf
-  offset=offset+bytes : rc=Service() : If rc<0 : ProcedureReturn rc : EndIf
- Wend
+ rc=QuicConnectionProbeBegin(@connection,0,0) : If rc<>0 : ProcedureReturn rc : EndIf
+ Repeat
+  rc=QuicConnectionProbeStep(@connection)
+  n=Service() : If n<0 : ProcedureReturn n : EndIf
+ Until rc<>0
+ If rc<>1 : ProcedureReturn rc : EndIf
  rc=SendSpace(@connection\initial) : If rc<>0 : ProcedureReturn rc : EndIf
  initialProbeAfter=connection\initial\history\inFlight
  If connection\outgoing\number<>1 Or initialProbeAfter<>2*initialProbeBefore : ProcedureReturn -9500 : EndIf
@@ -1424,6 +1461,8 @@ Procedure.i Main()
  CheckRecoveryPriority()
  CheckCryptoRetry(0,0) : CheckCryptoRetry(2,0)
  CheckCryptoRetry(0,1) : CheckCryptoRetry(2,1)
+ CheckCryptoRetry(0,2) : CheckCryptoRetry(2,2)
+ CheckCryptoRetry(0,3) : CheckCryptoRetry(2,3)
  ep\family=4 : ep\kind=0 : ep\port=55442
  For i=0 To 15 : PokeA(@ep\address+i,PeekA(?Peer+i)) : Next
  handle=UdpPayloadOpen(4,0,55013)

@@ -38,6 +38,7 @@ Procedure.i QuicConnectionReceiveBeginAt(*c.QuicConnection,level.i,packet.i,byte
  Define i.i,p.i,rc.i,h.QuicPacketHeader,*s.QuicConnectionSpace
  If quiccr_Valid(*c)=0 Or receivedAt< -1 : ProcedureReturn #QUIC_RECEIVE_ARGUMENT : EndIf
  If *c\phase<>1 Or (*c\incoming\phase<>0 And *c\incoming\phase<>4 And *c\incoming\phase<>6) : ProcedureReturn #QUIC_RECEIVE_STATE : EndIf
+ If *c\probe\phase=1 : ProcedureReturn #QUIC_SENT_BUSY : EndIf
  If *c\application\phase=1 : ProcedureReturn #QUIC_RECEIVE_STATE : EndIf
  If *c\controlPhase>=1 And *c\controlPhase<=3 : ProcedureReturn #QUIC_RECEIVE_STATE : EndIf
  If *c\startup\phase>=1 And *c\startup\phase<=8 : ProcedureReturn #QUIC_RECEIVE_STATE : EndIf
@@ -78,6 +79,7 @@ Procedure.i QuicConnectionReceivePacketBeginAt(*c.QuicConnection,packet.i,bytes.
  Define p.i,h.QuicPacketHeader,rc.i
  If quiccr_Valid(*c)=0 Or receivedAt< -1 : ProcedureReturn #QUIC_RECEIVE_ARGUMENT : EndIf
  If *c\phase<>1 Or (*c\incoming\phase<>0 And *c\incoming\phase<>4 And *c\incoming\phase<>6) : ProcedureReturn #QUIC_RECEIVE_STATE : EndIf
+ If *c\probe\phase=1 : ProcedureReturn #QUIC_SENT_BUSY : EndIf
  p=QuicConnectionBuffer(*c,15)
  If bytes<1 Or bytes>1472 Or packet<p Or packet>p+1472-bytes : ProcedureReturn #QUIC_RECEIVE_ARGUMENT : EndIf
  rc=QuicPacketRead(@h,packet,bytes,8)
