@@ -1,0 +1,15 @@
+from pathlib import Path
+import sys
+w=Path(__file__).parent
+sys.path.insert(0,str(w/'quic-peer1531'))
+sys.path.insert(0,r'C:/Users/ajtaj/Desktop/Anvil/tools')
+from quic_tls_live_peer import Peer
+d=w/'anvil-ipv6-20261030/quic-cid1698'
+with Peer(w/'quic-private1545',d/'peer.json') as peer:
+    source=(w/'run_quic_output1525.py').read_text().replace('quic-output1524','quic-cid1698').replace('QUIC TLS output admission CPU','QUIC CID signature refusal').replace('chunk_bytes=4096','chunk_bytes=1024')
+    needle="assert rec.get('x0') is not None,'No confirmed return; stop board access and inspect journal'"
+    assert source.count(needle)==1
+    source=source.replace(needle,needle+"\n assert not peer.result['complete'] and peer.result['error'] is None and peer.result['received'];peer.stop.set();peer.thread.join(3);assert not peer.thread.is_alive()")
+    exec(compile(source,str(w/'run_quic_cid1701.py'),'exec'))
+    assert not peer.result['complete'] and peer.result['error'] is None and peer.result['received']
+    print('Independent peer confirms bad signature refusal did not complete TLS',flush=True)

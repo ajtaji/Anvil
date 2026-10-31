@@ -4848,3 +4848,50 @@ Installed Anvil488 is unchanged. Connection initialization, CID policy and
 the first protected1RTT check remain fixture-owned. Application frames and
 packet space, HANDSHAKE_DONE, recovery, congestion/flow, streams/QPACK and real
 HTTP/3 remain open, plus earlier IPv6 and TLS compatibility/device blocking.
+
+
+### Shared handshake connection-ID admission
+
+The shared connection receiver now checks the QUIC version, packet-space kind,
+destination ID and peer source ID before admission. Header/CID mismatches
+return6 (discard) without changing the pending job or learned identity.
+`QuicConnectionReceivePacketBegin` selects Initial or Handshake from the
+header, while the existing level-specific Begin also enforces these checks.
+Retired Initial packets are discarded. Input remains a validated subspan of
+the connection's retained datagram buffer.
+
+The connection stores the peer-ID-known flag and length. A candidate source
+ID stays in the owned packet until authenticated packet processing completes;
+only then is it copied into the owned peer-ID buffer. Authentication failure
+or duplicate discard cannot establish that identity. Subsequent handshake
+packets must match it. Initial packet protection is not certificate identity;
+TLS peer validation still follows. The supported profile remains an eight-byte
+local ID and a nonempty peer source ID of at most20 bytes. Zero-length peer IDs,
+Retry, version negotiation, migration and application CID management remain
+outside this handshake receiver.
+
+The live fixture delegates long-header CID admission and peer-ID learning to
+the shared receiver. Before admission it temporarily changes a destination
+byte, and a source byte once known, checking discard without identity changes,
+then restores the exact wire bytes. It also verifies that admission alone
+does not establish identity. In a separate fresh connection, the retained
+Initial packet's authentication tag is corrupted; decryption must discard it
+with no learned ID, no peer-buffer writes and largest authenticated PN still
+-1. The original ciphertext is then restored for the existing suspended-receive
+cancellation probe. These mutations are local tests, not transmitted packets.
+
+Capture300 on Anvil488 passed36 checks, with independent peer verification of
+client Finished and h3. Exchange plus first close took1.412657 seconds;
+maximum foreground gap1.886ms, service238us, sender1.236ms, receive1.258ms,
+TLS feed1.763ms and ACK40us. There were258 TLS worker calls and266 full context
+checks. These are observations, not guarantees. The bad-certificate run also
+retained all CID/lifecycle checks and did not complete peer TLS.
+
+Evidence is in `docs/evidence/anvil-ipv6-20261030/quic-connection-cid488`.
+The same shared fixture compiled for Pi3 with its actual timer/RNG adapter;
+no Pi3 execution is claimed. Both final physical runs returned with cores,
+fonts and Vulkan healthy, watchdog off, and installed Anvil488 unchanged.
+Connection initialization and the first protected1RTT check remain fixture
+code. Application packet space/frames, HANDSHAKE_DONE, recovery, congestion/
+flow, streams/QPACK and real HTTP/3 remain, along with the earlier IPv6 and
+TLS compatibility/device-blocking work.

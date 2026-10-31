@@ -53,6 +53,8 @@ Structure QuicConnectionReceive
  level.i
  packet.i
  bytes.i
+ sourceOffset.i
+ sourceBytes.i
  worker.TlsWorkerJob
 EndStructure
 Structure QuicConnectionTls
@@ -92,6 +94,8 @@ Structure QuicConnection
  acknowledge.QuicConnectionAck
  incoming.QuicConnectionReceive
  feed.QuicConnectionTls
+ peerIdKnown.i
+ peerIdBytes.i
 EndStructure
 ; Span table order: RX data/bits,TX data/bits,ACK ranges,sent slots/metadata,
 ; TLS snapshot,handshake/receive/output/config,local/peer parameters/entries,
