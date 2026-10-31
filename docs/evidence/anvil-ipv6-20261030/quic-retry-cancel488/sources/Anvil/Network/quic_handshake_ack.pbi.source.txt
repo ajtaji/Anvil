@@ -1,0 +1,29 @@
+; SPDX-License-Identifier: MIT
+; Stable handshake-only facade over shared packet ACK range tracking.
+; The legacy descriptor keeps its original field layout.
+XIncludeFile "Anvil/Network/quic_packet_ack.pbi"
+Structure QuicHandshakeAck
+ phase.i
+ level.i
+ entries.i
+ capacity.i
+ count.i
+ demand.i
+ pending.i
+EndStructure
+Procedure.i QuicHandshakeAckInit(*s.QuicHandshakeAck,level.i,entries.i,capacity.i)
+ If level<>0 And level<>2 : ProcedureReturn #QUIC_ACK_ARGUMENT : EndIf
+ ProcedureReturn QuicPacketAckInit(*s,level,entries,capacity)
+EndProcedure
+Procedure.i QuicHandshakeAckSeen(*s.QuicHandshakeAck,pn.i)
+ ProcedureReturn QuicPacketAckSeen(*s,pn)
+EndProcedure
+Procedure.i QuicHandshakeAckRecord(*s.QuicHandshakeAck,pn.i,eliciting.i)
+ ProcedureReturn QuicPacketAckRecord(*s,pn,eliciting)
+EndProcedure
+Procedure.i QuicHandshakeAckWrite(*s.QuicHandshakeAck,dst.i,capacity.i,token.i)
+ ProcedureReturn QuicPacketAckWrite(*s,dst,capacity,token)
+EndProcedure
+Procedure.i QuicHandshakeAckSent(*s.QuicHandshakeAck,token.i)
+ ProcedureReturn QuicPacketAckSent(*s,token)
+EndProcedure

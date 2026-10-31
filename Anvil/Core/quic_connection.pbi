@@ -253,7 +253,7 @@ Procedure.i QuicConnectionRecoveryPoll(*c.QuicConnection,now.i)
  Define delay.i,level.i,history.i,stamp.i,unknown.i,selected.i,best.i,rc.i
  If qconn_Span(*c,SizeOf(QuicConnection))=0 Or now<0 : ProcedureReturn #QUIC_CONNECTION_ARGUMENT : EndIf
  If *c\phase<>1 : ProcedureReturn #QUIC_CONNECTION_STATE : EndIf
- If *c\initial\history\busy<>0 Or *c\handshake\history\busy<>0 Or *c\applicationHistory\busy<>0 : ProcedureReturn #QUIC_SENT_BUSY : EndIf
+ If *c\recoveryRetryRemaining<>0 Or *c\initial\history\busy<>0 Or *c\handshake\history\busy<>0 Or *c\applicationHistory\busy<>0 : ProcedureReturn #QUIC_SENT_BUSY : EndIf
  delay=QuicRttLossDelay(@*c\recoveryRtt) : If delay<0 : ProcedureReturn delay : EndIf
  unknown=-1 : selected=-1 : best=$7FFFFFFFFFFFFFFF
  For level=0 To 4 Step 2
@@ -310,7 +310,7 @@ Procedure.i QuicConnectionLossStep(*c.QuicConnection)
  If qconn_Span(*c,SizeOf(QuicConnection))=0 : ProcedureReturn #QUIC_CONNECTION_ARGUMENT : EndIf
  If *c\phase<>1 Or qconn_LossOwned(*c)=0 : ProcedureReturn #QUIC_CONNECTION_STATE : EndIf
  If *c\recoveryRetryRemaining>0
-  If *c\recoveryLoss\phase<>1 : ProcedureReturn #QUIC_CONNECTION_STATE : EndIf
+  If *c\recoveryLoss\phase<>1 : QuicConnectionClose(*c,#QUIC_CONNECTION_STATE) : ProcedureReturn #QUIC_CONNECTION_STATE : EndIf
   If *c\recoveryRetryLevel=0 : *s=@*c\initial : Else : *s=@*c\handshake : EndIf
   n=*c\recoveryRetryRemaining : If n>256 : n=256 : EndIf
   rc=QuicCryptoTxRetry(@*s\tx,*c\recoveryRetryOffset,n)

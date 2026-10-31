@@ -63,7 +63,7 @@ Procedure.i QuicConnectionSendBegin(*c.QuicConnection,level.i,peerBytes.i)
   *s=@*c\handshake
  EndIf
  If *s\writeKeys\ready<>1 : ProcedureReturn #QUIC_SEND_STATE : EndIf
- If *s\history\busy<>0 : ProcedureReturn #QUIC_SENT_BUSY : EndIf
+ If *s\history\busy<>0 Or *c\recoveryRetryRemaining<>0 : ProcedureReturn #QUIC_SENT_BUSY : EndIf
  For i=0 To SizeOf(QuicConnectionSend)-1 : PokeA(@*c\outgoing+i,0) : Next
  *c\outgoing\phase=1 : *c\outgoing\level=level : *c\outgoing\peerBytes=peerBytes : *c\outgoing\cursor=*s\tx\base
  ProcedureReturn 0

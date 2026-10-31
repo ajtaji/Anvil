@@ -836,7 +836,7 @@ Procedure RetryAssert(actual.i,wanted.i)
  retryChecks=retryChecks+1
  If actual<>wanted And retryFault=0 : retryFault=retryChecks : retryActual=actual : retryWanted=wanted : EndIf
 EndProcedure
-Procedure CheckCryptoRetry(level.i)
+Procedure CheckCryptoRetry(level.i,cancelled.i)
  Define *s.QuicConnectionSpace,job.QuicHandshakeSentAck,f.QuicHandshakeFrame,range.i,rc.i,i.i,v.QuicCryptoSlice
  priorityContext\phase=1 : priorityContext\peerIdKnown=1 : priorityContext\peerIdBytes=8
  If level=0 : *s=@priorityContext\initial : Else : *s=@priorityContext\handshake : EndIf
@@ -867,6 +867,25 @@ Procedure CheckCryptoRetry(level.i)
  RetryAssert(QuicConnectionLossBegin(@priorityContext,level,2000,100,3),#QUIC_CONNECTION_STATE)
  RetryAssert(QuicConnectionLossStep(@priorityContext),0)
  RetryAssert(priorityContext\recoveryRetryRemaining,344)
+ If cancelled=1
+  RetryAssert(QuicHandshakeSentLossCancel(@priorityContext\recoveryLoss),#QUIC_SENT_CANCELLED)
+  RetryAssert(*s\history\busy,0)
+  RetryAssert(QuicConnectionSendBegin(@priorityContext,level,8),#QUIC_SENT_BUSY)
+  RetryAssert(priorityContext\outgoing\phase,0)
+  RetryAssert(QuicConnectionRecoveryPoll(@priorityContext,3000),#QUIC_SENT_BUSY)
+  RetryAssert(QuicConnectionLossBegin(@priorityContext,level,3000,100,3),#QUIC_CONNECTION_STATE)
+  RetryAssert(QuicConnectionLossStep(@priorityContext),#QUIC_CONNECTION_STATE)
+  RetryAssert(priorityContext\phase,2)
+  RetryAssert(priorityContext\recoveryTimer\phase,0)
+  RetryAssert(priorityContext\recoveryRetryRemaining,344)
+  RetryAssert(QuicConnectionSendBegin(@priorityContext,level,8),#QUIC_SEND_STATE)
+  RetryAssert(((PeekA(@retryStates[0]+255/4)>>((255&3)*2))&3),2)
+  RetryAssert(((PeekA(@retryStates[0]+256/4)>>((256&3)*2))&3),1)
+  RetryAssert(((PeekA(@retryStates[0]+100/4)>>((100&3)*2))&3),3)
+  For i=0 To SizeOf(QuicConnection)-1 : PokeA(@priorityContext+i,0) : Next
+  For i=0 To 383 : PokeA(@prioritySlots[0]+i,0) : Next
+  ProcedureReturn
+ EndIf
  RetryAssert(QuicConnectionLossStep(@priorityContext),0)
  RetryAssert(priorityContext\recoveryRetryRemaining,88)
  RetryAssert(QuicConnectionLossStep(@priorityContext),1)
@@ -1377,7 +1396,8 @@ Procedure.i Main()
  PokeI($E1C00000,$55445331) : PokeI($E1C00008,#REPORT_COUNT)
  PokeI($E1C002A0,@CloseHoldEntry) : PokeI($E1C002A8,$1000000+workerBytes)
  CheckRecoveryPriority()
- CheckCryptoRetry(0) : CheckCryptoRetry(2)
+ CheckCryptoRetry(0,0) : CheckCryptoRetry(2,0)
+ CheckCryptoRetry(0,1) : CheckCryptoRetry(2,1)
  ep\family=4 : ep\kind=0 : ep\port=55442
  For i=0 To 15 : PokeA(@ep\address+i,PeekA(?Peer+i)) : Next
  handle=UdpPayloadOpen(4,0,55013)
