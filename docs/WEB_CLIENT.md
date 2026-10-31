@@ -4629,3 +4629,68 @@ uninstalled. This resource owner does not yet replace the fixture's handshake
 event loop with a reusable connection client. Application packet/frame state,
 HANDSHAKE_DONE, recovery, congestion/flow control, streams/QPACK and real HTTP/3
 traffic remain, as do the previously recorded IPv6 and TLS gaps.
+
+
+### Cooperative QUIC handshake packet output
+
+`Anvil/Core/quic_connection_send.pbi` moves Initial/Handshake output from
+the fixture into a shared state machine. Begin admits one sender. Step
+performs one bounded ready-range scan, packet framing phase, or cooperative
+encryption slice, then returns control to the dispatcher. The common crypto
+worker owns encryption across suspension, just as it owns TLS arithmetic.
+Another worker cannot borrow its scratch. Connection closure now recognizes
+and stops this owned packet worker before cancelling its packet job.
+
+Step returns 2 when an immutable protected datagram is ready and 3 while
+transport completion is pending. The dispatcher performs the actual UDP
+send; retries retain the same bytes and packet number. SendAccepted records
+history and marks CRYPTO bytes sent only after whole-datagram acceptance.
+SendCompleted acknowledges an ACK snapshot and retires Initial keys/history
+only after actual Handshake transmission. A negative completion starts
+terminal connection closure. The caller must not replace the pending sender
+or mutate its buffers/jobs directly. No UDP call or transport wait is hidden
+inside the shared module. The fixture's explicit polling loop is not a
+production event dispatcher.
+
+The UDP ABI returns a positive acceptance ticket, not a byte count. The
+fixture now passes the requested whole-datagram length to SendAccepted after
+checking that ticket. An initial trial caught this harness integration error;
+its diagnostic artifacts were retained locally. No monitor was updated.
+
+On installed Anvil 488, capture 291 passed 28 checks and the independent peer
+verified client Finished and h3. Every outgoing packet was held ready for an
+extra dispatch turn: repeated Step kept its exact bytes and packet number,
+wrong-length acceptance and premature completion were refused without history
+changes, and a second Begin was refused. A further unsent probe suspended
+packet encryption, then closed the connection; the owned worker and packet
+job stopped, shared GCM became idle, storage was released only after socket
+closure, and further send steps were refused. Only this injected probe used
+a one-counter-tick slice and restored the normal setting afterwards.
+
+The live exchange and first close measured 1.410282 seconds. Maximum sender
+Step was 1.239 ms, maximum TLS operation Step 1.788 ms, maximum foreground
+service gap 1.934 ms and service call 238 us. There were 259 TLS worker calls,
+265 complete TLS context checks and 22,677 sender Step calls, including idle
+transport polls. Closure took 43 calls with a 54 us maximum. Subsequent injected
+lifecycle/cancellation probes are excluded from these exchange timings.
+These observations are not hard timing guarantees or a throughput claim.
+
+The signature-refusal run also retained the lifecycle and sender checks; the
+peer did not complete TLS. The shared fixture compiled for BCM2837 with its
+real timer/RNG adapter, but was not executed on Pi 3. Exact sources, payloads,
+reports, identities and peer results are retained in
+`docs/evidence/anvil-ipv6-20261030/quic-connection-send488`.
+
+The host peer is now checked and stopped at payload return, before potentially
+slow diagnostic downloads. An earlier successful exchange was followed by
+the peer's idle timeout while report readback retried; that original record
+is preserved and the same payload was replayed with the corrected boundary.
+Report downloads used smaller bursts on the final runs. The earlier stalled
+capture was recovered from retained state without a reboot.
+
+Installed Anvil remains 488 and full candidate 491 remains uninstalled.
+Both final physical runs returned with healthy cores, fonts and Vulkan and
+watchdog off. This is the outgoing half of a reusable handshake client;
+receive/ACK/TLS dispatch still lives in the fixture. Application frames and
+HANDSHAKE_DONE, recovery, congestion/flow control, streams/QPACK and actual
+HTTP/3 requests remain, along with the previously recorded IPv6 and TLS gaps.

@@ -23,6 +23,22 @@ Structure QuicConnectionSpace
  history.QuicHandshakeSent
  metadata.i
 EndStructure
+Structure QuicConnectionSend
+ phase.i ; 0 fresh,1 scan,2 frame,3 encrypt,4 submit,5 transport,6 done,-1 failed
+ result.i
+ level.i
+ peerBytes.i
+ cursor.i
+ found.i
+ view.QuicCryptoSlice
+ number.i
+ token.i
+ copied.i
+ bytes.i
+ encryptStarted.i
+ cryptoResult.i
+ worker.TlsWorkerJob
+EndStructure
 Structure QuicConnection
  phase.i ; 0 fresh,1 active,2 closing,3 closed
  result.i
@@ -46,6 +62,8 @@ Structure QuicConnection
  spec.QuicLongPacketSpec
  header.QuicPacketHeader
  tlsOp.QuicTlsOperation
+ outgoing.QuicConnectionSend
+ initialRetired.i
 EndStructure
 ; Span table order: RX data/bits,TX data/bits,ACK ranges,sent slots/metadata,
 ; TLS snapshot,handshake/receive/output/config,local/peer parameters/entries,
@@ -165,11 +183,15 @@ Procedure.i QuicConnectionCloseStep(*c.QuicConnection)
  If *c\phase<>2 : ProcedureReturn #QUIC_CONNECTION_STATE : EndIf
  ; Another suspended TLS operation retains shared arithmetic scratch. Defer
  ; cleanup instead of allowing a packet cancellation to reset its GCM job.
- If TlsWorkerBusy()<>0 And TlsWorkerOwns(@*c\tlsOp\context\worker)=0 : ProcedureReturn #TLSWORK_BUSY : EndIf
+ If TlsWorkerBusy()<>0 And TlsWorkerOwns(@*c\tlsOp\context\worker)=0 And TlsWorkerOwns(@*c\outgoing\worker)=0 : ProcedureReturn #TLSWORK_BUSY : EndIf
  If *c\closeStage=0
   If *c\tlsOp\phase=1
    rc=QuicTlsOperationCancel(@*c\tlsOp)
    If rc<>#QUIC_OP_CANCELLED : ProcedureReturn rc : EndIf
+  EndIf
+  If *c\outgoing\worker\phase=1
+   rc=TlsWorkerCancel(@*c\outgoing\worker)
+   If rc<>1 : ProcedureReturn rc : EndIf
   EndIf
   If *c\ackJob\phase=1 Or *c\ackJob\phase=2
    rc=QuicHandshakeSentAckCancel(@*c\ackJob)

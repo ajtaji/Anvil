@@ -16,7 +16,8 @@ Global services.i,*pet,*clock,started.i,handle.i,maxService.i
 Global ep.UdpEndpoint,info.UdpDatagramInfo,status.UdpSocketStatus
 Global peerBytes.i,hsReady.i,paramsReady.i,initialDiscarded.i
 Global received.i,sent.i,ackEvents.i,appAuthenticated.i,stage.i
-Global lastPump.i,maxPumpGap.i,maxTlsStep.i
+Global lastPump.i,maxPumpGap.i,maxTlsStep.i,maxSendStep.i,sendSteps.i
+Global sendFault.i,sendProbes.i,packetCancelChecked.i
 Global deadlineOp.QuicTlsOperation,outputOp.QuicTlsOperation,inputOp.QuicTlsOperation
 Global probeTx.QuicCryptoTx,probeRx.QuicCryptoRx,probeOut.QuicTlsOutput
 Global operationFault.i,operationProbes.i,extraContextChecks.i
@@ -81,15 +82,6 @@ Procedure.i Pump()
  If rc<0 : ProcedureReturn rc : EndIf
  ProcedureReturn rc
 EndProcedure
-Procedure.i WaitTx()
- Define rc.i
- Repeat
-  rc=Pump() : If rc<0 : ProcedureReturn rc : EndIf
-  rc=UdpPayloadStatus(handle,@status) : If rc<>0 : ProcedureReturn rc : EndIf
-  If status\txState=#UDP_TX_SENT : ProcedureReturn 0 : EndIf
-  If status\txState=#UDP_TX_FAILED : ProcedureReturn status\txError : EndIf
- ForEver
-EndProcedure
 Procedure.i KeyDone(rc.i)
  Define p.i
  While rc=0
@@ -110,58 +102,48 @@ Procedure.i MakeOutput(*s.QuicConnectionSpace)
  ProcedureReturn rc
 EndProcedure
 Procedure.i SendSpace(*s.QuicConnectionSpace)
- Define rc.i,i.i,n.i,head.i,room.i,pn.i,token.i,cursor.i,found.i,view.QuicCryptoSlice,meta.i,copy.i
- ; Locate one bounded ready range. The test's output messages fit one packet.
- cursor=*s\tx\base
- Repeat
-  found=QuicCryptoTxFind(@*s\tx,cursor,1024,@view)
-  If found<0 : ProcedureReturn found : EndIf
-  If found=1 : Break : EndIf
-  cursor=view\offset
- Until cursor>=*s\tx\tail
- If found=0 And *s\ack\pending=0 : ProcedureReturn 0 : EndIf
- pn=QuicHandshakeSentReserve(@*s\history) : If pn<0 : ProcedureReturn pn : EndIf
- connection\spec\kind=*s\level : connection\spec\source=@clientId[0] : connection\spec\sourceBytes=8
- If peerBytes=0 : connection\spec\destination=@originalId[0] : connection\spec\destinationBytes=8
- Else : connection\spec\destination=@peerId[0] : connection\spec\destinationBytes=peerBytes : EndIf
- connection\spec\number=pn : connection\spec\numberBytes=4
- head=21+connection\spec\destinationBytes+Bool(*s\level=0)
- connection\spec\cipherBytes=1200-head
- n=QuicLongPacketWrite(@connection\spec,@output[0],1472) : If n<>head : ProcedureReturn -9303 : EndIf
- For i=head To 1199 : output[i]=0 : Next
- room=1200-head-16
- If *s\ack\pending<>0
-  rc=QuicHandshakeAckWrite(@*s\ack,@output[n],room,@token)
-  If rc<0 : ProcedureReturn rc : EndIf
-  n=n+rc : room=room-rc
- EndIf
- If found=1
-  copy=view\bytes : If copy>room-24 : copy=room-24 : EndIf
-  If copy<=0 : ProcedureReturn -9304 : EndIf
-  rc=QuicCryptoTxFrame(@*s\tx,view\offset,copy,@output[n],room)
-  If rc<0 : ProcedureReturn rc : EndIf
- EndIf
- rc=QuicPacketJobBegin(@connection\sendJob,@*s\writeKeys,@output[0],1200,0,pn,1)
+ Define rc.i,n.i,t.i,cost.i,held.i,i.i,number.i,inFlight.i
+ rc=QuicConnectionSendBegin(@connection,*s\level,peerBytes)
  If rc<>0 : ProcedureReturn rc : EndIf
  Repeat
-  rc=Pump() : If rc<0 : ProcedureReturn rc : EndIf
-  rc=QuicPacketJobStep(@connection\sendJob)
- Until rc<>0
- If rc<>1 : ProcedureReturn rc : EndIf
- rc=UdpPayloadSendTo(handle,@ep,@output[0],1200) : If rc<1 : ProcedureReturn rc : EndIf
- meta=*s\metadata+pn*16 : PokeI(meta,view\offset) : PokeI(meta+8,copy)
- rc=QuicHandshakeSentCommit(@*s\history,pn,1200,clock(),Bool(copy>0),1,meta) : If rc<>0 : ProcedureReturn rc : EndIf
- If copy>0 : rc=QuicCryptoTxSent(@*s\tx,view\offset,copy) : If rc<>0 : ProcedureReturn rc : EndIf : EndIf
- rc=WaitTx() : If rc<>0 : ProcedureReturn rc : EndIf
- If token<>0
-  rc=QuicHandshakeAckSent(@*s\ack,token) : If rc<>1 : ProcedureReturn -9305 : EndIf
- EndIf
- sent=sent+1
- If *s\level=2 And initialDiscarded=0
-  QuicKeysWipe(@connection\initial\readKeys) : QuicKeysWipe(@connection\initial\writeKeys)
-  rc=QuicHandshakeSentDiscard(@connection\initial\history) : If rc<>0 : ProcedureReturn rc : EndIf
-  initialDiscarded=1
- EndIf
+  n=Pump() : If n<0 : ProcedureReturn n : EndIf
+  t=clock() : rc=QuicConnectionSendStep(@connection) : cost=clock()-t
+  If cost>maxSendStep : maxSendStep=cost : EndIf
+  sendSteps=sendSteps+1
+  If connection\outgoing\worker\phase=1
+   If TlsWorkerBegin(@otherJob,@CloseHoldEntry,0)<>#TLSWORK_BUSY : sendFault=1 : EndIf
+  EndIf
+  If rc=2
+   If held=0
+    number=connection\outgoing\number : inFlight=*s\history\inFlight
+    For i=0 To 1199 : probeOutput[i]=output[i] : Next
+    If QuicConnectionSendBegin(@connection,*s\level,peerBytes)<>#QUIC_SEND_STATE : sendFault=2 : EndIf
+    If QuicConnectionSendAccepted(@connection,1199,clock())<>#QUIC_SEND_ARGUMENT : sendFault=3 : EndIf
+    If QuicConnectionSendCompleted(@connection,0)<>#QUIC_SEND_STATE : sendFault=4 : EndIf
+    If QuicConnectionSendStep(@connection)<>2 Or connection\outgoing\number<>number Or *s\history\inFlight<>inFlight : sendFault=5 : EndIf
+    For i=0 To 1199 : If probeOutput[i]<>output[i] : sendFault=6 : EndIf : Next
+    held=1 : sendProbes=sendProbes+1
+   Else
+    n=UdpPayloadSendTo(handle,@ep,QuicConnectionBuffer(@connection,16),connection\outgoing\bytes)
+    If n<>#SVC_EAGAIN
+     If n<1 : ProcedureReturn n : EndIf
+     ; UDP returns an acceptance ticket, not a byte count. A positive ticket
+     ; owns the whole datagram; acknowledge its requested length separately.
+     n=QuicConnectionSendAccepted(@connection,connection\outgoing\bytes,clock())
+     If n<>0 : ProcedureReturn n : EndIf
+    EndIf
+   EndIf
+  ElseIf rc=3
+   n=UdpPayloadStatus(handle,@status) : If n<>0 : ProcedureReturn n : EndIf
+   If status\txState=#UDP_TX_SENT
+    rc=QuicConnectionSendCompleted(@connection,0)
+    If rc=1 : sent=sent+1 : initialDiscarded=connection\initialRetired : EndIf
+   ElseIf status\txState=#UDP_TX_FAILED
+    rc=QuicConnectionSendCompleted(@connection,status\txError)
+   EndIf
+  EndIf
+  If rc<0 : ProcedureReturn rc : EndIf
+ Until rc=1
  ProcedureReturn 0
 EndProcedure
 Procedure.i HandleAck(*s.QuicConnectionSpace)
@@ -540,6 +522,44 @@ Procedure CheckConnectionLifecycle()
  lifecycleProbes=lifecycleProbes+1
  rc=Tls13ContextRestore(@ownerSnapshot[0],#TLS13_CONTEXT_SIZE)
 EndProcedure
+Procedure CheckPacketCancellation()
+ Define rc.i,n.i,i.i,socket.i,slice.i
+ socket=UdpPayloadOpen(4,0,55013)
+ If socket<=0 : sendFault=7 : ProcedureReturn : EndIf
+ rc=QuicConnectionBegin(@connection,@connectionSpans[0],socket,HwMicros(),20000000)
+ If rc<>0 : sendFault=8 : n=UdpPayloadClose(socket) : ProcedureReturn : EndIf
+ n=DrbgGenerate(@originalId[0],8)
+ rc=KeyDone(QuicInitialKeysBegin(@connection\keyjob,@connection\initial\writeKeys,@originalId[0],8,0))
+ If n<>8 Or rc<>0 : sendFault=9 : EndIf
+ rc=QuicCryptoTxAppend(@connection\initial\tx,@probeData[0],8)
+ If rc<>8 : sendFault=10 : EndIf
+ rc=QuicConnectionSendBegin(@connection,0,0)
+ If rc<>0 : sendFault=11 : EndIf
+ For i=0 To 7
+  rc=QuicConnectionSendStep(@connection)
+  If rc<>0 : sendFault=12 : EndIf
+  If connection\outgoing\encryptStarted=1 : Break : EndIf
+ Next
+ slice=tlsjob_sliceTicks : tlsjob_sliceTicks=1
+ rc=QuicConnectionSendStep(@connection)
+ tlsjob_sliceTicks=slice
+ If rc<>0 Or connection\sendJob\phase=0 Or TlsWorkerOwns(@connection\outgoing\worker)<>1 : sendFault=13 : EndIf
+ rc=QuicConnectionClose(@connection,-9420)
+ rc=QuicConnectionCloseStep(@connection)
+ If rc<>0 Or connection\closeStage<>1 Or TlsWorkerBusy()<>0 Or GcmJobBusy()<>0 Or connection\sendJob\phase<>0 : sendFault=14 : EndIf
+ Repeat
+  rc=QuicConnectionCloseStep(@connection)
+  If rc=2
+   n=UdpPayloadClose(socket) : n=QuicConnectionSocketClosed(@connection,socket,n)
+   If n<>0 : sendFault=15 : ProcedureReturn : EndIf
+  ElseIf rc<0
+   sendFault=16 : ProcedureReturn
+  EndIf
+  n=Service()
+ Until rc=1
+ If connection\result<>-9420 Or QuicConnectionSendStep(@connection)<>#QUIC_SEND_STATE Or HooksClear()<>1 : sendFault=17 : EndIf
+ packetCancelChecked=1
+EndProcedure
 Procedure.i Main()
  CaptureTable()
  Define i.i,rc.i,closed.i,cleanup.i,admit.i,saved.i,tlsState.i,tlsError.i,x509Error.i,certCount.i,alert.i
@@ -588,8 +608,11 @@ Procedure.i Main()
  PokeI($E1C00188,operationFault) : PokeI($E1C00190,operationProbes) : PokeI($E1C000A8,extraContextChecks)
  PokeI($E1C00198,connection\phase) : PokeI($E1C001A0,bufferWiped) : PokeI($E1C001A8,closeFault) : PokeI($E1C001B0,storageRefused)
  PokeI($E1C000B0,maxCloseStep) : PokeI($E1C000B8,closeCalls)
+ PokeI($E1C000C0,maxSendStep) : PokeI($E1C000C8,sendSteps)
  CheckConnectionLifecycle()
  PokeI($E1C001B8,lifecycleFault) : PokeI($E1C001C0,lifecycleProbes)
+ CheckPacketCancellation()
+ PokeI($E1C001C8,sendFault) : PokeI($E1C001D0,Bool(sendProbes=sent And sent>=1)) : PokeI($E1C001D8,packetCancelChecked)
  cleanup=Tls13ContextWipe(@beforeSnapshot[0],#TLS13_CONTEXT_SIZE)
  cleanup=Tls13ContextWipe(@afterSnapshot[0],#TLS13_CONTEXT_SIZE)
  Tls13PauseHook=0 : Tls13SetupPauseHook=0 : QuicCipherInvalidateHook=0
