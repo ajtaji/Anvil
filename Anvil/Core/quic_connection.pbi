@@ -16,6 +16,8 @@ XIncludeFile "Anvil/Network/quic_peer_ids.pbi"
 #QUIC_CONNECTION_STATE=-3513
 #QUIC_CONNECTION_IO=-3514
 #QUIC_CONNECTION_BUFFERS=20
+#QUIC_RECOVERY_PROBE=1
+#QUIC_RECOVERY_LOSS=2
 Structure QuicConnectionSpace
  level.i
  largest.i
@@ -124,6 +126,7 @@ Structure QuicConnection
  recoveryRtt.QuicRtt
  recoveryTimer.QuicProbeTimer
  recoveryLoss.QuicHandshakeSentLoss
+ recoveryLevel.i
 EndStructure
 ; Span table order: RX data/bits,TX data/bits,ACK ranges,sent slots/metadata,
 ; TLS snapshot,handshake/receive/output/config,local/peer parameters/entries,
@@ -236,13 +239,46 @@ Procedure.i QuicConnectionRecoveryRearm(*c.QuicConnection,resetBackoff.i)
  For i=0 To SizeOf(QuicProbeTimer)-1 : PokeA(@*c\recoveryTimer+i,PeekA(@candidate+i)) : Next
  ProcedureReturn rc
 EndProcedure
+; 0 idle,1 probe,2 run a bounded loss scan; recoveryLevel is valid on1/2.
+; A stale scan requests work immediately. Any pending loss deadline suppresses
+; PTO even when the stored PTO candidate is earlier. Poll never declares loss.
+; After2, use current RTT loss delay/threshold3, consume each scan event, then
+; poll again. Requests repeat until serviced; only a PTO advances backoff.
 Procedure.i QuicConnectionRecoveryPoll(*c.QuicConnection,now.i)
- If qconn_Span(*c,SizeOf(QuicConnection))=0 : ProcedureReturn #QUIC_CONNECTION_ARGUMENT : EndIf
+ Define delay.i,level.i,history.i,stamp.i,unknown.i,selected.i,best.i,rc.i
+ If qconn_Span(*c,SizeOf(QuicConnection))=0 Or now<0 : ProcedureReturn #QUIC_CONNECTION_ARGUMENT : EndIf
  If *c\phase<>1 : ProcedureReturn #QUIC_CONNECTION_STATE : EndIf
- ; A bounded ACK/loss job can have applied only part of its event stream.
- ; Preserve deadline/backoff until the dispatcher finishes or cancels it.
  If *c\initial\history\busy<>0 Or *c\handshake\history\busy<>0 Or *c\applicationHistory\busy<>0 : ProcedureReturn #QUIC_SENT_BUSY : EndIf
- ProcedureReturn QuicProbeTimerPoll(@*c\recoveryTimer,now)
+ delay=QuicRttLossDelay(@*c\recoveryRtt) : If delay<0 : ProcedureReturn delay : EndIf
+ unknown=-1 : selected=-1 : best=$7FFFFFFFFFFFFFFF
+ For level=0 To 4 Step 2
+  history=0
+  Select level
+   Case 0
+    If *c\initial\history\phase=1 And *c\initial\writeKeys\ready=1 : history=@*c\initial\history : EndIf
+   Case 2
+    If *c\handshake\history\phase=1 And *c\handshake\writeKeys\ready=1 : history=@*c\handshake\history : EndIf
+   Case 4
+    If *c\applicationHistory\phase=1 And *c\appWrite\ready=1 : history=@*c\applicationHistory : EndIf
+  EndSelect
+  If history<>0
+   stamp=QuicHandshakeSentLossTime(history,delay,3)
+   If stamp< -1 : ProcedureReturn stamp : EndIf
+   If stamp=-1
+    If unknown=-1 : unknown=level : EndIf
+   ElseIf stamp>0
+    If selected=-1 Or stamp<best : selected=level : best=stamp : EndIf
+   EndIf
+  EndIf
+ Next
+ If unknown>=0 : *c\recoveryLevel=unknown : ProcedureReturn #QUIC_RECOVERY_LOSS : EndIf
+ If selected>=0
+  If now>=best : *c\recoveryLevel=selected : ProcedureReturn #QUIC_RECOVERY_LOSS : EndIf
+  ProcedureReturn 0
+ EndIf
+ rc=QuicProbeTimerPoll(@*c\recoveryTimer,now)
+ If rc=1 : *c\recoveryLevel=*c\recoveryTimer\level : EndIf
+ ProcedureReturn rc
 EndProcedure
 Procedure.i qconn_LossOwned(*c.QuicConnection)
  ProcedureReturn Bool(*c\recoveryLoss\owner=@*c\initial\history Or *c\recoveryLoss\owner=@*c\handshake\history Or *c\recoveryLoss\owner=@*c\applicationHistory)

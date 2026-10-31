@@ -1,0 +1,10 @@
+import struct
+from check_pollguard1941 import check as previous
+
+def check(raw,peer):
+ out=previous(raw,peer)
+ read=lambda off:struct.unpack_from('<q',raw,off)[0]
+ assert read(0x5a0)==0,(read(0x5a0),read(0x5b0),read(0x5b8))
+ assert read(0x5a8)==104 and read(0x5c0)==1
+ out['scheduler_unit_checks']=read(0x5a8)
+ return out
