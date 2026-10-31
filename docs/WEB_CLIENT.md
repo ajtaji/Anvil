@@ -3880,3 +3880,46 @@ and the watchdog was off. Evidence: `docs/evidence/anvil-ipv6-20261030/quic-tls4
 Installed build 488 is unchanged. Packet dispatch, connection ownership,
 ACK/loss/congestion/flow handling, streams, QPACK and live HTTP/3 web traffic
 remain open, alongside the remaining TLS and off-link IPv6 qualification work.
+
+
+### Initial and Handshake packet frame decoding
+
+`QuicHandshakeFrameRead` in `quic_handshake_frames.pbi` reads one complete
+plaintext frame for Initial (level 0) or Handshake (level 2), returning its
+consumed byte count. It supports PADDING, PING, ACK/ACK_ECN, CRYPTO and transport
+CONNECTION_CLOSE. The borrowed view remains unchanged on errors; unused fields
+are zero after success. Following frames are not consumed. CRYPTO data and close
+reasons are borrowed bytes, not copied or interpreted as strings.
+
+ACK ranges are checked for subtraction underflow before acceptance. The view
+contains largest acknowledged, raw unscaled delay, total range count and a
+borrow of the encoded first range plus subsequent gap/range pairs. ECN counters
+are decoded but not validated against packet history. At most 64 ACK ranges are
+accepted per call; LIMIT is a local resource refusal, not a claim of malformed
+peer traffic. Packet-history checks, delay handling and ACK effects remain the
+connection's responsibility. A one-byte PADDING call bounds decoder work, but
+the packet dispatcher must separately bound its number of calls.
+
+Known application-only frames return LEVEL, unknown types FORMAT. This decoder
+elects to refuse nonminimal frame type encodings with LEVEL (the connection maps
+that to PROTOCOL_VIOLATION); other variable integers accept nonminimal encodings.
+This is a stricter dispatch policy than the standalone CRYPTO reader's generic
+integer decoding, not a change to that reader. RFC 9000 section 12.4 permits
+receiver rejection for nonminimal frame types. Input pointer/length and output
+alias checks precede parsing. Malformed/truncated fields must cause connection
+refusal, not skipping an unknown amount of packet data.
+
+Capture 249 on Anvil 488 passed 5,444 scalar assertions across 340 frame cases
+and four argument checks: independently encoded ACK ranges, ECN, all prefixes
+of representative frames, forbidden and unknown types, nonminimal integers,
+underflow, range limits, CRYPTO overflow and unchanged output on failure. The
+full fixture compiled for Pi 3 without a physical execution claim. The Pi 4
+returned normally with healthy cores/fonts/Vulkan and watchdog off. Evidence:
+`docs/evidence/anvil-ipv6-20261030/quic-frames488`. Build 488 remains installed.
+
+This is decoding, not an authenticated connection. Packet protection must be
+removed successfully before acting on frames, and a received packet must not
+be acknowledged until every frame has been applied successfully. Connection
+ownership, frame effects, ACK generation/loss/congestion/flow handling, streams,
+QPACK and live HTTP/3 traffic remain open. Earlier TLS and public off-link IPv6
+qualification gaps remain open too.
