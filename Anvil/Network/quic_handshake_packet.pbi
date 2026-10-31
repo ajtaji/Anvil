@@ -43,19 +43,27 @@ EndProcedure
 Procedure.i quicpkt_Fail(*s.QuicHandshakePacket,rc.i)
  *s\phase=-1 : *s\error=rc : ProcedureReturn rc
 EndProcedure
+; Public admission check for a containing crypto/packet owner. No receipt lookup
+; or state mutation, so it can run before packet authentication.
+Procedure.i QuicHandshakeStorageCheck(owner.i,ownerBytes.i,source.i,bytes.i,level.i,*r.QuicCryptoRx,*a.QuicHandshakeAck)
+ If ownerBytes<1 Or quicpkt_Span(owner,ownerBytes)=0 Or quicpkt_Span(source,bytes)=0 Or quicpkt_Span(*r,SizeOf(QuicCryptoRx))=0 Or quicpkt_Span(*a,SizeOf(QuicHandshakeAck))=0 : ProcedureReturn #QUIC_PROCESS_ARGUMENT : EndIf
+ If bytes>65535 : ProcedureReturn #QUIC_PROCESS_ARGUMENT : EndIf
+ If level<>0 And level<>2 : ProcedureReturn #QUIC_PROCESS_ARGUMENT : EndIf
+ If (*r\phase<>1 And *r\phase<>2) Or *a\phase<>1 Or level<>*r\level Or level<>*a\level : ProcedureReturn #QUIC_PROCESS_STATE : EndIf
+ If quicpkt_Separate(owner,ownerBytes,source,bytes)=0 Or quicpkt_OutsideRx(*r,owner,ownerBytes)=0 Or quicpkt_OutsideAck(*a,owner,ownerBytes)=0 : ProcedureReturn #QUIC_PROCESS_ARGUMENT : EndIf
+ If quicpkt_OutsideRx(*r,source,bytes)=0 Or quicpkt_OutsideAck(*a,source,bytes)=0 : ProcedureReturn #QUIC_PROCESS_ARGUMENT : EndIf
+ If quicpkt_OutsideAck(*a,*r,SizeOf(QuicCryptoRx))=0 Or quicpkt_OutsideAck(*a,*r\data,*r\capacity)=0 Or quicpkt_OutsideAck(*a,*r\bits,*r\capacity/8)=0 : ProcedureReturn #QUIC_PROCESS_ARGUMENT : EndIf
+ ProcedureReturn 0
+EndProcedure
 ; Zero-initialize job before first Begin. Unused/completed/discarded jobs may begin.
 ; Packet bytes and all initialized contexts/storage must be distinct and remain
 ; alive/exclusive until completion. TLS pumping follows packet completion.
 Procedure.i QuicHandshakePacketBegin(*s.QuicHandshakePacket,source.i,bytes.i,pn.i,level.i,*r.QuicCryptoRx,*a.QuicHandshakeAck)
  Define rc.i,i.i
- If quicpkt_Span(*s,SizeOf(QuicHandshakePacket))=0 Or quicpkt_Span(source,bytes)=0 Or quicpkt_Span(*r,SizeOf(QuicCryptoRx))=0 Or quicpkt_Span(*a,SizeOf(QuicHandshakeAck))=0 : ProcedureReturn #QUIC_PROCESS_ARGUMENT : EndIf
+ rc=QuicHandshakeStorageCheck(*s,SizeOf(QuicHandshakePacket),source,bytes,level,*r,*a)
+ If rc<0 : ProcedureReturn rc : EndIf
  If *s\phase<>0 And *s\phase<>4 And *s\phase<>6 : ProcedureReturn #QUIC_PROCESS_STATE : EndIf
- If bytes>65535 Or pn<0 Or pn>#QUIC_INTEGER_MAX : ProcedureReturn #QUIC_PROCESS_ARGUMENT : EndIf
- If level<>0 And level<>2 : ProcedureReturn #QUIC_PROCESS_ARGUMENT : EndIf
- If (*r\phase<>1 And *r\phase<>2) Or *a\phase<>1 Or level<>*r\level Or level<>*a\level : ProcedureReturn #QUIC_PROCESS_STATE : EndIf
- If quicpkt_Separate(*s,SizeOf(QuicHandshakePacket),source,bytes)=0 Or quicpkt_OutsideRx(*r,*s,SizeOf(QuicHandshakePacket))=0 Or quicpkt_OutsideAck(*a,*s,SizeOf(QuicHandshakePacket))=0 : ProcedureReturn #QUIC_PROCESS_ARGUMENT : EndIf
- If quicpkt_OutsideRx(*r,source,bytes)=0 Or quicpkt_OutsideAck(*a,source,bytes)=0 : ProcedureReturn #QUIC_PROCESS_ARGUMENT : EndIf
- If quicpkt_OutsideAck(*a,*r,SizeOf(QuicCryptoRx))=0 Or quicpkt_OutsideAck(*a,*r\data,*r\capacity)=0 Or quicpkt_OutsideAck(*a,*r\bits,*r\capacity/8)=0 : ProcedureReturn #QUIC_PROCESS_ARGUMENT : EndIf
+ If pn<0 Or pn>#QUIC_INTEGER_MAX : ProcedureReturn #QUIC_PROCESS_ARGUMENT : EndIf
  rc=QuicHandshakeAckSeen(*a,pn) : If rc<0 : ProcedureReturn rc : EndIf
  If bytes=0 And rc=0 : ProcedureReturn #QUIC_PROCESS_EMPTY : EndIf
  For i=0 To SizeOf(QuicHandshakePacket)-1 : PokeA(*s+i,0) : Next

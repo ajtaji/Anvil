@@ -4008,3 +4008,53 @@ The next integration remains the connection's UDP/protection/send path, includin
 actual ACK history validation, scheduling and retry, packet-number ownership,
 loss/congestion/flow handling, streams and QPACK, followed by certificate-verified
 HTTP/3 web traffic. Prior TLS and public off-link IPv6 qualification work is open.
+
+
+### Protected handshake packets enter receive processing
+
+`quic_handshake_receive.pbi` wraps the existing bounded header protection/GCM
+job and handshake packet processor. The caller selects the connection, keys,
+level and last authenticated largest packet number. Begin checks storage/key
+separation, Initial/Handshake kind and shared crypto availability. It processes
+one in-place long packet, exposing its declared consumed length; coalesced tail
+bytes remain untouched. Malformed unauthenticated headers and bad tags discard
+without frame, receive-buffer or ACK-history effects. Authenticated reserved
+bits and frame violations remain fatal. Crypto internal errors are not hidden
+as authentication drops. BUSY refuses before parsing and does not cancel or
+overwrite another crypto job.
+
+Only successful packet unprotection starts frame processing. Step then uses the
+existing more/ACK-event/complete/close/discard results. Accept/Reject apply to
+the pending ACK event, whose sent-history validation still belongs to the
+connection. Cancel terminates only this job and requires discarding the packet
+and closing the receive connection; partial state is not rolled back. Packet,
+key, context and receive storage must stay alive and exclusively owned. The
+public read-only `QuicHandshakeStorageCheck` now shares admission checks between
+the plaintext and containing protected-packet jobs, without duplicate lookup
+before authentication. TLS cipher invalidation remains the existing hook.
+
+The connection still owns CID/address/role checks, key installation/discard,
+AEAD usage limits, largest authenticated packet-number updates and peer identity.
+Initial packet protection is not server authentication. This wrapper supplies
+neither a socket nor a completed TLS handshake, and does not implement 0-RTT,
+application packets, Retry or Version Negotiation processing.
+
+Capture 252 on Anvil 488 produced 464 assertions across 29 scenarios using
+independently protected Python AEAD inputs and real shared crypto on the Pi.
+They cover both handshake levels, every altered tag byte, wrong keys, valid
+reserved-bit violations, authenticated malformed frames, duplicates, ACK events,
+cancellation, another crypto owner and coalesced-tail preservation. One original
+oracle expectation incorrectly expected a parsed length after BUSY; the actual
+length correctly stayed zero. The retained report passes all 464 assertions
+with that expectation corrected. Original identity/check plus corrected cases
+and check remain archived; runtime code and physical execution were unchanged.
+
+Capture 253 reran all 120 plaintext packet integration assertions after the
+shared admission refactor and passed. The complete protected-receive fixture
+also compiled for Pi 3 (no physical execution claim). Both Pi 4 runs returned
+with healthy cores/fonts/Vulkan and watchdog off. Evidence is under
+`docs/evidence/anvil-ipv6-20261030/quic-receive488`; build 488 remains installed.
+
+Actual UDP connection/send ownership, sent-packet history, ACK scheduling/retry,
+loss/congestion/flow handling, streams, QPACK and live authenticated HTTP/3 remain
+unfinished, as do the earlier TLS and public off-link IPv6 qualification items.

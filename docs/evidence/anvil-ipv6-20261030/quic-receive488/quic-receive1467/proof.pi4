@@ -1,0 +1,257 @@
+XIncludeFile "Anvil/Core/sha256.pbi"
+XIncludeFile "Anvil/Crypto/hmac.pbi"
+XIncludeFile "Anvil/Crypto/hkdf.pbi"
+XIncludeFile "Anvil/Crypto/aes.pbi"
+XIncludeFile "Anvil/Crypto/gcm.pbi"
+XIncludeFile "Anvil/Crypto/gcm_job.pbi"
+XIncludeFile "Anvil/Crypto/tls13_record.pbi"
+XIncludeFile "Anvil/Network/quic_handshake_receive.pbi"
+XIncludeFile "RaspberryPi4/Lib/mmu.pi4"
+Global receive.QuicHandshakeReceive,rx.QuicCryptoRx,ack.QuicHandshakeAck
+Global keys.QuicKeys,keyjob.QuicKeyJob
+Global Dim seed.a[32]
+Global Dim packet.a[4096]
+Global Dim original.a[4096]
+Global Dim data.a[4096]
+Global Dim bits.a[512]
+Global Dim ranges.a[1024]
+Global Dim dummy.a[32]
+Procedure.i Hash(p.i,n.i)
+ Define i.i,h.i
+ h=2166136261
+ For i=0 To n-1 : h=((h ! PeekA(p+i))*16777619)&$FFFFFFFF : Next
+ ProcedureReturn h
+EndProcedure
+Procedure Run(index.i,bytes.i,seedBytes.i,level.i,mode.i)
+ Define i.i,p.i,rc.i,n.i,early.i,baseline.i,events.i,eventGate.i,foreign.i,again.i
+ p=$E1C00100+index*128
+ For i=0 To SizeOf(QuicHandshakeReceive)-1 : PokeA(@receive+i,0) : Next
+ For i=0 To SizeOf(QuicKeys)-1 : PokeA(@keys+i,0) : Next
+ For i=0 To SizeOf(QuicKeyJob)-1 : PokeA(@keyjob+i,0) : Next
+ For i=0 To 4095 : packet[i]=$A5 : original[i]=$A5 : Next
+ For i=0 To seedBytes-1 : Read.a seed[i] : Next
+ For i=0 To bytes-1 : Read.a packet[i] : original[i]=packet[i] : Next
+ rc=QuicCryptoRxInit(@rx,level,@data[0],4096,@bits[0],512)
+ rc=QuicHandshakeAckInit(@ack,level,@ranges[0],64)
+ If level=0 : rc=QuicInitialKeysBegin(@keyjob,@keys,@seed[0],seedBytes,1)
+ Else : rc=QuicTrafficKeysBegin(@keyjob,@keys,@seed[0],seedBytes) : EndIf
+ While rc=0 : rc=QuicKeyJobStep(@keyjob) : Wend
+ If mode=5 : PokeA(@keys\key0,PeekA(@keys\key0) ! 1) : EndIf
+ If mode=4 : rc=QuicHandshakeAckRecord(@ack,1,0) : baseline=1 : EndIf
+ If mode=1 : rc=GcmJobBeginEncrypt(@keys\key0,16,@keys\iv0,0,0,0,0,0,@dummy[0]) : EndIf
+ rc=QuicHandshakeReceiveBegin(@receive,@keys,@packet[0],bytes,level,-1,@rx,@ack)
+ If mode=1 : foreign=GcmJobBusy() : GcmJobCancel() : EndIf
+ If mode=2 And rc=0 : rc=QuicHandshakeReceiveCancel(@receive) : EndIf
+ If rc=0
+  For n=0 To 4095
+   rc=QuicHandshakeReceiveStep(@receive)
+   If receive\authenticated=0
+    If rx\buffered<>0 Or ack\count<>baseline : early=early+1 : EndIf
+   EndIf
+   If rc=2
+    events=events+1
+    If ack\count<>baseline : eventGate=eventGate+1 : EndIf
+    If mode=3 : rc=QuicHandshakeReceiveReject(@receive)
+    Else : rc=QuicHandshakeReceiveAccept(@receive) : If rc=0 : rc=1 : EndIf : EndIf
+   EndIf
+   If rc<>1 : Break : EndIf
+  Next
+ EndIf
+ again=QuicHandshakeReceiveStep(@receive)
+ PokeI(p,rc) : PokeI(p+8,receive\authenticated) : PokeI(p+16,rx\buffered) : PokeI(p+24,ack\count)
+ PokeI(p+32,ack\pending) : PokeI(p+40,early) : PokeI(p+48,eventGate) : PokeI(p+56,GcmJobBusy())
+ PokeI(p+64,quicCryptoOwner) : PokeI(p+72,receive\consumed) : PokeI(p+80,again) : PokeI(p+88,events)
+ PokeI(p+96,foreign) : PokeI(p+104,Hash(@packet[0],bytes)) : PokeI(p+112,Hash(@data[0],rx\buffered))
+ If mode=2 : PokeI(p+104,QuicHandshakeReceiveStep(@receive)) : EndIf
+ PokeI(p+120,Hash(@packet[0]+bytes,4096-bytes))
+ QuicKeysWipe(@keys)
+EndProcedure
+Procedure.i Main()
+ Define rc.i,j.i
+ For j=0 To 65535 : PokeA($E1C00000+j,$A5) : Next
+ PokeI($E1C00000,$55445331)
+ MmuClearNc() : MmuAddNc($08A00000,$09200000) : MmuAddNc($08100000,$08180000)
+ rc=MmuBuildTables($4F80000) : If rc<>0 : ProcedureReturn 2 : EndIf
+ MmuEnableCached() : QuicCipherInvalidateHook=@Tls13RecInvalidateCipher
+Restore V0
+Run(0,49,8,0,0)
+Restore V1
+Run(1,48,32,2,0)
+Restore V2
+Run(2,49,8,0,0)
+Restore V3
+Run(3,49,8,0,0)
+Restore V4
+Run(4,49,8,0,0)
+Restore V5
+Run(5,49,8,0,0)
+Restore V6
+Run(6,49,8,0,0)
+Restore V7
+Run(7,49,8,0,0)
+Restore V8
+Run(8,49,8,0,0)
+Restore V9
+Run(9,49,8,0,0)
+Restore V10
+Run(10,49,8,0,0)
+Restore V11
+Run(11,49,8,0,0)
+Restore V12
+Run(12,49,8,0,0)
+Restore V13
+Run(13,49,8,0,0)
+Restore V14
+Run(14,49,8,0,0)
+Restore V15
+Run(15,49,8,0,0)
+Restore V16
+Run(16,49,8,0,0)
+Restore V17
+Run(17,49,8,0,0)
+Restore V18
+Run(18,45,8,0,0)
+Restore V19
+Run(19,49,8,0,0)
+Restore V20
+Run(20,49,8,0,5)
+Restore V21
+Run(21,49,8,0,2)
+Restore V22
+Run(22,49,8,0,1)
+Restore V23
+Run(23,49,8,0,4)
+Restore V24
+Run(24,52,8,0,0)
+Restore V25
+Run(25,52,8,0,3)
+Restore V26
+Run(26,98,8,0,0)
+Restore V27
+Run(27,3,8,0,0)
+Restore V28
+Run(28,49,32,2,0)
+PokeI($E1C00008,464)
+MmuDisableCachedFlushed()
+ProcedureReturn 0
+EndProcedure
+DataSection
+V0:
+ Data.a 131,148,200,240,62,81,87,8,199,0,0,0,1,8,97,98,99,100,101,102,103,104,4,87
+ Data.a 88,89,90,0,28,209,61,110,84,94,72,47,177,251,121,211,27,40,19,33,80,128,68,79
+ Data.a 15,212,69,19,255,251,94,154,201
+V1:
+ Data.a 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23
+ Data.a 24,25,26,27,28,29,30,31,234,0,0,0,1,8,97,98,99,100,101,102,103,104,4,87
+ Data.a 88,89,90,28,129,210,232,87,200,197,130,173,96,107,72,1,210,145,131,184,250,243,70,161
+ Data.a 111,109,228,185,26,3,26,150
+V2:
+ Data.a 131,148,200,240,62,81,87,8,199,0,0,0,1,8,97,98,99,100,101,102,103,104,4,87
+ Data.a 88,89,90,0,28,209,61,110,84,94,72,47,177,251,121,211,27,40,19,33,80,128,68,79
+ Data.a 15,212,69,19,255,251,94,154,200
+V3:
+ Data.a 131,148,200,240,62,81,87,8,199,0,0,0,1,8,97,98,99,100,101,102,103,104,4,87
+ Data.a 88,89,90,0,28,209,61,110,84,94,72,47,177,251,121,211,27,40,19,33,80,128,68,79
+ Data.a 15,212,69,19,255,251,94,155,201
+V4:
+ Data.a 131,148,200,240,62,81,87,8,199,0,0,0,1,8,97,98,99,100,101,102,103,104,4,87
+ Data.a 88,89,90,0,28,209,61,110,84,94,72,47,177,251,121,211,27,40,19,33,80,128,68,79
+ Data.a 15,212,69,19,255,251,95,154,201
+V5:
+ Data.a 131,148,200,240,62,81,87,8,199,0,0,0,1,8,97,98,99,100,101,102,103,104,4,87
+ Data.a 88,89,90,0,28,209,61,110,84,94,72,47,177,251,121,211,27,40,19,33,80,128,68,79
+ Data.a 15,212,69,19,255,250,94,154,201
+V6:
+ Data.a 131,148,200,240,62,81,87,8,199,0,0,0,1,8,97,98,99,100,101,102,103,104,4,87
+ Data.a 88,89,90,0,28,209,61,110,84,94,72,47,177,251,121,211,27,40,19,33,80,128,68,79
+ Data.a 15,212,69,19,254,251,94,154,201
+V7:
+ Data.a 131,148,200,240,62,81,87,8,199,0,0,0,1,8,97,98,99,100,101,102,103,104,4,87
+ Data.a 88,89,90,0,28,209,61,110,84,94,72,47,177,251,121,211,27,40,19,33,80,128,68,79
+ Data.a 15,212,69,18,255,251,94,154,201
+V8:
+ Data.a 131,148,200,240,62,81,87,8,199,0,0,0,1,8,97,98,99,100,101,102,103,104,4,87
+ Data.a 88,89,90,0,28,209,61,110,84,94,72,47,177,251,121,211,27,40,19,33,80,128,68,79
+ Data.a 15,212,68,19,255,251,94,154,201
+V9:
+ Data.a 131,148,200,240,62,81,87,8,199,0,0,0,1,8,97,98,99,100,101,102,103,104,4,87
+ Data.a 88,89,90,0,28,209,61,110,84,94,72,47,177,251,121,211,27,40,19,33,80,128,68,79
+ Data.a 15,213,69,19,255,251,94,154,201
+V10:
+ Data.a 131,148,200,240,62,81,87,8,199,0,0,0,1,8,97,98,99,100,101,102,103,104,4,87
+ Data.a 88,89,90,0,28,209,61,110,84,94,72,47,177,251,121,211,27,40,19,33,80,128,68,79
+ Data.a 14,212,69,19,255,251,94,154,201
+V11:
+ Data.a 131,148,200,240,62,81,87,8,199,0,0,0,1,8,97,98,99,100,101,102,103,104,4,87
+ Data.a 88,89,90,0,28,209,61,110,84,94,72,47,177,251,121,211,27,40,19,33,80,128,68,78
+ Data.a 15,212,69,19,255,251,94,154,201
+V12:
+ Data.a 131,148,200,240,62,81,87,8,199,0,0,0,1,8,97,98,99,100,101,102,103,104,4,87
+ Data.a 88,89,90,0,28,209,61,110,84,94,72,47,177,251,121,211,27,40,19,33,80,128,69,79
+ Data.a 15,212,69,19,255,251,94,154,201
+V13:
+ Data.a 131,148,200,240,62,81,87,8,199,0,0,0,1,8,97,98,99,100,101,102,103,104,4,87
+ Data.a 88,89,90,0,28,209,61,110,84,94,72,47,177,251,121,211,27,40,19,33,80,129,68,79
+ Data.a 15,212,69,19,255,251,94,154,201
+V14:
+ Data.a 131,148,200,240,62,81,87,8,199,0,0,0,1,8,97,98,99,100,101,102,103,104,4,87
+ Data.a 88,89,90,0,28,209,61,110,84,94,72,47,177,251,121,211,27,40,19,33,81,128,68,79
+ Data.a 15,212,69,19,255,251,94,154,201
+V15:
+ Data.a 131,148,200,240,62,81,87,8,199,0,0,0,1,8,97,98,99,100,101,102,103,104,4,87
+ Data.a 88,89,90,0,28,209,61,110,84,94,72,47,177,251,121,211,27,40,19,32,80,128,68,79
+ Data.a 15,212,69,19,255,251,94,154,201
+V16:
+ Data.a 131,148,200,240,62,81,87,8,199,0,0,0,1,8,97,98,99,100,101,102,103,104,4,87
+ Data.a 88,89,90,0,28,209,61,110,84,94,72,47,177,251,121,211,27,40,18,33,80,128,68,79
+ Data.a 15,212,69,19,255,251,94,154,201
+V17:
+ Data.a 131,148,200,240,62,81,87,8,199,0,0,0,1,8,97,98,99,100,101,102,103,104,4,87
+ Data.a 88,89,90,0,28,209,61,110,84,94,72,47,177,251,121,211,27,41,19,33,80,128,68,79
+ Data.a 15,212,69,19,255,251,94,154,201
+V18:
+ Data.a 131,148,200,240,62,81,87,8,204,0,0,0,1,8,97,98,99,100,101,102,103,104,4,87
+ Data.a 88,89,90,0,24,189,185,27,171,71,72,44,208,237,166,136,29,217,132,179,120,72,87,176
+ Data.a 158,219,223,238,146
+V19:
+ Data.a 131,148,200,240,62,81,87,8,203,0,0,0,1,8,97,98,99,100,101,102,103,104,4,87
+ Data.a 88,89,90,0,28,108,253,74,139,94,72,47,177,251,121,211,27,72,22,133,14,162,198,35
+ Data.a 171,76,73,164,215,145,210,146,55
+V20:
+ Data.a 131,148,200,240,62,81,87,8,199,0,0,0,1,8,97,98,99,100,101,102,103,104,4,87
+ Data.a 88,89,90,0,28,209,61,110,84,94,72,47,177,251,121,211,27,40,19,33,80,128,68,79
+ Data.a 15,212,69,19,255,251,94,154,201
+V21:
+ Data.a 131,148,200,240,62,81,87,8,199,0,0,0,1,8,97,98,99,100,101,102,103,104,4,87
+ Data.a 88,89,90,0,28,209,61,110,84,94,72,47,177,251,121,211,27,40,19,33,80,128,68,79
+ Data.a 15,212,69,19,255,251,94,154,201
+V22:
+ Data.a 131,148,200,240,62,81,87,8,199,0,0,0,1,8,97,98,99,100,101,102,103,104,4,87
+ Data.a 88,89,90,0,28,209,61,110,84,94,72,47,177,251,121,211,27,40,19,33,80,128,68,79
+ Data.a 15,212,69,19,255,251,94,154,201
+V23:
+ Data.a 131,148,200,240,62,81,87,8,199,0,0,0,1,8,97,98,99,100,101,102,103,104,4,87
+ Data.a 88,89,90,0,28,209,61,110,84,94,72,47,177,251,121,211,27,40,19,33,80,128,68,79
+ Data.a 15,212,69,19,255,251,94,154,201
+V24:
+ Data.a 131,148,200,240,62,81,87,8,200,0,0,0,1,8,97,98,99,100,101,102,103,104,4,87
+ Data.a 88,89,90,0,31,122,223,242,122,94,72,47,177,251,121,208,27,80,174,64,197,178,0,28
+ Data.a 131,232,217,10,61,54,49,111,252,165,225,100
+V25:
+ Data.a 131,148,200,240,62,81,87,8,200,0,0,0,1,8,97,98,99,100,101,102,103,104,4,87
+ Data.a 88,89,90,0,31,122,223,242,122,94,72,47,177,251,121,208,27,80,174,64,197,178,0,28
+ Data.a 131,232,217,10,61,54,49,111,252,165,225,100
+V26:
+ Data.a 131,148,200,240,62,81,87,8,199,0,0,0,1,8,97,98,99,100,101,102,103,104,4,87
+ Data.a 88,89,90,0,28,209,61,110,84,94,72,47,177,251,121,211,27,40,19,33,80,128,68,79
+ Data.a 15,212,69,19,255,251,94,154,201,199,0,0,0,1,8,97,98,99,100,101,102,103,104,4
+ Data.a 87,88,89,90,0,28,209,61,110,84,94,72,47,177,251,121,211,27,40,19,33,80,128,68
+ Data.a 79,15,212,69,19,255,251,94,154,201
+V27:
+ Data.a 131,148,200,240,62,81,87,8,195,0,0
+V28:
+ Data.a 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23
+ Data.a 24,25,26,27,28,29,30,31,199,0,0,0,1,8,97,98,99,100,101,102,103,104,4,87
+ Data.a 88,89,90,0,28,209,61,110,84,94,72,47,177,251,121,211,27,40,19,33,80,128,68,79
+ Data.a 15,212,69,19,255,251,94,154,201
+EndDataSection
