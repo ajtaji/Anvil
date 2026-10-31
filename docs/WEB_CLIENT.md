@@ -3688,3 +3688,26 @@ recovery/congestion/flow control, UDP integration and QPACK, followed by live
 certificate-verified HTTP/3. The new interface does not yet provide that request
 path. Existing TLS compatibility/device-blocking and public IPv6/RDNSS web
 qualification remain open.
+
+### IPv6 UDP wire support (Pi 4 build 485)
+
+`Anvil/Network/ipv6_udp.pbi` adds shared UDP emission and borrowed receive
+views using the existing IPv6 packet parser and checksum implementation.
+The checksum is mandatory; computed zero is emitted as `FFFF`. UDP length
+controls the delivered data and checksum, excluding trailing IP/link padding.
+Extension headers and atomic fragments use the common IPv6 parser; other
+fragments need reassembly. This ordinary-packet API excludes jumbograms and
+zero-checksum tunnel exceptions. Address ownership, scope, port binding and
+multicast membership belong to the endpoint, not this wire codec.
+
+Physical capture 230 on Pi 4 build 485 passed 40 independent byte/view cases,
+including 1200-byte QUIC payloads, minimum-MTU packets, corrupt/absent checksums,
+padding, extensions, fragments and pointer/output refusals. Cores, fonts and
+Vulkan remained healthy; watchdog off. The same UDP source compiled for Pi 3
+after removing Pi 4 cache lifecycle calls from the compile-only harness; its
+initial refusal is retained. There is no physical Pi 3 claim.
+Evidence: `docs/evidence/anvil-ipv6-20261030/ipv6-udp485`.
+
+This is packet support, not a live UDP socket or HTTP/3 request. Existing IPv6
+DNS currently uses TCP. The generic payload datagram API, IPv6 UDP dispatch,
+QUIC connection ownership/recovery and QPACK remain to be integrated.
