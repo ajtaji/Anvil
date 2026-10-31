@@ -10,6 +10,7 @@
 ; TLS completion is also checked independently by the server.
 Global recoveryCloseFault.i,recoveryCloseChecked.i
 Global rearmFault.i,rearmChecked.i,probeRearmDue.i,ackRearmDue.i
+Global repeatBase.i,repeatDue.i,repeatFired.i,thirdProbeDue.i
 Global timerFault.i,timerBase.i,timerDue.i,timerFired.i,timerCount.i
 Global pathRtt.QuicRtt,rttSamples.i,rttFault.i
 Global Dim rttTrace.i[32]
@@ -333,6 +334,7 @@ Procedure.i SendApplicationProbe(expected.i)
  rc=QuicConnectionControlAccepted(@connection,HwMicros()) : If rc<>0 : ProcedureReturn rc : EndIf
  If connection\recoveryTimer\armed<>1 Or connection\recoveryTimer\level<>4 : rearmFault=1 : EndIf
  If expected=2 : probeRearmDue=connection\recoveryTimer\deadline : EndIf
+ If expected=3 : thirdProbeDue=connection\recoveryTimer\deadline : EndIf
  rearmChecked=rearmChecked+1
  Repeat
   n=Service() : If n<0 : ProcedureReturn n : EndIf
@@ -611,11 +613,11 @@ Procedure.i ReceiveApplicationAck()
  ProcedureReturn 0
 EndProcedure
 
-; Real missing-datagram proof: PN1 is discarded by the peer before decryption.
-; Three later authenticated deliveries trigger the packet threshold, not a timer.
+; Real missing-datagram proof. Legacy mode uses three later deliveries; PTO
+; modes wait for deadlines, with optional consecutive encrypted datagram drops.
 Procedure.i CheckProbeLoss()
  Define rc.i,n.i,i.i,highest.i,delay.i
- highest=4-2*#PTO_PROBE_TEST
+ highest=4-2*#PTO_PROBE_TEST+#REPEAT_PROBE_TEST
  If #PTO_PROBE_TEST
   timerBase=QuicHandshakeSentProbeTime(@connection\applicationHistory)
   If connection\recoveryTimer\armed<>1 Or connection\recoveryTimer\level<>4 : ProcedureReturn -9493 : EndIf
@@ -631,6 +633,20 @@ Procedure.i CheckProbeLoss()
   If connection\applicationHistory\inFlight<>probeBytes Or connection\applicationHistory\acked<>1 : timerFault=3 : EndIf
  EndIf
  For i=2 To highest
+  If #REPEAT_PROBE_TEST And i=3
+   repeatBase=QuicHandshakeSentProbeTime(@connection\applicationHistory)
+   repeatDue=connection\recoveryTimer\deadline
+   If connection\recoveryTimer\armed<>1 Or connection\recoveryTimer\backoff<>1 : timerFault=6 : EndIf
+   Repeat
+    n=Service() : If n<0 : ProcedureReturn n : EndIf
+    repeatFired=HwMicros() : rc=QuicConnectionRecoveryPoll(@connection,repeatFired)
+   Until rc<>0
+   If rc<>1 : ProcedureReturn rc : EndIf
+   timerCount=timerCount+1
+   If connection\recoveryTimer\backoff<>2 Or connection\recoveryTimer\level<>4 Or repeatFired<repeatDue : timerFault=7 : EndIf
+   If connection\applicationHistory\inFlight<>2*probeBytes Or connection\applicationHistory\acked<>1 : timerFault=8 : EndIf
+   If QuicConnectionRecoveryPoll(@connection,HwMicros())<>0 : timerFault=9 : EndIf
+  EndIf
   rc=SendApplicationProbe(i) : If rc<>0 : ProcedureReturn rc : EndIf
  Next
  rc=QuicConnectionLossBegin(@connection,4,HwMicros(),$7FFFFFFFFFFFFFFF,3)
@@ -640,7 +656,7 @@ Procedure.i CheckProbeLoss()
  If connection\recoveryLoss\phase=1 : QuicHandshakeSentLossCancel(@connection\recoveryLoss) : ProcedureReturn -9492 : EndIf
  lossPhase=1
  rc=ReceiveApplicationAck() : If rc<>0 : ProcedureReturn rc : EndIf
- If lossAckCount<>highest-1 Or connection\applicationHistory\acked<>highest Or connection\applicationHistory\largestAcked<>highest Or connection\applicationHistory\inFlight<>probeBytes : lossFault=3 : EndIf
+ If lossAckCount<>highest-1-#REPEAT_PROBE_TEST Or connection\applicationHistory\acked<>highest-#REPEAT_PROBE_TEST Or connection\applicationHistory\largestAcked<>highest Or connection\applicationHistory\inFlight<>(1+#REPEAT_PROBE_TEST)*probeBytes : lossFault=3 : EndIf
  delay=$7FFFFFFFFFFFFFFF
  If #PTO_PROBE_TEST
   delay=QuicRttLossDelay(@connection\recoveryRtt)
@@ -652,7 +668,7 @@ Procedure.i CheckProbeLoss()
   rc=QuicConnectionLossStep(@connection)
   If rc=1
    lossEvents=lossEvents+1
-   If connection\recoveryLoss\number<>1 Or connection\recoveryLoss\packetBytes<>probeBytes Or connection\recoveryLoss\inFlightBytes<>probeBytes Or connection\recoveryLoss\sentAt<=0 : lossFault=4 : EndIf
+   If connection\recoveryLoss\number<>lossEvents Or connection\recoveryLoss\packetBytes<>probeBytes Or connection\recoveryLoss\inFlightBytes<>probeBytes Or connection\recoveryLoss\sentAt<=0 : lossFault=4 : EndIf
   EndIf
   n=Service()
   If n<0
@@ -661,7 +677,7 @@ Procedure.i CheckProbeLoss()
   EndIf
  Until rc=2 Or rc<0
  If rc<>2 : ProcedureReturn rc : EndIf
- If lossEvents<>1 Or connection\applicationHistory\inFlight<>0 Or connection\applicationHistory\busy<>0 : lossFault=5 : EndIf
+ If lossEvents<>1+#REPEAT_PROBE_TEST Or connection\applicationHistory\inFlight<>0 Or connection\applicationHistory\busy<>0 : lossFault=5 : EndIf
  If #PTO_PROBE_TEST
   If connection\recoveryTimer\armed<>0 : timerFault=5 : EndIf
  EndIf
@@ -1235,6 +1251,8 @@ Procedure.i Main()
  PokeI($E1C00258,applicationWriteReady) : PokeI($E1C00260,applicationFault)
  PokeI($E1C00268,applicationSteps) : PokeI($E1C00270,maxApplicationStep)
  PokeI($E1C00278,applicationCancelled) : PokeI($E1C00280,applicationPing)
+ PokeI($E1C00560,repeatBase) : PokeI($E1C00568,repeatDue)
+ PokeI($E1C00570,repeatFired) : PokeI($E1C00578,thirdProbeDue)
  PokeI($E1C00540,rearmFault) : PokeI($E1C00548,rearmChecked)
  PokeI($E1C00550,probeRearmDue) : PokeI($E1C00558,ackRearmDue)
  PokeI($E1C00530,recoveryCloseFault) : PokeI($E1C00538,recoveryCloseChecked)

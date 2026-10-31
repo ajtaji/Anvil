@@ -76,7 +76,7 @@ class FixtureConnection(QuicConnection):
             super()._replenish_connection_ids()
 
 class Peer:
-    def __init__(self, directory, report, host='192.168.1.104', port=55442, allowed='192.168.1.114', connection_id_length=8, drop_probe=False):
+    def __init__(self, directory, report, host='192.168.1.104', port=55442, allowed='192.168.1.114', connection_id_length=8, drop_probe=False, repeat_probe=False):
         assert 0 <= connection_id_length <= 20
         self.directory, self.report, self.allowed = directory, report, allowed
         self.sock=socket.socket(socket.AF_INET,socket.SOCK_DGRAM)
@@ -85,7 +85,7 @@ class Peer:
         self.config=QuicConfiguration(is_client=False,alpn_protocols=['h3'],connection_id_length=connection_id_length,
                   cipher_suites=[CipherSuite.AES_128_GCM_SHA256],quic_logger=self.logger,idle_timeout=30)
         self.config.load_cert_chain(str(directory/'chain.pem'),str(directory/'key.pem'))
-        self.drop_probe=drop_probe;self.short_packets=0
+        self.drop_probe=drop_probe or repeat_probe;self.drop_count=2 if repeat_probe else 1;self.short_packets=0
         self.connection=None;self.stop=threading.Event();self.thread=None
         self.result=dict(implementation='aioquic 1.7.0',connection_id_length=connection_id_length,received=[],sent=[],events=[],complete=False,error=None)
 
@@ -107,9 +107,11 @@ class Peer:
                         self.connection=FixtureConnection(configuration=self.config,original_destination_connection_id=header.destination_cid)
                     if data and not (data[0]&0x80):
                         self.short_packets+=1
-                        if self.drop_probe and self.short_packets==2:
+                        if self.drop_probe and 2<=self.short_packets<=1+self.drop_count:
                             # Discard encrypted bytes before the QUIC receiver sees them.
-                            self.result['dropped_probe']=dict(bytes=len(data),sha256=hashlib.sha256(data).hexdigest())
+                            item=dict(bytes=len(data),sha256=hashlib.sha256(data).hexdigest(),ordinal=self.short_packets)
+                            self.result.setdefault('dropped_probe',item)
+                            self.result.setdefault('dropped_probes',[]).append(item)
                             continue
                     self.connection.receive_datagram(data,addr,now)
                 if self.connection:
@@ -186,11 +188,11 @@ class Peer:
             packets=[e['data'] for e in events if e['name']=='transport:packet_received'
                      and e['data']['header']['packet_type']=='1RTT']
             numbers={int(p['header']['packet_number']) for p in packets}
-            assert 1 not in numbers,'Discarded probe reached the authenticated receiver'
-            if ({0}|set(range(2,upto+1)))<=numbers:
-                assert self.result.get('dropped_probe'),self.result
+            assert not numbers.intersection(range(1,1+self.drop_count)),'Discarded probe reached the authenticated receiver'
+            if ({0}|set(range(1+self.drop_count,upto+1)))<=numbers:
+                assert len(self.result.get('dropped_probes',[]))==self.drop_count,self.result
                 for p in packets:
-                    if int(p['header']['packet_number']) in range(2,upto+1):
+                    if int(p['header']['packet_number']) in range(1+self.drop_count,upto+1):
                         assert [f['frame_type'] for f in p['frames']]==['ping'],p
                 self.result['probe_loss_verified']=True
                 return

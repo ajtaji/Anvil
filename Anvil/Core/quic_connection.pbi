@@ -1,6 +1,7 @@
 ; Shared ownership for a QUIC handshake connection and its mutable storage.
 ; Compose TLS, quic_tls_operation, packet/key/ACK jobs and parameter parsing.
-; This owns resources/deadline/close, not packet dispatch, recovery or HTTP/3.
+; Owns resources/deadline/close and normal PTO rearming, not a full recovery
+; dispatcher or HTTP/3 implementation.
 ; Caller transfers one open UDP handle on successful Begin. The 20 input spans
 ; are exclusive, disjoint and alive until CloseStep returns1. Extra capacity
 ; beyond BufferBytes is not owned or wiped. Immutable host/trust inputs remain
