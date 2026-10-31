@@ -17,7 +17,10 @@ def build(compiler,out):
  def observe(name):
   acked=[i for i,x in enumerate(slots) if x[0]&16]
   values={'first':first,'issued':len(slots),'lastSent':last,'lastTime':lasttime,'acked':len(acked),'largestAcked':max(acked,default=-1),'inFlight':sum(x[1] for x in slots if x[0]&8),'level':level,'capacity':capacity}
+  values['elicitingInFlight']=sum((x[0]&12)==12 for x in slots)
+  values['lastEliciting']=max((x[2] for x in slots if x[0]&4),default=-1)
   for f,v in values.items():check(name+' '+f,'s\\'+f,v)
+  check(name+' probe time','QuicHandshakeSentProbeTime(@s)',values['lastEliciting'] if values['elicitingInFlight'] else -1)
   raw=b''.join(struct.pack('<4q',*x) for x in slots)
   if first:
    ring=[b'\xa5'*32 for _ in range(capacity)]
@@ -181,6 +184,21 @@ def build(compiler,out):
  init(4,4)
  reserve();commit(0,time=(1<<63)-11);reserve();commit(1,time=(1<<63)-10);ack({1})
  loss_scan((1<<63)-10,100)
+
+ # PTO eligibility is independent of padded byte flight and ACK-only sends.
+ init(8,4);observe('empty eligibility')
+ reserve();commit(0,time=0);observe('zero timestamp valid')
+ reserve();commit(1,time=10,eliciting=0);observe('ACK only cannot postpone')
+ reserve();commit(2,time=20,eliciting=0,padded=1);observe('padding cannot postpone')
+ reserve();commit(3,time=30);ack({3});observe('latest ACKed still anchors older flight')
+ prepare({0});check('probe refuses pending ACK','QuicHandshakeSentProbeTime(@s)',-3464)
+ check('cancel eligibility ACK','QuicHandshakeSentAckCancel(@job)',-3467)
+ lost(0);observe('padding alone is not PTO eligible');ack({0});lost(0);observe('late ACK no double decrement')
+ check('discard eligibility','QuicHandshakeSentDiscard(@s)',0)
+ check('discard clears count','s\\elicitingInFlight',0)
+ check('discard clears time','s\\lastEliciting',-1)
+ check('discarded query refused','QuicHandshakeSentProbeTime(@s)',-3462)
+ init(4,2);observe('reinit resets eligibility')
 
  # Independent arbitrary-precision oracle for path RTT and timer arithmetic.
  import random

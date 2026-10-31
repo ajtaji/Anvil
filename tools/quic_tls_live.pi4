@@ -609,7 +609,7 @@ Procedure.i CheckProbeLoss()
  Define rc.i,n.i,i.i,highest.i,delay.i
  highest=4-2*#PTO_PROBE_TEST
  If #PTO_PROBE_TEST
-  timerBase=connection\applicationHistory\lastTime
+  timerBase=QuicHandshakeSentProbeTime(@connection\applicationHistory)
   rc=QuicProbeTimerArm(@connection\recoveryTimer,@connection\recoveryRtt,connection\handshakeConfirmed,25000,-1,-1,timerBase)
   If rc<>1 : ProcedureReturn rc : EndIf
   timerDue=connection\recoveryTimer\deadline
@@ -657,7 +657,7 @@ Procedure.i CheckProbeLoss()
  If rc<>2 : ProcedureReturn rc : EndIf
  If lossEvents<>1 Or connection\applicationHistory\inFlight<>0 Or connection\applicationHistory\busy<>0 : lossFault=5 : EndIf
  If #PTO_PROBE_TEST
-  rc=QuicProbeTimerArm(@connection\recoveryTimer,@connection\recoveryRtt,1,25000,-1,-1,-1)
+  rc=QuicProbeTimerArm(@connection\recoveryTimer,@connection\recoveryRtt,1,25000,-1,-1,QuicHandshakeSentProbeTime(@connection\applicationHistory))
   If rc<>0 Or connection\recoveryTimer\armed<>0 : timerFault=5 : EndIf
  EndIf
  rc=QuicHandshakeSentPrune(@connection\applicationHistory,64)

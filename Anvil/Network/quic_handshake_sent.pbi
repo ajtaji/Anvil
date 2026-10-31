@@ -24,6 +24,8 @@ Structure QuicHandshakeSent
  acked.i
  largestAcked.i
  inFlight.i
+ elicitingInFlight.i
+ lastEliciting.i
 EndStructure
 Structure QuicHandshakeSentAck
  phase.i
@@ -75,7 +77,7 @@ Procedure.i QuicHandshakeSentInit(*s.QuicHandshakeSent,level.i,entries.i,capacit
  If *s\phase<>0 And *s\phase<>2 : ProcedureReturn #QUIC_SENT_STATE : EndIf
  For i=0 To SizeOf(QuicHandshakeSent)-1 : PokeA(*s+i,0) : Next
  *s\phase=1 : *s\level=level : *s\entries=entries : *s\capacity=capacity
- *s\lastSent=-1 : *s\largestAcked=-1 : ProcedureReturn 0
+ *s\lastEliciting=-1 : *s\lastSent=-1 : *s\largestAcked=-1 : ProcedureReturn 0
 EndProcedure
 ; Reserve BEFORE encrypting. A failed/cancelled protection/send burns its PN.
 ; Returns PN>=0. Exhaustion is a local limit, never permission to reuse a PN.
@@ -101,6 +103,7 @@ Procedure.i QuicHandshakeSentCommit(*s.QuicHandshakeSent,number.i,bytes.i,time.i
  If number<*s\first : ProcedureReturn #QUIC_SENT_STATE : EndIf
  p=*s\entries+(number % *s\capacity)*32
  If PeekI(p)<>1 Or number<=*s\lastSent Or time<*s\lastTime : ProcedureReturn #QUIC_SENT_STATE : EndIf
+ If eliciting : *s\elicitingInFlight=*s\elicitingInFlight+1 : *s\lastEliciting=time : EndIf
  flags=2+eliciting*4
  If eliciting Or padded : flags=flags|8 : *s\inFlight=*s\inFlight+bytes : EndIf
  PokeI(p,flags) : PokeI(p+8,bytes) : PokeI(p+16,time) : PokeI(p+24,cookie)
@@ -118,6 +121,7 @@ Procedure.i QuicHandshakeSentLost(*s.QuicHandshakeSent,number.i)
  p=*s\entries+(number % *s\capacity)*32 : flags=PeekI(p)
  If (flags&2)=0 : ProcedureReturn #QUIC_SENT_UNSENT : EndIf
  If flags&48 : ProcedureReturn 0 : EndIf
+ If (flags&12)=12 : *s\elicitingInFlight=*s\elicitingInFlight-1 : EndIf
  If flags&8 : *s\inFlight=*s\inFlight-PeekI(p+8) : EndIf
  PokeI(p,(flags|32)&(~8)) : ProcedureReturn 1
 EndProcedure
@@ -137,11 +141,24 @@ Procedure.i QuicHandshakeSentPrune(*s.QuicHandshakeSent,budget.i)
  Wend
  ProcedureReturn n
 EndProcedure
+; Last accepted ACK-eliciting send time when such packets remain in flight.
+; -1 means none; errors are below -1. Refuse partially applied ACK/loss jobs.
+; Later ACK-only/padding-only sends do not move this time. The latest eliciting
+; send remains the anchor even if ACKed while an older eliciting packet remains.
+; This is eligibility, not address-validation/no-flight probe policy.
+Procedure.i QuicHandshakeSentProbeTime(*s.QuicHandshakeSent)
+ Define rc.i
+ rc=quics_Ready(*s) : If rc<0 : ProcedureReturn rc : EndIf
+ If *s\busy<>0 : ProcedureReturn #QUIC_SENT_BUSY : EndIf
+ If *s\elicitingInFlight=0 : ProcedureReturn -1 : EndIf
+ If *s\elicitingInFlight<0 Or *s\elicitingInFlight>*s\capacity Or *s\lastEliciting<0 Or *s\lastEliciting>*s\lastTime : ProcedureReturn #QUIC_SENT_STATE : EndIf
+ ProcedureReturn *s\lastEliciting
+EndProcedure
 Procedure.i QuicHandshakeSentDiscard(*s.QuicHandshakeSent)
  Define rc.i
  rc=quics_Ready(*s) : If rc<0 : ProcedureReturn rc : EndIf
  If *s\busy<>0 : ProcedureReturn #QUIC_SENT_BUSY : EndIf
- *s\phase=2 : *s\inFlight=0 : ProcedureReturn 0
+ *s\phase=2 : *s\inFlight=0 : *s\elicitingInFlight=0 : *s\lastEliciting=-1 : ProcedureReturn 0
 EndProcedure
 Procedure.i quics_End(*j.QuicHandshakeSentAck,rc.i)
  Define *s.QuicHandshakeSent
@@ -230,6 +247,7 @@ Procedure.i QuicHandshakeSentAckStep(*j.QuicHandshakeSentAck)
    *j\cookie=PeekI(p+24) : *j\flags=flags : *j\inFlightBytes=0
    If *j\number=*j\largest : *j\rttLargestNew=1 : *j\rttSentAt=*j\sentAt : EndIf
    If flags&4 : *j\rttEliciting=1 : EndIf
+   If (flags&12)=12 : *s\elicitingInFlight=*s\elicitingInFlight-1 : EndIf
    If flags&8 : *j\inFlightBytes=*j\packetBytes : *s\inFlight=*s\inFlight-*j\packetBytes : EndIf
    PokeI(p,(flags|16)&(~8)) : *s\acked=*s\acked+1
    If *j\number>*s\largestAcked : *s\largestAcked=*j\number : EndIf
@@ -301,6 +319,7 @@ Procedure.i QuicHandshakeSentLossStep(*j.QuicHandshakeSentLoss)
    If *s\largestAcked-number>=*j\threshold Or *j\now-sent>=*j\delay
     *j\number=number : *j\packetBytes=PeekI(p+8) : *j\sentAt=sent
     *j\cookie=PeekI(p+24) : *j\flags=flags : *j\inFlightBytes=*j\packetBytes
+    If flags&4 : *s\elicitingInFlight=*s\elicitingInFlight-1 : EndIf
     *s\inFlight=*s\inFlight-*j\packetBytes : PokeI(p,(flags|32)&(~8))
     ProcedureReturn 1
    EndIf
