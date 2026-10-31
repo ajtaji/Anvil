@@ -1,5 +1,5 @@
 ; SPDX-License-Identifier: MIT
-; Independent RFC 9000 sections12.3/13.1/19.3, RFC 9002 sections4.1/6.1/6.4.
+; Independent RFC 9000 sections12.3/13.1/19.3, RFC 9002 sections4.1/5/6 (with verified erratum7539).
 ; Bounded Initial/Handshake/Application sent history; legacy API names retained.
 ; Caller owns transport, keys and recovery. ACKed prefixes may be reclaimed;
 ; packet numbers never restart and unsent gaps are never forgotten.
@@ -314,4 +314,98 @@ Procedure.i QuicHandshakeSentLossCancel(*j.QuicHandshakeSentLoss)
  If *s\busy<>*j : ProcedureReturn #QUIC_SENT_STATE : EndIf
  *s\busy=0 : *j\phase=-1 : *j\result=#QUIC_SENT_CANCELLED
  ProcedureReturn #QUIC_SENT_CANCELLED
+EndProcedure
+
+
+; Path timing, independent of packet-number spaces and transport scheduling.
+; Protocol equations independently expressed as checked integer arithmetic.
+; Same monotonic units throughout (recommended microseconds, initial333000,
+; granularity1000). Caller resets on a new path and owns timer/backoff policy.
+Structure QuicRtt
+ phase.i
+ hasSample.i
+ latest.i
+ minimum.i
+ smoothed.i
+ variation.i
+ granularity.i
+EndStructure
+Procedure.i quics_RttReady(*r.QuicRtt)
+ If quics_Span(*r,SizeOf(QuicRtt))=0 : ProcedureReturn #QUIC_SENT_ARGUMENT : EndIf
+ If *r\phase<>1 : ProcedureReturn #QUIC_SENT_STATE : EndIf
+ If *r\hasSample<0 Or *r\hasSample>1 Or *r\latest<1 Or *r\smoothed<1 Or *r\variation<0 Or *r\granularity<1 : ProcedureReturn #QUIC_SENT_STATE : EndIf
+ If *r\minimum<0 Or *r\minimum>*r\latest : ProcedureReturn #QUIC_SENT_STATE : EndIf
+ If *r\hasSample=1 And *r\minimum=0 : ProcedureReturn #QUIC_SENT_STATE : EndIf
+ ProcedureReturn 0
+EndProcedure
+Procedure.i QuicRttInit(*r.QuicRtt,initial.i,granularity.i)
+ If quics_Span(*r,SizeOf(QuicRtt))=0 Or initial<1 Or granularity<1 : ProcedureReturn #QUIC_SENT_ARGUMENT : EndIf
+ *r\phase=1 : *r\hasSample=0 : *r\latest=initial : *r\minimum=0
+ *r\smoothed=initial : *r\variation=initial/2 : *r\granularity=granularity
+ ProcedureReturn 0
+EndProcedure
+; Exact floor of weighted mean without forming the overflowing weighted sum.
+Procedure.i quics_RttBlend(previous.i,sample.i,divisor.i)
+ ProcedureReturn (previous/divisor)*(divisor-1)+sample/divisor+((previous%divisor)*(divisor-1)+sample%divisor)/divisor
+EndProcedure
+; Call once per fully validated ACK: its largest PN must be newly acknowledged
+; and at least one newly acknowledged packet must be ack-eliciting. elapsed is
+; receive time minus that largest PN's send time, not time since the ACK job ran.
+; delay is already decoded into local units. Never pass unchecked shifted input.
+; This math helper does not authenticate ACKs or enforce sampling eligibility.
+Procedure.i QuicRttSample(*r.QuicRtt,elapsed.i,delay.i,maxDelay.i,level.i,confirmed.i)
+ Define rc.i,adjusted.i,minimum.i,delta.i
+ rc=quics_RttReady(*r) : If rc<0 : ProcedureReturn rc : EndIf
+ If elapsed<1 Or delay<0 Or maxDelay<0 Or confirmed<0 Or confirmed>1 : ProcedureReturn #QUIC_SENT_ARGUMENT : EndIf
+ If level<>0 And level<>2 And level<>4 : ProcedureReturn #QUIC_SENT_ARGUMENT : EndIf
+ If *r\hasSample=0
+  *r\latest=elapsed : *r\minimum=elapsed : *r\smoothed=elapsed : *r\variation=elapsed/2 : *r\hasSample=1
+  ProcedureReturn 0
+ EndIf
+ minimum=*r\minimum : If elapsed<minimum : minimum=elapsed : EndIf
+ If level<>4 : delay=0 : EndIf
+ If confirmed=1 And delay>maxDelay : delay=maxDelay : EndIf
+ adjusted=elapsed
+ If delay<=elapsed-minimum : adjusted=elapsed-delay : EndIf
+ delta=*r\smoothed-adjusted : If delta<0 : delta=-delta : EndIf
+ ; Erratum7539: variation uses the previous smoothed value.
+ *r\variation=quics_RttBlend(*r\variation,delta,4)
+ *r\smoothed=quics_RttBlend(*r\smoothed,adjusted,8)
+ *r\latest=elapsed : *r\minimum=minimum
+ ProcedureReturn 0
+EndProcedure
+; Round the9/8 threshold upward; saturate unrepresentable durations.
+Procedure.i QuicRttLossDelay(*r.QuicRtt)
+ Define rc.i,n.i,extra.i
+ rc=quics_RttReady(*r) : If rc<0 : ProcedureReturn rc : EndIf
+ n=*r\latest : If *r\smoothed>n : n=*r\smoothed : EndIf
+ extra=n/8 : If n%8 : extra=extra+1 : EndIf
+ If extra>$7FFFFFFFFFFFFFFF-n : n=$7FFFFFFFFFFFFFFF : Else : n=n+extra : EndIf
+ If n<*r\granularity : n=*r\granularity : EndIf
+ ProcedureReturn n
+EndProcedure
+; No application-space PTO before confirmation. The caller selects the earliest
+; eligible space, supplies the connection backoff, and arms/restarts the timer.
+; Expiry calls for fresh probes: it is not proof of packet loss.
+Procedure.i QuicRttPto(*r.QuicRtt,level.i,confirmed.i,maxDelay.i,backoff.i)
+ Define rc.i,n.i,spread.i
+ rc=quics_RttReady(*r) : If rc<0 : ProcedureReturn rc : EndIf
+ If confirmed<0 Or confirmed>1 Or maxDelay<0 Or backoff<0 Or backoff>63 : ProcedureReturn #QUIC_SENT_ARGUMENT : EndIf
+ If level<>0 And level<>2 And level<>4 : ProcedureReturn #QUIC_SENT_ARGUMENT : EndIf
+ If level=4 And confirmed=0 : ProcedureReturn #QUIC_SENT_STATE : EndIf
+ spread=$7FFFFFFFFFFFFFFF
+ If *r\variation<=$7FFFFFFFFFFFFFFF/4 : spread=*r\variation*4 : EndIf
+ If spread<*r\granularity : spread=*r\granularity : EndIf
+ n=$7FFFFFFFFFFFFFFF
+ If spread<=$7FFFFFFFFFFFFFFF-*r\smoothed : n=*r\smoothed+spread : EndIf
+ If level=4
+  If maxDelay>$7FFFFFFFFFFFFFFF-n : n=$7FFFFFFFFFFFFFFF : Else : n=n+maxDelay : EndIf
+ EndIf
+ If n>($7FFFFFFFFFFFFFFF>>backoff) : ProcedureReturn $7FFFFFFFFFFFFFFF : EndIf
+ ProcedureReturn n<<backoff
+EndProcedure
+Procedure.i QuicRttDeadline(sentAt.i,duration.i)
+ If sentAt<0 Or duration<1 : ProcedureReturn #QUIC_SENT_ARGUMENT : EndIf
+ If duration>$7FFFFFFFFFFFFFFF-sentAt : ProcedureReturn $7FFFFFFFFFFFFFFF : EndIf
+ ProcedureReturn sentAt+duration
 EndProcedure

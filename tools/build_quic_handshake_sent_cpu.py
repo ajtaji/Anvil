@@ -181,12 +181,61 @@ def build(compiler,out):
  init(4,4)
  reserve();commit(0,time=(1<<63)-11);reserve();commit(1,time=(1<<63)-10);ack({1})
  loss_scan((1<<63)-10,100)
+
+ # Independent arbitrary-precision oracle for path RTT and timer arithmetic.
+ import random
+ M=(1<<63)-1
+ state={}
+ def observe_rtt(label):
+  for field in ['hasSample','latest','minimum','smoothed','variation','granularity']:
+   check(label+' '+field,'rtt\\'+field,state[field])
+  delay=max(state['latest'],state['smoothed'])
+  check(label+' loss delay','QuicRttLossDelay(@rtt)',min(M,max(state['granularity'],(9*delay+7)//8)))
+  for level,confirmed,cap,backoff in [(0,0,25000,0),(2,1,25000,1),(4,0,25000,0),(4,1,25000,0),(4,1,25000,5),(4,1,M,63)]:
+   want=-3462 if level==4 and not confirmed else min(M,(state['smoothed']+max(4*state['variation'],state['granularity'])+(cap if level==4 else 0))*(1<<backoff))
+   check(label+' PTO',f'QuicRttPto(@rtt,{level},{confirmed},{cap},{backoff})',want)
+ def reset_rtt(initial=333000,granularity=1000):
+  state.update(hasSample=0,latest=initial,minimum=0,smoothed=initial,variation=initial//2,granularity=granularity)
+  check('RTT init',f'QuicRttInit(@rtt,{initial},{granularity})',0);observe_rtt('initial RTT')
+ def sample_rtt(elapsed,delay=0,cap=25000,level=4,confirmed=1):
+  check('RTT sample',f'QuicRttSample(@rtt,{elapsed},{delay},{cap},{level},{confirmed})',0)
+  if not state['hasSample']:
+   state.update(hasSample=1,latest=elapsed,minimum=elapsed,smoothed=elapsed,variation=elapsed//2)
+  else:
+   minimum=min(state['minimum'],elapsed)
+   effective=0 if level!=4 else min(delay,cap) if confirmed else delay
+   adjusted=elapsed-effective if elapsed-effective>=minimum else elapsed
+   state['variation']=(3*state['variation']+abs(state['smoothed']-adjusted))//4
+   state['smoothed']=(7*state['smoothed']+adjusted)//8
+   state.update(latest=elapsed,minimum=minimum)
+  observe_rtt('updated RTT')
+ check('uninitialized RTT','QuicRttLossDelay(@rtt)',-3462)
+ check('null RTT','QuicRttInit(0,333000,1000)',-3461)
+ reset_rtt();sample_rtt(100000,99000);sample_rtt(200000);sample_rtt(125000,100000)
+ sample_rtt(125000,100000,level=0);sample_rtt(125000,100000,level=2)
+ sample_rtt(200000,50000,confirmed=0);sample_rtt(90000,100000);sample_rtt(1,M)
+ rng=random.Random(1874)
+ for i in range(60):
+  sample_rtt(rng.randrange(1,1000000),rng.randrange(100000),level=rng.choice([0,2,4]),confirmed=rng.randrange(2))
+ reset_rtt(M,M);sample_rtt(M);sample_rtt(1);sample_rtt(M,M);sample_rtt(M-1,1)
+ reset_rtt(1,1)
+ for v in [1,2,7,8,9,15,16,17,M//8,M//4,M//2,M-1,M]:sample_rtt(v)
+ for args in ['0,1000','333000,0','-1,1000']:
+  check('invalid RTT init',f'QuicRttInit(@rtt,{args})',-3461)
+ for args in ['0,0,0,4,1','1,-1,0,4,1','1,0,-1,4,1','1,0,0,1,1','1,0,0,4,2']:
+  check('invalid RTT sample',f'QuicRttSample(@rtt,{args})',-3461)
+ for args in ['4,1,0,64','4,1,0,-1','3,1,0,0','4,2,0,0','4,1,-1,0']:
+  check('invalid PTO',f'QuicRttPto(@rtt,{args})',-3461)
+ observe_rtt('refusals preserve RTT')
+ for start,duration in [(0,1),(100,999),(M-2,2),(M-2,3),(M,M),(0,M),(-1,1),(0,0)]:
+  check('deadline',f'QuicRttDeadline({start},{duration})',-3461 if start<0 or duration<1 else min(M,start+duration))
  assert 256+len(cases)*8<=65536
  source=out/'proof.pi4'
  source.write_text(r'''XIncludeFile "RaspberryPi4/Lib/mmu.pi4"
 XIncludeFile "Anvil/Network/quic_handshake_sent.pbi"
 Global s.QuicHandshakeSent,job.QuicHandshakeSentAck,other.QuicHandshakeSentAck,frame.QuicHandshakeFrame
 Global lossJob.QuicHandshakeSentLoss
+Global rtt.QuicRtt
 Global Dim storage.a[131104]
 Global Dim wire.a[1100]
 Global events.i,byteSum.i,flightSum.i,cookieSum.i,timeSum.i,eventHash.i
