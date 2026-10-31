@@ -129,6 +129,9 @@ Structure QuicConnection
  recoveryTimer.QuicProbeTimer
  recoveryLoss.QuicHandshakeSentLoss
  recoveryLevel.i
+ recoveryRetryOffset.i
+ recoveryRetryRemaining.i
+ recoveryRetryLevel.i
 EndStructure
 ; Span table order: RX data/bits,TX data/bits,ACK ranges,sent slots/metadata,
 ; TLS snapshot,handshake/receive/output/config,local/peer parameters/entries,
@@ -288,7 +291,7 @@ EndProcedure
 Procedure.i QuicConnectionLossBegin(*c.QuicConnection,level.i,now.i,delay.i,threshold.i)
  Define history.i
  If qconn_Span(*c,SizeOf(QuicConnection))=0 : ProcedureReturn #QUIC_CONNECTION_ARGUMENT : EndIf
- If *c\phase<>1 : ProcedureReturn #QUIC_CONNECTION_STATE : EndIf
+ If *c\phase<>1 Or *c\recoveryRetryRemaining<>0 : ProcedureReturn #QUIC_CONNECTION_STATE : EndIf
  If *c\controlPhase>=1 And *c\controlPhase<=3 : ProcedureReturn #QUIC_CONNECTION_STATE : EndIf
  If *c\outgoing\phase<>0 And *c\outgoing\phase<>6 : ProcedureReturn #QUIC_CONNECTION_STATE : EndIf
  Select level
@@ -299,11 +302,39 @@ Procedure.i QuicConnectionLossBegin(*c.QuicConnection,level.i,now.i,delay.i,thre
  EndSelect
  ProcedureReturn QuicHandshakeSentLossBegin(@*c\recoveryLoss,history,now,delay,threshold)
 EndProcedure
+; Handshake loss retries retained CRYPTO in <=256-byte steps before exposing
+; the loss event. ACKed/reclaimed bytes remain retired. Application events
+; still require their own frame owner. Keep the scan active until DONE/close.
 Procedure.i QuicConnectionLossStep(*c.QuicConnection)
- Define rc.i,n.i
+ Define rc.i,n.i,p.i,offset.i,bytes.i,*s.QuicConnectionSpace
  If qconn_Span(*c,SizeOf(QuicConnection))=0 : ProcedureReturn #QUIC_CONNECTION_ARGUMENT : EndIf
  If *c\phase<>1 Or qconn_LossOwned(*c)=0 : ProcedureReturn #QUIC_CONNECTION_STATE : EndIf
+ If *c\recoveryRetryRemaining>0
+  If *c\recoveryLoss\phase<>1 : ProcedureReturn #QUIC_CONNECTION_STATE : EndIf
+  If *c\recoveryRetryLevel=0 : *s=@*c\initial : Else : *s=@*c\handshake : EndIf
+  n=*c\recoveryRetryRemaining : If n>256 : n=256 : EndIf
+  rc=QuicCryptoTxRetry(@*s\tx,*c\recoveryRetryOffset,n)
+  If rc<0 : QuicConnectionClose(*c,rc) : ProcedureReturn rc : EndIf
+  *c\recoveryRetryOffset=*c\recoveryRetryOffset+n : *c\recoveryRetryRemaining=*c\recoveryRetryRemaining-n
+  If *c\recoveryRetryRemaining>0 : ProcedureReturn 0 : EndIf
+  ProcedureReturn 1
+ EndIf
  rc=QuicHandshakeSentLossStep(@*c\recoveryLoss)
+ If rc=1 And *c\recoveryLoss\owner<>@*c\applicationHistory
+  If *c\recoveryLoss\owner=@*c\initial\history : *s=@*c\initial : Else : *s=@*c\handshake : EndIf
+  p=*s\metadata+(*c\recoveryLoss\number % *s\history\capacity)*16
+  If qconn_Span(p,16)=0 Or *c\recoveryLoss\cookie<>p
+   QuicConnectionClose(*c,#QUIC_CONNECTION_STATE) : ProcedureReturn #QUIC_CONNECTION_STATE
+  EndIf
+  offset=PeekI(p) : bytes=PeekI(p+8)
+  If offset<0 Or bytes<0 Or bytes>16384 Or offset>#QUIC_INTEGER_MAX-bytes
+   QuicConnectionClose(*c,#QUIC_CONNECTION_STATE) : ProcedureReturn #QUIC_CONNECTION_STATE
+  EndIf
+  If bytes>0
+   *c\recoveryRetryOffset=offset : *c\recoveryRetryRemaining=bytes : *c\recoveryRetryLevel=*s\level
+   ProcedureReturn 0
+  EndIf
+ EndIf
  If rc=2
   n=QuicConnectionRecoveryRearm(*c,0) : If n<0 : ProcedureReturn n : EndIf
  EndIf

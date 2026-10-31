@@ -1,0 +1,188 @@
+; Scheduling uses existing shared ecp arithmetic; BearSSL reference.
+; Original arithmetic notices: licenses/BearSSL-LICENSE.txt.
+; Cooperative P-384/P-521 public signature verification. Include ecp.pbi
+; first. The job owns Ecp scratch exclusively until finished or cancelled;
+; synchronous Ecp calls must not interleave. No private-key operation here.
+Global EcpJobPhase.i
+Global EcpJobIndex.i
+Global EcpJobResult.i
+Global EcpInvJobDest.i
+Global EcpInvJobSource.i
+Global EcpInvJobMod.i
+Global EcpInvJobIndex.i
+Global EcpInvJobPhase.i
+
+Procedure EcpInvJobBegin(rd.i,ra.i,ms.i)
+ EcpInvJobDest=rd : EcpInvJobSource=ra : EcpInvJobMod=ms
+ EcpCopy(#ECP_REXP,ms) : EcpZero(#ECP_RX)
+ EcpV[#ECP_RX * #ECP_S]=2
+ EcpSubPlain(#ECP_REXP,#ECP_REXP,#ECP_RX)
+ EcpCopy(#ECP_RWIN,ra)
+ EcpInvJobIndex=1 : EcpInvJobPhase=1
+EndProcedure
+Procedure.i EcpInvJobStep()
+ Define k.i,w.i,ms.i
+ ms=EcpInvJobMod : k=EcpInvJobIndex
+ If EcpInvJobPhase=1
+  EcpMul(#ECP_RWIN+k,#ECP_RWIN+k-1,EcpInvJobSource,ms)
+  EcpInvJobIndex=k+1
+  If EcpInvJobIndex=15
+   If ms=0 : EcpCopy(#ECP_RACC,#ECP_RONEP) : Else : EcpCopy(#ECP_RACC,#ECP_RONEN) : EndIf
+   EcpInvJobIndex=EcpNL*32-4 : EcpInvJobPhase=2
+  EndIf
+  ProcedureReturn 0
+ EndIf
+ EcpMul(#ECP_RACC,#ECP_RACC,#ECP_RACC,ms)
+ EcpMul(#ECP_RACC,#ECP_RACC,#ECP_RACC,ms)
+ EcpMul(#ECP_RACC,#ECP_RACC,#ECP_RACC,ms)
+ EcpMul(#ECP_RACC,#ECP_RACC,#ECP_RACC,ms)
+ w=(EcpV[#ECP_REXP * #ECP_S+(k>>5)]>>(k & 31)) & 15
+ If w<>0 : EcpMul(#ECP_RACC,#ECP_RACC,#ECP_RWIN+w-1,ms) : EndIf
+ EcpInvJobIndex=k-4
+ If EcpInvJobIndex<0
+  EcpCopy(EcpInvJobDest,#ECP_RACC) : EcpInvJobPhase=0 : ProcedureReturn 1
+ EndIf
+ ProcedureReturn 0
+EndProcedure
+Procedure EcpJobCancel()
+ EcpJobPhase=0 : EcpJobIndex=0 : EcpJobResult=0 : EcpInvJobPhase=0
+EndProcedure
+Procedure.i EcpJobBegin(curve.i,hashAddr.i,hashLen.i,qAddr.i,qLen.i,sigAddr.i,sigLen.i)
+ Define half.i,nbytes.i,k.i
+ If EcpJobPhase<>0 : ProcedureReturn -2 : EndIf
+ EcpJobResult=0
+ If hashLen<0 Or hashLen>64 Or qAddr=0 Or sigAddr=0 : EcpLastErr=#ECP_ERR_BADSIG : ProcedureReturn 1 : EndIf
+ If hashLen>0
+  If hashAddr=0 : EcpLastErr=#ECP_ERR_BADSIG : ProcedureReturn 1 : EndIf
+ EndIf
+  EcpRefusedAt = #ECP_AT_NONE
+  If EcpLoadCurve(curve) = 0
+    EcpLastErr = #ECP_ERR_CURVE
+    EcpJobResult=-1 : ProcedureReturn 1
+  EndIf
+  EcpLastErr = #ECP_ERR_BADSIG
+
+  ; ---- 1. r and s, each in [1, n-1] ----
+  EcpRefusedAt = #ECP_AT_SHAPE
+  If sigLen <= 0 Or (sigLen & 1) <> 0
+    ProcedureReturn 1
+  EndIf
+  EcpRefusedAt = #ECP_AT_SCALAR
+  half = sigLen >> 1
+  If EcpDecode(#ECP_RR, sigAddr, half) = 0
+    ProcedureReturn 1
+  EndIf
+  If EcpDecode(#ECP_RS, sigAddr + half, half) = 0
+    ProcedureReturn 1
+  EndIf
+  If EcpScalarRange(#ECP_RR) = 0 Or EcpScalarRange(#ECP_RS) = 0
+    ProcedureReturn 1
+  EndIf
+
+  ; ---- 2. the public key: 0x04 || X || Y, both below p, on the curve ----
+  EcpRefusedAt = #ECP_AT_KEY
+  If qLen <> 1 + 2 * EcpPLen
+    ProcedureReturn 1
+  EndIf
+  If (PeekA(qAddr) & 255) <> 4
+    ProcedureReturn 1
+  EndIf
+  If EcpDecode(#ECP_RX, qAddr + 1, EcpPLen) = 0 Or EcpDecode(#ECP_RY, qAddr + 1 + EcpPLen, EcpPLen) = 0
+    ProcedureReturn 1
+  EndIf
+  If EcpLess(#ECP_RX, #ECP_RP) = 0 Or EcpLess(#ECP_RY, #ECP_RP) = 0
+    ProcedureReturn 1
+  EndIf
+  EcpMul(#ECP_QX, #ECP_RX, #ECP_R2P, 0)
+  EcpMul(#ECP_QY, #ECP_RY, #ECP_R2P, 0)
+  EcpCopy(#ECP_QZ, #ECP_RONEP)
+  EcpRefusedAt = #ECP_AT_CURVE
+  If EcpOnCurve(#ECP_QX, #ECP_QY) = 0
+    ProcedureReturn 1
+  EndIf
+
+  ; ---- 3. e = bits2int(hash) mod n ----
+  nbytes = (EcpNBits + 7) >> 3
+  k = hashLen
+  If k > nbytes
+    k = nbytes
+  EndIf
+  If k < 0
+    k = 0
+  EndIf
+  EcpZero(#ECP_RE)
+  If k > 0
+    EcpDecode(#ECP_RE, hashAddr, k)
+  EndIf
+  If k * 8 > EcpNBits
+    EcpShr(#ECP_RE, k * 8 - EcpNBits)
+  EndIf
+  If EcpLess(#ECP_RE, #ECP_RN) = 0
+    EcpSubPlain(#ECP_RE, #ECP_RE, #ECP_RN)
+  EndIf
+
+  ; ---- 4. w = 1/s, u1 = e*w, u2 = r*w (mod n) ----
+  EcpMul(#ECP_RZ, #ECP_RS, #ECP_R2N, 1)          ; s, Montgomery
+ EcpInvJobBegin(#ECP_RW,#ECP_RZ,1)
+ EcpJobPhase=1 : EcpJobIndex=0 : ProcedureReturn 0
+EndProcedure
+Procedure.i EcpJobStep()
+ Define slot.i,prev.i,i.i,k.i,b1.i,b2.i
+ If EcpJobPhase=0 : ProcedureReturn -1 : EndIf
+ Select EcpJobPhase
+ Case 1
+  If EcpInvJobStep()=0 : ProcedureReturn 0 : EndIf
+  EcpMul(#ECP_RU1,#ECP_RE,#ECP_RW,1)
+  EcpMul(#ECP_RU2,#ECP_RR,#ECP_RW,1)
+  EcpJobPhase=2
+ Case 2
+  k=EcpJobIndex & 3 : slot=#ECP_JOINT+EcpJobIndex*3
+  If EcpJobIndex=0
+   EcpCopy(slot,#ECP_RONEP) : EcpCopy(slot+1,#ECP_RONEP) : EcpZero(slot+2)
+  Else
+   If k=0 : prev=slot-12 : Else : prev=slot-3 : EndIf
+   EcpCopy(slot,prev) : EcpCopy(slot+1,prev+1) : EcpCopy(slot+2,prev+2)
+   If k=0
+    EcpAddPt(slot,slot+1,slot+2,#ECP_QX,#ECP_QY,#ECP_QZ)
+   Else
+    EcpAddPt(slot,slot+1,slot+2,#ECP_GX,#ECP_GY,#ECP_GZ)
+   EndIf
+  EndIf
+  EcpJobIndex=EcpJobIndex+1
+  If EcpJobIndex=16
+   EcpCopy(#ECP_AX,#ECP_RONEP) : EcpCopy(#ECP_AY,#ECP_RONEP) : EcpZero(#ECP_AZ)
+   EcpJobIndex=(EcpNBits-1) & -2 : EcpJobPhase=3
+  EndIf
+ Case 3
+  i=EcpJobIndex
+  EcpDbl(#ECP_AX,#ECP_AY,#ECP_AZ) : EcpDbl(#ECP_AX,#ECP_AY,#ECP_AZ)
+  b1=EcpBit(#ECP_RU1,i) : b2=EcpBit(#ECP_RU2,i)
+  If i+1<EcpNBits
+   b1=b1+2*EcpBit(#ECP_RU1,i+1) : b2=b2+2*EcpBit(#ECP_RU2,i+1)
+  EndIf
+  If b1<>0 Or b2<>0
+   slot=#ECP_JOINT+(b1+4*b2)*3
+   EcpAddPt(#ECP_AX,#ECP_AY,#ECP_AZ,slot,slot+1,slot+2)
+  EndIf
+  EcpJobIndex=i-2
+  If EcpJobIndex<0
+   EcpRefusedAt=#ECP_AT_INFINITY
+   If EcpIsZero(#ECP_AZ) : EcpJobCancel() : ProcedureReturn 1 : EndIf
+   EcpInvJobBegin(#ECP_RZ,#ECP_AZ,0) : EcpJobPhase=4
+  EndIf
+ Case 4
+  If EcpInvJobStep()=0 : ProcedureReturn 0 : EndIf
+  EcpMul(#ECP_RZ,#ECP_RZ,#ECP_RZ,0)
+  EcpMul(#ECP_RX,#ECP_AX,#ECP_RZ,0)
+  EcpMul(#ECP_RX,#ECP_RX,#ECP_RONE1,0)
+  If EcpLess(#ECP_RX,#ECP_RN)=0 : EcpSubPlain(#ECP_RX,#ECP_RX,#ECP_RN) : EndIf
+  EcpJobPhase=0
+  If EcpEqual(#ECP_RX,#ECP_RR)
+   EcpLastErr=#ECP_ERR_OK : EcpRefusedAt=#ECP_AT_NONE : EcpJobResult=1
+  Else
+   EcpRefusedAt=#ECP_AT_MISMATCH
+  EndIf
+  ProcedureReturn 1
+ EndSelect
+ ProcedureReturn 0
+EndProcedure
