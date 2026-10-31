@@ -14,7 +14,7 @@ Global retryChecks.i,retryFault.i,retryActual.i,retryWanted.i
 Global Dim retryData.a[4096]
 Global Dim retryStates.a[1024]
 Global Dim retrySource.a[600]
-Global Dim retryMeta.i[8]
+Global Dim retryMeta.i[16]
 Global handshakeRttCount.i,datagramReceivedAt.i
 Global Dim handshakeRttTrace.i[80]
 Global lossDispatchChecked.i,lossDispatchAt.i,lossDispatchDone.i
@@ -877,7 +877,7 @@ Procedure CheckCryptoRetry(level.i,cancelled.i)
    RetryAssert(*s\history\inFlight,620)
    RetryAssert(QuicHandshakeSentLossCancel(@foreignLoss),#QUIC_SENT_CANCELLED)
   Next
-  RetryAssert(QuicConnectionProbeBegin(@priorityContext,level,-1),#QUIC_SENT_ARGUMENT)
+  RetryAssert(QuicConnectionProbeBegin(@priorityContext,level,-2),#QUIC_SENT_ARGUMENT)
   RetryAssert(QuicConnectionProbeBegin(@priorityContext,level,1),#QUIC_SENT_STATE)
   RetryAssert(QuicConnectionProbeBegin(@priorityContext,level,0),0)
   RetryAssert(QuicConnectionProbeBegin(@priorityContext,level,0),#QUIC_CONNECTION_STATE)
@@ -958,6 +958,86 @@ Procedure CheckCryptoRetry(level.i,cancelled.i)
  For i=0 To 383 : PokeA(@prioritySlots[0]+i,0) : Next
 EndProcedure
 
+Procedure CheckAutoProbe(level.i,mode.i)
+ Define *s.QuicConnectionSpace,job.QuicHandshakeSentAck,f.QuicHandshakeFrame,range.i,i.i,rc.i,before.i,flags.i
+ priorityContext\phase=1 : priorityContext\peerIdKnown=1 : priorityContext\peerIdBytes=8
+ If level=0 : *s=@priorityContext\initial : Else : *s=@priorityContext\handshake : EndIf
+ *s\level=level : *s\metadata=@retryMeta[0] : *s\writeKeys\ready=1
+ RetryAssert(QuicRttInit(@priorityContext\recoveryRtt,1000,1),0)
+ RetryAssert(QuicProbeTimerInit(@priorityContext\recoveryTimer),0)
+ RetryAssert(QuicCryptoTxInit(@*s\tx,level,@retryData[0],4096,@retryStates[0],1024),0)
+ RetryAssert(QuicCryptoTxAppend(@*s\tx,@retrySource[0],600),600)
+ RetryAssert(QuicCryptoTxSent(@*s\tx,0,600),0)
+ RetryAssert(QuicCryptoTxAck(@*s\tx,0,100),0)
+ RetryAssert(QuicCryptoTxAck(@*s\tx,200,100),0)
+ If mode=1 : RetryAssert(QuicCryptoTxAck(@*s\tx,0,600),0) : EndIf
+ If mode=5 : RetryAssert(QuicCryptoTxReclaim(@*s\tx,100),100) : EndIf
+ RetryAssert(QuicHandshakeSentInit(@*s\history,level,@prioritySlots[0],8),0)
+ For i=0 To 4
+  RetryAssert(QuicHandshakeSentReserve(@*s\history),i)
+  retryMeta[i*2]=0 : retryMeta[i*2+1]=0
+  If i=1 : RetryAssert(QuicHandshakeSentCommit(@*s\history,i,20,100+i,0,0,@retryMeta[i*2]),0) : EndIf
+  If i>=2 : RetryAssert(QuicHandshakeSentCommit(@*s\history,i,620,100+i,1,0,@retryMeta[i*2]),0) : EndIf
+ Next
+ retryMeta[6]=0 : retryMeta[7]=100 : retryMeta[8]=100 : retryMeta[9]=500
+ If mode=7 : retryMeta[7]=0 : EndIf
+ f\kind=2 : f\count=1 : f\rangeBytes=1 : f\ranges=@range : f\largest=2
+ RetryAssert(QuicHandshakeSentAckBegin(@job,@*s\history,level,@f),0)
+ For i=0 To 7 : rc=QuicHandshakeSentAckStep(@job) : If rc<>0 And rc<>1 : Break : EndIf : Next
+ RetryAssert(rc,2)
+ If mode=4 : RetryAssert(QuicHandshakeSentLost(@*s\history,4),1) : EndIf
+ If mode=6 : PokeI(@prioritySlots[0]+4*32+24,@retryMeta[8]+8) : EndIf
+ before=*s\history\inFlight : flags=PeekI(@prioritySlots[0]+4*32)
+ RetryAssert(QuicHandshakeSentProbeCandidate(@*s\history,0,123),#QUIC_SENT_BUSY)
+ RetryAssert(QuicConnectionProbeBegin(@priorityContext,level,-1),0)
+ RetryAssert(QuicHandshakeSentProbeCandidate(@*s\history,0,@priorityContext),#QUIC_SENT_BUSY)
+ RetryAssert(priorityContext\probe\selecting,1)
+ RetryAssert(QuicConnectionSendBegin(@priorityContext,level,8),#QUIC_SENT_BUSY)
+ For i=0 To 31
+  rc=QuicConnectionProbeStep(@priorityContext)
+  RetryAssert(*s\history\inFlight,before)
+  RetryAssert(PeekI(@prioritySlots[0]+4*32),flags)
+  If mode=2 Or (mode=3 And priorityContext\probe\remaining=244)
+   RetryAssert(rc,0)
+   RetryAssert(QuicConnectionClose(@priorityContext,0),0)
+   RetryAssert(QuicConnectionCloseStep(@priorityContext),0)
+   RetryAssert(priorityContext\probe\phase,-1)
+   RetryAssert(*s\history\busy,0)
+   Break
+  EndIf
+  If rc<>0 : Break : EndIf
+ Next
+ If mode<>2 And mode<>3
+  If mode=6
+   RetryAssert(rc,#QUIC_CONNECTION_STATE)
+   RetryAssert(priorityContext\phase,2)
+   RetryAssert(QuicConnectionCloseStep(@priorityContext),0)
+   RetryAssert(*s\history\busy,0)
+  Else
+   If mode=1
+    RetryAssert(rc,2) : RetryAssert(QuicConnectionProbeStep(@priorityContext),2)
+    RetryAssert(priorityContext\probe\number,5)
+   Else
+    RetryAssert(rc,1) : RetryAssert(QuicConnectionProbeStep(@priorityContext),1)
+    RetryAssert(priorityContext\probe\number,4)
+    RetryAssert(priorityContext\probe\ready,1)
+   EndIf
+   RetryAssert(*s\history\busy,0)
+   If mode<>5
+    For i=0 To 599
+     If mode=1 Or i<100 Or (i>=200 And i<300)
+      RetryAssert((PeekA(@retryStates[0]+i/4)>>((i&3)*2))&3,3)
+     Else
+      RetryAssert((PeekA(@retryStates[0]+i/4)>>((i&3)*2))&3,2)
+     EndIf
+    Next
+   EndIf
+  EndIf
+ EndIf
+ For i=0 To SizeOf(QuicConnection)-1 : PokeA(@priorityContext+i,0) : Next
+ For i=0 To 383 : PokeA(@prioritySlots[0]+i,0) : Next
+EndProcedure
+
 Procedure.i InitialProbe()
  Define rc.i,n.i,offset.i,bytes.i
  initialProbeBefore=connection\initial\history\inFlight
@@ -969,7 +1049,7 @@ Procedure.i InitialProbe()
  If rc<>#QUIC_RECOVERY_PROBE Or connection\recoveryLevel<>0 Or connection\recoveryTimer\backoff<>1 : ProcedureReturn -9498 : EndIf
  If connection\initial\history\inFlight<>initialProbeBefore Or connection\initial\history\acked<>0 : ProcedureReturn -9499 : EndIf
  ; A PTO requests a fresh probe, not a declaration of packet loss.
- rc=QuicConnectionProbeBegin(@connection,0,0) : If rc<>0 : ProcedureReturn rc : EndIf
+ rc=QuicConnectionProbeBegin(@connection,0,-1) : If rc<>0 : ProcedureReturn rc : EndIf
  Repeat
   rc=QuicConnectionProbeStep(@connection)
   n=Service() : If n<0 : ProcedureReturn n : EndIf
@@ -1478,6 +1558,7 @@ Procedure.i Main()
  CheckCryptoRetry(0,1) : CheckCryptoRetry(2,1)
  CheckCryptoRetry(0,2) : CheckCryptoRetry(2,2)
  CheckCryptoRetry(0,3) : CheckCryptoRetry(2,3)
+ For i=0 To 7 : CheckAutoProbe(0,i) : CheckAutoProbe(2,i) : Next
  ep\family=4 : ep\kind=0 : ep\port=55442
  For i=0 To 15 : PokeA(@ep\address+i,PeekA(?Peer+i)) : Next
  handle=UdpPayloadOpen(4,0,55013)

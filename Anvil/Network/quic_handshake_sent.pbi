@@ -96,6 +96,20 @@ Procedure.i QuicHandshakeSentProbeCookie(*s.QuicHandshakeSent,number.i)
  ProcedureReturn PeekI(p+24)
 EndProcedure
 
+; One candidate query while a higher-level probe owns the ledger. Zero means
+; ineligible/no metadata (including the end cursor); positive means cookie.
+; The caller must preserve ownership until its bounded search is finished.
+Procedure.i QuicHandshakeSentProbeCandidate(*s.QuicHandshakeSent,number.i,owner.i)
+ Define rc.i,p.i,flags.i
+ rc=quics_Ready(*s) : If rc<0 : ProcedureReturn rc : EndIf
+ If owner<=0 Or *s\busy<>owner : ProcedureReturn #QUIC_SENT_BUSY : EndIf
+ If number<*s\first Or number>*s\issued : ProcedureReturn #QUIC_SENT_ARGUMENT : EndIf
+ If number=*s\issued : ProcedureReturn 0 : EndIf
+ p=*s\entries+(number % *s\capacity)*32 : flags=PeekI(p)
+ If (flags&2)=0 Or (flags&4)=0 Or (flags&16)<>0 : ProcedureReturn 0 : EndIf
+ ProcedureReturn PeekI(p+24)
+EndProcedure
+
 ; Reserve BEFORE encrypting. A failed/cancelled protection/send burns its PN.
 ; Returns PN>=0. Exhaustion is a local limit, never permission to reuse a PN.
 Procedure.i QuicHandshakeSentReserve(*s.QuicHandshakeSent)

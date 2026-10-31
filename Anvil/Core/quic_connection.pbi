@@ -86,6 +86,9 @@ Structure QuicConnectionProbe
  number.i
  offset.i
  remaining.i
+ automatic.i
+ selecting.i
+ ready.i
 EndStructure
 Structure QuicConnection
  phase.i ; 0 fresh,1 active,2 closing,3 closed
@@ -294,12 +297,12 @@ Procedure.i QuicConnectionRecoveryPoll(*c.QuicConnection,now.i)
  ProcedureReturn rc
 EndProcedure
 ; Prepare retained CRYPTO from one selected packet for a fresh PTO probe.
-; Caller chooses an eligible packet after a timeout; this does not mark loss,
-; send a packet, pick another packet or implement address-validation policy.
+; Number -1 selects retained data automatically, one packet per Step. Explicit
+; numbers retain the direct-selection API. No send or address-validation policy.
 Procedure.i QuicConnectionProbeBegin(*c.QuicConnection,level.i,number.i)
- Define p.i,cookie.i,offset.i,bytes.i,*s.QuicConnectionSpace
+ Define p.i,cookie.i,offset.i,bytes.i,rc.i,*s.QuicConnectionSpace
  If qconn_Span(*c,SizeOf(QuicConnection))=0 Or (level<>0 And level<>2) : ProcedureReturn #QUIC_CONNECTION_ARGUMENT : EndIf
- If *c\phase<>1 Or (*c\probe\phase<>0 And *c\probe\phase<>2) Or *c\recoveryRetryRemaining<>0 : ProcedureReturn #QUIC_CONNECTION_STATE : EndIf
+ If *c\phase<>1 Or (*c\probe\phase<>0 And *c\probe\phase<>2 And *c\probe\phase<>3) Or *c\recoveryRetryRemaining<>0 : ProcedureReturn #QUIC_CONNECTION_STATE : EndIf
  ; Probe preparation can later rearm all spaces; another ledger owner must finish first.
  If *c\initial\history\busy<>0 Or *c\handshake\history\busy<>0 Or *c\applicationHistory\busy<>0 : ProcedureReturn #QUIC_SENT_BUSY : EndIf
  If *c\outgoing\phase<>0 And *c\outgoing\phase<>6 : ProcedureReturn #QUIC_CONNECTION_STATE : EndIf
@@ -310,30 +313,66 @@ Procedure.i QuicConnectionProbeBegin(*c.QuicConnection,level.i,number.i)
  If *c\application\phase=1 Or TlsWorkerBusy()<>0 : ProcedureReturn #QUIC_CONNECTION_STATE : EndIf
  If level=0 : *s=@*c\initial : Else : *s=@*c\handshake : EndIf
  If *s\writeKeys\ready<>1 Or *s\tx\phase<>1 : ProcedureReturn #QUIC_CONNECTION_STATE : EndIf
+ If number=-1
+  rc=QuicHandshakeSentProbeTime(@*s\history) : If rc< -1 : ProcedureReturn rc : EndIf
+  *c\probe\phase=1 : *c\probe\level=level : *c\probe\number=*s\history\first
+  *c\probe\offset=0 : *c\probe\remaining=0 : *c\probe\automatic=1 : *c\probe\selecting=1 : *c\probe\ready=0
+  *s\history\busy=@*c\probe : ProcedureReturn 0
+ EndIf
  cookie=QuicHandshakeSentProbeCookie(@*s\history,number) : If cookie<0 : ProcedureReturn cookie : EndIf
  p=*s\metadata+(number % *s\history\capacity)*16
  If qconn_Span(p,16)=0 Or cookie<>p : ProcedureReturn #QUIC_CONNECTION_STATE : EndIf
  offset=PeekI(p) : bytes=PeekI(p+8)
  If offset<0 Or bytes<1 Or bytes>16384 Or offset>#QUIC_INTEGER_MAX-bytes : ProcedureReturn #QUIC_CONNECTION_STATE : EndIf
  If offset+bytes>*s\tx\tail : ProcedureReturn #QUIC_CONNECTION_STATE : EndIf
+ *c\probe\automatic=0 : *c\probe\selecting=0 : *c\probe\ready=0
  *c\probe\phase=1 : *c\probe\level=level : *c\probe\number=number : *c\probe\offset=offset : *c\probe\remaining=bytes
  *s\history\busy=@*c\probe : ProcedureReturn 0
 EndProcedure
-; 0 pending,1 ready for normal sender,negative refusal/failure. At most256
-; retained bytes per step. Close cancels ownership; no rollback is promised.
+; 0 pending,1 ready for normal sender,2 exhausted without data,negative failure.
+; One candidate OR <=256 retained bytes per step. Exhaustion needs caller policy
+; (e.g. PING/address validation), never a declaration of loss. Close cancels.
 Procedure.i QuicConnectionProbeStep(*c.QuicConnection)
- Define rc.i,n.i,*s.QuicConnectionSpace
+ Define rc.i,n.i,p.i,offset.i,bytes.i,start.i,v.QuicCryptoSlice,*s.QuicConnectionSpace
  If qconn_Span(*c,SizeOf(QuicConnection))=0 : ProcedureReturn #QUIC_CONNECTION_ARGUMENT : EndIf
  If *c\phase<>1 : ProcedureReturn #QUIC_CONNECTION_STATE : EndIf
  If *c\probe\phase=2 : ProcedureReturn 1 : EndIf
+ If *c\probe\phase=3 : ProcedureReturn 2 : EndIf
  If *c\probe\phase<>1 : ProcedureReturn #QUIC_CONNECTION_STATE : EndIf
  If *c\probe\level=0 : *s=@*c\initial : Else : *s=@*c\handshake : EndIf
  If *s\history\busy<>@*c\probe : QuicConnectionClose(*c,#QUIC_CONNECTION_STATE) : ProcedureReturn #QUIC_CONNECTION_STATE : EndIf
+ If *c\probe\selecting=1
+  rc=QuicHandshakeSentProbeCandidate(@*s\history,*c\probe\number,@*c\probe)
+  If rc<0 : QuicConnectionClose(*c,rc) : ProcedureReturn rc : EndIf
+  If *c\probe\number=*s\history\issued
+   *s\history\busy=0 : *c\probe\phase=3 : ProcedureReturn 2
+  EndIf
+  If rc=0 : *c\probe\number=*c\probe\number+1 : ProcedureReturn 0 : EndIf
+  p=*s\metadata+(*c\probe\number % *s\history\capacity)*16
+  If qconn_Span(p,16)=0 Or rc<>p : QuicConnectionClose(*c,#QUIC_CONNECTION_STATE) : ProcedureReturn #QUIC_CONNECTION_STATE : EndIf
+  offset=PeekI(p) : bytes=PeekI(p+8)
+  If offset<0 Or bytes<0 Or bytes>16384 Or offset>#QUIC_INTEGER_MAX-bytes : QuicConnectionClose(*c,#QUIC_CONNECTION_STATE) : ProcedureReturn #QUIC_CONNECTION_STATE : EndIf
+  If offset+bytes>*s\tx\tail : QuicConnectionClose(*c,#QUIC_CONNECTION_STATE) : ProcedureReturn #QUIC_CONNECTION_STATE : EndIf
+  If bytes=0 : *c\probe\number=*c\probe\number+1 : ProcedureReturn 0 : EndIf
+  *c\probe\offset=offset : *c\probe\remaining=bytes : *c\probe\selecting=0 : *c\probe\ready=0
+  ProcedureReturn 0
+ EndIf
  n=*c\probe\remaining : If n>256 : n=256 : EndIf
  rc=QuicCryptoTxRetry(@*s\tx,*c\probe\offset,n)
  If rc<0 : QuicConnectionClose(*c,rc) : ProcedureReturn rc : EndIf
+ If *c\probe\automatic And *c\probe\ready=0
+  start=*c\probe\offset : If start<*s\tx\base : start=*s\tx\base : EndIf
+  If start<*c\probe\offset+n
+   rc=QuicCryptoTxFind(@*s\tx,start,*c\probe\offset+n-start,@v)
+   If rc<0 : QuicConnectionClose(*c,rc) : ProcedureReturn rc : EndIf
+   If rc=1 : *c\probe\ready=1 : EndIf
+  EndIf
+ EndIf
  *c\probe\offset=*c\probe\offset+n : *c\probe\remaining=*c\probe\remaining-n
  If *c\probe\remaining>0 : ProcedureReturn 0 : EndIf
+ If *c\probe\automatic And *c\probe\ready=0
+  *c\probe\number=*c\probe\number+1 : *c\probe\selecting=1 : ProcedureReturn 0
+ EndIf
  *s\history\busy=0 : *c\probe\phase=2 : ProcedureReturn 1
 EndProcedure
 
