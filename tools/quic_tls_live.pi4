@@ -838,7 +838,7 @@ Procedure RetryAssert(actual.i,wanted.i)
  If actual<>wanted And retryFault=0 : retryFault=retryChecks : retryActual=actual : retryWanted=wanted : EndIf
 EndProcedure
 Procedure CheckCryptoRetry(level.i,cancelled.i)
- Define *s.QuicConnectionSpace,job.QuicHandshakeSentAck,f.QuicHandshakeFrame,range.i,rc.i,i.i,v.QuicCryptoSlice
+ Define *s.QuicConnectionSpace,job.QuicHandshakeSentAck,f.QuicHandshakeFrame,range.i,rc.i,i.i,v.QuicCryptoSlice,*busyHistory.QuicHandshakeSent,foreignLoss.QuicHandshakeSentLoss,j.i
  priorityContext\phase=1 : priorityContext\peerIdKnown=1 : priorityContext\peerIdBytes=8
  If level=0 : *s=@priorityContext\initial : Else : *s=@priorityContext\handshake : EndIf
  *s\level=level : *s\metadata=@retryMeta[0] : *s\writeKeys\ready=1
@@ -862,6 +862,21 @@ Procedure CheckCryptoRetry(level.i,cancelled.i)
  Next
  RetryAssert(rc,2)
  If cancelled>=2
+  ; Hold a real loss job before probe admission, including the other spaces.
+  For j=0 To 2
+   If j=0 : *busyHistory=@priorityContext\initial\history : EndIf
+   If j=1 : *busyHistory=@priorityContext\handshake\history : EndIf
+   If j=2 : *busyHistory=@priorityContext\applicationHistory : EndIf
+   If *busyHistory<>@*s\history
+    RetryAssert(QuicHandshakeSentInit(*busyHistory,j*2,@prioritySlots[0]+128+j*64,2),0)
+   EndIf
+   RetryAssert(QuicHandshakeSentLossBegin(@foreignLoss,*busyHistory,2000,100,3),0)
+   RetryAssert(QuicConnectionProbeBegin(@priorityContext,level,0),#QUIC_SENT_BUSY)
+   RetryAssert(priorityContext\probe\phase,0)
+   RetryAssert(*busyHistory\busy,@foreignLoss)
+   RetryAssert(*s\history\inFlight,620)
+   RetryAssert(QuicHandshakeSentLossCancel(@foreignLoss),#QUIC_SENT_CANCELLED)
+  Next
   RetryAssert(QuicConnectionProbeBegin(@priorityContext,level,-1),#QUIC_SENT_ARGUMENT)
   RetryAssert(QuicConnectionProbeBegin(@priorityContext,level,1),#QUIC_SENT_STATE)
   RetryAssert(QuicConnectionProbeBegin(@priorityContext,level,0),0)

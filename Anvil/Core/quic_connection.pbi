@@ -300,6 +300,8 @@ Procedure.i QuicConnectionProbeBegin(*c.QuicConnection,level.i,number.i)
  Define p.i,cookie.i,offset.i,bytes.i,*s.QuicConnectionSpace
  If qconn_Span(*c,SizeOf(QuicConnection))=0 Or (level<>0 And level<>2) : ProcedureReturn #QUIC_CONNECTION_ARGUMENT : EndIf
  If *c\phase<>1 Or (*c\probe\phase<>0 And *c\probe\phase<>2) Or *c\recoveryRetryRemaining<>0 : ProcedureReturn #QUIC_CONNECTION_STATE : EndIf
+ ; Probe preparation can later rearm all spaces; another ledger owner must finish first.
+ If *c\initial\history\busy<>0 Or *c\handshake\history\busy<>0 Or *c\applicationHistory\busy<>0 : ProcedureReturn #QUIC_SENT_BUSY : EndIf
  If *c\outgoing\phase<>0 And *c\outgoing\phase<>6 : ProcedureReturn #QUIC_CONNECTION_STATE : EndIf
  If *c\controlPhase>=1 And *c\controlPhase<=3 : ProcedureReturn #QUIC_CONNECTION_STATE : EndIf
  If *c\acknowledge\phase>=1 And *c\acknowledge\phase<=4 : ProcedureReturn #QUIC_CONNECTION_STATE : EndIf
