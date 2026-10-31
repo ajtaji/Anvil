@@ -3923,3 +3923,46 @@ be acknowledged until every frame has been applied successfully. Connection
 ownership, frame effects, ACK generation/loss/congestion/flow handling, streams,
 QPACK and live HTTP/3 traffic remain open. Earlier TLS and public off-link IPv6
 qualification gaps remain open too.
+
+
+### Handshake packet receipt and ACK generation
+
+`quic_handshake_ack.pbi` adds one caller-owned tracker per Initial or Handshake
+packet-number space. Init accepts 1 through 64 range slots, each two native
+integers (inclusive low/high). Seen is read-only duplicate lookup. Record is
+called only after packet authentication and successful application of every
+frame; it inserts/merges ranges and returns new versus duplicate receipt. No
+range pruning is performed. Capacity exhaustion is an explicit local resource
+refusal, and the connection must not acknowledge an unrecorded packet or silently
+forget history. Context and entry storage remain exclusively owned and unmodified
+between API calls. Application packet spaces are not implemented by this API.
+
+Write produces a type-2 ACK with zero delay for handshake spaces, canonical
+integer encodings and all retained ranges. Capacity is checked before writing;
+short output refuses without changing bytes or the demand token. No receipts
+returns zero bytes. ECN feedback is not emitted. The caller protects the frame,
+submits it through UDP, and calls Sent with the captured token only after actual
+send acceptance. Write does not clear pending demand or imply network delivery.
+
+Each ACK-eliciting receipt, including a duplicate, advances the demand token.
+An older send completion cannot clear demand created after its snapshot. A
+non-eliciting receipt changes the ranges but does not create or advance demand;
+an older ACK completion can therefore clear the demand it covered without
+starting an ACK-only response loop. The token exhaustion guard refuses before
+mutation. This is caller-interleaved bookkeeping, not a thread-safety promise.
+ACK scheduling, failed-send retry, packet protection and recovery remain with
+the future connection owner.
+
+Capture 250 on Anvil 488 passed 5,535 assertions using an independent Python
+packet-number set and wire encoder. Coverage includes duplicate lookup, range
+bridging, descending insertion, 0 and maximum packet numbers, full capacity,
+refusal without mutation, exact ACK bytes and output guards, decoding generated
+ACKs, stale send completion, ACK-only receipts, aliases and token exhaustion.
+The same full fixture compiled for Pi 3 without execution there. The Pi 4
+returned normally with cores/fonts/Vulkan healthy and watchdog off. Evidence:
+`docs/evidence/anvil-ipv6-20261030/quic-ack488`. Installed Anvil remains 488.
+
+This is not a live QUIC connection or HTTP/3 request. Connection ownership and
+UDP integration, frame effects, ACK scheduling, loss/congestion/flow handling,
+streams, QPACK and actual authenticated HTTP/3 traffic remain open. The earlier
+TLS compatibility/device-blocking and public off-link IPv6 work also remains.
