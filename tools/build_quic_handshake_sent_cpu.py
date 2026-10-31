@@ -7,7 +7,7 @@ from build_quic_handshake_frames_cpu import vi
 def build(compiler,out):
  root=Path(__file__).resolve().parents[1];out.mkdir(parents=True,exist_ok=False)
  names=['Anvil/Network/quic_handshake_sent.pbi','Anvil/Network/quic_handshake_frames.pbi','Anvil/Network/quic_crypto_stream.pbi','Anvil/Network/quic_wire.pbi','Anvil/Network/byte_order.pbi','RaspberryPi4/Lib/mmu.pi4']
- steps=[];cases=[];slots=[];capacity=0;level=0;last=-1;lasttime=0
+ steps=[];cases=[];slots=[];capacity=0;level=0;last=-1;lasttime=0;first=0
  def code(s):steps.append(s)
  def check(name,expr,want):code(f'PokeI($E1C00100+{len(cases)*8},{expr})');cases.append(dict(name=name,expected=want))
  def fnv(b):
@@ -16,26 +16,30 @@ def build(compiler,out):
   return h
  def observe(name):
   acked=[i for i,x in enumerate(slots) if x[0]&16]
-  values={'issued':len(slots),'lastSent':last,'lastTime':lasttime,'acked':len(acked),'largestAcked':max(acked,default=-1),'inFlight':sum(x[1] for x in slots if x[0]&8),'level':level,'capacity':capacity}
+  values={'first':first,'issued':len(slots),'lastSent':last,'lastTime':lasttime,'acked':len(acked),'largestAcked':max(acked,default=-1),'inFlight':sum(x[1] for x in slots if x[0]&8),'level':level,'capacity':capacity}
   for f,v in values.items():check(name+' '+f,'s\\'+f,v)
   raw=b''.join(struct.pack('<4q',*x) for x in slots)
-  check(name+' exact slots','Hash(@storage[16],s\\issued*32)',fnv(raw))
+  if first:
+   ring=[b'\xa5'*32 for _ in range(capacity)]
+   for n,x in enumerate(slots):ring[n%capacity]=bytes(32) if n<first else struct.pack('<4q',*x)
+   raw=b''.join(ring)
+  check(name+' exact slots',f'Hash(@storage[16],{len(raw)})',fnv(raw))
   check(name+' prefix guard','Hash(@storage[0],16)',fnv(b'\xa5'*16))
   check(name+' suffix guard',f'Hash(@storage[{16+capacity*32}],16)',fnv(b'\xa5'*16))
  def init(cap=128,lev=0):
-  nonlocal slots,capacity,level,last,lasttime
+  nonlocal slots,capacity,level,last,lasttime,first
   code('If s\\phase=1 : rc=QuicHandshakeSentDiscard(@s) : EndIf\nFor i=0 To 131103 : storage[i]=$A5 : Next')
   check('initialize',f'QuicHandshakeSentInit(@s,{lev},@storage[16],{cap})',0)
-  slots=[];capacity=cap;level=lev;last=-1;lasttime=0
+  slots=[];capacity=cap;level=lev;last=-1;lasttime=0;first=0
  def reserve():
-  n=len(slots);check('reserve', 'QuicHandshakeSentReserve(@s)', n if n<capacity else -3463)
-  if n<capacity:slots.append([1,0,0,0])
+  n=len(slots);check('reserve', 'QuicHandshakeSentReserve(@s)', n if n-first<capacity else -3463)
+  if n-first<capacity:slots.append([1,0,0,0])
  def commit(n,size=1200,time=None,eliciting=1,padded=0):
   nonlocal last,lasttime
   time=n+100 if time is None else time
   if n<0 or size<1 or size>65527 or time<0 or eliciting not in (0,1) or padded not in (0,1):want=-3461
   elif n>=len(slots):want=-3465
-  elif slots[n][0]!=1 or n<=last or time<lasttime:want=-3462
+  elif n<first or slots[n][0]!=1 or n<=last or time<lasttime:want=-3462
   else:
    want=0;slots[n]=[2+eliciting*4+8*int(bool(eliciting or padded)),size,time,n+70];last=n;lasttime=time
   check('commit',f'QuicHandshakeSentCommit(@s,{n},{size},{time},{eliciting},{padded},{n+70})',want)
@@ -55,11 +59,11 @@ def build(compiler,out):
   if ecn:b+=vi(100)+vi(2)+vi(1)
   code('For i=0 To 1099 : wire[i]=0 : Next')
   for i,v in enumerate(b):code(f'wire[{i}]={v}')
-  check('decode ACK',f'QuicHandshakeFrameRead(@wire[0],{len(b)},{level},@frame)',len(b))
+  check('decode ACK',f'QuicHandshakeFrameRead(@wire[0],{len(b)},{2 if level==4 else level},@frame)',len(b))
   if mutation:code(mutation)
   check('begin ACK',f'QuicHandshakeSentAckBegin(@job,@s,{level},@frame)',0)
  def apply(numbers,limit=None):
-  fresh=[n for n in sorted(numbers,reverse=True) if not slots[n][0]&16]
+  fresh=[n for n in sorted(numbers,reverse=True) if n>=first and not slots[n][0]&16]
   if limit is not None:fresh=fresh[:limit]
   byte_sum=sum(slots[n][1] for n in fresh);flight=sum(slots[n][1] for n in fresh if slots[n][0]&8)
   cookie_sum=sum(slots[n][3] for n in fresh);time_sum=sum(slots[n][2] for n in fresh)
@@ -104,6 +108,29 @@ def build(compiler,out):
  code('For i=0 To 4095\n rc=QuicHandshakeSentReserve(@s)\n rc=QuicHandshakeSentCommit(@s,i,1200,100+i,1,0,70+i)\nNext')
  slots=[[14,1200,100+i,70+i] for i in range(4096)];last=4095;lasttime=4195
  reserve();ack(set(range(4096)));ack(set(range(4096)))
+
+ def prune(budget=64):
+  nonlocal first
+  old=first
+  while first<len(slots) and first-old<budget and slots[first][0]&18==18:first+=1
+  check('prune exact count',f'QuicHandshakeSentPrune(@s,{budget})',first-old)
+  observe('pruned')
+ init(4,4)
+ for _ in range(4):reserve();commit(len(slots)-1)
+ reserve();ack({1,2,3});prune();ack({0});prune(2)
+ commit(0);lost(0)
+ for _ in range(2):reserve();commit(len(slots)-1)
+ ack(set(range(6)));prune()
+ for cycle in range(12):
+  for _ in range(4):reserve();commit(len(slots)-1)
+  ack(set(range(len(slots))))
+  prepare({len(slots)-1});check('busy prune','QuicHandshakeSentPrune(@s,64)',-3464)
+  check('cancel duplicate validation','QuicHandshakeSentAckCancel(@job)',-3467)
+  prune(3);prune(1)
+ check('bad prune zero','QuicHandshakeSentPrune(@s,0)',-3461)
+ check('bad prune budget','QuicHandshakeSentPrune(@s,65)',-3461)
+ reserve();reserve();commit(len(slots)-1);ack({len(slots)-1});prune()
+ ack({len(slots)-2,len(slots)-1});prune()
  assert 256+len(cases)*8<=65536
  source=out/'proof.pi4'
  source.write_text(r'''XIncludeFile "RaspberryPi4/Lib/mmu.pi4"

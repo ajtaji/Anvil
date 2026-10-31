@@ -1,7 +1,8 @@
 ; SPDX-License-Identifier: MIT
 ; Independent RFC 9000 sections12.3/13.1/19.3, RFC 9002 sections4.1/6.4.
 ; Bounded Initial/Handshake/Application sent history; legacy API names retained.
-; Caller owns transport, keys and recovery. No pruning or PN reuse.
+; Caller owns transport, keys and recovery. ACKed prefixes may be reclaimed;
+; packet numbers never restart and unsent gaps are never forgotten.
 XIncludeFile "Anvil/Network/quic_handshake_frames.pbi"
 #QUIC_SENT_ARGUMENT=-3461
 #QUIC_SENT_STATE=-3462
@@ -16,6 +17,7 @@ Structure QuicHandshakeSent
  entries.i
  capacity.i
  issued.i
+ first.i
  lastSent.i
  lastTime.i
  busy.i
@@ -53,12 +55,13 @@ EndProcedure
 Procedure.i quics_Ready(*s.QuicHandshakeSent)
  If quics_Span(*s,SizeOf(QuicHandshakeSent))=0 : ProcedureReturn #QUIC_SENT_ARGUMENT : EndIf
  If *s\phase<>1 Or (*s\level<>0 And *s\level<>2 And *s\level<>4) Or *s\capacity<1 Or *s\capacity>4096 : ProcedureReturn #QUIC_SENT_STATE : EndIf
- If quics_Span(*s\entries,*s\capacity*32)=0 Or *s\issued<0 Or *s\issued>*s\capacity : ProcedureReturn #QUIC_SENT_STATE : EndIf
+ If quics_Span(*s\entries,*s\capacity*32)=0 Or *s\issued<0 Or *s\first<0 Or *s\first>*s\issued Or *s\issued-*s\first>*s\capacity Or *s\issued>#QUIC_INTEGER_MAX+1 : ProcedureReturn #QUIC_SENT_STATE : EndIf
  ProcedureReturn 0
 EndProcedure
 ; Zero-initialized context or a discarded OLD connection only. Never restart
 ; packet numbering with existing keys. Slots are32 bytes: flags,bytes,time,cookie.
-; No pruning: retain sent/unsent facts until this number space is discarded.
+; Slots form a ring. first is the exclusive proven-ACKed prefix; issued is
+; the next absolute packet number, not a slot index. No unsent PN is pruned.
 Procedure.i QuicHandshakeSentInit(*s.QuicHandshakeSent,level.i,entries.i,capacity.i)
  Define i.i
  If quics_Span(*s,SizeOf(QuicHandshakeSent))=0 Or (level<>0 And level<>2 And level<>4) Or capacity<1 Or capacity>4096 : ProcedureReturn #QUIC_SENT_ARGUMENT : EndIf
@@ -75,8 +78,8 @@ Procedure.i QuicHandshakeSentReserve(*s.QuicHandshakeSent)
  Define rc.i,p.i,n.i,i.i
  rc=quics_Ready(*s) : If rc<0 : ProcedureReturn rc : EndIf
  If *s\busy<>0 : ProcedureReturn #QUIC_SENT_BUSY : EndIf
- If *s\issued=*s\capacity : ProcedureReturn #QUIC_SENT_LIMIT : EndIf
- n=*s\issued : p=*s\entries+n*32
+ If *s\issued-*s\first=*s\capacity Or *s\issued>#QUIC_INTEGER_MAX : ProcedureReturn #QUIC_SENT_LIMIT : EndIf
+ n=*s\issued : p=*s\entries+(n % *s\capacity)*32
  For i=0 To 31 : PokeA(p+i,0) : Next
  PokeI(p,1) : *s\issued=n+1 : ProcedureReturn n
 EndProcedure
@@ -90,7 +93,8 @@ Procedure.i QuicHandshakeSentCommit(*s.QuicHandshakeSent,number.i,bytes.i,time.i
  If *s\busy<>0 : ProcedureReturn #QUIC_SENT_BUSY : EndIf
  If number<0 Or bytes<1 Or bytes>65527 Or time<0 Or (eliciting<>0 And eliciting<>1) Or (padded<>0 And padded<>1) : ProcedureReturn #QUIC_SENT_ARGUMENT : EndIf
  If number>=*s\issued : ProcedureReturn #QUIC_SENT_UNSENT : EndIf
- p=*s\entries+number*32
+ If number<*s\first : ProcedureReturn #QUIC_SENT_STATE : EndIf
+ p=*s\entries+(number % *s\capacity)*32
  If PeekI(p)<>1 Or number<=*s\lastSent Or time<*s\lastTime : ProcedureReturn #QUIC_SENT_STATE : EndIf
  flags=2+eliciting*4
  If eliciting Or padded : flags=flags|8 : *s\inFlight=*s\inFlight+bytes : EndIf
@@ -105,11 +109,28 @@ Procedure.i QuicHandshakeSentLost(*s.QuicHandshakeSent,number.i)
  If *s\busy<>0 : ProcedureReturn #QUIC_SENT_BUSY : EndIf
  If number<0 : ProcedureReturn #QUIC_SENT_ARGUMENT : EndIf
  If number>=*s\issued : ProcedureReturn #QUIC_SENT_UNSENT : EndIf
- p=*s\entries+number*32 : flags=PeekI(p)
+ If number<*s\first : ProcedureReturn 0 : EndIf
+ p=*s\entries+(number % *s\capacity)*32 : flags=PeekI(p)
  If (flags&2)=0 : ProcedureReturn #QUIC_SENT_UNSENT : EndIf
  If flags&48 : ProcedureReturn 0 : EndIf
  If flags&8 : *s\inFlight=*s\inFlight-PeekI(p+8) : EndIf
  PokeI(p,(flags|32)&(~8)) : ProcedureReturn 1
+EndProcedure
+; Reclaim at most budget (1..64) contiguous fully acknowledged slots.
+; Returns reclaimed count. An outstanding/lost/unsent slot stops reclamation.
+; Old ACK ranges below first are safe to ignore: every such PN was ACKed.
+Procedure.i QuicHandshakeSentPrune(*s.QuicHandshakeSent,budget.i)
+ Define rc.i,n.i,p.i,i.i
+ rc=quics_Ready(*s) : If rc<0 : ProcedureReturn rc : EndIf
+ If *s\busy<>0 : ProcedureReturn #QUIC_SENT_BUSY : EndIf
+ If budget<1 Or budget>64 : ProcedureReturn #QUIC_SENT_ARGUMENT : EndIf
+ While n<budget And *s\first<*s\issued
+  p=*s\entries+(*s\first % *s\capacity)*32
+  If (PeekI(p)&18)<>18 : Break : EndIf
+  For i=0 To 31 : PokeA(p+i,0) : Next
+  *s\first=*s\first+1 : n=n+1
+ Wend
+ ProcedureReturn n
 EndProcedure
 Procedure.i QuicHandshakeSentDiscard(*s.QuicHandshakeSent)
  Define rc.i
@@ -192,7 +213,11 @@ Procedure.i QuicHandshakeSentAckStep(*j.QuicHandshakeSentAck)
    EndIf
    If *j\high>=*s\issued : ProcedureReturn quics_End(*j,#QUIC_SENT_UNSENT) : EndIf
   EndIf
-  p=*s\entries+*j\current*32 : flags=PeekI(p)
+  If *j\current<*s\first
+   ; Skip the proven delivered prefix without iterating over old PN values.
+   *j\current=*j\low-1
+  Else
+  p=*s\entries+(*j\current % *s\capacity)*32 : flags=PeekI(p)
   If (flags&2)=0 : ProcedureReturn quics_End(*j,#QUIC_SENT_UNSENT) : EndIf
   *j\current=*j\current-1
   If *j\phase=2 And (flags&16)=0
@@ -202,6 +227,7 @@ Procedure.i QuicHandshakeSentAckStep(*j.QuicHandshakeSentAck)
    PokeI(p,(flags|16)&(~8)) : *s\acked=*s\acked+1
    If *j\number>*s\largestAcked : *s\largestAcked=*j\number : EndIf
    ProcedureReturn 1
+  EndIf
   EndIf
  Next
  ProcedureReturn 0

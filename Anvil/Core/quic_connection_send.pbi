@@ -141,7 +141,9 @@ Procedure.i QuicConnectionSendAccepted(*c.QuicConnection,bytes.i,now.i)
  If quiccs_Valid(*c)=0 Or now<0 : ProcedureReturn #QUIC_SEND_ARGUMENT : EndIf
  If *c\phase<>1 Or *c\outgoing\phase<>4 : ProcedureReturn #QUIC_SEND_STATE : EndIf
  If bytes<>*c\outgoing\bytes : ProcedureReturn #QUIC_SEND_ARGUMENT : EndIf
- *s=quiccs_Space(*c) : meta=*s\metadata+*c\outgoing\number*16
+ *s=quiccs_Space(*c)
+ If *s\history\capacity<1 Or *c\outgoing\number<*s\history\first Or *c\outgoing\number>=*s\history\issued : ProcedureReturn quiccs_Fail(*c,#QUIC_SEND_STATE) : EndIf
+ meta=*s\metadata+(*c\outgoing\number % *s\history\capacity)*16
  PokeI(meta,*c\outgoing\view\offset) : PokeI(meta+8,*c\outgoing\copied)
  rc=QuicHandshakeSentCommit(@*s\history,*c\outgoing\number,bytes,now,Bool(*c\outgoing\copied>0),1,meta)
  If rc<>0 : ProcedureReturn quiccs_Fail(*c,rc) : EndIf

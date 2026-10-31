@@ -58,8 +58,8 @@ Procedure.i QuicConnectionAckStep(*c.QuicConnection)
   If rc=0 : ProcedureReturn 0 : EndIf
   If rc=2 : *c\acknowledge\phase=4 : ProcedureReturn 0 : EndIf
   If rc<>1 : ProcedureReturn quicca_Fail(*c,#QUIC_CONNECTION_ACK_STATE) : EndIf
-  If *c\ackJob\number<0 Or *c\ackJob\number>=*s\history\capacity : ProcedureReturn quicca_Fail(*c,#QUIC_CONNECTION_ACK_METADATA) : EndIf
-  p=*s\metadata+*c\ackJob\number*16
+  If *c\ackJob\number<*s\history\first Or *c\ackJob\number>=*s\history\issued : ProcedureReturn quicca_Fail(*c,#QUIC_CONNECTION_ACK_METADATA) : EndIf
+  p=*s\metadata+(*c\ackJob\number % *s\history\capacity)*16
   If *c\ackJob\cookie<>p : ProcedureReturn quicca_Fail(*c,#QUIC_CONNECTION_ACK_METADATA) : EndIf
   offset=PeekI(p) : bytes=PeekI(p+8)
   If offset<0 Or bytes<0 Or bytes>16384 Or offset>#QUIC_INTEGER_MAX-bytes : ProcedureReturn quicca_Fail(*c,#QUIC_CONNECTION_ACK_METADATA) : EndIf

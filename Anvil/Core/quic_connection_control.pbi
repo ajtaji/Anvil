@@ -29,7 +29,7 @@ Procedure.i QuicConnectionControlBegin(*c.QuicConnection,now.i,exponent.i,ping.i
  If TlsWorkerBusy()<>0 : ProcedureReturn #TLSWORK_BUSY : EndIf
  rc=QuicApplicationAckDelay(@*c\applicationState,now,exponent) : If rc<0 : ProcedureReturn rc : EndIf
  If *c\applicationHistory\busy<>0 Or *c\applicationHistory\issued<>*c\applicationState\nextNumber : ProcedureReturn #QUIC_CONTROL_STATE : EndIf
- If *c\applicationHistory\issued>=*c\applicationHistory\capacity : ProcedureReturn #QUIC_SENT_LIMIT : EndIf
+ If *c\applicationHistory\issued-*c\applicationHistory\first>=*c\applicationHistory\capacity : ProcedureReturn #QUIC_SENT_LIMIT : EndIf
  number=QuicApplicationNumberReserve(@*c\applicationState) : If number<0 : ProcedureReturn number : EndIf
  rc=QuicHandshakeSentReserve(@*c\applicationHistory)
  If rc<>number : ProcedureReturn quicco_Fail(*c,#QUIC_CONTROL_STATE) : EndIf

@@ -520,6 +520,8 @@ Procedure.i ReceiveApplicationAck()
      If connection\applicationHistory\acked=1
       If connection\applicationHistory\inFlight<>0 Or connection\applicationHistory\largestAcked<>0 : deliveryFault=2 : EndIf
       applicationDelivery=1 : deliveryNumber=pn
+      rc=QuicHandshakeSentPrune(@connection\applicationHistory,64)
+      If rc<>1 Or connection\applicationHistory\first<>1 Or connection\applicationHistory\issued<>1 : deliveryFault=7 : EndIf
      EndIf
     ElseIf applicationFrame\base\kind=24
      rc=QuicConnectionPeerIdAdd(@connection,applicationFrame\sequence,applicationFrame\retire,applicationFrame\base\data,applicationFrame\idBytes,applicationFrame\resetToken)
