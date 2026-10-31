@@ -5188,3 +5188,67 @@ Pi3 adapter; no Pi3 execution is claimed. Application ACK transmission still
 needs connection-owned receipt tracking and frame effects. Handshake
 confirmation/key retirement, recovery, congestion/flow control, streams/QPACK,
 real HTTP/3 and remaining IPv6/TLS/device work remain open.
+
+### Connection-owned application packet state — 2026-10-31
+
+`Anvil/Network/quic_application_state.pbi` provides `QuicApplicationState` with
+inline storage for64 ACK ranges, independent authenticated/processed largest
+packet numbers, the processed largest packet's receipt timestamp, and the next
+outgoing number. On the tested AArch64 targets it occupies1,120 bytes.
+`QuicConnection` embeds and initializes it, then wipes it during final close.
+The existing20 external buffer spans are unchanged. The descriptor is larger;
+consumers must compile against the updated definition. Keep the state at its
+original address: its ACK descriptor points into its inline storage.
+
+`QuicApplicationStateInit` accepts a fresh zeroed descriptor only. An active
+state cannot be reinitialized. `QuicApplicationNumberReserve` returns a fresh
+number or negative refusal. Reserve before encryption; abandoned work never
+returns a reservation to the pool. The last legal number can be reserved once,
+then exhaustion remains a refusal without wrapping. Preserve this state across
+key updates; only a genuinely new connection/key lifetime may restart numbering.
+This follows the packet-number requirements in
+[RFC9000 section12.3](https://www.rfc-editor.org/rfc/rfc9000.html#section-12.3).
+
+`QuicApplicationAuthenticated` is called only after packet authentication. It
+updates the reconstruction reference and returns whether that PN was already
+fully processed. It does not create an ACK receipt. `QuicApplicationProcessed`
+is a separate caller assertion that this packet was authenticated and all its
+frames successfully processed. Its PN upper-bound check is not proof of those
+conditions. The serialized connection dispatcher must enforce them and prevent
+duplicate effects. Range exhaustion refuses without updating processed timing.
+
+`QuicApplicationAckDelay` scales elapsed controlled receipt time using our
+advertised exponent0..20. Older or duplicate PNs do not replace the largest
+processed PN's timestamp. `QuicApplicationAckWrite` serializes that delay using
+the shared ACK writer and rejects output/token overlap with any part of the
+state, including packet-number counters. These operations do not schedule ACKs,
+authenticate packets, apply frames, enforce max_ack_delay, or transmit packets.
+
+Physical evidence:
+`docs/evidence/anvil-ipv6-20261030/quic-application-state488/`.
+The standalone Pi4 proof passed2,716 checks, including numbering exhaustion,
+refused reinitialization, separate authentication/receipt state, duplicate and
+out-of-order timestamps, capacity, stale completions, delay overflow/scaling,
+exact ACK bytes/guards and unchanged state on refusal. The live fixture uses
+the owner to reserve the outgoing PING's PN, update authenticated reception
+only after tag success, and verify every byte of the state is erased on close.
+It deliberately leaves ACK receipts empty because application frame effects
+are not integrated yet. The final live run passed36 existing checks plus all
+additional lifecycle/application/state assertions; the independent peer
+verified Finished/h3 and client 1-RTT PING.
+
+The first live run failed a fixture shutdown probe: its callback had crossed
+the old hard-coded512KiB scheduler registration. That failed run is retained.
+The fixture now registers a linker-derived, aligned code extent, records both
+callback and limit, and still closes the owned connection if probe admission
+fails. The callback at0x108022c is outside the old0x1080000 limit and within the
+new0x10869f8 limit. Its first64 bytes are identical at that address in both
+builds. The final registered extent lies within the validated image map.
+
+Both qualifying Pi4 runs returned healthy, with watchdog off and resident488
+unchanged. The failed development run also returned with healthy cores, fonts
+and Vulkan. The final composition compiled with the actual Pi3 adapter; it was
+not executed there. No reset or resident update was needed. Application frame
+effects and ACK transmission, handshake confirmation/key retirement, recovery,
+congestion/flow control, streams/QPACK/realHTTP3 and remaining IPv6/TLS/device
+work remain open.

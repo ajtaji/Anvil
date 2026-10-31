@@ -8,6 +8,7 @@
 ; Child jobs use only this owner's storage. Start no work once closing begins,
 ; and honor the shared worker's crypto exclusion across suspended execution.
 XIncludeFile "Anvil/Core/quic_application_packet.pbi"
+XIncludeFile "Anvil/Network/quic_application_state.pbi"
 #QUIC_CONNECTION_ARGUMENT=-3511
 #QUIC_CONNECTION_TIMEOUT=-3512
 #QUIC_CONNECTION_STATE=-3513
@@ -105,6 +106,7 @@ Structure QuicConnection
  peerIdBytes.i
  startup.QuicConnectionStart
  application.QuicApplicationPacket
+ applicationState.QuicApplicationState
 EndStructure
 ; Span table order: RX data/bits,TX data/bits,ACK ranges,sent slots/metadata,
 ; TLS snapshot,handshake/receive/output/config,local/peer parameters/entries,
@@ -175,6 +177,7 @@ Procedure.i QuicConnectionBegin(*c.QuicConnection,spans.i,socket.i,now.i,timeout
  *c\phase=1 : *c\started=now : *c\timeout=timeoutUs
  rc=qconn_Space(*c,@*c\initial,0,0)
  If rc=0 : rc=qconn_Space(*c,@*c\handshake,2,1) : EndIf
+ If rc=0 : rc=QuicApplicationStateInit(@*c\applicationState) : EndIf
  If rc<>0 : *c\phase=2 : *c\result=rc : ProcedureReturn rc : EndIf
  *c\socket=socket
  ProcedureReturn 0

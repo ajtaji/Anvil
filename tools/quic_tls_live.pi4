@@ -25,6 +25,7 @@ Global feedFault.i,keyCancelled.i,feedSteps.i,maxFeedStep.i
 Global keyOp.QuicTlsOperation,probeKey.QuicKeyJob,probeKeys.QuicKeys
 Global preparedKeyOp.QuicTlsOperation
 Global applicationFrame.QuicApplicationFrame,applicationFrames.i,doneSeen.i
+Global applicationStateFault.i
 Global applicationFault.i,applicationBadTag.i,applicationCancelled.i,applicationPing.i
 Global applicationSteps.i,maxApplicationStep.i,applicationNumber.i,applicationWriteReady.i
 Global savedApplicationBytes.i,savedApplicationKeys.QuicKeys
@@ -255,16 +256,18 @@ Procedure.i ApplicationCrypt(packetAddress.i,bytes.i,idBytes.i,number.i,encrypt.
  ProcedureReturn rc
 EndProcedure
 Procedure.i SendApplicationPing()
- Define rc.i,n.i,i.i,header.i,bytes.i
+ Define rc.i,n.i,i.i,header.i,bytes.i,number.i
  If applicationPing<>0 Or connection\appWrite\ready<>1 : ProcedureReturn -9441 : EndIf
+ number=QuicApplicationNumberReserve(@connection\applicationState)
+ If number<>0 Or connection\applicationState\nextNumber<>1 : applicationStateFault=1 : ProcedureReturn -9451 : EndIf
  applicationWriteReady=1
  ; One diagnostic packet, PN0 exactly once under these fresh write keys.
  ; Header: fixed bit, key phase0, spin0, four PN bytes, then PING and tag space.
  PokeA(@output[0],$43)
  For i=0 To peerBytes-1 : output[1+i]=peerId[i] : Next
- NetWriteBE32(@output[0]+1+peerBytes,0)
+ NetWriteBE32(@output[0]+1+peerBytes,number & $FFFFFFFF)
  header=1+peerBytes+4 : output[header]=1 : bytes=header+1+16
- rc=ApplicationCrypt(@output[0],bytes,peerBytes,0,1) : If rc<>1 : ProcedureReturn rc : EndIf
+ rc=ApplicationCrypt(@output[0],bytes,peerBytes,number,1) : If rc<>1 : ProcedureReturn rc : EndIf
  Repeat
   n=Service() : If n<0 : ProcedureReturn n : EndIf
   rc=UdpPayloadSendTo(handle,@ep,@output[0],bytes)
@@ -289,16 +292,19 @@ Procedure.i PacketOne(p.i,bytes.i)
   For i=0 To savedApplicationBytes-1 : savedApplication[i]=PeekA(p+i) : Next
   For i=0 To SizeOf(QuicKeys)-1 : PokeA(@savedApplicationKeys+i,PeekA(@connection\appRead+i)) : Next
   PokeA(p+savedApplicationBytes-1,PeekA(p+savedApplicationBytes-1)!1)
-  rc=ApplicationCrypt(p,savedApplicationBytes,8,-1,0)
+  rc=ApplicationCrypt(p,savedApplicationBytes,8,connection\applicationState\largestAuthenticated,0)
   If rc<>#QUIC_CRYPTO_AUTH : applicationFault=5 : ProcedureReturn -9442 : EndIf
   For i=0 To savedApplicationBytes-1
    old=savedApplication[i] : If i=savedApplicationBytes-1 : old=old!1 : EndIf
    If PeekA(p+i)<>old : applicationFault=6 : EndIf
   Next
+  If connection\applicationState\largestAuthenticated<>-1 : applicationStateFault=2 : EndIf
   applicationBadTag=1
   For i=0 To savedApplicationBytes-1 : PokeA(p+i,savedApplication[i]) : Next
-  rc=ApplicationCrypt(p,savedApplicationBytes,8,-1,0) : If rc<>1 : ProcedureReturn rc : EndIf
+  rc=ApplicationCrypt(p,savedApplicationBytes,8,connection\applicationState\largestAuthenticated,0) : If rc<>1 : ProcedureReturn rc : EndIf
   applicationNumber=connection\application\crypto\number
+  old=QuicApplicationAuthenticated(@connection\applicationState,applicationNumber)
+  If old<>0 Or connection\applicationState\largestAuthenticated<>applicationNumber Or connection\applicationState\ack\count<>0 : applicationStateFault=3 : EndIf
   cursor=0
   While cursor<connection\application\crypto\plainBytes
    n=QuicApplicationFrameRead(p+connection\application\crypto\plainOffset+cursor,connection\application\crypto\plainBytes-cursor,@applicationFrame)
@@ -561,7 +567,7 @@ EndProcedure
 Procedure.i CloseConnection(reason.i)
  Define rc.i,n.i,i.i,j.i,p.i,t.i,cost.i,saved.i
  rc=TlsWorkerBegin(@closeHold,@CloseHoldEntry,0)
- If rc<>1 : ProcedureReturn rc : EndIf
+ If rc=1
  rc=TlsWorkerStep(@closeHold)
  If rc<>0 Or closeHoldRuns<>1 : closeFault=1 : EndIf
  rc=QuicConnectionClose(@connection,reason)
@@ -569,6 +575,10 @@ Procedure.i CloseConnection(reason.i)
  If rc<>#TLSWORK_BUSY Or connection\closeStage<>0 Or Tls13State<>saved Or SchedState(closeHold\task)<>#SCHED_READY : closeFault=2 : EndIf
  rc=TlsWorkerStep(@closeHold)
  If rc<>1 Or closeHoldRuns<>2 : closeFault=3 : EndIf
+ Else
+  closeFault=8
+  rc=QuicConnectionClose(@connection,reason)
+ EndIf
  Repeat
   t=HwMicros() : rc=QuicConnectionCloseStep(@connection) : cost=HwMicros()-t
   If cost>maxCloseStep : maxCloseStep=cost : EndIf
@@ -763,15 +773,17 @@ Procedure CheckApplicationCancellation()
 EndProcedure
 Procedure.i Main()
  CaptureTable()
- Define i.i,rc.i,closed.i,cleanup.i,admit.i,saved.i,tlsState.i,tlsError.i,x509Error.i,certCount.i,alert.i
+ Define i.i,rc.i,closed.i,cleanup.i,admit.i,saved.i,tlsState.i,tlsError.i,x509Error.i,certCount.i,alert.i,workerBytes.i
  rc=UdpPayloadBind(services) : If rc<>0 : ProcedureReturn 71 : EndIf
  pet=PeekI(services+16+6*8) : clock=PeekI(services+16+11*8) : started=clock()
  MmuClearNc() : MmuAddNc($08A00000,$09200000) : MmuAddNc($08100000,$08180000)
  rc=MmuBuildTables($4F80000) : If rc<>0 : ProcedureReturn 72 : EndIf
  MmuEnableCached()
- If TlsWorkerInstall($1000000,$80000)<>1 : MmuDisableCachedFlushed() : ProcedureReturn 73 : EndIf
+ workerBytes=(?FixtureImageEnd-$1000000)&-4
+ If TlsWorkerInstall($1000000,workerBytes)<>1 : MmuDisableCachedFlushed() : ProcedureReturn 73 : EndIf
  For i=0 To 65535 : PokeA($E1C00000+i,0) : Next
  PokeI($E1C00000,$55445331) : PokeI($E1C00008,#REPORT_COUNT)
+ PokeI($E1C002A0,@CloseHoldEntry) : PokeI($E1C002A8,$1000000+workerBytes)
  ep\family=4 : ep\kind=0 : ep\port=55442
  For i=0 To 15 : PokeA(@ep\address+i,PeekA(?Peer+i)) : Next
  handle=UdpPayloadOpen(4,0,55013)
@@ -795,6 +807,8 @@ Procedure.i Main()
  Else
   rc=handle : closed=-1
  EndIf
+ For i=0 To SizeOf(QuicApplicationState)-1 : If PeekA(@connection\applicationState+i)<>0 : applicationStateFault=4 : EndIf : Next
+ PokeI($E1C00298,applicationStateFault)
  PokeI($E1C00100,rc) : PokeI($E1C00108,tlsState) : PokeI($E1C00110,tlsError)
  PokeI($E1C00220,peerBytes)
  PokeI($E1C00248,applicationFrames) : PokeI($E1C00250,doneSeen)

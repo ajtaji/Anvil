@@ -34,7 +34,7 @@ def build(compiler,out,public,wrong_name=False,bad_signature=False):
                        ('LocalTemplate',params),('Peer',bytes([192,168,1,104])+bytes(12))]:
         source+=label+':\n'
         for p in range(0,len(data),24):source+=' Data.a '+','.join(str(n) for n in data[p:p+24])+'\n'
-    source+='EndDataSection\n'
+    source+='FixtureImageEnd:\n Data.a 0\nEndDataSection\n'
     path=out/'proof.pi4';path.write_text(source,encoding='utf8')
     q=subprocess.run([str(resolve_compiler(compiler)),'--compile',str(path),'-t','pi4','--load-addr','0x1000000','--stack-addr','0x4f00000','--entry-returns','--wants-services','-o',str(out/'proof.img')],env=dict(os.environ,PMF_ROOT=str(root)),capture_output=True,text=True,timeout=180,creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
     log=q.stdout+q.stderr;(out/'compile.txt').write_text(log,encoding='utf8');print(log[-1400:]);assert q.returncode==0
