@@ -92,16 +92,29 @@ Procedure SchedRemoveWait(slot.i)
   Next
 EndProcedure
 
+; Claim one named READY task without running any other task. This is for
+; dispatchers whose installed context belongs to a specific owner. It preserves
+; the relative order of all remaining ready tasks and does not provide fairness.
+; The same serialized-owner rule as SchedNext applies.
+Procedure.i SchedTake(handle.i)
+  Protected slot.i
+  If sched_running <> 0 : ProcedureReturn 0 : EndIf
+  slot = SchedSlot(handle)
+  If slot < 0 : ProcedureReturn 0 : EndIf
+  If sched_state[slot] <> #SCHED_READY : ProcedureReturn 0 : EndIf
+  SchedRemove(slot)
+  sched_state[slot] = #SCHED_RUNNING
+  sched_running = handle
+  ProcedureReturn handle
+EndProcedure
+
 Procedure.i SchedNext()
   Protected slot.i
   If sched_running <> 0 Or sched_count = 0
     ProcedureReturn 0
   EndIf
   slot = sched_queue[0]
-  SchedRemove(slot)
-  sched_state[slot] = #SCHED_RUNNING
-  sched_running = sched_generation[slot] * 32 + slot
-  ProcedureReturn sched_running
+  ProcedureReturn SchedTake(sched_generation[slot] * 32 + slot)
 EndProcedure
 
 Procedure.i SchedYield(handle.i)

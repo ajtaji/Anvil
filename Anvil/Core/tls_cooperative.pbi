@@ -211,7 +211,7 @@ Procedure tlsw_Advance()
  ; a yield would let unrelated callers try to suspend the scheduler's caller.
  tlsw_SetHooks()
  tlsw_gapStart=HwMicros() : tlsw_lastCheck=-1
- ran=ScRunOne()
+ ran=ScRunHandle(tlsw_handle)
  tlsw_CheckGap(8)
  tlsw_ClearHooks()
  state=SchedState(tlsw_handle)

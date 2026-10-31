@@ -4342,3 +4342,57 @@ certificate-verified HTTP/3 request remain open. Fixture teardown closes its
 UDP socket and stops the disposable peer; it is not a production QUIC close
 state machine. Earlier TLS compatibility/device blocking and public off-link
 IPv6/RDNSS qualification also remain open.
+
+
+### Select the TLS worker before installing its execution context
+
+The TLS driver previously installed its connection-specific crypto hooks and
+then used `ScRunOne()`, which chooses the first ready task. With another task
+ahead in the shared queue, that unrelated task could run under TLS hooks. This
+source-confirmed ownership gap was recorded in forum reply 4378 before changes.
+
+The portable state scheduler now provides `SchedTake(handle)`: claim exactly one
+READY task when no task is already running. It validates the generation and
+state, removes only the chosen task, and preserves the relative order of the
+remaining ready queue. It neither wakes waiting tasks nor provides fairness.
+The existing serialized-owner requirement still applies. `SchedNext()` uses the
+same claim path for its normal first-ready selection.
+
+`ScRunHandle(handle)` adds targeted execution to the existing AArch64 cooperative
+backend. It rejects invalid, stale, foreign, waiting, completed and nested
+requests without selecting another task. Stack, core and execution-environment
+checks remain shared with `ScRunOne()`. An owned task with a failed stack guard
+is made terminal without entering its function. This is same-core cooperative
+execution, not timer preemption, SMP or support for unqualified execution levels.
+
+The TLS worker now calls `ScRunHandle(tlsw_handle)` while its hooks and selected
+connection context are installed. Hooks are cleared again on return. The
+selection change is in shared code, not a Pi 4-only branch.
+
+Capture 272 on Anvil 488 passed 58 named-dispatch checks: actual interleaved task
+traces, preserved FIFO order for other tasks, local values across yield/wait,
+targeted wake/resume, nested and busy refusal, foreign ownership, generation
+reuse and stale handles, stack-guard failure, cancellation and cleanup. The
+same fixture compiled for Pi 3; no physical Pi 3 execution is claimed.
+
+Capture 273 passed all 31 existing X25519/RSA context and signature-corpus cases
+with an unrelated ready task deliberately queued before each TLS worker. The
+task stayed untouched through TLS slices and cancellation, then ran explicitly
+and observed all TLS hooks cleared. Existing crypto verdicts, private-scratch
+wiping and local/caller context checks passed. The maximum observed outer worker
+call was 4.172 ms; slice targets remain soft. This fixture uses controlled TLS
+work with real crypto and the actual cooperative driver, not a live HTTPS test.
+Unused profile-formatting entry points are tripwires that fail the test if called.
+
+Three harness compile refusals are retained: missing diagnostic declarations,
+a conservative indirect-clock recursion refusal, and missing string formatting.
+The harness now reads the qualified counter directly and explicitly detects
+unexpected profile formatting; no compiler restriction was disabled.
+
+Evidence is `docs/evidence/anvil-ipv6-20261030/scheduler-owner488`. Cores, fonts
+and Vulkan remained healthy and watchdog was off after both RAM tests. A full
+Anvil 489 image compiled with the normal automatic build stamp; it is a candidate
+and has NOT replaced installed Anvil 488. The ownership fix is source/RAM-qualified,
+not yet deployed in the resident monitor. Live QUIC still needs its production
+connection worker and application packet/HTTP/3 processing; the preceding TLS,
+IPv6 and HTTP/3 limitations remain open.

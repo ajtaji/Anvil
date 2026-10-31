@@ -1,0 +1,105 @@
+XIncludeFile "Anvil/Kernel/Scheduler/scheduler.pbi"
+XIncludeFile "Anvil/Kernel/Scheduler/cooperative_a64.pbi"
+Global a.i,b.i,c.i,hook.i,count.i,nested.i,busy.i,localGood.i,hookGood.i
+Global Dim trace.i[16]
+Procedure Add(value.i)
+ trace[count]=value : count=count+1
+EndProcedure
+Procedure.i TaskA()
+ Define value.i
+ value=ScArgument() : Add(10)
+ If ScYield()=0 : ProcedureReturn -1 : EndIf
+ Add(11) : ProcedureReturn value
+EndProcedure
+Procedure.i TaskB()
+ Define value.i
+ value=ScArgument()
+ If hook=2 : hookGood=hookGood+1 : EndIf
+ nested=Bool(ScRunHandle(a)=0) : busy=Bool(SchedTake(a)=0)
+ Add(20)
+ If ScYield()=0 : ProcedureReturn -2 : EndIf
+ localGood=Bool(value=202)
+ If hook=2 : hookGood=hookGood+1 : EndIf
+ Add(21)
+ If ScWait(7,500)=0 : ProcedureReturn -3 : EndIf
+ If hook=2 : hookGood=hookGood+1 : EndIf
+ Add(22) : ProcedureReturn value
+EndProcedure
+Procedure.i TaskC()
+ Add(30) : ProcedureReturn ScArgument()
+EndProcedure
+Procedure.i Main()
+ Define i.i,foreign.i,replacement.i
+ For i=0 To 65535 : PokeA($E1C00000+i,0) : Next
+ PokeI($E1C00000,$55445331)
+PokeI($E1C00008,58)
+PokeI($E1C00100+0,ScConfigure(@TaskA,@Main-@TaskA))
+a=ScCreate(@TaskA,101) : b=ScCreate(@TaskB,202) : c=ScCreate(@TaskC,303)
+PokeI($E1C00100+8,Bool(a>0 And b>0 And c>0))
+hook=2
+PokeI($E1C00100+16,Bool(ScRunHandle(b)=b))
+hook=0
+PokeI($E1C00100+24,count)
+PokeI($E1C00100+32,trace[0])
+PokeI($E1C00100+40,SchedState(a))
+PokeI($E1C00100+48,SchedState(c))
+PokeI($E1C00100+56,nested)
+PokeI($E1C00100+64,busy)
+PokeI($E1C00100+72,Bool(ScRunOne()=a))
+PokeI($E1C00100+80,trace[1])
+hook=2
+PokeI($E1C00100+88,Bool(ScRunHandle(b)=b))
+hook=0
+PokeI($E1C00100+96,localGood)
+PokeI($E1C00100+104,trace[2])
+PokeI($E1C00100+112,SchedState(b))
+PokeI($E1C00100+120,ScRunHandle(b))
+PokeI($E1C00100+128,count)
+PokeI($E1C00100+136,Bool(ScRunOne()=c))
+PokeI($E1C00100+144,ScResult(c))
+PokeI($E1C00100+152,ScRunHandle(c))
+PokeI($E1C00100+160,count)
+PokeI($E1C00100+168,Bool(ScRunOne()=a))
+PokeI($E1C00100+176,ScResult(a))
+PokeI($E1C00100+184,ScRunOne())
+PokeI($E1C00100+192,SchedWake(7,1))
+hook=2
+PokeI($E1C00100+200,Bool(ScRunHandle(b)=b))
+hook=0
+PokeI($E1C00100+208,ScResult(b))
+PokeI($E1C00100+216,hookGood)
+PokeI($E1C00100+224,count)
+PokeI($E1C00100+232,trace[0])
+PokeI($E1C00100+240,trace[1])
+PokeI($E1C00100+248,trace[2])
+PokeI($E1C00100+256,trace[3])
+PokeI($E1C00100+264,trace[4])
+PokeI($E1C00100+272,trace[5])
+foreign=SchedCreate()
+PokeI($E1C00100+280,ScRunHandle(foreign))
+PokeI($E1C00100+288,SchedState(foreign))
+PokeI($E1C00100+296,SchedCancel(foreign))
+PokeI($E1C00100+304,SchedReap(foreign))
+PokeI($E1C00100+312,ScReap(b))
+replacement=ScCreate(@TaskC,404)
+PokeI($E1C00100+320,Bool(replacement<>b And replacement%32=b%32))
+PokeI($E1C00100+328,ScRunHandle(b))
+PokeI($E1C00100+336,SchedTake(b))
+PokeI($E1C00100+344,SchedState(replacement))
+PokeI($E1C00100+352,ScRunHandle(0))
+PokeI($E1C00100+360,ScRunHandle(-1))
+PokeI($E1C00100+368,count)
+PokeI(ScStack(SchedSlot(replacement)),0)
+PokeI($E1C00100+376,Bool(ScRunHandle(replacement)=replacement))
+PokeI($E1C00100+384,ScResult(replacement))
+PokeI($E1C00100+392,count)
+PokeI($E1C00100+400,SchedState(replacement))
+PokeI($E1C00100+408,ScReap(replacement))
+PokeI($E1C00100+416,ScReap(a))
+PokeI($E1C00100+424,ScReap(c))
+PokeI($E1C00100+432,sched_count)
+PokeI($E1C00100+440,sched_waitcount)
+PokeI($E1C00100+448,sched_running)
+PokeI($E1C00100+456,sc_active)
+ProcedureReturn 0
+EndProcedure

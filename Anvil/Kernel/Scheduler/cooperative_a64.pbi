@@ -289,11 +289,9 @@ Procedure.i ScWait(key.i, deadline.i)
   ScBack()
   ProcedureReturn 1
 EndProcedure
-Procedure.i ScRunOne()
-  Protected handle.i
+; Internal: the state scheduler has already claimed this handle.
+Procedure.i sc_RunClaimed(handle.i)
   Protected slot.i
-  If sc_active <> 0 Or ScValidEnvironment() = 0 : ProcedureReturn 0 : EndIf
-  handle = SchedNext()
   If handle = 0 : ProcedureReturn 0 : EndIf
   slot = SchedSlot(handle)
   If sc_owner[slot] <> handle Or ScGuard(slot) = 0
@@ -311,6 +309,22 @@ Procedure.i ScRunOne()
     If SchedState(handle) = #SCHED_READY Or SchedState(handle) = #SCHED_WAITING : SchedCancel(handle) : EndIf
   EndIf
   ProcedureReturn handle
+EndProcedure
+Procedure.i ScRunOne()
+  If sc_active <> 0 Or ScValidEnvironment() = 0 : ProcedureReturn 0 : EndIf
+  ProcedureReturn sc_RunClaimed(SchedNext())
+EndProcedure
+; Resume only this owned READY context. Invalid, stale, waiting, completed,
+; foreign or nested requests return zero without choosing a substitute task.
+; Stack guards and environment checks are identical to ScRunOne. Callers own
+; fairness and must scope task-specific hooks around this targeted invocation.
+Procedure.i ScRunHandle(handle.i)
+  Protected slot.i
+  If sc_active <> 0 Or ScValidEnvironment() = 0 : ProcedureReturn 0 : EndIf
+  slot=SchedSlot(handle)
+  If slot<0 : ProcedureReturn 0 : EndIf
+  If sc_owner[slot]<>handle : ProcedureReturn 0 : EndIf
+  ProcedureReturn sc_RunClaimed(SchedTake(handle))
 EndProcedure
 Procedure.i ScResult(handle.i)
   Protected slot.i
