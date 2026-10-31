@@ -38,7 +38,7 @@ def cases():
  add('raw-feed-legacy-refused',13,b'\0',57,10,consumed=0)
  return rows
 
-def build(compiler,out):
+def build(compiler,out,transform=None):
  root=Path(__file__).resolve().parents[1];out.mkdir(parents=True,exist_ok=False)
  hs=(root/'Anvil/Crypto/tls13_hs.pbi').read_text()
  names=re.findall(r';     XIncludeFile "([^"]+)"',hs)+['RaspberryPi4/Lib/mmu.pi4']
@@ -133,7 +133,9 @@ Procedure.i Main()
  Tls13PauseHook=@Yield : Tls13SetupPauseHook=@Yield
  TlsInitTables() : X25519Init()
 '''
- rows=cases();s+=f' PokeI($E1C00008,{len(rows)})\n'
+ rows=cases()
+ if transform is not None:s,rows,names=transform(s,rows,names)
+ s+=f' PokeI($E1C00008,{len(rows)})\n'
  for i,c in enumerate(rows):s+=f' Restore QuicTlsCase{i}\n Run({i},{c["mode"]},{len(bytes.fromhex(c["input"]))})\n'
  s+=' MmuDisableCachedFlushed()\n ProcedureReturn 0\nEndProcedure\nDataSection\nquic_alpn:\n Data.a 2,104,51\n'
  for i,c in enumerate(rows):s+=f'QuicTlsCase{i}:\n Data.a '+','.join(map(str,bytes.fromhex(c['input']) or b'\0'))+'\n'

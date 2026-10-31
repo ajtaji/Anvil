@@ -3843,3 +3843,40 @@ Cores, fonts and Vulkan remained healthy; watchdog off. Evidence is in
 This is physical execution of the receive component, not a live QUIC handshake.
 The installed monitor stays at 488. Connection ownership, frame dispatch and
 TLS handoff, recovery, streams, QPACK and live HTTP/3 qualification remain open.
+
+
+### Reassembled QUIC bytes handed to TLS
+
+`Anvil/Network/quic_tls_receive.pbi` adds `QuicCryptoTlsStep` after the complete
+shared TLS includes. The caller restores the correct TLS connection and
+selects its receive stream; this adapter does not own or switch connections.
+It offers at most 256 contiguous bytes to `Tls13FeedQuic` and consumes exactly
+the accepted count. A gap or empty/sealed stream returns zero. TLS still checks
+message boundaries and encryption levels, and retains the existing key schedule,
+certificate processing and Finished verification.
+
+After a successful receive-level transition, the old stream must seal without
+unconsumed data, including a gap followed by retained bytes. TLS failure or a
+failed transition poisons the stream (phase 3); Put and Step then refuse until
+fresh Init. Any negative Step result requires connection closure. A transition
+error can occur after TLS accepted bytes: its state is not rolled back. The
+caller must not retry on another stream or continue the connection. Restored
+TLS context and stream/storage require exclusive ownership for the call and
+across cooperative hooks. Input slicing is not a wall-clock certificate-work
+bound; install the existing cooperative TLS hooks. Packet authentication must
+precede insertion into receive streams.
+
+Capture 248 on Anvil 488 passed 18 scenarios using real shared TLS, X25519,
+HKDF and Finished processing: reordered/duplicate input, single-byte fragments,
+Initial-to-Handshake transition, wrong levels, gapped old data, Finished with
+trailing data, bad Finished, application tickets, forbidden KeyUpdate, exact
+consumed offsets, sealed-idle calls and repeat refusal after poisoning. Existing
+raw/record Finished output checks remain in the suite. Deterministic starting
+states isolate the boundaries; this does not prove certificate-chain processing
+or a live authenticated QUIC peer. The returning payload completed in 2.5 s;
+that is fixture duration, not handshake latency. Cores/fonts/Vulkan were healthy
+and the watchdog was off. Evidence: `docs/evidence/anvil-ipv6-20261030/quic-tls488`.
+
+Installed build 488 is unchanged. Packet dispatch, connection ownership,
+ACK/loss/congestion/flow handling, streams, QPACK and live HTTP/3 web traffic
+remain open, alongside the remaining TLS and off-link IPv6 qualification work.
