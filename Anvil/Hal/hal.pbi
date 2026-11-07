@@ -2972,3 +2972,17 @@ EndProcedure
 ; HwPmfTargetId() remains the board's independent positive identity. Both ISA
 ; and board must match before loading; unknown/zero backend identities refuse.
 ; A non-ARM backend does not inherit AArch64's numeric ID, stack or v1 policy.
+
+; PORTABLE PAYLOAD ENTRY CONTRACT
+; HwPayloadRun(entry.i, argument.i) enter through the selected ISA/board backend
+; The argument is the service-table address or zero. The backend maps it to
+; its entry calling convention and owns stack/context transfer, device
+; quiesce and recovery. On every return, including refusal before the jump,
+; clear any staged argument so it cannot leak to a later plain run. A payload
+; that does not return keeps control. An unsafe recovery must not resume
+; ordinary monitor work or unmask interrupts through unknown exception state.
+
+; RunAt(entry.i) legacy board launch policy used by the selected architecture
+; adapter and plain monitor commands. It retains that board's range/device,
+; watchdog and recovery behavior; portable container code uses HwPayloadRun
+; instead of staging a register argument for this one-argument legacy entry.

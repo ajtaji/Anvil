@@ -340,3 +340,36 @@ a mutant that substitutes the container's target for the board's fails six
 cases. The existing full boot-container test still executes a valid ARM
 payload and refuses corrupted/overlapping/conflicting-pointer containers.
 These desk proofs are separate from physical boot acceptance.
+
+## Payload entry and recovery boundary (2026-11-07)
+
+The common PMFBOOT engine calls `HwPayloadRun(entry, argument)` after validation
+and owner preparation. It supplies the service-table address or zero as a local
+value; it no longer reads or writes the ARM trampoline's `gGoX0` staging global.
+The architecture/board backend owns the register mapping and transition.
+
+The selected ARM gateway retains each board's existing `RunAt` quiesce,
+watchdog and return behavior. It clears its staged argument after every return,
+including a refusal before RunAt reaches its ordinary cleanup. This prevents
+a refused table-bearing launch from leaking that pointer to a later plain run.
+
+Pi 3 and UNO Q now select `Anvil/Kernel/AArch64/payload_call.pbi` explicitly.
+The old `Anvil/Kernel/payload_call.pbi` is a compatibility include for that ARM
+implementation, not an architecture selector for new machines. The ARM helper
+retains register clearing, the full return value, monitor SP recovery and
+interrupt masking before the board's recovery hook. If the hook reports failure,
+it now remains masked in a wait loop instead of restoring interrupts through
+unknown exception state. A failed recovery cannot safely return to normal work.
+Pi 4 retains its existing board-specific trampoline and its own fail-stop policy;
+unifying those two ARM implementations is separate work.
+
+`tools/payload_boundary_check.py` executes the real gateway on Zentaji with a
+controlled board adapter, the exact common PmfEnter procedure on emitted ARM
+with controlled owner providers, and the actual ARM trampoline. It checks
+zero/table arguments, preparation/refusal/cleanup, poisoned registers, a
+full-width result, destroyed-SP recovery, masked callback entry and a failed
+recovery park. A private copy restoring the old ignored-recovery bug must fail.
+This is bounded desk proof, not physical entry/recovery acceptance and not a
+Zentaji Anvil boot. A real Zentaji transition, its callable payload startup,
+service-table calling convention, exception/context code and module relocation
+backend remain to be implemented.

@@ -940,7 +940,7 @@ EndProcedure
 ;
 ;  Everything above has passed. This arms the monitor's entry point so
 ;  that a payload which returns leaves `run` pointing at the right place,
-;  says what is about to happen, and calls the board's RunAt() - the ONE
+;  says what is about to happen, and calls HwPayloadRun() - the ONE
 ;  place in this program a payload is entered, shared with `run` and with
 ;  `autoboot`, so the three cannot drift apart in what they flush, what
 ;  they stop and what they print.
@@ -954,6 +954,7 @@ XIncludeFile "Anvil/Hal/input_service.pbi"
 
 Procedure PmfEnter()
   Define graphicsRc.i,inputRc.i
+  Define entryArgument.i = 0
   gEntry = gPmfEntry
   gHaveEntry = 1
   If (gPmfFlags & #PMF_FLAG_WANTS_DTB) <> 0
@@ -969,7 +970,7 @@ Procedure PmfEnter()
 
   ; ------------------------------------------------------------------
   ;  THE HANDOVER. The one place in this monitor a payload is given
-  ;  anything in x0 at all.
+  ;  an entry argument at all.
   ;
   ;  THE TABLE IS BUILT HERE AND NOT AT START-UP, and that is worth a
   ;  line. BuildServiceTable() fills 184 pointers into the monitor's own
@@ -983,8 +984,8 @@ Procedure PmfEnter()
   ;  It is idempotent, so a second container in the same session refills
   ;  it rather than accumulating anything.
   ;
-  ;  RunAt() CLEARS gGoX0 ON THE WAY BACK OUT, so a plain `run` after
-  ;  this one is not handed a stale pointer. See RaspberryPi4/Board/cache.pi4.
+  ;  HwPayloadRun owns argument staging and cleanup, including entry refusal.
+  ;  The common engine does not select a register or touch a trampoline global.
   ; ------------------------------------------------------------------
   ; What SvcReturn is allowed to do. Anvil/Hal/abi.pbi is included before
   ; this file - it has to be, because this procedure calls
@@ -1004,22 +1005,20 @@ Procedure PmfEnter()
     CompilerEndIf
     graphicsRc=GraphicsServiceEnter()
     If graphicsRc<>0
-      gGoX0=0
       PrintN("!! resident graphics cleanup is still outstanding, so this payload was not entered.")
       Print("   Graphics status: ") : PrintDec(graphicsRc) : PrintNl()
       ProcedureReturn 0
     EndIf
     inputRc=InputServiceEnter()
     If inputRc<>0
-      gGoX0=0
       GraphicsServiceLeave()
       PrintN("!! resident input cleanup is still outstanding, so this payload was not entered.")
       Print("   Input status: ") : PrintDec(inputRc) : PrintNl()
       ProcedureReturn 0
     EndIf
-    gGoX0 = SvcTableAddr()
-    Print("This payload asked for the service table, so it is entered with x0 = ")
-    PutAddr(gGoX0)
+    entryArgument = SvcTableAddr()
+    Print("This payload asked for the service table, so it is entered with entry argument = ")
+    PutAddr(entryArgument)
     PrintNl()
     Print("  (ABI ")
     PrintDec(#SVC_ABI_MAJOR)
@@ -1029,14 +1028,14 @@ Procedure PmfEnter()
     PrintDec(#SVC_SLOT_COUNT)
     PrintN(" slots). It can call back into this monitor.")
   Else
-    gGoX0 = 0
+    entryArgument = 0
   EndIf
 
-  ; RunAt may never return. All validation, digest and ABI prose is complete,
+  ; HwPayloadRun may never return. All validation, digest and ABI prose is complete,
   ; so present it now rather than waiting for a prompt a healthy payload is
   ; not required to give back.
   ScreenServiceTick()
-  RunAt(gPmfEntry)
+  HwPayloadRun(gPmfEntry, entryArgument)
   If (gPmfFlags & #PMF_FLAG_WANTS_SERVICES) <> 0
     ; GPU targets retire this scope before their platform bus-master recovery.
     ; The idempotent fallback also covers targets with no graphics device and

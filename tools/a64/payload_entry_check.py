@@ -6,7 +6,7 @@ x1..x7 = 0 at its first instruction, and the monitor its own sp back when
 the payload returns. Until 2026-09-27 only the Pi 4 kept that promise: the
 Pi 3 entered with x0 = the entry address, the UNO Q with x0 = 0, and every
 gate modelled the table instead of entering through the board, so nothing
-noticed. Anvil/Kernel/payload_call.pbi is now the one entry, and this gate
+noticed. Anvil/Kernel/AArch64/payload_call.pbi is now the one entry, and this gate
 proves it ON THE REAL MONITOR IMAGES:
 
   For each of board.pi3 and board.unoq, the monitor is
@@ -74,7 +74,7 @@ BOARDS = {
 }
 BOARD_ID_SOURCE = {"pi3": "RaspberryPi3/Board/board.pi3",
                    "unoq": "ArduinoQ/Board/board.unoq"}
-TREES = ("Anvil", "RaspberryPi3", "ArduinoQ")
+TREES = ("Anvil", "RaspberryPi3", "ArduinoQ", "Shared")
 RETURN = d.RETURN
 DRIVER_STACK_GAP = 0x4000          # the gate's own frame below the monitor stack
 POISON = 0xD1ED_0000_0000_0000
@@ -393,16 +393,16 @@ def gate_board(cc: str, target: str, override: dict, work: pathlib.Path) -> list
 
 
 MUTANTS = [
-    ("Anvil/Kernel/payload_call.pbi", "x0 = the entry address (the Pi 3's old defect)",
+    ("Anvil/Kernel/AArch64/payload_call.pbi", "x0 = the entry address (the Pi 3's old defect)",
      "    adrp x0, global_ggox0\n    add  x0, x0, #:lo12:global_ggox0\n    ldr  x0, [x0]\n",
      "    mov  x0, x9\n", None),
-    ("Anvil/Kernel/payload_call.pbi", "x5..x7 not cleared",
+    ("Anvil/Kernel/AArch64/payload_call.pbi", "x5..x7 not cleared",
      "    movz x5, #0\n    movz x6, #0\n    movz x7, #0\n", "", None),
-    ("Anvil/Kernel/payload_call.pbi", "the monitor's sp not restored",
+    ("Anvil/Kernel/AArch64/payload_call.pbi", "the monitor's sp not restored",
      "    ldr  x11, [x10]\n    mov  sp, x11\n", "    ldr  x11, [x10]\n", None),
-    ("Anvil/Kernel/payload_call.pbi", "DAIF not restored",
+    ("Anvil/Kernel/AArch64/payload_call.pbi", "DAIF not restored",
      "    msr  daif, x11\n", "", None),
-    ("Anvil/Kernel/payload_call.pbi", "DAIF restored BEFORE the vectors are reinstalled",
+    ("Anvil/Kernel/AArch64/payload_call.pbi", "DAIF restored BEFORE the vectors are reinstalled",
      "    msr  daifset, #15\n", "", None),
     ("RaspberryPi3/Board/hw_board.pi3", "the Pi 3's old `blr x0` entry",
      "Procedure Pi3EnterPayload(a.i)\n  PayloadEnter(a)\nEndProcedure",
