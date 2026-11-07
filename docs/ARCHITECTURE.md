@@ -373,3 +373,32 @@ This is bounded desk proof, not physical entry/recovery acceptance and not a
 Zentaji Anvil boot. A real Zentaji transition, its callable payload startup,
 service-table calling convention, exception/context code and module relocation
 backend remain to be implemented.
+
+## Architecture-owned payload state (2026-11-07)
+
+Common state owns the selected payload entry and returned value. AArch64's
+saved monitor stack and x0 staging slots now live in
+`Anvil/Kernel/AArch64/payload_state.pbi`. Pi 4 selects this state explicitly;
+the common ARM trampoline and gateway select it through a guarded include.
+This lets another CPU use `Anvil/Core/state.pbi` without adopting ARM's
+register staging or stack-recovery storage. The focused boundary fixtures
+include that production state rather than redeclaring copies of its globals.
+
+The service ABI's entry section now states architecture-neutral requirements.
+[ABI_AARCH64.md](ABI_AARCH64.md) owns the existing register/stack/interrupt
+contract, including the mandatory EL3 requirement and the unresolved UNO Q
+entry gap. The old common ABI prose describing EL2 entry and a future
+privilege downshift was stale; it does not override the current architecture
+rule. No slot, signature, ABI version or trampoline instruction changed.
+Other remaining architecture dependencies in service diagnostics, modules and
+context handling still need their own CPU backends.
+
+The updated boundary check also compiles and executes the **actual complete**
+`Anvil/Core/state.pbi` closure on Zentaji with no architecture adapter selected.
+It checks zeroed independent buffers, full-width entry/result values and the
+real display connection policy through attach, redraw, spaced absence probes
+and detach. The ARM entry/recovery fixture includes the real private state
+file and still kills the old ignored-recovery mutant. Full monitor compilations
+passed for Pi 4 build495, Pi 3 build105 and UNO Q build103 using production
+Forge; these are desk artifacts, not new physical acceptance or staged card
+releases. Full Anvil/Zentaji boot remains open.

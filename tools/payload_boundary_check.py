@@ -14,8 +14,63 @@ import tempfile
 from pmf_compiler import resolve_compiler
 ROOT=Path(__file__).resolve().parents[1]
 
+SHARED_STATE = r'''
+IncludeFile "Anvil/Core/state.pbi"
+Procedure.i Main()
+  If gGoAddr<>0 Or gGoRc<>0 Or gLineLen<>0 Or gParseOk<>0
+    ProcedureReturn 1
+  EndIf
+  If gLine[0]<>0 Or gLine[#LINE_MAX+7]<>0 Or gRec[259]<>0 Or gName[1023]<>0 Or gHashOut[63]<>0 Or gNumBuf[31]<>0 Or gI2cBuf[263]<>0
+    ProcedureReturn 2
+  EndIf
+  gLine[#LINE_MAX+7]=11 : gRec[259]=22 : gName[1023]=33
+  gHashOut[63]=44 : gNumBuf[31]=55 : gI2cBuf[263]=66
+  gGoAddr=$1122334455667788 : gGoRc=-1234567890123
+  If gLine[#LINE_MAX+7]<>11 Or gRec[259]<>22 Or gName[1023]<>33 Or gHashOut[63]<>44 Or gNumBuf[31]<>55 Or gI2cBuf[263]<>66
+    ProcedureReturn 3
+  EndIf
+  If gGoAddr<>$1122334455667788 Or gGoRc<>-1234567890123
+    ProcedureReturn 4
+  EndIf
+  If ScreenConnectionState()<>#SCREEN_CONNECTION_DISABLED Or ScreenConnectionRegister(100)<>1
+    ProcedureReturn 5
+  EndIf
+  If ScreenConnectionNextAction(0)<>#SCREEN_CONNECTION_ACTION_PROBE Or ScreenConnectionNextAction(0)<>#SCREEN_CONNECTION_ACTION_NONE
+    ProcedureReturn 6
+  EndIf
+  If ScreenConnectionComplete(#SCREEN_CONNECTION_ACTION_PROBE,#SCREEN_CONNECTION_COMPLETE,0)<>1 Or ScreenConnectionNextAction(0)<>#SCREEN_CONNECTION_ACTION_ATTACH
+    ProcedureReturn 7
+  EndIf
+  If ScreenConnectionDisable()<>0 Or ScreenConnectionComplete(#SCREEN_CONNECTION_ACTION_ATTACH,#SCREEN_CONNECTION_COMPLETE,0)<>1
+    ProcedureReturn 8
+  EndIf
+  If ScreenConnectionNextAction(0)<>#SCREEN_CONNECTION_ACTION_REDRAW Or ScreenConnectionComplete(#SCREEN_CONNECTION_ACTION_REDRAW,#SCREEN_CONNECTION_COMPLETE,0)<>1
+    ProcedureReturn 9
+  EndIf
+  If ScreenConnectionState()<>#SCREEN_CONNECTION_ATTACHED Or ScreenConnectionGeneration()<>1 Or ScreenConnectionNextAction(99)<>#SCREEN_CONNECTION_ACTION_NONE
+    ProcedureReturn 10
+  EndIf
+  If ScreenConnectionNextAction(100)<>#SCREEN_CONNECTION_ACTION_PROBE Or ScreenConnectionComplete(#SCREEN_CONNECTION_ACTION_PROBE,#SCREEN_CONNECTION_RESULT_ABSENT,100)<>1
+    ProcedureReturn 11
+  EndIf
+  If ScreenConnectionState()<>#SCREEN_CONNECTION_ATTACHED Or ScreenConnectionNextAction(199)<>#SCREEN_CONNECTION_ACTION_NONE
+    ProcedureReturn 12
+  EndIf
+  If ScreenConnectionNextAction(200)<>#SCREEN_CONNECTION_ACTION_PROBE Or ScreenConnectionComplete(#SCREEN_CONNECTION_ACTION_PROBE,#SCREEN_CONNECTION_RESULT_ABSENT,200)<>1
+    ProcedureReturn 13
+  EndIf
+  If ScreenConnectionNextAction(200)<>#SCREEN_CONNECTION_ACTION_DETACH Or ScreenConnectionComplete(#SCREEN_CONNECTION_ACTION_DETACH,#SCREEN_CONNECTION_COMPLETE,200)<>1
+    ProcedureReturn 14
+  EndIf
+  If ScreenConnectionState()<>#SCREEN_CONNECTION_ABSENT Or ScreenConnectionDisable()<>1
+    ProcedureReturn 15
+  EndIf
+  ProcedureReturn 42
+EndProcedure
+'''
+
 GATEWAY = r'''
-Global gGoX0.i
+IncludeFile "Anvil/Kernel/AArch64/payload_state.pbi"
 Global test_arg.i
 Global test_entry.i
 Global test_refuse.i
@@ -52,9 +107,8 @@ EndProcedure
 '''
 ARM_PRELUDE = r'''
 Global gGoAddr.i
-Global gGoX0.i
 Global gGoRc.i
-Global gSp.i
+IncludeFile "Anvil/Kernel/AArch64/payload_state.pbi"
 Global test_recovery.i
 '''
 ARM_TAIL = r'''
@@ -221,6 +275,11 @@ def main():
         out=run([a.zenemu.resolve(),cfg,'--max','1000000'],env)
         assert 'exit=2A ' in out,out
         print('PASS actual payload gateway on Zentaji: full-width argument, normal/refused cleanup, next plain run, zero argument')
+        src.write_text(SHARED_STATE,encoding='utf-8')
+        run([cc,'--compile',src,'-o',image],env)
+        out=run([a.zenemu.resolve(),cfg,'--max','1000000'],env)
+        assert 'exit=2A ' in out,out
+        print('PASS actual common state on Zentaji: zeroed independent buffers, wide entry/result, full display attach/probe/detach lifecycle; no ARM backend selected')
         core=(ROOT/'Anvil/Kernel/AArch64/payload_call.pbi').read_text(encoding='utf-8')
         def build(text,name):
             src=td/(name+'.pi4');img=td/(name+'.img')

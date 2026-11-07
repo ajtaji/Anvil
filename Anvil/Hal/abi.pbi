@@ -1,5 +1,5 @@
 ; ======================================================================
-;  abi.pi4 - THE PAYLOAD ABI. The service table Anvil hands a payload.
+;  abi.pbi - THE PAYLOAD SERVICE ABI. The service table Anvil hands a payload.
 ;
 ;  ELD/Phase A - Anvil payload ABI - implementation brief.md is the
 ;  specification this file is built against, as amended on 2026-09-04
@@ -14,10 +14,11 @@
 ;  all - right for a diagnostic blob, useless for an application. Anvil
 ;  already owns a console, a filesystem, a radio, an IP stack, TLS, USB,
 ;  GPIO and I2C, all proven on silicon. The payload needs to reach them
-;  WITHOUT LEARNING THE NAME OF A SINGLE CHIP, so that the same bytes run
-;  on the Pi 4 today and on another board later.
+;  WITHOUT LEARNING THE NAME OF A SINGLE CHIP. Shared source compiles for
+;  each CPU; compatible machine code can run on another admitted board of
+;  that same architecture.
 ;
-;  The answer is one pointer, handed over in x0 at entry, behind a
+;  The answer is one pointer, handed over in the CPU backend's entry argument, behind a
 ;  versioned header, whose slots are procedure addresses into Anvil.
 ;
 ; ----------------------------------------------------------------------
@@ -55,66 +56,33 @@
 ;  Everything in this list is guaranteed. NOTHING ELSE IS. An Anvil worker
 ;  must not change any of it without raising #SVC_ABI_MAJOR.
 ;
-;    x0        the address of this service table. NEVER 0 for a payload
-;              that declared #PMF_FLAG_WANTS_SERVICES.
-;    x1..x7    ZERO. Not "unspecified" - zero, so that a payload which
-;              reads one gets a predictable value rather than whatever the
-;              monitor happened to leave there. Kept by CallAddr() in
-;              RaspberryPi4/Board/cache.pi4, in seven instructions,
-;              because a guarantee that costs nothing to keep and is
-;              documented as absent is a guarantee that becomes false
-;              silently.
-;    x8..x30   unspecified. The payload owns them.
-;    SP        the payload's own stack, at the address its --stack-addr
-;              declared, ALREADY SWITCHED. The payload's own prologue does
-;              that switch and does it under #PMF_FLAG_RETURNS too.
-;    EL        THE SAME LEVEL ANVIL RUNS AT, whatever that is. The payload
-;              does NOT change it, and it MUST NOT hard-code a number.
+;    argument  the address of this service table for a payload that declared
+;              #PMF_FLAG_WANTS_SERVICES, otherwise zero. The CPU backend
+;              maps this value to its own entry register/calling convention.
+;    stack     the architecture's validated stack contract, including its
+;              alignment, initial extent and startup switch convention.
+;    context   the monitor's required privileged context. AArch64 requires
+;              EL3; a Zentaji backend requires supervisor mode, not ARM EL3.
+;              A future lower-privilege payload gate is a separate ABI design,
+;              not permission to downshift the current monitor or payload.
+;    MMU and   whatever state the selected backend reports. SvcMmuState()
+;    caches    answers; payload code must ask rather than assume.
+;    IRQs      masked as required by the CPU's entry/return boundary, with
+;              the monitor's fault handling installed. Register names and
+;              recovery mechanisms belong to the architecture backend.
+;    image     placed at load, digest-verified there and BSS zeroed by the
+;              shared container engine before entry.
+;    cores     only the owning core executes the entry. Other cores remain
+;              under the board's owner until admitted by a parallel service.
+;    deadman   armed if the operator armed it. The payload must call SvcPet()
+;              in its own loop; the monitor does not pet it on its behalf.
 ;
-;              This said "EL2, Non-secure" until 2026-09-07, and it was a
-;              fact about one boot path being written down as a contract.
-;              Anvil runs at EL2 when the firmware's own arm stub loads
-;              it and at EL3 when RaspberryPi4/Board/armstub8.asm does,
-;              and a payload is entered at whichever it is. At EL3 the
-;              world is Secure, so "Non-secure" was wrong there too.
-;
-;              THIS IS NOT AN ABI BREAK AND DID NOT RAISE THE MAJOR, for
-;              a reason worth stating rather than assuming: no slot's
-;              signature changed and no payload can observe the level
-;              except through SvcMmuState() and its own CurrentEL read,
-;              both of which already answered truthfully. What changed is
-;              this sentence, which promised more than the monitor knew.
-;              A payload that BUILT IN the number 2 was relying on
-;              something never guaranteed - the line above it says the
-;              same about the MMU and the caches, and for the same
-;              reason: ASK, do not assume.
-;
-;              PHASE 2 will drop the payload to EL2 or EL1 under an EL3
-;              monitor, with an SMC gate in place of the direct function
-;              pointers in this table - a lower level cannot call an EL3
-;              address. That IS an ABI change and it will raise the
-;              major. Phase 1 calls payloads at the monitor's own level
-;              so that this table and every proof over it stay exactly
-;              as they are.
-;    MMU and   WHATEVER STATE ANVIL IS IN, which is not fixed and must not
-;    caches    be assumed. SvcMmuState() answers; the payload ASKS rather
-;              than guessing. (In practice RunAt hands over with the
-;              caches off, but that is behaviour, not contract.)
-;    IRQs      masked at DAIF. Anvil's fault vectors are installed and
-;              stay installed.
-;    image     placed at `load`, digest-verified AT THAT ADDRESS, BSS
-;              zeroed - all by Anvil/Core/pmfboot.pbi before entry.
-;    cores 1-3 parked. ABI 1.0 IS CORE-0 ONLY - see THE RE-ENTRANCY
-;              CONSTRAINT below.
-;    deadman   armed if the operator armed it. THE PAYLOAD CALLS SvcPet()
-;              IN ITS OWN LOOP. Anvil never pets it on the payload's
-;              behalf, because a monitor that petted a watchdog for a
-;              program it is not running would have disarmed the one thing
-;              that makes a bricked truck impossible.
-;
-;  CALLING CONVENTION for every slot: the standard one this backend
-;  already emits. Arguments in x0-x7, return in x0, x19-x28 callee-saved.
-;  A slot never writes the payload's stack below SP.
+;  CALLING CONVENTION for every slot: the convention of the admitted payload's
+;  CPU backend. Function pointers are executable only on that architecture;
+;  the service vocabulary does not make machine code portable across ISAs.
+;  The existing AArch64 register, stack and interrupt contract is preserved
+;  in docs/ABI_AARCH64.md. This refactor changes no slot, layout or signature
+;  and does not claim an implemented Zentaji service-table backend.
 ;
 ;  GETTING OUT, three ways, all explicit:
 ;    SvcReturn()  back to the prompt. Does not return. REQUIRES
@@ -873,29 +841,11 @@ Procedure.i SvcReturn()
     gSvcDetail = "this payload's container did not set bit 0, the returns-to-monitor flag"
     ProcedureReturn #SVC_EFLAG
   EndIf
-  ; ------------------------------------------------------------------
-  ;  NOT IMPLEMENTED IN ABI 1.0, AND THIS IS THE HONEST REASON RATHER
-  ;  THAN A PLAUSIBLE ONE.
-  ;
-  ;  The brief specifies SvcReturn as "back to the prompt, does not
-  ;  return". Delivering that means a LONGJMP: restore the monitor's SP
-  ;  from gSp and branch to the instruction after CallAddr's `blr x9`.
-  ;  gSp is saved and available; THE LANDING ADDRESS IS NOT. `blr` puts
-  ;  it in x30, which the payload owns and has certainly overwritten by
-  ;  the time it calls this, and capturing it BEFORE the branch needs a
-  ;  PC-relative constant or a label inside an inline-asm block - which
-  ;  is hand-written assembly whose correctness no compiler check can
-  ;  see, and RULES.md rule 9 is explicit about what that costs.
-  ;
-  ;  So this refuses, loudly, and says what to do instead. THE WORKING
-  ;  PATH IS THE PAYLOAD RETURNING FROM ITS OWN ENTRY: CallAddr enters
-  ;  with BLR precisely so that a payload built --entry-returns can `ret`
-  ;  back to the monitor, which is proven on silicon (2026-08-25) and is
-  ;  what pi4SvcProbe does.
-  ;
-  ;  Owed: a board seam HwReturnToMonitor(), saving the landing address
-  ;  in CallAddr beside gSp. It is small and it is not Phase A item 1.
-  ; ------------------------------------------------------------------
+  ; A nonlocal service return requires the architecture backend to retain
+  ; both a saved monitor context and a trusted recovery landing address.
+  ; Current backends do not implement this service. Returning from the
+  ; payload's own entry remains the supported path; a service must not
+  ; guess a saved stack or link-register layout from another architecture.
   gSvcDetail = "this monitor cannot unwind out of a payload from inside a service call; return from the payload's own entry point instead, which is what the returns-to-monitor flag is for"
   ProcedureReturn #SVC_ENOSYS
 EndProcedure

@@ -150,28 +150,11 @@ Global gHiHi.i                 ;            highest address written
 Global gEntry.i                ;            entry point
 Global gHaveEntry.i
 
-Global gGoAddr.i               ; in  to CallAddr
-Global gGoRc.i                 ; out of CallAddr - x0 at return
-Global gSp.i                   ; monitor sp saved across the payload
+Global gGoAddr.i               ; entry selected for a validated payload
+Global gGoRc.i                 ; full-width result returned to the monitor
 
-; WHAT THE PAYLOAD FINDS IN x0 AT ITS FIRST INSTRUCTION.
-;
-; Zero for everything this monitor has ever entered up to now - `run`,
-; `autoboot`, a flat image, a container without the wants-services flag -
-; and that zero is a GUARANTEE the payload ABI makes (Anvil/Hal/abi.pbi,
-; the entry contract), not an accident of what happened to be in the
-; register. The one caller that sets it non-zero is PmfEnter() in
-; Anvil/Core/pmfboot.pbi, for a container that declared
-; #PMF_FLAG_WANTS_SERVICES, and the value is then the address of the
-; service table.
-;
-; IT IS A GLOBAL AND NOT A PARAMETER TO RunAt, for the reason CallAddr's
-; own header gives about gGoAddr: everything crosses into that asm in BSS
-; globals, because the stack is the one thing a payload is guaranteed to
-; disturb. RunAt() clears it on every entry and the caller sets it after,
-; so a value left over from a previous boot cannot leak into a payload
-; that asked for nothing.
-Global gGoX0.i                 ; in  to CallAddr - what x0 holds at entry
+; Saved machine context and entry-register staging belong to the selected
+; CPU backend. Shared state does not define a stack register or an ISA ABI.
 
 ; ----------------------------------------------------------------------
 ;  THE MEMORY-FAMILY WIDTH SUFFIX  -  U-Boot's .b / .w / .l

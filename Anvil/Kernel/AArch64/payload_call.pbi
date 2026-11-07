@@ -26,7 +26,7 @@
 ;  IN   gGoAddr   where to branch (the board has already judged it)
 ;       gGoX0     what x0 holds at entry: the table, or 0
 ;  OUT  gGoRc     x0 at return, all 64 bits
-;  Everything crosses in BSS globals (Anvil/Core/state.pbi), because the
+;  Entry/result use shared BSS; private context uses payload_state.pbi, because the
 ;  stack is the one thing a payload is guaranteed to disturb.
 ;
 ;  WHAT IS RESTORED ON THE WAY BACK, AND WHAT IS NOT
@@ -59,6 +59,8 @@
 Global gPayloadDaif.i          ; DAIF across the branch, restored after
 
 Declare.i HwPayloadReturned()  ; the board's half - Anvil/Hal/hal.pbi, HwPayload*
+
+XIncludeFile "Anvil/Kernel/AArch64/payload_state.pbi"
 
 Procedure PayloadCall()
   ASM
