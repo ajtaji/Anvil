@@ -67,7 +67,7 @@ CREDENTIAL_LITERAL_RE = re.compile(
 TEXT_SUFFIXES = {
     "", ".asm", ".board", ".def", ".example", ".gitattributes", ".gitignore",
     ".in", ".json", ".md", ".pb", ".pbi", ".pi3", ".pi4", ".py",
-    ".rockpi4c", ".rsp", ".sh", ".txt", ".unoq", ".pmi", ".zentaji",
+    ".rockpi4c", ".rsp", ".sh", ".txt", ".unoq", ".pmi", ".zentaji", ".zen",
 }
 
 

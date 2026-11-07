@@ -124,7 +124,70 @@ network, radio maintenance and log-file notification are counted test adapters.
 They are not implemented Zentaji devices. This is still a component composition,
 not a complete monitor image, command dispatcher, ROM boot or physical input proof.
 
-Next are complete board startup/vector ownership, storage backends,
+## Owned privileged entry and ROM handoff
+
+`Anvil/Kernel/Zentaji/startup.zen` now establishes Anvil's supervisor entry.
+It runs before an ordinary compiled frame and uses no incoming stack. It checks
+core 0, reset STATUS, disabled page protection, the documented device table and
+boot source, actual RAM and image/stack separation. Successful entry installs
+a 4 KB-aligned table for all 64 causes and a private stack below the ROM's top 1 MB
+workspace. Other cores stay parked. Interrupt delivery stays masked; the board
+still owns routing and the later idle-timer reservation.
+
+Compiled entry receives r1=device table, r2=boot source and r3=context, with
+r4..r15 zero and a valid return link. Callable `--entry-returns` startup
+may return its result to a final halt; ordinary Forge startup halts itself.
+The 128-byte version1 context records the incoming stack, actual RAM,
+owned stack bounds, vectors and image extent. `boot_context.pbi` supplies the
+field constants and bounded validation for the compiled monitor. Default stack
+size is64 KB; the packer accepts aligned sizes 16 KB..1 MB and startup checks that
+the selected size fits the actual machine. At least 2 MB RAM is required.
+
+Every unhandled cause reports cause/PC/info on serial0 and halts. Causes 13..15
+use NEPC/NEINFO; other causes use EPC/EINFO. The report has no stack dependency
+and bypasses ordinary console/message state. Raw output skips an active TX block
+transfer and has a finite 4096-probe budget per byte under FIFO pressure. This is
+best-effort fail-stop reporting, not trap resumption, page-protection recovery,
+payload return recovery or secondary-core startup.
+
+Wrap a Forge result and its matching compiler source map:
+
+```text
+python tools/zentaji_boot_image.py compiled.zex anvil-entry.zex --zasm <zasm executable>
+```
+
+The original payload stays at its original addresses, without relocation. BSS
+becomes zero bytes at its original addresses before the appended startup slab.
+The output is a supervisor ZEX with a new entry and CRC; input flags/reserved
+fields, extents and CRC are checked, with a 64 MB input payload/BSS pack limit.
+The tool emits `.boot.json`, `.asm` and `.zmap` beside the image and publishes
+all four as one rollback transaction. It refuses collisions with its compiler
+inputs, input source map or startup source. This tool supplies architecture
+entry, not a board composition or PMFBOOT architecture identifier.
+
+The merged map retains the compiler's exact instruction rows and source hashes.
+New startup rows come from the production ASM assembler, rebound to the actual
+startup file and physical lines. Embedded guest data, padding and LIQ trailing
+words acquire no synthetic breakpoints. The map hashes the final wrapped image;
+invalid input identity, rows or merged limits refuse before publication.
+
+```text
+python tools/zentaji_startup_check.py --compiler <Forge executable> --zen-tools <tools/zentaji directory>
+```
+
+Twenty real native/twin full-state/RAM cases check direct entry, RAM rounding,
+owned SP/EVEC/context, rejected table/status/core/source/protection/size/overlap,
+original BSS, minimum stack, callable entry return, damaged-SP BRK and raw TX-block exclusion, NMI and
+watchdog reporting. All64 vector slots are independently checked. Both actual
+ROM boot routes load the compiled entry and then also reach the complete shared
+ReadLine composition with timed serial input and service/message activity.
+The latter still uses the previously documented counted adapters for unavailable
+hardware. Native source break/step reaches startup and original language source;
+publication rollback, input collisions and damaged maps are checked too.
+Actual host MCHECK injection, visible input and Linux remain unverified.
+
+Next are the production monitor command composition and startup integration,
+storage backends,
 the remaining runtime/compiler facilities and production payload/service ABI.
 ROM must load Anvil, and Anvil must then reach the shared prompt and load
 applications. The built-in Forge must ultimately target Zentaji itself only.

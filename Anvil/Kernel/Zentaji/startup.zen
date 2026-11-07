@@ -1,0 +1,418 @@
+; Zentaji privileged entry and fail-stop vectors for a compiled Anvil image.
+; WHAT: validate the ROM/direct-load handoff, own a bounded stack and EVEC,
+; and pass device table, boot source and a versioned context to compiled entry.
+; HOW: the packer supplies ZEN_* constants and embeds the original guest bytes
+; unchanged before this 4KB-aligned vector slab. No incoming stack is used.
+; WHY ASM: SP/EVEC and exception registers must be established before an ordinary
+; frame exists. Fault reporting must also work when a payload has damaged SP.
+; This is guest architecture code, not a host wait or compiler intrinsic.
+; IE stays masked. Unhandled exceptions halt; recovery/secondary startup is
+; separate work. The board owns interrupt routing and its later idle reservation.
+
+.org ZEN_VECTOR_BASE
+anvil_zen_vectors:
+.org ZEN_VECTOR_BASE+0
+  LI r200,0
+  JMP anvil_zen_fault
+.org ZEN_VECTOR_BASE+64
+  LI r200,1
+  JMP anvil_zen_fault
+.org ZEN_VECTOR_BASE+128
+  LI r200,2
+  JMP anvil_zen_fault
+.org ZEN_VECTOR_BASE+192
+  LI r200,3
+  JMP anvil_zen_fault
+.org ZEN_VECTOR_BASE+256
+  LI r200,4
+  JMP anvil_zen_fault
+.org ZEN_VECTOR_BASE+320
+  LI r200,5
+  JMP anvil_zen_fault
+.org ZEN_VECTOR_BASE+384
+  LI r200,6
+  JMP anvil_zen_fault
+.org ZEN_VECTOR_BASE+448
+  LI r200,7
+  JMP anvil_zen_fault
+.org ZEN_VECTOR_BASE+512
+  LI r200,8
+  JMP anvil_zen_fault
+.org ZEN_VECTOR_BASE+576
+  LI r200,9
+  JMP anvil_zen_fault
+.org ZEN_VECTOR_BASE+640
+  LI r200,10
+  JMP anvil_zen_fault
+.org ZEN_VECTOR_BASE+704
+  LI r200,11
+  JMP anvil_zen_fault
+.org ZEN_VECTOR_BASE+768
+  LI r200,12
+  JMP anvil_zen_fault
+.org ZEN_VECTOR_BASE+832
+  LI r200,13
+  JMP anvil_zen_fault
+.org ZEN_VECTOR_BASE+896
+  LI r200,14
+  JMP anvil_zen_fault
+.org ZEN_VECTOR_BASE+960
+  LI r200,15
+  JMP anvil_zen_fault
+.org ZEN_VECTOR_BASE+1024
+  LI r200,16
+  JMP anvil_zen_fault
+.org ZEN_VECTOR_BASE+1088
+  LI r200,17
+  JMP anvil_zen_fault
+.org ZEN_VECTOR_BASE+1152
+  LI r200,18
+  JMP anvil_zen_fault
+.org ZEN_VECTOR_BASE+1216
+  LI r200,19
+  JMP anvil_zen_fault
+.org ZEN_VECTOR_BASE+1280
+  LI r200,20
+  JMP anvil_zen_fault
+.org ZEN_VECTOR_BASE+1344
+  LI r200,21
+  JMP anvil_zen_fault
+.org ZEN_VECTOR_BASE+1408
+  LI r200,22
+  JMP anvil_zen_fault
+.org ZEN_VECTOR_BASE+1472
+  LI r200,23
+  JMP anvil_zen_fault
+.org ZEN_VECTOR_BASE+1536
+  LI r200,24
+  JMP anvil_zen_fault
+.org ZEN_VECTOR_BASE+1600
+  LI r200,25
+  JMP anvil_zen_fault
+.org ZEN_VECTOR_BASE+1664
+  LI r200,26
+  JMP anvil_zen_fault
+.org ZEN_VECTOR_BASE+1728
+  LI r200,27
+  JMP anvil_zen_fault
+.org ZEN_VECTOR_BASE+1792
+  LI r200,28
+  JMP anvil_zen_fault
+.org ZEN_VECTOR_BASE+1856
+  LI r200,29
+  JMP anvil_zen_fault
+.org ZEN_VECTOR_BASE+1920
+  LI r200,30
+  JMP anvil_zen_fault
+.org ZEN_VECTOR_BASE+1984
+  LI r200,31
+  JMP anvil_zen_fault
+.org ZEN_VECTOR_BASE+2048
+  LI r200,32
+  JMP anvil_zen_fault
+.org ZEN_VECTOR_BASE+2112
+  LI r200,33
+  JMP anvil_zen_fault
+.org ZEN_VECTOR_BASE+2176
+  LI r200,34
+  JMP anvil_zen_fault
+.org ZEN_VECTOR_BASE+2240
+  LI r200,35
+  JMP anvil_zen_fault
+.org ZEN_VECTOR_BASE+2304
+  LI r200,36
+  JMP anvil_zen_fault
+.org ZEN_VECTOR_BASE+2368
+  LI r200,37
+  JMP anvil_zen_fault
+.org ZEN_VECTOR_BASE+2432
+  LI r200,38
+  JMP anvil_zen_fault
+.org ZEN_VECTOR_BASE+2496
+  LI r200,39
+  JMP anvil_zen_fault
+.org ZEN_VECTOR_BASE+2560
+  LI r200,40
+  JMP anvil_zen_fault
+.org ZEN_VECTOR_BASE+2624
+  LI r200,41
+  JMP anvil_zen_fault
+.org ZEN_VECTOR_BASE+2688
+  LI r200,42
+  JMP anvil_zen_fault
+.org ZEN_VECTOR_BASE+2752
+  LI r200,43
+  JMP anvil_zen_fault
+.org ZEN_VECTOR_BASE+2816
+  LI r200,44
+  JMP anvil_zen_fault
+.org ZEN_VECTOR_BASE+2880
+  LI r200,45
+  JMP anvil_zen_fault
+.org ZEN_VECTOR_BASE+2944
+  LI r200,46
+  JMP anvil_zen_fault
+.org ZEN_VECTOR_BASE+3008
+  LI r200,47
+  JMP anvil_zen_fault
+.org ZEN_VECTOR_BASE+3072
+  LI r200,48
+  JMP anvil_zen_fault
+.org ZEN_VECTOR_BASE+3136
+  LI r200,49
+  JMP anvil_zen_fault
+.org ZEN_VECTOR_BASE+3200
+  LI r200,50
+  JMP anvil_zen_fault
+.org ZEN_VECTOR_BASE+3264
+  LI r200,51
+  JMP anvil_zen_fault
+.org ZEN_VECTOR_BASE+3328
+  LI r200,52
+  JMP anvil_zen_fault
+.org ZEN_VECTOR_BASE+3392
+  LI r200,53
+  JMP anvil_zen_fault
+.org ZEN_VECTOR_BASE+3456
+  LI r200,54
+  JMP anvil_zen_fault
+.org ZEN_VECTOR_BASE+3520
+  LI r200,55
+  JMP anvil_zen_fault
+.org ZEN_VECTOR_BASE+3584
+  LI r200,56
+  JMP anvil_zen_fault
+.org ZEN_VECTOR_BASE+3648
+  LI r200,57
+  JMP anvil_zen_fault
+.org ZEN_VECTOR_BASE+3712
+  LI r200,58
+  JMP anvil_zen_fault
+.org ZEN_VECTOR_BASE+3776
+  LI r200,59
+  JMP anvil_zen_fault
+.org ZEN_VECTOR_BASE+3840
+  LI r200,60
+  JMP anvil_zen_fault
+.org ZEN_VECTOR_BASE+3904
+  LI r200,61
+  JMP anvil_zen_fault
+.org ZEN_VECTOR_BASE+3968
+  LI r200,62
+  JMP anvil_zen_fault
+.org ZEN_VECTOR_BASE+4032
+  LI r200,63
+  JMP anvil_zen_fault
+
+.org ZEN_VECTOR_BASE+4096
+anvil_zen_entry:
+  ; Only the documented boot table pointer is dereferenced.
+  LIQ r4,$FFFF000000010000
+  BNE r1,r4,anvil_bad_table
+  MFCR r4,STATUS
+  BNEI r4,0,anvil_bad_status
+  MFCR r4,COREID
+  BNEI r4,0,anvil_bad_core
+  MFCR r4,PROT
+  BNEI r4,0,anvil_bad_protection
+  LD64 r4,[r1]
+  LIQ r5,$00494A41544E455A
+  BNE r4,r5,anvil_bad_table
+  LD16U r4,[r1+8]
+  BNEI r4,1,anvil_bad_table
+  LD16U r4,[r1+10]
+  BNEI r4,64,anvil_bad_table
+  LD32U r4,[r1+20]
+  BNEI r4,64,anvil_bad_table
+  LD32U r4,[r1+16]
+  BEQI r4,0,anvil_bad_table
+  LI r5,1023
+  BLTU r5,r4,anvil_bad_table
+  LI r5,6
+  SHL r4,r4,r5
+  ADDI r4,r4,64
+  LD32U r5,[r1+12]
+  BLTU r5,r4,anvil_bad_table
+  LI r4,65536
+  BLTU r4,r5,anvil_bad_table
+  LI r4,3
+  BGEU r2,r4,anvil_bad_source
+  LD8U r4,[r1+35]
+  BNE r2,r4,anvil_bad_source
+  LD64 r4,[r1+24]
+  LI r5,$200000
+  BLTU r4,r5,anvil_bad_ram
+  LIQ r5,$8000000000000000
+  BGEU r4,r5,anvil_bad_ram
+  ; Preserve the ROM's top 1MB work area, including its service storage.
+  LI r5,-16
+  AND r6,r4,r5
+  ADDI r6,r6,-1048576
+  LI r5,ZEN_STACK_BYTES
+  SUB r7,r6,r5
+  LIQ r15,anvil_zen_image_end
+  BLTU r7,r15,anvil_bad_overlap
+  LIQ r3,anvil_zen_context
+  ST64 r1,[r3+24]
+  ST64 r2,[r3+32]
+  ST64 r4,[r3+40]
+  ST64 r255,[r3+48]
+  ST64 r7,[r3+56]
+  ST64 r6,[r3+64]
+  MFCR r4,STATUS
+  ST64 r4,[r3+88]
+  LIQ r4,anvil_zen_vectors
+  MTCR r0,r4,EVEC
+  OR r255,r6,r0
+  ; r1/r2 stay the loader's values; r3 is the owned context. Clear other
+  ; argument registers so compiled entry never inherits validation scratch.
+  LI r4,0
+  LI r5,0
+  LI r6,0
+  LI r7,0
+  LI r8,0
+  LI r9,0
+  LI r10,0
+  LI r11,0
+  LI r12,0
+  LI r13,0
+  LI r14,0
+  LI r15,0
+  LIQ r16,ZEN_COMPILED_ENTRY
+  CALLR r16,r254
+anvil_zen_returned:
+  ; Callable startup may return; ordinary Forge startup already halts itself.
+  HALT r1
+anvil_bad_table:
+  LI r200,1
+  JMP anvil_zen_refuse
+anvil_bad_status:
+  LI r200,2
+  JMP anvil_zen_refuse
+anvil_bad_core:
+  LI r200,3
+  JMP anvil_zen_refuse
+anvil_bad_protection:
+  LI r200,4
+  JMP anvil_zen_refuse
+anvil_bad_source:
+  LI r200,5
+  JMP anvil_zen_refuse
+anvil_bad_ram:
+  LI r200,6
+  JMP anvil_zen_refuse
+anvil_bad_overlap:
+  LI r200,7
+anvil_zen_refuse:
+  LIQ r1,anvil_zen_refusal_text
+  CALL r254,anvil_zen_puts
+  OR r1,r200,r0
+  CALL r254,anvil_zen_hex
+  LI r1,13
+  CALL r254,anvil_zen_putc
+  LI r1,10
+  CALL r254,anvil_zen_putc
+  HALT r200
+
+anvil_zen_fault:
+  ; No stack or ordinary monitor/console state is trusted by this path.
+  LI r4,13
+  BLTU r200,r4,anvil_zen_sync_fault
+  LI r4,16
+  BGEU r200,r4,anvil_zen_sync_fault
+  MFCR r201,NEPC
+  MFCR r202,NEINFO
+  JMP anvil_zen_fault_report
+anvil_zen_sync_fault:
+  MFCR r201,EPC
+  MFCR r202,EINFO
+anvil_zen_fault_report:
+  LIQ r1,anvil_zen_fault_text
+  CALL r254,anvil_zen_puts
+  OR r1,r200,r0
+  CALL r254,anvil_zen_hex
+  LIQ r1,anvil_zen_pc_text
+  CALL r254,anvil_zen_puts
+  OR r1,r201,r0
+  CALL r254,anvil_zen_hex
+  LIQ r1,anvil_zen_info_text
+  CALL r254,anvil_zen_puts
+  OR r1,r202,r0
+  CALL r254,anvil_zen_hex
+  LI r1,13
+  CALL r254,anvil_zen_putc
+  LI r1,10
+  CALL r254,anvil_zen_putc
+  ADDI r200,r200,256
+  HALT r200
+
+; Best-effort raw serial0 output. Each byte has a finite 4096-probe budget;
+; full/busy transport drops that byte. No stack, timer or interrupt is needed.
+anvil_zen_putc:
+  LIQ r16,$FFFF000000100000
+  LI r17,4096
+anvil_zen_putc_probe:
+  LD64 r18,[r16+8]
+  LI r19,16
+  AND r18,r18,r19
+  BNEI r18,0,anvil_zen_putc_done
+  LD64 r18,[r16+$58]
+  BNEI r18,0,anvil_zen_putc_write
+  ADDI r17,r17,-1
+  BNEI r17,0,anvil_zen_putc_probe
+anvil_zen_putc_done:
+  JR r254
+anvil_zen_putc_write:
+  ST64 r1,[r16+$40]
+  JR r254
+anvil_zen_puts:
+  OR r21,r254,r0
+  OR r22,r1,r0
+anvil_zen_puts_next:
+  LD8U r1,[r22]
+  BEQI r1,0,anvil_zen_puts_done
+  CALL r254,anvil_zen_putc
+  ADDI r22,r22,1
+  JMP anvil_zen_puts_next
+anvil_zen_puts_done:
+  JR r21
+anvil_zen_hex:
+  OR r20,r254,r0
+  OR r8,r1,r0
+  LI r9,16
+  LI r10,60
+  LI r11,15
+anvil_zen_hex_next:
+  SHR r1,r8,r10
+  AND r1,r1,r11
+  LI r12,10
+  BLTU r1,r12,anvil_zen_hex_digit
+  ADDI r1,r1,55
+  JMP anvil_zen_hex_emit
+anvil_zen_hex_digit:
+  ADDI r1,r1,48
+anvil_zen_hex_emit:
+  CALL r254,anvil_zen_putc
+  ADDI r10,r10,-4
+  ADDI r9,r9,-1
+  BNEI r9,0,anvil_zen_hex_next
+  JR r20
+anvil_zen_refusal_text:
+  .ascii "Anvil startup refused code="
+  .byte 0
+anvil_zen_fault_text:
+  .ascii "Anvil exception cause="
+  .byte 0
+anvil_zen_pc_text:
+  .ascii " pc="
+  .byte 0
+anvil_zen_info_text:
+  .ascii " info="
+  .byte 0
+.align 16
+anvil_zen_context:
+  ; magic, version, size; device table/source/RAM/loader SP/stack bottom/top;
+  ; vectors, compiled entry, saved STATUS, image extent, stack size, reserved.
+  .word $4E455A4C49564E41,1,128,0,0,0,0,0,0
+  .word anvil_zen_vectors,ZEN_COMPILED_ENTRY,0,ZEN_IMAGE_LOAD,anvil_zen_image_end,ZEN_STACK_BYTES,0
+anvil_zen_image_end:

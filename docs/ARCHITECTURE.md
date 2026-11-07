@@ -477,3 +477,31 @@ Counted full ARM monitor builds pass with signed production Forge `2f134c743`:
 Pi4 build497, Pi3 build107 and UNO Q build105. These are desk artifacts, not
 physical deployments or card releases. Startup/vectors, storage, the command
 composition and production payload/service ABI still block full Zentaji boot.
+
+
+## Zentaji startup ownership and wrapped guest maps (2026-11-07)
+
+`Anvil/Kernel/Zentaji/startup.zen` is architecture entry before compiled code,
+with supervisor/reset handoff validation, a stack below the ROM's reserved 1 MB,
+all 64 fail-stop vectors and a versioned context in r3. Boot table/source stay
+in r1/r2 and interrupts stay masked. `boot_context.pbi` owns the context fields
+and validation. No ARM privilege model or register contract is imposed on this
+backend. Recovery/resumption, secondary startup and the production payload ABI
+remain separate work.
+
+`tools/zentaji_boot_image.py` keeps compiled bytes/addresses and original BSS
+positions fixed, appends aligned startup/vectors and publishes ZEX plus source
+map, assembly and metadata as a rollback transaction. Native assembler rows
+supply the startup locations; original language rows/hashes remain unchanged.
+All are bound to the final image. An actual native debugger break/step checks
+both sides. The packer does not assign a Zentaji PMFBOOT identity or pretend to
+supply the rest of the monitor composition.
+
+Twenty native/twin full-state/RAM cases cover successful/refused entry, owned
+resources, BSS, damaged-SP BRK, TX-block ownership, NMI/watchdog and both real ROM
+boot routes. Both routes also reach the actual shared ReadLine/input/editor/
+scheduler/messages over the hardware backend, with timed input. Unavailable
+service/device providers remain counted adapters. This is the ROM/startup/core
+composition proof; a production command composition, storage and payload/service
+ABI are still required for a complete Anvil image. No ARM source or native
+compiler/emulator executable changed, so unchanged monitor builds were not rerun.
