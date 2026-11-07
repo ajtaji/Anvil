@@ -402,3 +402,21 @@ file and still kills the old ignored-recovery mutant. Full monitor compilations
 passed for Pi 4 build495, Pi 3 build105 and UNO Q build103 using production
 Forge; these are desk artifacts, not new physical acceptance or staged card
 releases. Full Anvil/Zentaji boot remains open.
+
+## Zentaji clock and bounded idle backend (2026-11-07)
+
+`Zentaji/Board/prompt_idle.pbi` now implements the common idle HAL over real
+per-core timer MMIO and the shipped Zentaji CPU runtime, preserved verbatim
+in `Anvil/Kernel/Zentaji/zen_cpu.pbi`. The board explicitly reserves its
+calling-core timer and owns line1 admission; the backend does not reconfigure
+global timers or interrupt-controller routing. It masks delivery around WFI,
+which still wakes on an admitted interrupt, clears its timer reason and restores
+the prior STATUS before returning. The shared scheduler continues to own work,
+input and utilization policy. See [the Zentaji bring-up contract](../Zentaji/README.md)
+for registration, bounds, resource ownership and proof scope.
+
+The actual backend and shared scheduler pass32 native/twin full-state/RAM cases
+on cores0/1, plus a two-second headless live run with active service lanes and
+recorded replay. Initial measured startup-adjusted CPU was0.015625s over1.994336s
+wall. No complete Zentaji monitor is linked yet; ROM boot, vectors, remaining
+board devices/runtime and the production payload ABI are still open.

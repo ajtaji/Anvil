@@ -167,3 +167,7 @@
 ; rather than shared, so a future divergence is a compile-time question
 ; instead of a silent one.
 #MOD_TEMP_NONE = -273151
+
+; Prompt idle, selected per architecture/board. The complete bounded-wait
+; and context-preservation contract lives in Anvil/Hal/prompt_idle.pbi.
+; HwPromptIdleReady() / HwPromptIdleWait() / HwPromptBoardService()

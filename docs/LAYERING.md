@@ -41,10 +41,10 @@ three moves landed.
 ### 1. No downward call
 
 Every `Procedure` / `ProcedureNaked` definition in the tree is indexed, in
-every extension the compiler knows: `.pbi .pi4 .pi3 .unoq .rockpi4c .pb`.
+every extension the compiler knows: `.pbi .pi4 .pi3 .unoq .rockpi4c .zentaji .pb`.
 Names are matched **case-insensitively**, because they are case-insensitive
 in this language. A file under `Anvil/` is shared; a file under
-`RaspberryPi3/`, `RaspberryPi4/`, `RockPi4C/` or `ArduinoQ/` is board.
+`RaspberryPi3/`, `RaspberryPi4/`, `RockPi4C/`, `ArduinoQ/` or `Zentaji/` is board.
 
 A call from a shared file to a name that **only** board folders define is a
 downward call. A name defined in a shared file as well is not — it resolves
@@ -547,3 +547,9 @@ the file. Calls in declaration initializers remain checked, and a local name
 does not exempt a procedure address in another scope. Explicit calls remain
 visible. The self-test covers these cases alongside the existing planted
 violations. No name-specific exemption or increased ratchet limit is needed.
+
+Zentaji's board root and `.zentaji` program extension participate in all
+layering rules. Self-tests plant a Zentaji downward call/include and a board
+extension under the shared core, so a new ISA cannot become an unindexed
+exception. Prompt idle methods are explicitly declared seams; their selected
+CPU/board implementations remain mutually exclusive in an image.

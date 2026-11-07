@@ -54,13 +54,13 @@ RATCHET = Path(__file__).resolve().parent / "layering_ratchet.json"
 # The compiler keys off the extension, so the extension set IS the scope.
 # .pi3 and .rockpi4c are in it because two other gates forgot them and went
 # blind on two whole boards.
-SOURCE_EXTS = (".pbi", ".pi4", ".pi3", ".unoq", ".rockpi4c", ".pb")
+SOURCE_EXTS = (".pbi", ".pi4", ".pi3", ".unoq", ".rockpi4c", ".zentaji", ".pb")
 
 # A board extension inside the shared tree is the tree lying about itself.
-BOARD_EXTS = (".pi4", ".pi3", ".unoq", ".rockpi4c")
+BOARD_EXTS = (".pi4", ".pi3", ".unoq", ".rockpi4c", ".zentaji")
 
 SHARED_ROOT = "Anvil/"
-BOARD_ROOTS = ("RaspberryPi3/", "RaspberryPi4/", "RockPi4C/", "ArduinoQ/")
+BOARD_ROOTS = ("RaspberryPi3/", "RaspberryPi4/", "RockPi4C/", "ArduinoQ/", "Zentaji/")
 
 # Compiler-selected registries, not a list of exempt symbol spellings. These
 # identify builtins for board callers only; shared code still owes a HAL seam.
@@ -1034,6 +1034,11 @@ SELF_TEST_TREE["Anvil/Core/runtime_hidden.pbi"] = (
     "Procedure RuntimeHidden()\n  str_Hidden()\nEndProcedure\n"
 )
 
+SELF_TEST_TREE["Zentaji/Board/private.zentaji"] = "Procedure ZentajiBoardOnly()\nEndProcedure\n"
+SELF_TEST_TREE["Anvil/Core/zentaji_down.pbi"] = "Procedure WrongZentajiDependency()\nZentajiBoardOnly()\nEndProcedure\n"
+SELF_TEST_TREE["Anvil/Core/zentaji_include.pbi"] = 'XIncludeFile "Zentaji/Board/private.zentaji"\n'
+SELF_TEST_TREE["Anvil/Core/incorrect.zentaji"] = "Procedure NonNeutralEntry()\nEndProcedure\n"
+
 def self_test():
     failures = []
     sha_pairs = "Data.l $428A2F98, $D728AE22, $71374491, $23EF65CD, $6A09E667, $F3BCC908, $BB67AE85, $84CAA73B\n"
@@ -1085,6 +1090,9 @@ def self_test():
         want("Anvil/Core/reaches_down.pbi" in dcall
              and "BoardOnlyThing" in dcall.get("Anvil/Core/reaches_down.pbi", {}),
              "rule 1 red on the planted downward call")
+        want(dcall.get("Anvil/Core/zentaji_down.pbi") == {"ZentajiBoardOnly": 1}
+             and dincl.get("Anvil/Core/zentaji_include.pbi", {}).get("Zentaji/Board/private.zentaji") == 1,
+             "Zentaji board procedures/includes and .zentaji roots participate in layering")
         want("Anvil/Core/legal.pbi" not in dcall,
              "rule 1 quiet on the declared console seam and the Hw* family")
         want(dcall.get("Anvil/Core/address_storage.pbi") == {"BoardOnlyThing": 1},
@@ -1100,7 +1108,7 @@ def self_test():
         want(dincl.get("Anvil/Graphics/Vulkan/includes_down_relative.pbi", {}).get(
              "RaspberryPi4/Lib/board_lib.pi4") == 1,
              "rule 2a red on the same include written as a relative path")
-        want(bext == ["Anvil/Graphics/planted_backend.pi4"],
+        want(bext == ["Anvil/Core/incorrect.zentaji", "Anvil/Graphics/planted_backend.pi4"],
              "rule 2b red on the planted board-extension file under Anvil/")
         crc = proto.get("crc32-polynomial", {})
         counters = proto.get("generic-timer-read", {})
