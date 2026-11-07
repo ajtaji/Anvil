@@ -187,7 +187,72 @@ publication rollback, input collisions and damaged maps are checked too.
 Actual host MCHECK injection, visible input and Linux remain unverified.
 
 Next are the production monitor command composition and startup integration,
-storage backends,
+storage facade integration and durable host disk backing,
 the remaining runtime/compiler facilities and production payload/service ABI.
 ROM must load Anvil, and Anvil must then reach the shared prompt and load
 applications. The built-in Forge must ultimately target Zentaji itself only.
+
+
+## Block storage and shared FAT32
+
+`Zentaji/Board/disk.pbi` supplies the existing filesystem range callbacks over
+Zentaji's 4096-byte block device. Register `ZentajiDiskRead`, `ZentajiDiskWrite`
+and `ZentajiDiskFlush` with `FatSetRangeReader`, `FatSetRangeWriter` and
+`FatSetBlockFlusher`. The shared filesystem continues to use 512-byte sectors;
+partial physical-block writes use read/modify/write. There is one serialized
+controller owner on one core and one outstanding command. Other medium writers
+must be excluded for the entire acquisition, including read/modify/write.
+
+The board first establishes normal supervisor context with masked delivery,
+configures its bounded idle timer, then calls `ZentajiDiskOpen(instance)`.
+Acquisition requires exclusive ownership and a quiesced previous owner; disabled
+registers do not prove that old DMA has finished. The driver checks the device
+table before accessing a disk instance, refuses enabled or dirty controllers,
+and retains the old disabled ring configuration and IRQ enable for close.
+It does not configure INTC or reserve another timer. A routed disk IRQ can wake
+it early; otherwise the reserved per-core timer bounds each sleep.
+
+`ZentajiDiskRead(lba,count,buffer)` and `ZentajiDiskWrite(lba,count,buffer)` use
+512-byte units and return 1 on success, 0 on refusal or failure. Zero-length
+requests are allowed after state/range validation. RAM extents and overlap with
+private driver storage are checked. `ZentajiDiskSectors()` reports capacity in
+512-byte sectors. `ZentajiDiskTimeoutUs(us)` selects a representable 1..2000000 us
+deadline; the default is two seconds, with an additional finite probe budget.
+`ZentajiDiskLastError()`, `ZentajiDiskErrorText()` and
+`ZentajiDiskDeviceStatus()` distinguish admission, device and completion errors.
+
+Every DMA uses private aligned rings and a private bounce buffer. A timeout
+quarantines them until a matching completion actually retires. Caller RAM can be
+reused after a failed call returns. A timed-out write can still modify the medium
+later; failure is not rollback or a multi-sector transaction. `ZentajiDiskClose()`
+is nonblocking and refuses while DMA is pending or ownership/completion identity
+is uncertain. Successful close restores the acquired disabled configuration and
+resets the emptied private queue indices. Mode 0 is closed, 1 ready, 2 quarantined.
+
+**Durability is unfinished in the emulator.** Guest write/readback works, but the
+current deterministic runner acknowledges FLUSH without updating its host image.
+The native loader discards the backing path and FLUSH is a no-op; FUA is also
+ignored. This must be fixed before filesystem write completion can promise host
+persistence. The ROM also disables and clears its boot-disk ring descriptors
+without resetting the consumed indices. This driver conservatively refuses that
+dirty controller. Boot-used disk reuse needs a quiescent ROM handoff fix.
+
+```text
+python tools/zentaji_disk_check.py --compiler <Forge executable> --zen-tools <tools/zentaji directory>
+```
+
+Twenty actual Forge/reference-assembly/native/twin cases compare complete state,
+RAM and independently expected medium bytes. They cover unaligned and cross-4KB
+I/O, full and partial writes, phase wrap, read-only/bounds/context/ownership
+refusals, flush, device errors, timeout quarantine, late DMA, caller-buffer reuse,
+corrupt completions and actual core1 execution. The host backing comparison
+reports the durability gap separately; the transport pass does not close it.
+
+A further case compiles the unchanged full `Anvil/Storage/fat32.pbi`, binds these
+real disk callbacks, and runs under Anvil's owned supervisor startup, stack and
+vectors. It mounts an MBR partition, walks root/allocation metadata with expected
+corrupt-chain refusals, reads a fragmented file, rewinds, reads chunks and checks
+EOF/not-found behavior. Native/twin state and RAM match, independent expected file
+bytes match, and the read-only medium stays unchanged. This is a component proof
+with direct owned startup, not ROM disk boot, the full storage facade, exFAT,
+a writable filesystem durability proof or the complete monitor command loop.
