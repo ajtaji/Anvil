@@ -2951,3 +2951,15 @@ EndProcedure
 ;    NeonHardwareShutdown() native owner release and native state cleanup
 ;    NeonHardwareFrameBegin(colour.i) begin native recording without dispatch
 ;    NeonHardwareFrameEnd() finish native recording/execution without dispatch
+
+; COOPERATIVE PROMPT INPUT AND SCREEN SERVICE CONTRACT
+; Existing names are retained so board drivers and shared callers agree.
+; A board supplies these bounded service steps; absence is an empty step,
+; not a copied command loop. None may wait for input to arrive.
+; MouseTick()                     admit pending pointing-device events
+; TouchTick()                     admit pending touch-device events
+; TouchKeyboardServiceTick()      advance the board's optional touch keyboard
+; ScreenServiceTick()             advance pending console presentation
+; These operations preserve shared input ordering and return after bounded
+; work. Device register access and renderer selection stay in the board.
+; Prompt idle/wake operations are specified in Anvil/Hal/prompt_idle.pbi.

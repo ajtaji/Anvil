@@ -4,9 +4,18 @@ Anvil has one portable monitor core and one hardware composition per target.
 The top-level board entry chooses the target drivers and includes them in the
 order required by the compiler.
 
-## Mandatory execution level
+## Architecture and privileged execution contract
 
-The resident Anvil runtime runs at **EL3 on every board**. This covers the
+Anvil supports different CPU architectures. Shared command, scheduler, storage
+and boot policy must not contain an ISA instruction, a CPU register name, or an
+assumption that every machine has ARM exception levels. Each architecture
+backend supplies context entry/return, interrupts, bounded idle, code-cache
+synchronization and its payload calling convention; each board supplies its
+memory map and devices. A payload's architecture must be validated before
+loading or execution. Adding a machine never makes incompatible payload code
+executable on it.
+
+**For the existing AArch64 targets, EL3 remains mandatory.** This covers the
 firmware-to-compiled-entry handoff, `Main`, the monitor's ordinary services,
 and return from a payload. An EL3 stub that executes `ERET` to EL2 or EL1 before
 entering Anvil is not compliant. Every board entry must preserve and verify
@@ -27,6 +36,12 @@ EL3-selected stack, firmware arguments, DAIF, CPTR_EL3/FP access, VBAR_EL3,
 and EL3 MMU/cache state. The board owns those transitions; shared code must
 not assume an EL2 bank or downshift privilege for convenience. See the
 per-board gaps below before treating any target as compliant.
+
+Zentaji instead requires its documented supervisor mode and ROM-to-image
+handoff. It has no ARM EL3. Its boot path is ROM -> Anvil -> payloads; the
+`.zex` envelope used by ROM and Anvil's application payload container are
+separate contracts. A future architecture must name and verify its own required
+privileged context. This does not authorize lowering the existing ARM targets.
 
 This status snapshot distinguishes hardware-verified EL3 paths from open
 entry gaps. A lower-level path remains a gap, not an approved exception:
@@ -49,7 +64,7 @@ changing the rule or treating current firmware behavior as an exception.
 |---|---|---|
 | Portable core | `Anvil/Core/*.pbi` | Command loop, parsing, settings, transfer and boot logic, hashes, network orchestration, and hardware-independent commands |
 | Hardware contract | `Anvil/Hal/*.pbi` | Named `Hw*` entry points and the versioned service-table ABI |
-| Architecture | `Anvil/Kernel/*.pbi` | AArch64 facts that belong to no chip: the EL2/EL3 exception vectors and the scheduler's contexts |
+| Architecture | `Anvil/Kernel/` | CPU-specific entry, exceptions, contexts and idle mechanisms; AArch64 implementations do not define the contract of other ISAs |
 | Filesystems | `Anvil/Storage/*.pbi` | FAT32, exFAT, and the one path and partition layer over them. A board supplies a block reader and writer by pointer and nothing else |
 | File seam | `Anvil/Storage/hwfile.pbi` | The `HwFile*` / `HwDir*` families over those filesystems, for **any** board with a block device. The board sets three values - mounted, writable, and the ranged writer - and writes no file code of its own. A board without a block device answers the same seam differently; the UNO Q does it through UEFI |
 | A/B records | `Anvil/Storage/ab_record.pbi` | The two-slot boot-control record: layout, checksum, state machine and handoff page, driven by two caller-supplied callbacks. No filesystem and no chip in it, so a board reaches its records by name through the shared layer rather than by walking a cluster chain |
@@ -261,3 +276,34 @@ BCM2711 address, register or peripheral - only AArch64 EL2 and EL3 vector
 tables and the frame they save. The move changed one include line in each of
 its five dependents and the Pi 4 image came out **byte-identical**, which is
 the standard a move of this kind has to meet.
+
+## Prompt scheduler architecture boundary (2026-11-07)
+
+`Anvil/Core/prompt_scheduler.pbi` owns cooperative service ordering, queued-input
+and software-PWM admission, and elapsed idle accounting using 64-bit ticks.
+`Anvil/Core/parse.pbi` includes that shared policy. Board compositions select
+the implementation of `HwPromptIdleReady()`, `HwPromptIdleWait()` and the
+bounded `HwPromptBoardService()` step before
+including the parser; the exact contract is `Anvil/Hal/prompt_idle.pbi`.
+
+The three existing compositions using the shared parser select
+`Anvil/Kernel/AArch64/prompt_idle.pbi`. It retains their counter-event setup,
+EL3 checks, Pi-specific qualification and bounded WFE behavior. The shared core
+contains none of those instructions. A non-ARM backend supplies the same two
+operations using that CPU's timer/event facilities.
+
+`python tools/prompt_scheduler_check.py --compiler <PureMetalForge.exe>
+--zenemu <zenemu.exe>` compiles and executes the actual shared scheduler on
+Zentaji with deterministic service adapters. It checks input/PWM refusal,
+service fairness, idle utilization and a clock above 32 bits, then compile-checks
+the policy and real idle mechanism for AArch64. Current Wi-Fi maintenance
+and optional ARM board idle callbacks are preserved. This is a portability proof of
+the scheduler, not an Anvil boot or hardware wake proof. A full monitor build
+currently encounters a pre-existing missing `Shared/A64/string.pmi` dependency
+with the current compiler, reproduced on unmodified source as well.
+
+Remaining architecture work includes payload architecture IDs and calling
+conventions, relocation handling, privilege/context entry and return, exception
+frames, multicore coordination, and the real Zentaji hardware backend. The
+existing AArch64-only checks inside PMFBOOT/module validation must move behind
+explicit architecture contracts without accepting another ISA's image.
