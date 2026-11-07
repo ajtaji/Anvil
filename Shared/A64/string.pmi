@@ -1,0 +1,2344 @@
+; ======================================================================
+; string.pmi - the string built-ins of the 64-bit boards, in readable code
+; ----------------------------------------------------------------------
+;
+;     XIncludeFile "Shared/A64/string.pmi"
+;
+; ONE STRING LIBRARY FOR FIVE BOARDS: the Raspberry Pi 3, 4 and 5, the
+; ROCK Pi 4C and the Arduino UNO Q (-t pi3, pi4, pi5, rockpi4c, unoq). They
+; share one AArch64 compiler core, so they share one copy of this file -
+; nothing in it touches a register of any chip. The compiler admits a file
+; under Shared/A64/ on those five and refuses it, at the include and in one
+; sentence, on every other target.
+;
+; IT IS THE PORT OF RP2350/Lib/string.pico2, which is the port of
+; RP2040/Lib/string.pico and of Atmel328pAndRelated/Lib/string.avrb, and it
+; is ANSWER-COMPATIBLE with them: the same program source, calling the same
+; names with the same arguments, produces the same bytes in the same
+; buffers here as on a Pico, an Uno R4 or an ATmega328P. That portability is
+; the entire point, so the surprising-semantics sections below are
+; reproduced rather than corrected, and every "& 255" is load-bearing.
+; Every executable line before NUMBERS AT THIS FAMILY'S WIDTH is the 32-bit
+; file's, unchanged, except Val.
+;
+; WHAT DIFFERS, BECAUSE A WHOLE NUMBER IS 64 BITS HERE (ruling 2026-10-15):
+;   * Val reads a SIGNED 64-BIT number, -9223372036854775808 to
+;     9223372036854775807. Text beyond that is CLAMPED to the nearer end -
+;     the 32-bit families' rule, at this family's width.
+;   * Str, Hex, Bin and a number joined into text ("n=" + v) write a value
+;     wider than 16 bits at its own width: the compiler calls the routines
+;     of NUMBERS AT THIS FAMILY'S WIDTH, at the end of this file, instead.
+;     A narrow value (a .b, a .w, a number up to 65535) takes the 16-bit
+;     routines, exactly as on every other target.
+;
+; ======================================================================
+; WHAT IS IN HERE
+; ======================================================================
+; TWENTY-NINE routines a program calls by name, in three tranches, each
+; with its own header block further down explaining what it added and why:
+;
+;   the original ten   Len, Asc, Chr, UCase, LCase, Left, Right, Mid,
+;                      Val, NumToStr
+;   the second (11)    FindString, CountString, LTrim, RTrim, Trim,
+;                      ReverseString, Space, Hex, Bin, StringField, Str
+;   the third (8)      ReplaceString, RemoveString, InsertString, LSet,
+;                      RSet, PeekS, PokeS, StringByteLength
+;
+; Str() is the one to reach for when writing a number into text - NumToStr
+; is unsigned 16-bit and writes -1 as 65535.
+;
+; Plus the names the COMPILER calls on a program's behalf: the joins of a
+; number, __string_concat_num and __string_set_num for a narrow value and
+; the 64-bit ones at the end, and the wide Str / Hex / Bin there. The six
+; AVR primitives (__string_copy ... __string_concat_ram) are kept too, as
+; ordinary procedures, so AVR source compiles unchanged; on these boards
+; the compiler emits its own copy, compare and join (__a64_string_*) and
+; never calls them - see THE SIX FRONTEND-EMITTED PRIMITIVES.
+;
+; NOTHING TO SHADOW. The part files of these five boards declare no string
+; intrinsic, so this file is the ONLY definition of these names here.
+; Include it and you have them; do not, and a call to Len() is an
+; undeclared-procedure error that names this file.
+;
+; The names are spelled exactly as on AVR, for the one reason that
+; matters: one program source must compile unchanged for every family.
+;
+; ======================================================================
+; REQUIRES
+; ======================================================================
+; NOTHING. This file includes nothing (house rule: a library never
+; includes a library - the MAIN file lists them) and needs nothing but
+; PeekA, PokeB and arithmetic. It costs you no serial port, no timer and no
+; board bring-up.
+;
+; PRINTING IS SOMEBODY ELSE'S JOB, deliberately. Nothing here writes to a
+; port. Shared/A64/string_out.pmi is the file that turns text and numbers
+; into characters on PrintChar, and it is separate for the same reason this
+; file has no dependencies: a program that only wants Mid() should not
+; acquire a UART.
+;
+; ======================================================================
+; ADDRESSES ARE 64 BITS HERE, AND THE .i IS THE TYPE THAT CARRIES ONE
+; ======================================================================
+; .i is the NATIVE integer - 2 bytes on AVR, 4 on the 32-bit ARM parts, 8
+; here. It is the one target-dependent type in this language, which is
+; exactly what an address wants to be, so every address-typed parameter and
+; local in the *_at routines below is .i, and so are the public signatures:
+; *s.i, *d.i. A pointer kept in anything narrower is not a smaller address,
+; it is a DIFFERENT one - the failure is a silent wrong answer, not a fault.
+;
+; THE CHARACTER AND COUNT VARIABLES STAY .w. Do not "finish the job" by
+; widening them. A .w is 16 bits here exactly as on the AVR - the compiler
+; narrows a .w on every store - so str_num_at's division walks exactly
+; sixteen passes and the 16-bit routines wrap exactly where they do there.
+; That is answer parity, and it is the reason those routines exist at all.
+;
+; ======================================================================
+; READ THIS BEFORE CHANGING ANY WORKING VARIABLE TO A BYTE
+; ======================================================================
+; Every character here is held in a 16-BIT .w, never in a .a or .b, and
+; every read of a byte is masked:
+;
+;     c = PeekA(p) & 255
+;
+; The mask is what keeps the value 0..255 whatever the load does, and the
+; 16-bit width is kept for ANSWER PARITY with the AVR file: UCase and LCase
+; test two range boundaries per character and Val tests two per digit, and
+; the byte >= 128 case is exactly what a high-bit character in a string is
+; - a UTF-8 text is full of them. 0..255 in a 16-bit word is unambiguous
+; under every reading.
+;
+; ======================================================================
+; WHY THIS IS SOURCE AND NOT AN ASSEMBLY TEMPLATE
+; ======================================================================
+; An @ASM template is hand-written assembly with its registers substituted
+; by text. It is invisible to the type checker, the width analysis, the
+; register allocator and every other check the compiler makes - it can
+; only be executed and hoped for. Ordinary source is checked. Nothing in
+; this file needed an intrinsic at all.
+;
+; ======================================================================
+; SEMANTICS ARE THE AVR TEMPLATES', NOT THE HOST LANGUAGE'S
+; ======================================================================
+; These reproduce what avr_hardware.def did, verbatim, including the parts
+; that are surprising:
+;
+;  * Left/Right/Mid take the DESTINATION FIRST and write into a buffer
+;    you supply. They return nothing. There is no heap here.
+;
+;    The desktop-BASIC spelling - part = Left(src, 4) - works as well, and
+;    compiles to a call to THIS procedure with a destination the compiler
+;    supplies. The two forms are told apart by ARGUMENT COUNT, so the
+;    three-argument form below is unchanged.
+;  * NumToStr(destination, number) - buffer first, number second.
+;  * Mid's start position is 1-BASED. Mid(d, s, 1, n) starts at the
+;    first character. A start of 0 is treated as 1, because the
+;    template tested for zero before decrementing.
+;  * The count/position arguments were BYTE registers in the templates
+;    (mov %S2, r%3 takes the low half and nothing else), so a count of
+;    256 meant zero and 300 meant 44. The "& 255" on each of them below
+;    is what keeps that true rather than quietly improving it. It is also
+;    what the compiler's own string runtime does with a size, on every
+;    target, and for this same reason.
+;  * Every routine that writes a destination null-terminates it, on
+;    every path, including the empty ones.
+;
+; WHAT HAS RUN ON SILICON: see THE BOARD RUN at the end of this file.
+; ======================================================================
+
+; LONG STRINGS (ruling 50, forum 1319, 2026-10-15). On this family a string
+; may be declared up to .s{32767} (Len() is a .w), so nothing below counts in
+; a byte any more: a count, a start and a size are taken to 16 bits (& $FFFF -
+; a count of -1 is still "the rest of the string", now 65535 of it), and a
+; length is the whole length. The AVR libraries keep the byte, and the 254
+; characters that go with it. Where a comment below speaks of "& 255" it
+; describes the AVR template this file was ported from.
+
+; ----------------------------------------------------------------------
+; str_len_at(addr) - the string walk, shared by Len and Right.
+;
+; NOTE ON THE MISSING STAR, and it is not a typo: in a procedure taking
+; `*s.i`, the BARE name `s` inside the body IS the address, and `*s`
+; DEREFERENCES it. Writing str_len_at(*s) passes the two bytes the
+; string starts with as if they were its address - which compiles, runs,
+; and reads whatever that lands on. serial_str.avrb records the same
+; convention, and caught the mistake only on the simulator.
+;
+; The address is .i; the LENGTH it returns is a .w, because a length is a
+; count and counts stay 16-bit here.
+; ----------------------------------------------------------------------
+Procedure.w str_len_at(p.i)
+  Protected n.w
+  n = 0
+  While (PeekA(p) & 255) <> 0
+    n = n + 1
+    p = p + 1
+  Wend
+  ProcedureReturn n
+EndProcedure
+
+; ----------------------------------------------------------------------
+; Len(s) - byte length of a string, up to its null terminator.
+; ----------------------------------------------------------------------
+Procedure.w Len(*s.i)
+  ProcedureReturn str_len_at(s)
+EndProcedure
+
+; ----------------------------------------------------------------------
+; Asc(s) - numeric value of the first character, 0 for an empty string.
+;
+; The template zero-extended into the high half (clr r%H1), so the
+; answer is 0..255 and never negative. The mask below is that clr.
+; ----------------------------------------------------------------------
+Procedure.w Asc(*s.i)
+  Protected c.w
+  c = PeekA(s) & 255
+  ProcedureReturn c
+EndProcedure
+
+; ----------------------------------------------------------------------
+; EVERY ROUTINE THAT WRITES INTO A DESTINATION IS HANDED ITS SIZE
+; (ruling 49, 2026-10-15; forums 1311, 1312).
+;
+; The last parameter of Chr, Str, Hex, Bin, NumToStr, Space, StringField,
+; ReplaceString, RemoveString, InsertString, LSet, RSet and PeekS - like
+; Left, Right and Mid since forum 978 - is the destination's size in bytes,
+; terminator included. THE COMPILER FILLS IT IN: a program writes
+; Space(@pad, 40) or pad = Space(40) as before, and the call is made with
+; the size of pad. A destination whose size cannot be known (a pointer, a
+; structure field) is handed the largest size the parameter holds, which is
+; what every one of these calls did before.
+;
+; Nothing is ever written past that size:
+;   - TEXT (Space, StringField, ReplaceString, RemoveString, InsertString,
+;     LSet, RSet, PeekS) is CUT at the size, the way an assignment cuts a
+;     text that is too long for its string;
+;   - A NUMBER (Str, Hex, Bin, NumToStr) or a character (Chr) is written
+;     WHOLE OR NOT AT ALL - a destination too small for it is left empty -
+;     because a number cut short is a different number. That is the rule the
+;     joins ("n=" + v) have always followed. The number is formatted into
+;     str_text_buf first, so its length is known before anything is written.
+;     One buffer: these routines are not re-entrant (an interrupt handler
+;     that formats a number while the main program is formatting one shares
+;     it), as the joins' buffer never was.
+; A size of 0 or less writes nothing at all.
+; ----------------------------------------------------------------------
+Global Dim str_text_buf.a[68]
+
+; Copy the text in str_text_buf into d when it fits in maxLen bytes with its
+; terminator; else leave d empty.
+Procedure str_text_fit(d.i, maxLen.l)
+  Protected n.l
+  Protected i.l
+  If maxLen <= 0
+    ProcedureReturn
+  EndIf
+  n = 0
+  While str_text_buf[n] <> 0
+    n = n + 1
+  Wend
+  If n + 1 > maxLen
+    PokeB(d, 0)
+    ProcedureReturn
+  EndIf
+  For i = 0 To n
+    PokeB(d + i, str_text_buf[i])
+  Next
+EndProcedure
+
+; ----------------------------------------------------------------------
+; Chr(destination, value) - one character plus a null terminator.
+;
+; DESTINATION FIRST. This writes into your buffer and returns nothing.
+; The value-returning Chr() of desktop BASIC also works now - the
+; compiler rewrites Chr(65) into a call to this one with a hidden
+; destination - but the returning happens up in the compiler, not here.
+; ----------------------------------------------------------------------
+Procedure str_chr_at(p.i, v.w)
+  PokeB(p, v)
+  PokeB(p + 1, 0)
+EndProcedure
+
+; Chr(destination, code) - write ONE character into your buffer, given its
+; number: Chr(@buf, 65) puts "A" there. Chr(65) on the right of an = also
+; works; the compiler finds a buffer for it.
+Procedure Chr(*d.i, v.w, maxLen.l)
+  If maxLen >= 2
+    str_chr_at(d, v)
+  ElseIf maxLen = 1
+    PokeB(d, 0)
+  EndIf
+EndProcedure
+
+; ----------------------------------------------------------------------
+; UCase(s) / LCase(s) - case conversion IN PLACE.
+;
+; Only 'a'..'z' (97..122) and 'A'..'Z' (65..90) move. The template's
+; range tests were `cpi`/`brlt`/`brge` - SIGNED - so any byte >= 128
+; failed the low test and was left alone. Holding the character in a
+; 16-bit .w reproduces that exactly and for the right reason: 200 is
+; simply not in 97..122.
+;
+; The template spelled the down-shift `subi %S1, 224`, which is -32 in
+; eight bits. Written as + 32 here because that is what it means.
+; ----------------------------------------------------------------------
+Procedure str_upper_at(p.i)
+  Protected c.w
+  c = PeekA(p) & 255
+  While c <> 0
+    If c >= 97 And c <= 122
+      PokeB(p, c - 32)
+    EndIf
+    p = p + 1
+    c = PeekA(p) & 255
+  Wend
+EndProcedure
+
+; UCase(s) - turn the string into CAPITALS, in place. It changes the string
+; you hand it and returns nothing, so write UCase(@name) on a line of its own.
+Procedure UCase(*s.i)
+  str_upper_at(s)
+EndProcedure
+
+; The worker behind LCase, taking a raw address. Call LCase.
+Procedure str_lower_at(p.i)
+  Protected c.w
+  c = PeekA(p) & 255
+  While c <> 0
+    If c >= 65 And c <= 90
+      PokeB(p, c + 32)
+    EndIf
+    p = p + 1
+    c = PeekA(p) & 255
+  Wend
+EndProcedure
+
+; LCase(s) - turn the string into lower case, in place. Like UCase it changes
+; the string you hand it and returns nothing.
+Procedure LCase(*s.i)
+  str_lower_at(s)
+EndProcedure
+
+; ----------------------------------------------------------------------
+; Left(destination, source, count) - the first COUNT bytes.
+;
+; Stops early at the source's own null terminator, and null-terminates
+; the destination on BOTH exits - the template wrote a zero at X in the
+; count-exhausted path and stored the source's own zero in the
+; natural-end path, which is the same byte either way.
+; ----------------------------------------------------------------------
+; FORUM 978: maxLen is the DESTINATION's declared byte capacity, the same
+; number an ordinary assignment or concatenation has always received from
+; the compiler - the semantic
+; front end now computes it from the "@name" (or bare temp) the caller
+; wrote and appends it as a hidden last argument, so every call site keeps
+; writing Left(dest, source, count) unchanged. `room` is capacity minus
+; one byte held back for the terminator; count is clamped to it BEFORE
+; the copy loop runs, so this can never write past the destination
+; whatever count is asked for. maxLen <= 0 means the destination has no
+; room at all - not even for the terminator - so nothing is written.
+Procedure str_left_at(d.i, p.i, count.w, maxLen.l)
+  Protected c.w
+  Protected k.l
+  Protected room.l
+  If maxLen <= 0
+    ProcedureReturn
+  EndIf
+  room = maxLen - 1
+  k = count & $FFFF               ; 16 bits: -1 is 65535, the rest (ruling 50; the AVR template's byte)
+  If k > room : k = room : EndIf
+  While k > 0
+    c = PeekA(p) & 255
+    If c = 0
+      Break
+    EndIf
+    PokeB(d, c)
+    d = d + 1
+    p = p + 1
+    k = k - 1
+  Wend
+  PokeB(d, 0)
+EndProcedure
+
+; Left(destination, source, count) - copy the FIRST count characters into your
+; own buffer. Left(@part, @line, 4) of "HELLO" gives "HELL". The value form
+; part = Left(line, 4) works too. maxLen is filled in by the compiler (forum
+; 978) - it is not something a caller ever writes.
+Procedure Left(*d.i, *s.i, count.w, maxLen.l)
+  str_left_at(d, s, count, maxLen)
+EndProcedure
+
+; ----------------------------------------------------------------------
+; Right(destination, source, count) - the last COUNT bytes.
+;
+; Asking for more than there is gives the whole string, because the
+; template's `cp len, count / brlo` clamped the start to zero. brlo is
+; the UNSIGNED branch, and both operands here are 0..255 held in 16-bit
+; words, so "<" below is that same comparison.
+; ----------------------------------------------------------------------
+; FORUM 978: maxLen and room are exactly as in str_left_at above. The copy
+; loop below still copies the terminator as part of the same walk the
+; template's `ld/st X+/tst/breq` did, but now stops - and forces a
+; terminator of its own - the moment `room` characters have been written,
+; so a source longer than the destination can hold no longer runs past
+; it. k here counts characters WRITTEN, not (as elsewhere in this file) a
+; countdown.
+Procedure str_right_at(d.i, p.i, count.w, maxLen.l)
+  Protected c.w
+  Protected k.l
+  Protected n.l
+  Protected room.l
+  If maxLen <= 0
+    ProcedureReturn
+  EndIf
+  room = maxLen - 1
+
+  n = str_len_at(p)               ; the whole length (ruling 50; the AVR template counted in a byte)
+  k = count & $FFFF
+  If n < k
+    k = 0                         ; want more than exists - start at 0
+  Else
+    k = n - k
+  EndIf
+
+  While k > 0
+    p = p + 1
+    k = k - 1
+  Wend
+
+  k = 0
+  Repeat
+    c = PeekA(p) & 255
+    If c <> 0 And k >= room
+      Break                       ; capacity reached before the source's natural end
+    EndIf
+    PokeB(d, c)
+    d = d + 1
+    p = p + 1
+    k = k + 1
+  Until c = 0
+  If c <> 0
+    PokeB(d, 0)                   ; the loop broke early - terminate what it did write
+  EndIf
+EndProcedure
+
+; Right(destination, source, count) - copy the LAST count characters. Asking
+; for more than there is gives you the whole string rather than an error.
+; maxLen is filled in by the compiler (forum 978).
+Procedure Right(*d.i, *s.i, count.w, maxLen.l)
+  str_right_at(d, s, count, maxLen)
+EndProcedure
+
+; ----------------------------------------------------------------------
+; Mid(destination, source, start, count) - COUNT bytes from 1-BASED
+; position START.
+;
+; START IS 1-BASED. Mid(d, s, 1, 3) is the first three characters. The
+; template tested the start for zero BEFORE decrementing it, so a start
+; of 0 skips nothing and behaves as 1 - reproduced below rather than
+; corrected, because a program relying on it would change behaviour
+; silently otherwise.
+;
+; The skip stops at the source's null, so a start past the end yields
+; an empty string rather than reading off the end of the buffer.
+; ----------------------------------------------------------------------
+; FORUM 978: maxLen and room are exactly as in str_left_at above; the
+; skip-to-start walk only moves the SOURCE pointer and is unaffected.
+Procedure str_mid_at(d.i, p.i, start.w, count.w, maxLen.l)
+  Protected c.w
+  Protected k.l
+  Protected room.l
+  If maxLen <= 0
+    ProcedureReturn
+  EndIf
+  room = maxLen - 1
+
+  k = start & $FFFF               ; 16 bits (ruling 50; the AVR template's start was a byte)
+  If k > 1
+    k = k - 1
+    While k > 0
+      c = PeekA(p) & 255
+      If c = 0
+        Break
+      EndIf
+      p = p + 1
+      k = k - 1
+    Wend
+  EndIf
+
+  k = count & $FFFF
+  If k > room : k = room : EndIf
+  While k > 0
+    c = PeekA(p) & 255
+    If c = 0
+      Break
+    EndIf
+    PokeB(d, c)
+    d = d + 1
+    p = p + 1
+    k = k - 1
+  Wend
+  PokeB(d, 0)
+EndProcedure
+
+; Mid(destination, source, start, count) - copy count characters starting at
+; position start. THE FIRST CHARACTER IS 1, not 0. maxLen is filled in by
+; the compiler (forum 978).
+Procedure Mid(*d.i, *s.i, start.w, count.w, maxLen.l)
+  str_mid_at(d, s, start, count, maxLen)
+EndProcedure
+
+; ----------------------------------------------------------------------
+; Val(s) - a decimal string to a SIGNED 64-BIT value.
+;
+; Leading space, tab, CR and LF are skipped (ruling 2026-08-20, forum tid
+; 270: Val(" 42") is 42). Then one optional '-', then digits; the first
+; byte that is not a digit ends the number. No digits at all - an empty
+; string, "abc", a lone "-" - is 0. There is no '+'. All exactly as on
+; every other target.
+;
+; THE RANGE IS THIS FAMILY'S WHOLE NUMBER, -9223372036854775808 to
+; 9223372036854775807 (ruling 2026-10-15). It returns a .q, the width of
+; the native integer on these boards, as Val returns the 32-bit .l on the
+; 32-bit families and the 16-bit .w on the AVR: Val("4294967295") is
+; 4294967295 here and 2147483647 on a Pico. A number beyond the range is
+; CLAMPED to the nearer end - Val("99999999999999999999") is
+; 9223372036854775807 - the rule the 32-bit families follow at 32 bits,
+; and the rule a .f converted to a whole number follows. Store the result
+; in a .q or .i: a .l or .n keeps only the low 32 bits of what it is given.
+;
+; The digits are gathered on the NEGATIVE side (acc = acc * 10 - digit),
+; whose range is one larger, so -9223372036854775808 needs no special case.
+; Before each step the accumulator is checked against -922337203685477580
+; (and the digit against 8), so the multiply can never wrap.
+; ----------------------------------------------------------------------
+Procedure.q str_val_at(p.i)
+  Protected acc.q
+  Protected c.q
+  Protected neg.q
+  Protected over.q
+
+  acc = 0
+  neg = 0
+  over = 0
+
+  Repeat
+    c = PeekA(p) & 255
+    If c <> 32 And c <> 9 And c <> 13 And c <> 10
+      Break
+    EndIf
+    p = p + 1
+  ForEver
+
+  If (PeekA(p) & 255) = 45        ; '-'
+    neg = 1
+    p = p + 1
+  EndIf
+
+  Repeat
+    c = PeekA(p) & 255
+    If c < 48 Or c > 57
+      Break
+    EndIf
+    p = p + 1
+    c = c - 48
+    If over = 0
+      If acc < -922337203685477580 Or (acc = -922337203685477580 And c > 8)
+        over = 1
+      Else
+        acc = acc * 10 - c
+      EndIf
+    EndIf
+  ForEver
+
+  If over = 1
+    If neg = 1
+      ProcedureReturn -9223372036854775807 - 1
+    EndIf
+    ProcedureReturn 9223372036854775807
+  EndIf
+  If neg = 1
+    ProcedureReturn acc
+  EndIf
+  If acc = -9223372036854775807 - 1   ; "9223372036854775808" has no positive twin
+    ProcedureReturn 9223372036854775807
+  EndIf
+  ProcedureReturn 0 - acc
+EndProcedure
+
+; Val(s) - the number a string of digits stands for: Val(@"123") is 123.
+; A SIGNED 64-bit value; stops at the first character that is not a digit,
+; 0 means "no digits", and a number beyond the 64-bit range comes back as
+; the nearer end. For a number with a decimal point use ValF in
+; Shared/A64/string_f32.pmi: Val reads a whole number and stops at the point.
+Procedure.q Val(*s.i)
+  ProcedureReturn str_val_at(s)
+EndProcedure
+
+; ----------------------------------------------------------------------
+; NumToStr(destination, number) - a 16-bit UNSIGNED decimal, written
+; into a buffer you supply, then a terminating zero.
+;
+; TWO ARGUMENTS AND THE BUFFER COMES FIRST. It returns nothing, so
+; `s = NumToStr(n)` is not a thing - write NumToStr(@buf, n). The
+; buffer needs room for 5 digits plus the terminator.
+;
+; ======================================================================
+; DO NOT "SIMPLIFY" THE LOOP BELOW TO v / 10 AND v % 10
+; ======================================================================
+; The obvious code is wrong here, and wrong in the silent way. This
+; printer is UNSIGNED - that is what the template did - but this
+; language's divide is SIGNED. Measured on the simulator and recorded
+; in serial_num.avrb:
+;
+;     g.w = 40000 : h = g / 10   ->  62983    (want 4000)
+;     g.w = 40000 : h = g % 10   ->  65530    (want 0)
+;
+; because 40000 in a signed 16-bit type is -25536. Every value above
+; 32767 would come out wrong, with nothing reporting a problem.
+;
+; NO DIVIDER RESCUES THIS. It is tempting to think the measurement above
+; is an AVR artifact - AVR has no divide instruction and the answer came
+; out of a soft-divide routine. The Cortex-A cores of these boards do have
+; udiv and sdiv, and this backend emits them; that changes nothing below.
+;
+; The correction does not weaken the argument, it removes the only part
+; of it that could ever have been wrong: the bad answer comes from the
+; TYPE, not from the implementation and not from the speed. v is a signed
+; 16-bit .w, 40000 in it IS -25536 on every target, and a signed divide
+; of -25536 is entitled to give a negative quotient however it is
+; computed and however fast.
+;
+; So this is the template's own restoring shift-subtract division
+; written out: shift the value left a bit at a time into a remainder,
+; and whenever the remainder reaches 10 subtract it and set the
+; quotient's low bit. Sixteen passes leaves quotient and remainder in
+; hand, and it is unsigned BY CONSTRUCTION because it never uses the
+; divide operator at all. The digits fall out least-significant
+; first and are replayed backwards, which is what the template's
+; push/pop pair did.
+;
+; SIXTEEN PASSES IS TIED TO v BEING A .w. It is a 16-bit algorithm on a
+; 16-bit value. If v ever became .i this loop would silently start
+; dropping the top half of the number - which is the other reason the
+; port left every non-address variable in this file alone.
+;
+; The top bit is taken with (v >> 15) & 1 rather than (v & 32768),
+; because 32768 does not fit a signed 16-bit literal. The "& 1" makes
+; this correct whether >> is a logical or an arithmetic shift, since
+; either way bit 0 of the result is bit 15 of v.
+; ======================================================================
+
+; A 16-bit value is at most 5 decimal digits. File-level rather than
+; local because str_num_at is NOT RE-ENTRANT: one buffer costs less than
+; a frame, and nothing here ever calls it twice at once.
+;
+; Recursion is refused on every target (by design - a program on these
+; boards runs forever), so nothing here can be inside itself twice on ONE
+; core. AND ON THESE BOARDS "NOT RE-ENTRANT" HAS A LIVE HALF: Anvil's
+; four-core service runs one procedure on four cores at once, and two cores
+; inside NumToStr or Str together overwrite these digits underneath each
+; other - the result is a wrong string, not a crash. Call them from one
+; core.
+Dim str_digits.b[8]
+
+; The worker behind NumToStr, taking a raw address. Call NumToStr - or better,
+; Str(), which handles negatives.
+Procedure str_num_at(d.i, v.w)
+  Protected q.w
+  Protected rem.w
+  Protected i.w
+  Protected n.w
+
+  n = 0
+  Repeat
+    rem = 0
+    q = 0
+    For i = 1 To 16
+      rem = (rem << 1) | ((v >> 15) & 1)
+      v = v << 1
+      q = q << 1
+      If rem >= 10
+        rem = rem - 10
+        q = q | 1
+      EndIf
+    Next
+    str_digits[n] = 48 + rem
+    n = n + 1
+    v = q
+  Until v = 0
+
+  While n > 0
+    n = n - 1
+    PokeB(d, str_digits[n])
+    d = d + 1
+  Wend
+  PokeB(d, 0)
+EndProcedure
+
+; ----------------------------------------------------------------------
+; NumToStr(destination, value) - UNSIGNED. USE Str() INSTEAD.
+;
+; >>> Str(out, v) is the one you want. NumToStr(out, -17) prints 65519.
+;
+; That is not a bug waiting to be fixed here. The number is declared .u
+; ON PURPOSE so that NumToStr(out, 40000) is accepted as written - and
+; 40000 and -25536 are the same two bytes, so one routine cannot print
+; both. Changing the type would break every program that passes a value
+; above 32767, which is the case this routine exists for.
+;
+; So the signed printer is a SEPARATE routine, under the name the desktop BASIC
+; already uses: Str(). See it above. NumToStr stays for the programs
+; that already call it, and for the genuinely unsigned case.
+;
+; (A .w here would warn on exactly the values this routine exists to
+; print. str_num_at() takes it as a .w because the algorithm reads it as
+; a bit pattern, and the two are the same two bytes.)
+; ----------------------------------------------------------------------
+Procedure NumToStr(*d.i, v.u, maxLen.l)
+  str_num_at(@str_text_buf, v)
+  str_text_fit(d, maxLen)
+EndProcedure
+
+
+
+; ======================================================================
+;  THE SECOND TRANCHE - the desktop-BASIC string functions people expect
+; ======================================================================
+; Added 2026-08-02. Before this the library had ten routines: Len, Asc,
+; Chr, UCase, LCase, Left, Right, Mid, Val and NumToStr. That is enough
+; to take a string apart if you already know where the pieces are, and
+; not enough to READ A LINE OFF A SERIAL PORT, which is what most
+; programs on these parts actually do.
+;
+; Everything here follows the two rules the first ten already follow:
+;
+;   - a routine that produces TEXT takes the DESTINATION FIRST, because
+;     there is no heap to return a new string from. The compiler also
+;     accepts the desktop-BASIC spelling - "s = Hex(v)" - and fills the
+;     destination in for you (the compiler's SemanticCore module, HoistStringTemporaries);
+;   - a routine that produces a NUMBER returns it normally, because a
+;     number needs no buffer.
+;
+; And one rule of its own: the routines that MODIFY a string in place -
+; the Trim family and ReverseString - take one argument and change it
+; where it sits, exactly like UCase. They do not return anything, so
+; "s = Trim(s)" is not how they are used.
+; ======================================================================
+
+; ----------------------------------------------------------------------
+; FindString(haystack, needle, start) - WHERE a substring is, or 0.
+;
+; The position is 1-BASED, matching Mid: FindString("hello", "l", 1) is
+; 3, and 0 means "not there". START lets you find the SECOND one by
+; searching again from just past the first.
+;
+; An empty needle returns 0. The desktop BASIC returns the start position for
+; that case; 0 is chosen here because "found nothing at position 1" is
+; the answer that stops a search loop, and a loop that never stops on a
+; part with no debugger is a bad trade for matching a corner case.
+; ----------------------------------------------------------------------
+Procedure.w str_find_at(h.i, n.i, start.w)
+  Protected i.w
+  Protected d.w
+  Protected matched.w
+  Protected scanning.w
+  Protected hs.i
+  Protected ns.i
+
+  If (PeekA(n) & 255) = 0
+    ProcedureReturn 0
+  EndIf
+  If start < 1
+    start = 1
+  EndIf
+
+  ; walk to the start position, giving up if the string ends first
+  i = 1
+  While i < start
+    If (PeekA(h) & 255) = 0
+      ProcedureReturn 0
+    EndIf
+    h = h + 1
+    i = i + 1
+  Wend
+
+  While (PeekA(h) & 255) <> 0
+    hs = h
+    ns = n
+    matched = 1
+    scanning = 1
+    While scanning = 1
+      d = PeekA(ns) & 255
+      If d = 0
+        scanning = 0                    ; needle ran out - this is a hit
+      Else
+        If (PeekA(hs) & 255) <> d
+          matched = 0
+          scanning = 0
+        Else
+          hs = hs + 1
+          ns = ns + 1
+        EndIf
+      EndIf
+    Wend
+    If matched = 1
+      ProcedureReturn i
+    EndIf
+    h = h + 1
+    i = i + 1
+  Wend
+  ProcedureReturn 0
+EndProcedure
+
+; FindString(s, sub, start) - WHERE sub appears inside s, counting from 1, or
+; 0 if it is not there. Pass start = 1 to search the whole string.
+Procedure.w FindString(*s.i, *sub.i, start.w)
+  ProcedureReturn str_find_at(s, sub, start)
+EndProcedure
+
+; ----------------------------------------------------------------------
+; CountString(s, sub) - HOW MANY times a substring appears.
+;
+; Counts NON-OVERLAPPING occurrences, which is what the desktop BASIC does:
+; CountString("aaaa", "aa") is 2, not 3. Each hit advances past the whole
+; needle rather than by one character.
+;
+; COST: this drives str_find_at, which counts positions from the START of
+; the string on every call - so finding the k'th hit re-walks the first
+; k-1 fields to get there. That makes this roughly hits*length, not
+; length. It is the exact pattern str_match_here further down exists to
+; avoid, and it is left that way here because CountString is called once
+; to size a buffer, not in a loop. Do not build a rewrite loop out of it.
+; ----------------------------------------------------------------------
+Procedure.w str_count_at(h.i, n.i)
+  Protected total.w
+  Protected pos.w
+  Protected nl.w
+  nl = str_len_at(n)
+  If nl = 0
+    ProcedureReturn 0
+  EndIf
+  total = 0
+  pos = 1
+  Repeat
+    pos = str_find_at(h, n, pos)
+    If pos = 0
+      ProcedureReturn total
+    EndIf
+    total = total + 1
+    pos = pos + nl
+  ForEver
+EndProcedure
+
+; CountString(s, sub) - HOW MANY times sub appears in s. Occurrences do not
+; overlap, so counting "aa" in "aaaa" gives 2.
+Procedure.w CountString(*s.i, *sub.i)
+  ProcedureReturn str_count_at(s, sub)
+EndProcedure
+
+; ----------------------------------------------------------------------
+; LTrim / RTrim / Trim - remove spaces and tabs, IN PLACE.
+;
+; Like UCase, these change the string you hand them; there is no
+; destination and nothing is returned. Both a space (32) and a tab (9)
+; count as whitespace, which is what a line arriving over a serial port
+; usually contains.
+; ----------------------------------------------------------------------
+Procedure str_ltrim_at(p.i)
+  Protected c.w
+  Protected q.i
+  q = p
+  c = PeekA(q) & 255
+  While c = 32 Or c = 9
+    q = q + 1
+    c = PeekA(q) & 255
+  Wend
+  If q = p
+    ProcedureReturn
+  EndIf
+  ; shift the rest down over the removed run, terminator included
+  Repeat
+    c = PeekA(q) & 255
+    PokeB(p, c)
+    p = p + 1
+    q = q + 1
+  Until c = 0
+EndProcedure
+
+; LTrim(s) - remove spaces and tabs from the FRONT, in place.
+Procedure LTrim(*s.i)
+  str_ltrim_at(s)
+EndProcedure
+
+; The worker behind RTrim, taking a raw address. Call RTrim.
+Procedure str_rtrim_at(p.i)
+  Protected n.w
+  Protected c.w
+  Protected go.w
+  n = str_len_at(p)
+  go = 1
+  While go = 1 And n > 0
+    c = PeekA(p + n - 1) & 255
+    If c = 32 Or c = 9
+      n = n - 1
+    Else
+      go = 0
+    EndIf
+  Wend
+  PokeB(p + n, 0)
+EndProcedure
+
+; RTrim(s) - remove spaces and tabs from the END, in place. This is the one
+; that cleans up a line arriving over a serial port.
+Procedure RTrim(*s.i)
+  str_rtrim_at(s)
+EndProcedure
+
+; Trim(s) - remove spaces and tabs from BOTH ends, in place.
+Procedure Trim(*s.i)
+  ; RIGHT FIRST, then left. Doing it the other way round works too but
+  ; copies the whole string down before shortening it - trimming the tail
+  ; first means the left shift moves fewer bytes.
+  str_rtrim_at(s)
+  str_ltrim_at(s)
+EndProcedure
+
+; ----------------------------------------------------------------------
+; ReverseString(s) - turn the string back to front, IN PLACE.
+; ----------------------------------------------------------------------
+Procedure str_reverse_at(p.i)
+  Protected n.w
+  Protected i.w
+  Protected a.w
+  Protected b.w
+  n = str_len_at(p)
+  i = 0
+  While i < n / 2
+    a = PeekA(p + i) & 255
+    b = PeekA(p + n - 1 - i) & 255
+    PokeB(p + i, b)
+    PokeB(p + n - 1 - i, a)
+    i = i + 1
+  Wend
+EndProcedure
+
+; ReverseString(s) - turn the string back to front, in place.
+Procedure ReverseString(*s.i)
+  str_reverse_at(s)
+EndProcedure
+
+; ----------------------------------------------------------------------
+; Space(destination, count) - COUNT spaces.
+;
+; Useful for lining columns up in a serial log, where a fixed-width
+; field is the difference between a readable table and a wall of text.
+; ----------------------------------------------------------------------
+Procedure str_space_at(d.i, n.w, maxLen.l)
+  If maxLen <= 0
+    ProcedureReturn
+  EndIf
+  If n > maxLen - 1
+    n = maxLen - 1                  ; cut at the destination's size
+  EndIf
+  While n > 0
+    PokeB(d, 32)
+    d = d + 1
+    n = n - 1
+  Wend
+  PokeB(d, 0)
+EndProcedure
+
+; Space(destination, count) - fill your buffer with count spaces, for lining
+; columns up in a serial log.
+Procedure Space(*d.i, count.w, maxLen.l)
+  str_space_at(d, count, maxLen)
+EndProcedure
+
+; ----------------------------------------------------------------------
+; Hex(destination, value) - the value in base 16, UPPER CASE.
+;
+; No leading zeros and no "0x" - Hex(255) is "FF", Hex(0) is "0". Put the
+; prefix in yourself if you want one; a register dump usually does not.
+;
+; The shift is masked to four bits AFTER shifting, so this is correct for
+; a negative value too: >> is an ARITHMETIC shift here (it sign-extends),
+; and masking discards the sign bits it drags in.
+; ----------------------------------------------------------------------
+Procedure str_hex_at(d.i, v.w)
+  Protected i.w
+  Protected nib.w
+  Protected started.w
+  started = 0
+  For i = 3 To 0 Step -1
+    nib = (v >> (i * 4)) & 15
+    If nib <> 0 Or started = 1 Or i = 0
+      started = 1
+      If nib < 10
+        PokeB(d, 48 + nib)
+      Else
+        PokeB(d, 55 + nib)          ; 55 + 10 = 65 = "A"
+      EndIf
+      d = d + 1
+    EndIf
+  Next
+  PokeB(d, 0)
+EndProcedure
+
+; Hex(destination, value) - the value written in HEXADECIMAL (base 16), with
+; no leading zeros and no "$". 255 becomes "FF".
+Procedure Hex(*d.i, value.w, maxLen.l)
+  str_hex_at(@str_text_buf, value)
+  str_text_fit(d, maxLen)
+EndProcedure
+
+; ----------------------------------------------------------------------
+; Bin(destination, value) - the value in base 2, no leading zeros.
+;
+; Bin(5) is "101". This is the one you want when a datasheet describes a
+; register bit by bit and you need to see what you actually wrote.
+; ----------------------------------------------------------------------
+Procedure str_bin_at(d.i, v.w)
+  Protected i.w
+  Protected b.w
+  Protected started.w
+  started = 0
+  For i = 15 To 0 Step -1
+    b = (v >> i) & 1
+    If b = 1 Or started = 1 Or i = 0
+      started = 1
+      PokeB(d, 48 + b)
+      d = d + 1
+    EndIf
+  Next
+  PokeB(d, 0)
+EndProcedure
+
+; Bin(destination, value) - the value written in BINARY, one character per bit
+; with no leading zeros. 5 becomes "101". Handy for looking at a port.
+Procedure Bin(*d.i, value.w, maxLen.l)
+  str_bin_at(@str_text_buf, value)
+  str_text_fit(d, maxLen)
+EndProcedure
+
+; ----------------------------------------------------------------------
+; StringField(destination, source, index, delimiter) - one piece of a
+; separated line.
+;
+; StringField(out, "12,34,56", 2, ",") puts "34" in out. The index is
+; 1-BASED like everything else here, and asking for a field past the end
+; gives an empty string rather than an error - a line that arrived short
+; is a normal event on a serial port, not a fault.
+;
+; ONLY THE FIRST CHARACTER of the delimiter is used. A multi-character
+; separator would need a search per field, and one character covers the
+; comma, tab, colon and space that real protocols actually use.
+; ----------------------------------------------------------------------
+Procedure str_field_at(d.i, s.i, index.w, dl.i, maxLen.l)
+  Protected c.w
+  Protected sep.w
+  Protected f.w
+  Protected room.l
+  If maxLen <= 0
+    ProcedureReturn
+  EndIf
+  room = maxLen - 1
+  sep = PeekA(dl) & 255
+  If sep = 0 Or index < 1
+    PokeB(d, 0)
+    ProcedureReturn
+  EndIf
+
+  f = 1
+  While f < index
+    c = PeekA(s) & 255
+    If c = 0
+      PokeB(d, 0)               ; ran out of fields
+      ProcedureReturn
+    EndIf
+    s = s + 1
+    If c = sep
+      f = f + 1
+    EndIf
+  Wend
+
+  Repeat
+    c = PeekA(s) & 255
+    If c = 0 Or c = sep Or room = 0
+      PokeB(d, 0)                    ; the field's end, or the destination's
+      ProcedureReturn
+    EndIf
+    PokeB(d, c)
+    d = d + 1
+    s = s + 1
+    room = room - 1
+  ForEver
+EndProcedure
+
+; StringField(destination, source, index, delimiter) - pull out ONE piece of a
+; separated line. Field 1 of "12,34,56" split on "," is "12". Index counts
+; from 1, and an index past the end gives an empty string rather than junk.
+Procedure StringField(*d.i, *s.i, index.w, *delim.i, maxLen.l)
+  str_field_at(d, s, index, delim, maxLen)
+EndProcedure
+
+; ----------------------------------------------------------------------
+; Str(destination, value) - the number as text, WITH ITS SIGN.
+;
+; THIS IS THE ONE TO USE. NumToStr below it takes an UNSIGNED value, so
+; NumToStr(out, -17) prints 65519 - the bit pattern, not the number. That
+; is not a bug to fix in place: it is declared .u on purpose so that
+; NumToStr(out, 40000) is accepted, and 40000 and -25536 are the same two
+; bytes. A routine cannot print both.
+;
+; So the fix is a SECOND routine with the other signedness, under the
+; name the desktop BASIC already uses for it. Str(out, -17) gives "-17";
+; Str(out, 32767) gives "32767". On these boards a value wider than 16
+; bits (a .l, a .n, a .q, a .i, any arithmetic) is written at its own
+; width by __str_q / __str_x, which the compiler calls instead (below).
+;
+; -32768 works: negating it wraps back to itself, and the unsigned
+; printer then reads that pattern as 32768 - which, after the minus sign
+; already written, is exactly right.
+; ----------------------------------------------------------------------
+Procedure str_signed_at(d.i, v.w)
+  If v < 0
+    PokeB(d, 45)                ; "-"
+    d = d + 1
+    v = 0 - v
+  EndIf
+  str_num_at(d, v)
+EndProcedure
+
+; Str(destination, value) - the value written in decimal, WITH a minus sign if
+; it is negative. This is the one you want for printing a number; NumToStr is
+; unsigned and prints -1 as 65535.
+Procedure Str(*d.i, value.w, maxLen.l)
+  str_signed_at(@str_text_buf, value)
+  str_text_fit(d, maxLen)
+EndProcedure
+
+; ======================================================================
+;  THE THIRD TRANCHE - editing a string, and the raw-memory pair
+; ======================================================================
+; Added 2026-08-03. The first ten take a string apart; the second tranche
+; searches and formats one. Nothing before this could EDIT one - swap a
+; substring out, drop one, splice one in - or lay a value out in a
+; fixed-width column, which is what turns a serial log into a table.
+;
+; Eight routines: ReplaceString, RemoveString, InsertString, LSet, RSet,
+; PeekS, PokeS and StringByteLength.
+;
+; ======================================================================
+; THE DESKTOP BEHAVIOUR WAS MEASURED, NOT REMEMBERED
+; ======================================================================
+; Every corner below was RUN on the desktop compiler before it was
+; written here, because these five have more corners than they look like
+; and three of them are not what you would guess:
+;
+;   * RSet TRUNCATES FROM THE LEFT, like LSet. RSet("abcdefgh", 5) is
+;     "abcde", NOT "defgh". Right-justification decides where the PADDING
+;     goes, not which end survives - so both are Left(s, width) once the
+;     source is too long, and only the padding differs.
+;   * LSet/RSet with a width of 0 or less give an EMPTY string, not the
+;     source and not an error.
+;   * InsertString CLAMPS its position at both ends. Position 0 or
+;     negative inserts at the front; a position past the end appends. A
+;     position of Len + 1 is the append case and is legal.
+;   * ReplaceString rescans FROM AFTER THE REPLACEMENT, so replacing "a"
+;     with "aa" in "aa" gives "aaaa" and terminates. Scanning from the
+;     start of the text just written would never finish.
+;   * ReplaceString and RemoveString are CASE SENSITIVE and their hits do
+;     not overlap: removing "aa" from "aaa" leaves "a", not "".
+;   * An empty needle changes nothing - the result is a copy. The desktop
+;     agrees, and it is also the only answer that terminates.
+;
+; ======================================================================
+; TWO PLACES THIS CANNOT MATCH THE DESKTOP, AND WHY
+; ======================================================================
+; 1. NO OPTIONAL ARGUMENTS. This language's parameter list has no default
+;    values at all (ParserCore's parameter loop never looks for an "="),
+;    so LSet's and RSet's padding character is a REQUIRED fourth argument
+;    and it is a CHARACTER CODE, not a string: LSet(@o, @s, 10, 32) pads
+;    with spaces, ...(@o, @s, 10, 46) with dots. A code rather than a
+;    string pointer because Chr() next door already takes one, because 32
+;    is the desktop's own default spelled out, and because the AVR file
+;    must spell it the same way (there a one-character literal lives in
+;    FLASH and PeekB cannot see it at all). One program source, three
+;    families - that rule outranks a nicer signature on one of them.
+;
+; 2. NO HEAP, SO THE DESTINATION COMES FIRST. Same rule the whole file
+;    follows. PeekS on the desktop RETURNS a newly allocated string;
+;    here it fills a buffer you own, and so does everything else.
+;
+; ======================================================================
+; HOW BIG DOES THE DESTINATION HAVE TO BE?
+; ======================================================================
+; Nothing here bounds the destination, for the same reason Left, Right,
+; Mid, Space and StringField do not: the bound would have to be an extra
+; argument, the desktop spelling has no room for one, and a wrong bound
+; silently truncates - which is the failure this project likes least. So
+; the size is YOURS to get right, and the exact figure is written down
+; per routine rather than left to be worked out:
+;
+;   LSet / RSet          width + 1 bytes, always, whatever the source is
+;   PeekS / PokeS        length + 1 bytes (or Len(source) + 1 when the
+;                        length is -1)
+;   RemoveString         Len(source) + 1 bytes - it can only shrink
+;   InsertString         Len(source) + Len(inserted) + 1
+;   ReplaceString        THE ONE THAT CAN GROW WITHOUT BOUND:
+;                        Len(source) + CountString(source, find) *
+;                        (Len(replacement) - Len(find)) + 1, and the
+;                        multiplier is why. Replacing "," with ", " in a
+;                        40-character CSV line needs 40 + one byte per
+;                        comma. Call CountString() first if you cannot
+;                        reason about it - it is right there above.
+;
+; EVERY POINTER AND CURSOR BELOW IS .i, NOT .w. Addresses are 64 bits
+; here, so a pointer held in a .w is not a smaller address, it is a DIFFERENT
+; one. The counts, positions, widths and character codes stay .w for the
+; reasons at the top of this file, and for answer parity with the AVR
+; build. Same split the first two tranches already use.
+;
+; AND THE DESTINATION MUST NOT BE THE SOURCE. All SEVEN of these that
+; take a destination - the five above plus PeekS and PokeS - write
+; forwards while still reading, so passing the same buffer twice reads
+; bytes that have already been overwritten. (RSet is the worst of them:
+; it measures the source's length first and then writes its padding
+; straight over the bytes it is about to copy.) There is no way to detect
+; it from in here - a pointer that equals another pointer is a legal
+; thing to pass - so it is stated instead. Use a second buffer, then copy
+; back.
+; ======================================================================
+
+; ----------------------------------------------------------------------
+; str_match_here(h, n) - does the needle sit EXACTLY at h? 1 or 0.
+;
+; The inner test of the three edit routines, and deliberately not
+; str_find_at(): that one counts positions from the START of the string
+; on every call, so driving a rewrite loop with it would walk the whole
+; haystack once per character. This answers the only question a rewrite
+; loop asks - "is it here, at this pointer" - in the length of the
+; needle.
+;
+; An empty needle matches anywhere, which is why every caller checks for
+; one before entering its loop.
+; ----------------------------------------------------------------------
+Procedure.w str_match_here(h.i, n.i)
+  Protected c.w
+  Repeat
+    c = PeekA(n) & 255
+    If c = 0
+      ProcedureReturn 1             ; needle ran out with everything equal
+    EndIf
+    If (PeekA(h) & 255) <> c
+      ProcedureReturn 0
+    EndIf
+    h = h + 1
+    n = n + 1
+  ForEver
+EndProcedure
+
+; ----------------------------------------------------------------------
+; str_replace_at(dest, source, find, repl) - the engine under both
+; ReplaceString and RemoveString.
+;
+; ONE worker for the two of them on purpose. Removing a substring is
+; replacing it with nothing, and writing that out twice is how the two
+; drift apart later - see how RemoveString supplies its "nothing" below,
+; which costs no storage at all.
+;
+; The source pointer advances by the whole NEEDLE on a hit and by one
+; character otherwise, so hits never overlap and the scan always makes
+; progress. Nothing just written is ever re-examined, which is what stops
+; ReplaceString(@o, @"aa", @"a", @"aa") from running forever.
+; ----------------------------------------------------------------------
+Procedure str_replace_at(d.i, s.i, f.i, r.i, maxLen.l)
+  Protected c.w
+  Protected q.i                     ; a CURSOR
+  Protected fl.w
+  Protected room.l
+
+  If maxLen <= 0
+    ProcedureReturn
+  EndIf
+  room = maxLen - 1                 ; characters that may still be written
+  fl = str_len_at(f)
+  If fl = 0
+    ; An empty needle is not "matches everywhere" - the desktop returns
+    ; the string unchanged, and so does this.
+    Repeat
+      c = PeekA(s) & 255
+      If c = 0 Or room = 0
+        PokeB(d, 0)
+        ProcedureReturn
+      EndIf
+      PokeB(d, c)
+      d = d + 1
+      s = s + 1
+      room = room - 1
+    ForEver
+  EndIf
+
+  Repeat
+    c = PeekA(s) & 255
+    If c = 0 Or room = 0
+      PokeB(d, 0)
+      ProcedureReturn
+    EndIf
+
+    If str_match_here(s, f) = 1
+      q = r                         ; copy the replacement, sans terminator
+      c = PeekA(q) & 255
+      While c <> 0 And room > 0
+        PokeB(d, c)
+        d = d + 1
+        q = q + 1
+        room = room - 1
+        c = PeekA(q) & 255
+      Wend
+      s = s + fl
+    Else
+      PokeB(d, c)
+      d = d + 1
+      s = s + 1
+      room = room - 1
+    EndIf
+  ForEver
+EndProcedure
+
+; ReplaceString(destination, source, find, replacement) - copy source into your
+; buffer with EVERY occurrence of find swapped for replacement. Case sensitive,
+; and the destination may need to be bigger than the source - see the notes.
+Procedure ReplaceString(*d.i, *s.i, *find.i, *repl.i, maxLen.l)
+  str_replace_at(d, s, find, repl, maxLen)
+EndProcedure
+
+; ----------------------------------------------------------------------
+; str_remove_at(dest, source, find) - RemoveString's worker.
+;
+; The "empty replacement" it hands the engine is the needle's OWN
+; TERMINATOR - the byte at find + Len(find), which is a zero by
+; definition and therefore a perfectly good empty string. No file-level
+; buffer, no zero-pointer sentinel standing in for "nothing" (address 0 is
+; ordinary memory on these boards with the MMU off, so a stray 0 pointer
+; reads a live word and not a fault), and nothing to initialise.
+; ----------------------------------------------------------------------
+Procedure str_remove_at(d.i, s.i, f.i, maxLen.l)
+  Protected e.i
+  ; HOISTED, not inlined as str_replace_at(d, s, f, f + str_len_at(f), ...):
+  ; an expression in a call argument that itself needs a call can destroy
+  ; an argument already sitting in a register - see the note in string_f32.
+  e = f + str_len_at(f)             ; the needle's own terminator
+  str_replace_at(d, s, f, e, maxLen)
+EndProcedure
+
+; RemoveString(destination, source, find) - copy source into your buffer with
+; every occurrence of find deleted. The destination never needs to be bigger
+; than the source.
+Procedure RemoveString(*d.i, *s.i, *find.i, maxLen.l)
+  str_remove_at(d, s, find, maxLen)
+EndProcedure
+
+; ----------------------------------------------------------------------
+; str_insert_at(dest, source, insert, position) - splice a string in.
+;
+; POSITION IS 1-BASED, like Mid and FindString. Position 1 puts the new
+; text in front of everything; position Len + 1 appends it. Both ends
+; CLAMP rather than fail - 0 and negative behave as 1, and anything past
+; the end appends - which is what the desktop does and what a program
+; that computed the position from FindString() needs.
+; ----------------------------------------------------------------------
+Procedure str_insert_at(d.i, s.i, ins.i, pos.w, maxLen.l)
+  Protected c.w
+  Protected i.w
+  Protected q.i                     ; a CURSOR
+  Protected go.w
+  Protected room.l
+
+  If maxLen <= 0
+    ProcedureReturn
+  EndIf
+  room = maxLen - 1
+  If pos < 1
+    pos = 1                         ; clamp: the desktop inserts at the front
+  EndIf
+
+  ; the part before the insertion point, stopping early if the source is
+  ; shorter than the position asked for - that is the append case
+  i = 1
+  go = 1
+  While go = 1 And i < pos
+    c = PeekA(s) & 255
+    If c = 0
+      go = 0
+    ElseIf room = 0
+      PokeB(d, 0)
+      ProcedureReturn
+    Else
+      PokeB(d, c)
+      d = d + 1
+      s = s + 1
+      i = i + 1
+      room = room - 1
+    EndIf
+  Wend
+
+  q = ins
+  c = PeekA(q) & 255
+  While c <> 0
+    If room = 0
+      PokeB(d, 0)
+      ProcedureReturn
+    EndIf
+    PokeB(d, c)
+    d = d + 1
+    q = q + 1
+    room = room - 1
+    c = PeekA(q) & 255
+  Wend
+
+  ; the rest of the source
+  Repeat
+    c = PeekA(s) & 255
+    If c = 0 Or room = 0
+      PokeB(d, 0)
+      ProcedureReturn
+    EndIf
+    PokeB(d, c)
+    d = d + 1
+    s = s + 1
+    room = room - 1
+  ForEver
+EndProcedure
+
+; InsertString(destination, source, insert, position) - copy source into your
+; buffer with insert spliced in at position. THE FIRST CHARACTER IS POSITION 1;
+; a position past the end appends, and 0 or less inserts at the front.
+Procedure InsertString(*d.i, *s.i, *insert.i, position.w, maxLen.l)
+  str_insert_at(d, s, insert, position, maxLen)
+EndProcedure
+
+; ----------------------------------------------------------------------
+; str_lset_at(dest, source, width, pad) - LEFT-justify into a field.
+;
+; Exactly WIDTH characters come out, every time: short sources are padded
+; on the right, long ones are cut. A width of 0 or less gives an empty
+; string. PAD IS A CHARACTER CODE - 32 is the space the desktop uses when
+; you leave the argument out, which here you cannot.
+;
+; Truncation is silent, and that is the desktop's behaviour rather than a
+; choice made here: the whole point of a fixed-width field is that the
+; column does not move, so a value too long for it has to lose
+; characters. Check Len() first if losing them matters.
+; ----------------------------------------------------------------------
+Procedure str_lset_at(d.i, s.i, width.w, pad.w, maxLen.l)
+  Protected c.w
+  Protected k.w
+
+  If maxLen <= 0
+    ProcedureReturn
+  EndIf
+  If width > maxLen - 1
+    width = maxLen - 1              ; cut at the destination's size
+  EndIf
+  k = width
+  c = 1                             ; anything non-zero, to enter the loop
+  While k > 0 And c <> 0
+    c = PeekA(s) & 255
+    If c <> 0
+      PokeB(d, c)
+      d = d + 1
+      s = s + 1
+      k = k - 1
+    EndIf
+  Wend
+
+  While k > 0                       ; the padding, on the RIGHT
+    PokeB(d, pad)
+    d = d + 1
+    k = k - 1
+  Wend
+  PokeB(d, 0)
+EndProcedure
+
+; LSet(destination, source, width, padCode) - LEFT-justify source in a field of
+; width characters, padding on the right with the character whose code you give
+; (32 is a space). Longer sources are TRUNCATED to width.
+Procedure LSet(*d.i, *s.i, width.w, padCode.w, maxLen.l)
+  str_lset_at(d, s, width, padCode, maxLen)
+EndProcedure
+
+; ----------------------------------------------------------------------
+; str_rset_at(dest, source, width, pad) - RIGHT-justify into a field.
+;
+; The padding moves to the left; the TRUNCATION DOES NOT MOVE WITH IT.
+; A source longer than the field keeps its FIRST width characters, not
+; its last - measured on the desktop, where RSet("abcdefgh", 5) is
+; "abcde". It reads as a surprise every time, so it is written down here
+; and reproduced rather than improved.
+; ----------------------------------------------------------------------
+Procedure str_rset_at(d.i, s.i, width.w, pad.w, maxLen.l)
+  Protected c.w
+  Protected k.w
+  Protected n.w
+
+  If maxLen <= 0
+    ProcedureReturn
+  EndIf
+  If width < 1
+    PokeB(d, 0)                     ; an empty field is an empty string
+    ProcedureReturn
+  EndIf
+
+  n = str_len_at(s)
+  If n > width
+    n = width                       ; keep the FIRST width characters
+  EndIf
+
+  ; The field is (width - n) pads and then n characters. Cut at the
+  ; destination's size, it is the first maxLen - 1 of those.
+  k = width - n
+  If k > maxLen - 1
+    k = maxLen - 1
+  EndIf
+  If n > maxLen - 1 - k
+    n = maxLen - 1 - k
+  EndIf
+  While k > 0                       ; the padding, on the LEFT
+    PokeB(d, pad)
+    d = d + 1
+    k = k - 1
+  Wend
+
+  k = n
+  While k > 0
+    c = PeekA(s) & 255
+    PokeB(d, c)
+    d = d + 1
+    s = s + 1
+    k = k - 1
+  Wend
+  PokeB(d, 0)
+EndProcedure
+
+; RSet(destination, source, width, padCode) - RIGHT-justify source in a field of
+; width characters, padding on the LEFT with the character whose code you give
+; (32 is a space). A source longer than width keeps its FIRST width characters.
+Procedure RSet(*d.i, *s.i, width.w, padCode.w, maxLen.l)
+  str_rset_at(d, s, width, padCode, maxLen)
+EndProcedure
+
+; ----------------------------------------------------------------------
+; str_copyn_at(dest, source, count) - the bounded copy under PeekS AND
+; PokeS. Returns how many characters were copied, terminator excluded.
+;
+; COUNT OF -1 MEANS "TO THE TERMINATOR", which is the desktop's own
+; spelling of the same idea and the reason the counter is tested against
+; zero rather than against one: -1 counts down away from zero and only
+; the source's own null ends the loop.
+;
+; ONE routine serves both because on these parts they ARE one operation.
+; On the desktop PeekS builds a new string and PokeS writes bytes out of
+; one, so they are opposites; here neither allocates and both are a
+; bounded, null-terminated copy from a source pointer to a destination
+; pointer. Writing that twice is how the two would drift apart.
+; ----------------------------------------------------------------------
+Procedure.w str_copyn_at(d.i, s.i, count.w)
+  Protected c.w
+  Protected k.w
+  Protected n.w
+  Protected go.w
+
+  k = count
+  n = 0
+  go = 1
+  While go = 1 And k <> 0
+    c = PeekA(s) & 255
+    If c = 0
+      go = 0
+    Else
+      PokeB(d, c)
+      d = d + 1
+      s = s + 1
+      n = n + 1
+      k = k - 1
+    EndIf
+  Wend
+  PokeB(d, 0)
+  ProcedureReturn n
+EndProcedure
+
+; ----------------------------------------------------------------------
+; PeekS(destination, address, length) - read a string OUT of memory.
+;
+; The parser's Peek/Poke sugar covers PeekA/B/C/W/U/I/L and stops there,
+; and its own comment says why S is missing: "reading a string from an
+; address is a COPY, not a load - it is Lib/string's job". This is that
+; job.
+;
+; DIFFERS FROM THE DESKTOP IN ONE WAY: there it returns a newly allocated
+; string, and there is no heap here, so the buffer comes first like
+; everything else in this file. Length -1 reads to the terminator; a
+; length shorter than the string cuts it there and terminates; a length
+; longer stops at the terminator anyway.
+; ----------------------------------------------------------------------
+Procedure PeekS(*d.i, *address.i, length.w, maxLen.l)
+  If maxLen <= 0
+    ProcedureReturn
+  EndIf
+  If length < 0 Or length > maxLen - 1
+    length = maxLen - 1             ; -1 (to the terminator) or too long: cut at the size
+  EndIf
+  str_copyn_at(d, address, length)
+EndProcedure
+
+; ----------------------------------------------------------------------
+; PokeS(address, source, length) - write a string INTO memory, and give
+; back how many characters were written.
+;
+; THE ARGUMENT ORDER IS THE DESKTOP'S UNCHANGED, because PokeS already
+; put its destination first - the one routine in this file where the
+; house rule and the original spelling agree by accident.
+;
+; The count it returns excludes the terminator, which is written in every
+; case: PokeS(@buf, @s, 0) leaves an empty string and returns 0. The
+; desktop returns the same number.
+;
+; A literal source works here, because a literal and a buffer share one
+; address space on these boards and PeekB reads both. IT DOES NOT ON AVR, where a
+; literal needs read_rom_8 - so a program that must build for all three
+; families should pass a variable.
+; ----------------------------------------------------------------------
+Procedure.w PokeS(*address.i, *s.i, length.w)
+  ProcedureReturn str_copyn_at(address, s, length)
+EndProcedure
+
+; ----------------------------------------------------------------------
+; StringByteLength(s) - how many BYTES the string occupies.
+;
+; IT IS THE SAME NUMBER Len() GIVES, on this target and on every other
+; one here, and that is worth saying plainly rather than implying a
+; distinction that does not exist. A string on the desktop is UTF-16, so
+; there the two differ by a factor of two and the byte count is the one
+; you need before a memory copy; on these parts a character IS a byte, so
+; the two questions have one answer.
+;
+; It exists so that source written against the desktop spelling compiles
+; unchanged - which is the whole reason this file uses those names - and
+; it costs one call. Use Len() in new code.
+; ----------------------------------------------------------------------
+Procedure.w StringByteLength(*s.i)
+  ProcedureReturn str_len_at(s)
+EndProcedure
+
+; ======================================================================
+; ======================================================================
+; THE SIX FRONTEND-EMITTED STRING PRIMITIVES
+; ======================================================================
+; ======================================================================
+;
+; Everything above this line is a routine the PROGRAMMER calls by name.
+; Everything below it is a routine the compiler calls on the programmer's
+; behalf ON AVR - and the "on AVR" is the whole story of this section.
+;
+; On the ATmega328P, the compiler's IRCore_AVR module emits these six calls itself:
+;
+;     a$ = "literal"        ->  __string_copy            (flash -> SRAM)
+;     a$ = b$               ->  __string_copy_ram        (SRAM  -> SRAM)
+;     If a$ = "literal"     ->  __string_compare_flash
+;     If a$ = b$            ->  __string_compare_ram
+;     a$ + "literal"        ->  __string_concat_flash
+;     a$ + b$               ->  __string_concat_ram
+;
+; ON THESE BOARDS THE COMPILER DOES NOT CALL THEM. It emits its own
+; AArch64 string runtime - __a64_string_copy, __a64_string_compare and
+; __a64_string_concat, the twins of the Cortex-M families' __arm_string_*
+; - three and not six for the reason given under THE FLASH/RAM SPLIT
+; below. So there is no name collision with the six here, and nothing in
+; the compiler reaches them.
+;
+; THEY ARE KEPT ANYWAY, and deliberately. They are ordinary, callable
+; procedures with the AVR names and the AVR behaviour, so that a source
+; file that mentions one - a test, a port in progress, a program written
+; against the AVR library - compiles here unchanged. They cost flash only
+; if something calls them.
+;
+; The AVR file carries a DANGER block here about string work inside a
+; ProcedureInterrupt being silently miscompiled. THAT HAZARD CANNOT ARISE
+; HERE: ProcedureInterrupt is refused on these boards (there is no
+; exception vector table in a program yet), and the compiler never emits
+; a call to these six at all.
+;
+; ======================================================================
+; DO NOT WRITE A STRING ASSIGNMENT, COMPARISON OR CONCATENATION IN HERE
+; ======================================================================
+; Not as a convenience, not in a comment you later uncomment, not in
+; anything these procedures call. Every byte below moves through
+; PeekB/PokeB and explicit loops. There is no string-typed variable
+; anywhere in this section, and there must not be one.
+;
+; On AVR the reason is a recursion trap: `x$ = y$` inside
+; __string_copy_ram lowers to a CALL TO __string_copy_ram, which - now
+; that the name resolves to this file rather than to an inlined template -
+; is direct recursion, and that backend refuses recursion outright. Here
+; the name would resolve to __arm_string_copy instead, so it is not
+; self-recursive - but it would make these six silently DIFFERENT from
+; their AVR twins, which defeats the only reason they exist, and on the
+; RA4M1 recursion compiles unverified rather than being refused. The rule
+; is the same rule; only the failure mode moved.
+;
+; ======================================================================
+; THE MAX-LENGTH ARGUMENT IS THE DESTINATION'S DECLARED SIZE
+; ======================================================================
+; The frontend passes the destination string variable's declared size -
+; `Global a.s{16}` gives 16, and a bare `.s` gives the default 32. It is
+; a TOTAL BYTE BUDGET INCLUDING THE TERMINATOR, and the templates
+; enforced it in a way that is worth spelling out because it looks like
+; an off-by-one and is not:
+;
+;     st X+, %S1        ; store the byte, THEN
+;     dec %S2           ; spend the budget
+;     ...
+;   force_null:
+;     sbiw r26, 1       ; on exhaustion, back up over the last byte
+;     st X, 0           ; and overwrite it with the terminator
+;
+; The routine writes maxlen bytes and then turns the last one into the
+; null, so a 16-byte buffer holds at most 15 characters. Every arrival
+; below reproduces that, including the arithmetic on the pointer, and so
+; does the compiler's own string runtime, on every target.
+;
+; ONE SHARP EDGE IS REPRODUCED DELIBERATELY: __string_copy with maxlen 0
+; takes the force-null path immediately, having stored nothing, and so
+; writes its zero at DESTINATION - 1 - one byte BEFORE the buffer. The
+; template did exactly this, and it is left alone rather than "fixed"
+; because a silent behaviour change is worse than a documented sharp
+; edge. The concat pair do NOT share it: they test the counter before
+; their first load.
+;
+; IT IS REACHABLE FROM ORDINARY SOURCE, and this note used to say it was
+; not. The budget is masked to a byte one line below - `maxlen & 255`,
+; which is the template's byte register - so ANY DECLARED SIZE THAT IS A
+; MULTIPLE OF 256 ARRIVES AS 0. `Global a.s{256}` is an ordinary
+; declaration; ParserCore takes the number in the braces as written and
+; puts no ceiling on it.
+;
+; MEASURED 2026-08-05, two globals and three lines of source:
+;
+;     Global Guard.l                  ; laid out immediately below a
+;     Global a.s{256}
+;     Global b.s{255}
+;     Guard = -1 : a = "hi" : b = "hi"
+;
+;   b   -> "hi"          correct
+;   a   -> ""            NOTHING was copied
+;   Guard -> $00FFFFFF   the top byte overwritten with the terminator
+;                        that went one byte BELOW a
+;
+; So the failure is silent, it loses the assignment, AND it corrupts a
+; different variable. 255 is safe; 256 is not.
+;
+; THIS IS NOT CONFINED TO THESE SIX, which is why it is worth the space.
+; The compiler does not call them on these boards - it emits
+; __a64_string_copy - and that routine masks the same way, `uxtb w2, w2`,
+; deliberately and for the same AVR-parity reason: a maxlen of 256 means 0
+; there too.
+; The mask is doing what it was written to do; the missing piece was a
+; refusal at the DECLARATION, where a size the runtime cannot express
+; ought to stop the build by name. Since 2026-08-05 ParserCore refuses
+; a declared string size outside 1..255 on every target, so a size
+; reaching this budget always fits it. The mask stays regardless - the
+; count arguments to Left/Mid and friends are still runtime values.
+;
+; ======================================================================
+; THE COUNTER IS SHARED ACROSS BOTH HALVES OF A CONCATENATION
+; ======================================================================
+; __string_concat_* walks the destination to its terminator and then
+; appends - on ONE counter that is never reset. So the budget covers the
+; existing contents AND the appended text together, which is what makes
+; `a$ = a$ + "x"` in a loop stop growing at the buffer's size instead of
+; running off the end of it.
+;
+; Two consequences of the template's exact shape, both preserved:
+;
+;  * The null byte that ENDS the destination is read without spending a
+;    count (`breq found` jumps out before the `dec`), so a 5-byte budget
+;    over "AB" leaves 3 for the append and produces "ABCD" - 5 bytes with
+;    the terminator.
+;  * If the counter runs out BEFORE a terminator is found, the routine
+;    returns having written NOTHING AT ALL - not even a terminator. An
+;    unterminated destination stays unterminated. That is the template's
+;    `.L_strcat_find_null / breq done` path, and a program can only reach
+;    it with a buffer that was already unterminated.
+;
+; AND THE COST, WHICH NOTHING ELSE HERE STATES: that first loop walks the
+; destination from its START, every single call. So `a$ = a$ + "x"` in a
+; loop is QUADRATIC - appending n characters one at a time reads about
+; n^2/2 bytes, because each append re-walks everything already there.
+; That is correct, it is bounded (the budget stops it at the buffer's
+; size), and on a few dozen characters it is invisible. Building a
+; 200-byte line a character at a time is 20000 reads, which on a serial
+; loop you can measure. If you are assembling text in a loop, keep your
+; own cursor and PokeB at it, or build the pieces and append whole
+; fields rather than characters.
+;
+; ======================================================================
+; THE FLASH/RAM SPLIT IS AN AVR ARTIFACT AND MEANS NOTHING HERE
+; ======================================================================
+; This is the one place where the port is not a straight transcription,
+; so it gets the long explanation.
+;
+; On AVR, program memory and data memory are SEPARATE ADDRESS SPACES. The
+; address 600 in flash and the address 600 in SRAM are two different
+; bytes, and only the `lpm` instruction reaches the first one. No amount
+; of ordinary source can express `lpm`, so read_rom_8() is an intrinsic
+; there, and every routine that might be handed a string LITERAL needs a
+; second copy of itself that loads through it. That is where the _flash /
+; _ram pairing comes from - it is not about the strings, it is about which
+; instruction can fetch the byte.
+;
+; THESE BOARDS HAVE ONE ADDRESS SPACE. A literal is in the image and a
+; buffer is in the program's variable memory, both plain addresses, and
+; one ldrb reads either. PeekB() reaches a string literal exactly as it
+; reaches a buffer, and read_rom_8() DOES NOT EXIST ON THESE TARGETS - no
+; part file of theirs declares it, and there is nothing for it to do.
+;
+; So every `read_rom_8(p) & 255` in the AVR file is `PeekB(p) & 255` here,
+; and the consequence is that str_copy_flash_at is now CHARACTER-FOR-
+; CHARACTER IDENTICAL to str_copy_ram_at, str_cmp_flash_at to
+; str_cmp_ram_at, and str_cat_flash_at to str_cat_ram_at. That duplication
+; is VESTIGIAL and it is intentional. The compiler's own helpers collapsed
+; the six into three for this exact reason; this file does not, because
+; collapsing them would delete names that AVR source legitimately mentions
+; and break the one-source-three-targets property. Each of the three
+; _flash routines below carries a one-line note saying so, so that nobody
+; reading it in isolation "fixes" the redundancy.
+; ======================================================================
+
+
+; ----------------------------------------------------------------------
+; __string_copy(destination, flashSource, maxlen).
+;
+; Emitted for  a$ = "literal"  on AVR, where the source is in a separate
+; address space. HERE THE _flash AND _ram FORMS ARE THE SAME ROUTINE:
+; one address space, so this is a plain PeekB read. Kept under both names
+; so AVR source compiles unchanged - see THE FLASH/RAM SPLIT above.
+; ----------------------------------------------------------------------
+Procedure str_copy_flash_at(d.i, p.i, maxlen.w)
+  Protected c.w
+  Protected k.w
+
+  k = maxlen & $FFFF              ; 16 bits (ruling 50; the AVR template's budget was a byte)
+  Repeat
+    If k = 0
+      d = d - 1                   ; budget spent: back up over the last
+      PokeB(d, 0)                 ; byte written and terminate there
+      Break
+    EndIf
+    c = PeekA(p) & 255            ; read_rom_8() on AVR; no such thing here
+    p = p + 1
+    PokeB(d, c)
+    d = d + 1
+    If c = 0                      ; the source's own terminator, already
+      Break                       ; copied - the string ends naturally
+    EndIf
+    k = k - 1
+  ForEver
+EndProcedure
+
+; COMPILER-EMITTED ON AVR. Not called by hand: there this is what a$ = "literal" becomes.
+; Copies from FLASH into SRAM, stopping at maxlen.
+Procedure __string_copy(*d.i, *s.i, maxlen.w)
+  str_copy_flash_at(d, s, maxlen)
+EndProcedure
+
+; ----------------------------------------------------------------------
+; __string_copy_ram(destination, source, maxlen).
+;
+; Emitted for  a$ = b$  on AVR. Identical to __string_copy in every
+; respect - on AVR that was true except for the load instruction, and
+; here it is true without qualification.
+;
+; Overlapping buffers copy FORWARDS one byte at a time, so a destination
+; that sits below its source is fine and one that sits above it inside
+; the same string is not. The template had the same property.
+; ----------------------------------------------------------------------
+Procedure str_copy_ram_at(d.i, p.i, maxlen.w)
+  Protected c.w
+  Protected k.w
+
+  k = maxlen & $FFFF
+  Repeat
+    If k = 0
+      d = d - 1
+      PokeB(d, 0)
+      Break
+    EndIf
+    c = PeekA(p) & 255
+    p = p + 1
+    PokeB(d, c)
+    d = d + 1
+    If c = 0
+      Break
+    EndIf
+    k = k - 1
+  ForEver
+EndProcedure
+
+; COMPILER-EMITTED ON AVR, the SRAM-to-SRAM twin of __string_copy - what a$ = b$
+; becomes when the source is a variable rather than a literal.
+Procedure __string_copy_ram(*d.i, *s.i, maxlen.w)
+  str_copy_ram_at(d, s, maxlen)
+EndProcedure
+
+; ----------------------------------------------------------------------
+; __string_compare_flash(string, literal) - 1 if equal, else 0.
+;
+; Emitted for  If a$ = "literal"  on AVR (and, with the frontend inverting
+; the result afterwards, for  a$ <> "literal"). SAME ROUTINE AS THE _ram
+; FORM HERE - one address space, so both sides are plain PeekB reads.
+;
+; There is NO max-length argument here, so this walks until the strings
+; disagree or both terminate. Two unterminated buffers full of matching
+; bytes will run off the end of them, and did in the template too.
+;
+; The template compared raw bytes with `cp`, so it is byte EQUALITY and
+; the sign question never arises - but the values are held in 16-bit .w
+; anyway, because this file does not have per-routine exceptions to the
+; mask-and-widen rule in its header.
+; ----------------------------------------------------------------------
+Procedure.w str_cmp_flash_at(a.i, b.i)
+  Protected x.w
+  Protected y.w
+  Protected r.w
+
+  r = 1                           ; equal until proven otherwise
+  Repeat
+    x = PeekA(a) & 255
+    y = PeekA(b) & 255            ; read_rom_8() on AVR; no such thing here
+    If x <> y
+      r = 0
+      Break
+    EndIf
+    If x = 0                      ; both ended, and ended together
+      Break
+    EndIf
+    a = a + 1
+    b = b + 1
+  ForEver
+
+  ProcedureReturn r
+EndProcedure
+
+; COMPILER-EMITTED ON AVR. What a$ = "literal" becomes in an If. Returns 1 when the
+; two match and 0 when they differ - the same way round as its worker above,
+; and NOT the C strcmp convention this line used to state.
+Procedure.w __string_compare_flash(*a.i, *b.i)
+  ProcedureReturn str_cmp_flash_at(a, b)
+EndProcedure
+
+; ----------------------------------------------------------------------
+; __string_compare_ram(string, string) - 1 if equal, else 0.
+;
+; Emitted for  If a$ = b$  on AVR.
+; ----------------------------------------------------------------------
+Procedure.w str_cmp_ram_at(a.i, b.i)
+  Protected x.w
+  Protected y.w
+  Protected r.w
+
+  r = 1
+  Repeat
+    x = PeekA(a) & 255
+    y = PeekA(b) & 255
+    If x <> y
+      r = 0
+      Break
+    EndIf
+    If x = 0
+      Break
+    EndIf
+    a = a + 1
+    b = b + 1
+  ForEver
+
+  ProcedureReturn r
+EndProcedure
+
+; COMPILER-EMITTED ON AVR, the SRAM-to-SRAM twin of __string_compare_flash.
+Procedure.w __string_compare_ram(*a.i, *b.i)
+  ProcedureReturn str_cmp_ram_at(a, b)
+EndProcedure
+
+; ----------------------------------------------------------------------
+; __string_concat_flash(destination, flashSource, maxlen) - append a
+; literal to a buffer.
+;
+; Emitted for the second and later terms of  a$ = ... + "literal"  on AVR.
+; SAME ROUTINE AS THE _ram FORM HERE - one address space.
+;
+; Read the "THE COUNTER IS SHARED" note above before touching the two
+; loops: they run on ONE counter, and the null that ends the destination
+; costs nothing.
+; ----------------------------------------------------------------------
+Procedure str_cat_flash_at(d.i, p.i, maxlen.w)
+  Protected c.w
+  Protected k.w
+  Protected found.w
+
+  k = maxlen & $FFFF
+
+  ; --- walk the destination to its terminator ---
+  found = 0
+  While k > 0
+    c = PeekA(d) & 255
+    d = d + 1
+    If c = 0
+      found = 1
+      Break                       ; NOTE: no k = k - 1 on this path
+    EndIf
+    k = k - 1
+  Wend
+
+  ; found = 0 means the budget ran out with no terminator in sight. The
+  ; template returned here having written nothing, and so does this.
+  If found = 1
+    d = d - 1                     ; back onto the terminator just read
+
+    Repeat
+      If k = 0
+        d = d - 1
+        PokeB(d, 0)
+        Break
+      EndIf
+      c = PeekA(p) & 255          ; read_rom_8() on AVR; no such thing here
+      p = p + 1
+      PokeB(d, c)
+      d = d + 1
+      If c = 0
+        Break
+      EndIf
+      k = k - 1
+    ForEver
+  EndIf
+EndProcedure
+
+; COMPILER-EMITTED ON AVR. What a$ + "literal" becomes - appends, respecting maxlen.
+Procedure __string_concat_flash(*d.i, *s.i, maxlen.w)
+  str_cat_flash_at(d, s, maxlen)
+EndProcedure
+
+; ----------------------------------------------------------------------
+; __string_concat_ram(destination, source, maxlen) - append a string to
+; a buffer.
+;
+; Emitted for the second and later terms of  a$ = ... + b$  on AVR.
+; ----------------------------------------------------------------------
+Procedure str_cat_ram_at(d.i, p.i, maxlen.w)
+  Protected c.w
+  Protected k.w
+  Protected found.w
+
+  k = maxlen & $FFFF
+
+  found = 0
+  While k > 0
+    c = PeekA(d) & 255
+    d = d + 1
+    If c = 0
+      found = 1
+      Break
+    EndIf
+    k = k - 1
+  Wend
+
+  If found = 1
+    d = d - 1
+
+    Repeat
+      If k = 0
+        d = d - 1
+        PokeB(d, 0)
+        Break
+      EndIf
+      c = PeekA(p) & 255
+      p = p + 1
+      PokeB(d, c)
+      d = d + 1
+      If c = 0
+        Break
+      EndIf
+      k = k - 1
+    ForEver
+  EndIf
+EndProcedure
+
+; COMPILER-EMITTED ON AVR, the SRAM-to-SRAM twin of __string_concat_flash.
+Procedure __string_concat_ram(*d.i, *s.i, maxlen.w)
+  str_cat_ram_at(d, s, maxlen)
+EndProcedure
+
+; ----------------------------------------------------------------------
+; __string_concat_num - append a NUMBER's decimal digits to a string.
+;
+; The seventh frontend-emitted primitive. It exists on the AVR since
+; 2026-08-01 (Atmel328pAndRelated/Lib/string.avrb) and was MISSING from all
+; three ARM ports until 2026-08-13, which is what made
+;
+;     n = "n=" + 7          ->  ASSEMBLER FATAL: undefined symbol 'global_7'
+;     msg = "count=" + k    ->  "count=*" for k = 42
+;
+; the two shapes of forum tid 267 and the ARM half of tid 137. The frontend
+; had no case for a numeric term in a string chain, so it took the term's
+; ADDRESS: a literal has no symbol, so the name "global_7" was invented and
+; the assembler refused it; a variable does have one, so the raw bytes of
+; its storage were concatenated as text and the build was CLEAN. A .w
+; holding 42 is $2A $00, which reads as "*" and then terminates.
+;
+; SIGNED, unlike NumToStr, and that is the whole reason this is a separate
+; routine rather than a call to the existing unsigned formatter: PrintN(-17)
+; prints -17, and a string built from the same value has to agree with it.
+; Negating -32768 stays -32768, whose bit pattern read as unsigned is 32768 -
+; exactly the magnitude wanted, so the edge case needs no special handling.
+;
+; maxlen is honoured the same way str_cat_ram_at honours it. A 16-bit value
+; is at most 5 digits, plus a possible sign, plus the terminator - so if
+; fewer than 7 bytes remain the number is not appended AT ALL rather than
+; half-written. A truncated number is a WRONG number, and a wrong number that
+; looks plausible is the failure this routine exists to end.
+;
+; BYTE-FOR-BYTE the AVR routine, like everything else in this file. The same
+; program source must give the same characters in the same buffer on the
+; ATmega328P and here.
+; ----------------------------------------------------------------------
+Procedure __string_concat_num(*d.i, v.w, maxlen.w)
+  ; dd is .i, NOT the .w the AVR file uses. That is the ONE line that could
+  ; not be copied across: on the AVR a pointer IS 16 bits, so .w holds an
+  ; address there and truncates one here. Measured, not reasoned - the first
+  ; port kept the .w, PokeB wrote through a 16-bit-truncated 0x20000324, and
+  ; "n=" + 7 came back as "n=" with the digit silently dropped.
+  Protected dd.i
+  Protected k.w
+  Protected c.w
+
+  dd = d
+  k = maxlen & $FFFF
+
+  ; Walk to the existing terminator, counting the room left.
+  While k > 0
+    c = PeekA(dd) & 255
+    If c = 0
+      Break
+    EndIf
+    dd = dd + 1
+    k = k - 1
+  Wend
+
+  ; 5 digits + sign + terminator. Not enough room means leave the string
+  ; exactly as it was.
+  If k < 7
+    ProcedureReturn
+  EndIf
+
+  If v < 0
+    PokeB(dd, 45)          ; '-'
+    dd = dd + 1
+    v = -v
+  EndIf
+
+  str_num_at(dd, v)        ; writes the digits and the terminator
+EndProcedure
+
+; The same thing when the number STARTS the chain - "msg = n + ..." - where
+; the destination has not been written yet and whatever bytes are sitting in
+; it are not a string. Terminating it first turns the append above into a
+; plain assignment; without this, __string_concat_num walks an uninitialised
+; buffer looking for a zero that may be anywhere.
+Procedure __string_set_num(*d.i, v.w, maxlen.w)
+  PokeB(d, 0)
+  __string_concat_num(d, v, maxlen)
+EndProcedure
+
+; ======================================================================
+;  NUMBERS AT THIS FAMILY'S WIDTH (2026-10-15)
+; ======================================================================
+; Str(), Hex(), Bin() and a number joined into text ("n=" + v) above take
+; a .w: they were written for the 8-bit targets, where a whole number is 16
+; bits, and they are kept so a narrow value gives the very text it gives
+; on every other target. A whole number is 64 bits on these boards, so the
+; compiler looks at the value's type where the call is made and calls one
+; of these instead:
+;
+;   an unsigned 64-bit value (a .x, or arithmetic with one)
+;                                   -> the _x names, 0 to 18446744073709551615
+;   any other whole number wider than 16 bits - a .l, .n, .u, .q, .i,
+;   PeekL, a number from 65536 up, and EVERY ARITHMETIC EXPRESSION, which
+;   is worked out at 64 bits here (forum 1283)
+;                                   -> the _q names, -9223372036854775808
+;                                      to 9223372036854775807
+;   anything narrower               -> Str / Hex / Bin / __string_concat_num
+;                                      above, exactly as before
+;
+; A .n and a .u need no unsigned routine: their register holds the value
+; itself, zero-extended, so the signed 64-bit routine writes it as it is.
+;
+; HEX AND BIN WRITE THE VALUE'S BIT PATTERN AT ITS OWN WIDTH: __hex_l and
+; __bin_l for a 4-byte value (Hex of -1 as a .l is FFFFFFFF, as on the
+; 32-bit families), __hex_q and __bin_q for anything wider or computed (Hex
+; of -1 as a .q is FFFFFFFFFFFFFFFF).
+;
+; ONE routine writes the digits for all of them, str_num64_at. With bits =
+; 32 it keeps the low 32 bits first. With sgn set and v negative it writes
+; '-' and goes on with 0 - v, whose bit pattern is the magnitude even for
+; -9223372036854775808. The value is then read as UNSIGNED: a value with
+; bit 63 set has its last digit taken off first with the zero-filling
+; halving - v / base read unsigned is
+; ((v >> 1) & $7FFFFFFFFFFFFFFF) / (base / 2), which is below 2^63 - and the
+; rest is an ordinary non-negative number. That is str_num32_at of the
+; 32-bit families, one width up.
+; ----------------------------------------------------------------------
+Procedure str_num64_at(d.i, v.q, base.q, sgn.q, bits.q)
+  Dim dig.a[66]
+  Define k.q
+  Define p.q
+  Define r.q
+  If bits = 32
+    v = v & $FFFFFFFF                  ; the 4-byte pattern of a .l or .n
+  EndIf
+  If sgn <> 0 And v < 0
+    PokeB(d, 45)                       ; "-"
+    d = d + 1
+    v = 0 - v
+  EndIf
+  k = 0
+  If v < 0
+    p = ((v >> 1) & $7FFFFFFFFFFFFFFF) / (base / 2)
+    r = v - p * base                   ; 0 .. base-1: the last digit
+    dig[0] = r
+    k = 1
+    v = p
+  EndIf
+  Repeat
+    dig[k] = v % base
+    k = k + 1
+    v = v / base
+  Until v = 0
+  While k > 0
+    k = k - 1
+    r = dig[k]
+    If r < 10
+      PokeB(d, 48 + r)
+    Else
+      PokeB(d, 55 + r)                 ; 55 + 10 = 65 = "A"
+    EndIf
+    d = d + 1
+  Wend
+  PokeB(d, 0)
+EndProcedure
+
+; COMPILER-CALLED: Str(out, v) when v is wider than 16 bits and signed.
+Procedure __str_q(*d.i, value.q, maxLen.l)
+  str_num64_at(@str_text_buf, value, 10, 1, 64)
+  str_text_fit(d, maxLen)
+EndProcedure
+
+; COMPILER-CALLED: Str(out, v) when v is unsigned 64-bit (a .x).
+Procedure __str_x(*d.i, value.q, maxLen.l)
+  str_num64_at(@str_text_buf, value, 10, 0, 64)
+  str_text_fit(d, maxLen)
+EndProcedure
+
+; COMPILER-CALLED: Hex(out, v) when v is 4 bytes wide (.l, .n).
+Procedure __hex_l(*d.i, value.q, maxLen.l)
+  str_num64_at(@str_text_buf, value, 16, 0, 32)
+  str_text_fit(d, maxLen)
+EndProcedure
+
+; COMPILER-CALLED: Hex(out, v) when v is 8 bytes wide or computed.
+Procedure __hex_q(*d.i, value.q, maxLen.l)
+  str_num64_at(@str_text_buf, value, 16, 0, 64)
+  str_text_fit(d, maxLen)
+EndProcedure
+
+; COMPILER-CALLED: Bin(out, v) when v is 4 bytes wide.
+Procedure __bin_l(*d.i, value.q, maxLen.l)
+  str_num64_at(@str_text_buf, value, 2, 0, 32)
+  str_text_fit(d, maxLen)
+EndProcedure
+
+; COMPILER-CALLED: Bin(out, v) when v is 8 bytes wide or computed.
+Procedure __bin_q(*d.i, value.q, maxLen.l)
+  str_num64_at(@str_text_buf, value, 2, 0, 64)
+  str_text_fit(d, maxLen)
+EndProcedure
+
+; The join of a wide number. maxlen is honoured the way every join honours
+; it: the number is written whole or not at all - a number cut short is a
+; wrong number. It is written when its digits and the terminator fit in the
+; room left, so the text is formatted first, into str_num64_buf.
+Global Dim str_num64_buf.a[68]
+Procedure str_cat_num64_at(d.i, v.q, maxlen.q, sgn.q)
+  Protected dd.i
+  Protected k.q
+  Protected c.q
+  Protected n.q
+  Protected i.q
+  dd = d
+  k = maxlen & $FFFF
+  While k > 0
+    c = PeekA(dd) & 255
+    If c = 0
+      Break
+    EndIf
+    dd = dd + 1
+    k = k - 1
+  Wend
+  str_num64_at(@str_num64_buf, v, 10, sgn, 64)
+  n = 0
+  While str_num64_buf[n] <> 0
+    n = n + 1
+  Wend
+  If k < n + 1
+    ProcedureReturn
+  EndIf
+  For i = 0 To n
+    PokeB(dd + i, str_num64_buf[i])
+  Next
+EndProcedure
+
+; COMPILER-CALLED: "text" + v when v is wider than 16 bits and signed.
+Procedure __string_concat_q(*d.i, v.q, maxlen.w)
+  str_cat_num64_at(d, v, maxlen, 1)
+EndProcedure
+
+; COMPILER-CALLED: "text" + v when v is unsigned 64-bit (a .x).
+Procedure __string_concat_x(*d.i, v.q, maxlen.w)
+  str_cat_num64_at(d, v, maxlen, 0)
+EndProcedure
+
+; COMPILER-CALLED: v + "text" (the number starts the chain), signed.
+Procedure __string_set_q(*d.i, v.q, maxlen.w)
+  PokeB(d, 0)
+  str_cat_num64_at(d, v, maxlen, 1)
+EndProcedure
+
+; COMPILER-CALLED: v + "text" (the number starts the chain), a .x.
+Procedure __string_set_x(*d.i, v.q, maxlen.w)
+  PokeB(d, 0)
+  str_cat_num64_at(d, v, maxlen, 0)
+EndProcedure
+
+; ======================================================================
+;  THE BOARD RUN
+; ======================================================================
+; 2026-10-15, a Raspberry Pi 4 through the Anvil monitor (ruling 47): the
+; test program of tools/a64_string_runtime_check.py (every routine above,
+; the joins, Str / Hex / Bin at 64 bits, Val .q) and the overrun canary of
+; tools/string_bounds_check.py, as one returning payload printing into a
+; buffer the host read back - 129 of 129 lines as worked out on the PC.
+; A first run of it the same day stopped at a processor exception: the
+; compiler's 32-byte temporary for "e2 = Bin(big)" was overrun (forum
+; 1311) - the reason every routine here that writes into a destination
+; now takes that destination's size (ruling 49).
+; The Pi 3, Pi 5, ROCK Pi 4C and UNO Q are built, not run.

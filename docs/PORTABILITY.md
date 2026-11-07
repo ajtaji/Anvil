@@ -56,3 +56,13 @@ avoids that mismatch without requiring a compiler change.
 
 The repository does not contain the private compiler implementation or a
 compiler executable.
+
+## Shipped guest runtime closure
+
+Current Forge injects `Shared/A64/string.pmi` when an AArch64 program uses
+string expressions. Because `PMF_ROOT` deliberately forbids a fallback outside
+this checkout, that shipped guest library is included here and required by the
+export manifest. Its origin revision and digest are recorded in
+`PROVENANCE.json`. This is runtime source for the guest, not a second compiler
+or private compiler implementation. `.pmi` files receive the same public-source
+boundary and hygiene checks as `.pbi` files.

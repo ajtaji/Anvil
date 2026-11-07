@@ -298,9 +298,10 @@ Zentaji with deterministic service adapters. It checks input/PWM refusal,
 service fairness, idle utilization and a clock above 32 bits, then compile-checks
 the policy and real idle mechanism for AArch64. Current Wi-Fi maintenance
 and optional ARM board idle callbacks are preserved. This is a portability proof of
-the scheduler, not an Anvil boot or hardware wake proof. A full monitor build
-currently encounters a pre-existing missing `Shared/A64/string.pmi` dependency
-with the current compiler, reproduced on unmodified source as well.
+the scheduler, not an Anvil boot or hardware wake proof. The pinned checkout now carries the shipped `Shared/A64/string.pmi` runtime
+required by current Forge. Full Pi 4 build 492 compiles the complete composition
+with the extracted scheduler/backend; that is compile proof, not new hardware
+acceptance. Runtime origin and digest are recorded in `PROVENANCE.json`.
 
 Remaining architecture work includes payload architecture IDs and calling
 conventions, relocation handling, privilege/context entry and return, exception
