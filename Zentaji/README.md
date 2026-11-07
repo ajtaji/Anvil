@@ -1,6 +1,6 @@
 # Zentaji backend bring-up
 
-The machine has a real clock and bounded prompt-idle backend. This is not yet
+The machine has a real clock, bounded prompt-idle backend and serial console transport. This is not yet
 a full Anvil monitor image, a ROM boot proof, or a self-hosted Forge build.
 The shared monitor remains the source of scheduler and command policy.
 
@@ -58,7 +58,41 @@ headless live run keeps service lanes active and verifies startup-adjusted CPU
 use below 20%, with exact recorded native/twin replay. This is currently a
 Windows execution proof; Linux execution and visible input remain unverified.
 
-Next are complete board startup/vector ownership, console/input/storage backends,
+`Board/console.pbi` adopts serial port 0 without resetting it, draining RX,
+changing baud or clearing counters. The monitor must exclude block/DMA users;
+adoption refuses active TX/RX block transfers. Reads preserve all byte values,
+including NUL and 255. Read readiness never consumes input. Healthy blocking
+input uses the qualified timer/WFI backend above; missing idle admission or
+lost transport ownership returns -1 and records a fault instead of spinning.
+
+Transmit pressure, bounded polling and drain have a 4096-probe ceiling and a
+100 ms machine-time deadline. These ceilings are upper bounds, not promised
+wait durations; a fast polling loop may exhaust its probes earlier. Drain checks
+actual timed TX completion. Baud changes require an empty, unowned transmitter;
+zero selects the machine's unpaced mode. Logical detach preserves configuration
+and queued bytes. Drop reporting combines rejected writes with the hardware
+counter delta for the attachment, frozen at detach.
+
+`Anvil/Core/console_bytes.pbi` owns the existing byte-string and CRLF output
+helpers shared by all four transports. `Anvil/Core/input_byte_state.pbi` owns
+CRLF normalization state used by the shared input queue. The existing ARM
+board-global compositions include this guarded state at their original position.
+The Zentaji console proof compiles the actual shared input queue and line editor;
+it dispatches their events without duplicating their implementation.
+
+```text
+python tools/zentaji_console_check.py --compiler <Forge executable> --zen-tools <tools/zentaji directory>
+```
+
+Fourteen native/twin full-state, RAM and exact-output cases cover byte/UTF8
+output, nonconsuming readiness, editing/cancel and cross-line CRLF, pressure,
+drain, adoption/detach, baud validation, DMA ownership and timer-backed input.
+A two-second headless live input wait also has exact recorded native/twin replay
+and checks startup-adjusted host CPU below 20%. This is a Windows component
+proof. Background-message brackets, compiler Print routing and full ReadLine
+composition remain open; the test does not claim a linked monitor prompt.
+
+Next are complete board startup/vector ownership, storage backends,
 the remaining runtime/compiler facilities and production payload/service ABI.
 ROM must load Anvil, and Anvil must then reach the shared prompt and load
 applications. The built-in Forge must ultimately target Zentaji itself only.

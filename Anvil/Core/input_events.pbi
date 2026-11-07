@@ -1,4 +1,5 @@
 XIncludeFile "Anvil/Hal/input_codes.pbi"
+XIncludeFile "Anvil/Core/input_byte_state.pbi"
 ; ======================================================================
 ;  input_events.pbi - THE NORMALIZED INPUT DISPATCHER
 ;
@@ -505,8 +506,7 @@ EndProcedure
 ;  are resolved across the whole build - but it may NOT name a constant
 ;  that has not been declared yet, and a constant cannot be forward
 ;  declared. ArduinoQ/Board/qstubs_q.unoq is included ahead of this file
-;  (it declares gLastCR, which InputFeedByte below reads, so it has to
-;  be), and its RunAt was therefore unable to write the #AIC_PAYLOAD
+;  in the legacy composition, so its RunAt was unable to name #AIC_PAYLOAD
 ;  spelling at all. A seam that takes no argument keeps the #AIC_
 ;  vocabulary inside the layer that defines it, which is where it should
 ;  have been anyway: the board says WHAT HAPPENED, and this file decides
@@ -708,7 +708,7 @@ EndProcedure
 ;  throw the line away and then type "[A". Those two keys reach the
 ;  editor from the soft keyboard, which sends the key and not the byte.
 ;
-;  gLastCR IS A BOARD GLOBAL AND IT SURVIVES BETWEEN LINES on purpose: a
+;  gLastCR IS SHARED BYTE-INPUT STATE AND IT SURVIVES BETWEEN LINES on purpose: a
 ;  CRLF terminal sends the CR that ends one line and the LF that arrives
 ;  at the start of the next, so the de-duplication cannot be per-line
 ;  state. Getting this wrong draws two prompts for every Enter, which

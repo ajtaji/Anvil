@@ -420,3 +420,28 @@ on cores0/1, plus a two-second headless live run with active service lanes and
 recorded replay. Initial measured startup-adjusted CPU was0.015625s over1.994336s
 wall. No complete Zentaji monitor is linked yet; ROM boot, vectors, remaining
 board devices/runtime and the production payload ABI are still open.
+
+
+## Shared console byte policy and Zentaji transport (2026-11-07)
+
+The byte-string and CRLF output procedures formerly repeated in Pi 4, Pi 3
+and UNO Q now live once in `Anvil/Core/console_bytes.pbi`. Each existing
+transport includes those unchanged bodies. Byte-input CRLF state similarly
+belongs to `Anvil/Core/input_byte_state.pbi`, included at the original board
+positions and by the shared input queue. This keeps normalization state alive
+across command lines without requiring a new machine to declare board globals.
+
+`Zentaji/Board/console.pbi` supplies actual serial-0 MMIO transport, preserving
+hardware state on adoption and detach. It refuses conflicting DMA ownership,
+bounds transmit pressure and drain, and uses the qualified timer/WFI backend
+for healthy blocking input. The focused console check executes the production
+transport plus the existing shared input queue and line editor. Fourteen exact
+output/full-state/RAM cases and a two-second live timed-input wake pass against
+native and independent twin execution. See the Zentaji contract for limits,
+resource ownership and the still-open Print/background-message/full-prompt work.
+
+
+The extraction preserves both helper procedure bodies exactly across all three
+existing ARM transports. Counted full monitor builds pass with signed production
+Forge `7d68c0c3d`: Pi 4 build496, Pi 3 build106 and UNO Q build104. These are desk
+compilation proofs; no physical deployment or card release was performed.
