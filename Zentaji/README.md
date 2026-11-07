@@ -233,9 +233,9 @@ resets the emptied private queue indices. Mode 0 is closed, 1 ready, 2 quarantin
 current deterministic runner acknowledges FLUSH without updating its host image.
 The native loader discards the backing path and FLUSH is a no-op; FUA is also
 ignored. This must be fixed before filesystem write completion can promise host
-persistence. The ROM also disables and clears its boot-disk ring descriptors
-without resetting the consumed indices. This driver conservatively refuses that
-dirty controller. Boot-used disk reuse needs a quiescent ROM handoff fix.
+persistence. The ROM now resets its empty owned queues after both boot READs
+complete, then disables and clears their descriptors before entry. The driver can
+therefore acquire that same boot disk without treating disable as cancellation.
 
 ```text
 python tools/zentaji_disk_check.py --compiler <Forge executable> --zen-tools <tools/zentaji directory>
@@ -256,3 +256,18 @@ EOF/not-found behavior. Native/twin state and RAM match, independent expected fi
 bytes match, and the read-only medium stays unchanged. This is a component proof
 with direct owned startup, not ROM disk boot, the full storage facade, exFAT,
 a writable filesystem durability proof or the complete monitor command loop.
+
+
+```text
+python tools/zentaji_disk_boot_check.py --compiler <Forge executable> --zen-tools <tools/zentaji directory>
+```
+
+This boots the compiled driver through the actual ROM on disk0 and disk15, enters
+Anvil's owned supervisor startup, and reacquires the same disk. It reads the boot
+header and payload using 512-byte range callbacks, refuses a read-only write,
+closes, reopens and reads again. Full native/twin state and RAM match; independent
+header/payload bytes match; final queues are empty and disabled; host images stay
+unchanged. The fixture uses the production Forge startup (including its global
+initialization) and a bounded one-million-instruction allowance. The native tools
+must include the ROM queue-reset fix. This closes boot-disk reuse, not durable
+writable backing or the complete monitor/storage composition.
