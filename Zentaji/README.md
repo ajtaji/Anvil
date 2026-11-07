@@ -84,13 +84,45 @@ it dispatches their events without duplicating their implementation.
 python tools/zentaji_console_check.py --compiler <Forge executable> --zen-tools <tools/zentaji directory>
 ```
 
-Fourteen native/twin full-state, RAM and exact-output cases cover byte/UTF8
+Twenty native/twin full-state, RAM and exact-output cases cover byte/UTF8
 output, nonconsuming readiness, editing/cancel and cross-line CRLF, pressure,
 drain, adoption/detach, baud validation, DMA ownership and timer-backed input.
+They also check nested/partial/newline message diversion, unbound output,
+drop-newest overflow, FIFO wrap, fatal abandon and unregister/register behavior.
 A two-second headless live input wait also has exact recorded native/twin replay
 and checks startup-adjusted host CPU below 20%. This is a Windows component
-proof. Background-message brackets, compiler Print routing and full ReadLine
-composition remain open; the test does not claim a linked monitor prompt.
+proof. `Anvil/Core/console_messages.pbi` now owns background-message byte
+routing once for all four transports. A registered drain receives bracketed
+output; ordinary console bytes stay on the wire. With no drain, brackets do
+not divert anything. A concrete unbound callback target plus a separate bound
+flag makes this optional service compile in standalone diagnostics without
+claiming that a log has been installed. Registration/writes remain serialized;
+the drain must not print, and callback entry is guarded against reentry.
+
+The console supplies `PrintChar` over `UartWrite` and selects the existing
+`Shared/A64/string_out.pmi` guest formatters unchanged. Despite the historical
+folder name, those procedures contain no CPU instructions or hardware access.
+Their revision and byte hash are recorded in `PROVENANCE.json`. Forge routes
+Print/PrintN to ordinary formatter calls before shared call analysis, so those
+edges also participate in recursion and callback checking. Dynamic `.s` runtime
+operations and floating conversion-to-text libraries remain separate work.
+
+```text
+python tools/zentaji_prompt_check.py --compiler <Forge executable> --zen-tools <tools/zentaji directory>
+```
+
+This compiles the complete production `parse.pbi`/ReadLine, input queue, editor,
+message log and scheduler with the real Zentaji console/timer backend. Five
+native/twin full-state/RAM/exact-output cases cover editing, cross-line CRLF,
+case-insensitive words, full-width hex parsing, Ctrl-C, normalized keyboard Tab
+refusal in the log, line truncation and fair background service. Serial Tab is
+intentionally ignored by the existing byte translator; the refusal case feeds
+a normalized key event through the real event API. A two-second live ReadLine
+wait keeps service lanes and message routing active, checks CPU below 20%, and
+has exact recorded native/twin replay. Providers for unavailable display, mouse,
+network, radio maintenance and log-file notification are counted test adapters.
+They are not implemented Zentaji devices. This is still a component composition,
+not a complete monitor image, command dispatcher, ROM boot or physical input proof.
 
 Next are complete board startup/vector ownership, storage backends,
 the remaining runtime/compiler facilities and production payload/service ABI.

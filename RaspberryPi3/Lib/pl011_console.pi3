@@ -148,14 +148,7 @@ Global p3c_deferredRxLost.i
 ;  UartMessageAbandon() first, so a fault taken inside a background
 ;  service is still printed.
 ; ======================================================================
-Global Dim p3c_msg.a[#P3C_MSG_BYTES]
-Global p3c_msgDepth.i
-Global p3c_msgHead.i
-Global p3c_msgTail.i
-Global p3c_msgLost.i
-Global p3c_msgBytes.i
-Global *p3c_msgDrain
-Global p3c_msgBusy.i
+XIncludeFile "Anvil/Core/console_messages.pbi"
 
 ; Independent auxiliary output tap consumed by common NetConsoleFlush.
 ; The screen mirror and this ring have separate cursors, so neither steals
@@ -172,96 +165,6 @@ Global uart_auxBulk.i
 ; Register the message log's drain, or 0 to stop diverting. The drain
 ; MUST NOT print: it runs inside UartWrite. It is re-entry guarded
 ; regardless, because "must not" is not a mechanism.
-Procedure UartMessageSetDrain(*fn)
-  *p3c_msgDrain = *fn
-EndProcedure
-
-Procedure UartMessageBegin()
-  p3c_msgDepth = p3c_msgDepth + 1
-EndProcedure
-
-; Closing the OUTERMOST bracket hands whatever the context wrote to the
-; drain, so a message that did not end in a newline is not left sitting
-; in the ring until the next one arrives and joins onto it.
-Procedure UartMessageEnd()
-  If p3c_msgDepth <= 0
-    p3c_msgDepth = 0
-    ProcedureReturn
-  EndIf
-  p3c_msgDepth = p3c_msgDepth - 1
-  If p3c_msgDepth = 0 And *p3c_msgDrain <> 0 And p3c_msgBusy = 0
-    p3c_msgBusy = 1
-    p3c_msgDrain()
-    p3c_msgBusy = 0
-  EndIf
-EndProcedure
-
-; Leave every bracket at once. The fatal-exception path only.
-Procedure UartMessageAbandon()
-  p3c_msgDepth = 0
-EndProcedure
-
-Procedure.i UartMessageDepth()
-  ProcedureReturn p3c_msgDepth
-EndProcedure
-
-; 1 while a byte written now would be diverted.
-Procedure.i UartMessageActive()
-  If p3c_msgDepth > 0 And *p3c_msgDrain <> 0
-    ProcedureReturn 1
-  EndIf
-  ProcedureReturn 0
-EndProcedure
-
-Procedure.i UartMessageGet()
-  Define c.i
-  If p3c_msgTail = p3c_msgHead
-    ProcedureReturn -1
-  EndIf
-  c = p3c_msg[p3c_msgTail] & $FF
-  p3c_msgTail = p3c_msgTail + 1
-  If p3c_msgTail >= #P3C_MSG_BYTES
-    p3c_msgTail = 0
-  EndIf
-  ProcedureReturn c
-EndProcedure
-
-Procedure.i UartMessageLost()
-  ProcedureReturn p3c_msgLost
-EndProcedure
-
-Procedure.i UartMessageBytes()
-  ProcedureReturn p3c_msgBytes
-EndProcedure
-
-; Overflow drops the NEWEST and counts it. Dropping the oldest would
-; silently rewrite history the operator has not read yet.
-Procedure p3c_MessagePut(c.i)
-  Define nxt.i
-  Define n.i
-  p3c_msgBytes = p3c_msgBytes + 1
-  nxt = p3c_msgHead + 1
-  If nxt >= #P3C_MSG_BYTES
-    nxt = 0
-  EndIf
-  If nxt = p3c_msgTail
-    p3c_msgLost = p3c_msgLost + 1
-    ProcedureReturn
-  EndIf
-  p3c_msg[p3c_msgHead] = c & $FF
-  p3c_msgHead = nxt
-  n = p3c_msgHead - p3c_msgTail
-  If n < 0
-    n = n + #P3C_MSG_BYTES
-  EndIf
-  If p3c_msgBusy = 0
-    If c = 10 Or n > (#P3C_MSG_BYTES - 2048)
-      p3c_msgBusy = 1
-      p3c_msgDrain()
-      p3c_msgBusy = 0
-    EndIf
-  EndIf
-EndProcedure
 
 ; Enable or disable the common netconsole output tap.
 Procedure UartAuxMirror(on.i)
@@ -347,11 +250,9 @@ EndProcedure
 ;  which is every character the operator ever waits for.
 ; ----------------------------------------------------------------------
 Procedure.i UartWrite(c.i)
-  If p3c_msgDepth > 0
-    If *p3c_msgDrain <> 0
-      p3c_MessagePut(c)
-      ProcedureReturn 1
-    EndIf
+  If UartMessageActive()<>0
+    UartMessagePut(c)
+    ProcedureReturn 1
   EndIf
   If Pi3UartWrite(c & $FF) <> 0
     ; HDMI is a mirror of the accepted UART stream, never a second print

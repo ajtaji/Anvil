@@ -177,99 +177,7 @@ EndProcedure
 ;  not to the firmware console. With no drain registered nothing is
 ;  diverted. The full reasoning is in uart.pi4; this is the same contract.
 ; ======================================================================
-#Q_MSG_BYTES = 8192
-Global Dim gQMsg.a[#Q_MSG_BYTES]
-Global gQMsgDepth.i
-Global gQMsgHead.i
-Global gQMsgTail.i
-Global gQMsgLost.i
-Global gQMsgBytes.i
-Global *gQMsgDrain
-Global gQMsgBusy.i
-
-Procedure UartMessageSetDrain(*fn)
-  *gQMsgDrain = *fn
-EndProcedure
-
-Procedure UartMessageBegin()
-  gQMsgDepth = gQMsgDepth + 1
-EndProcedure
-
-Procedure UartMessageEnd()
-  If gQMsgDepth <= 0
-    gQMsgDepth = 0
-    ProcedureReturn
-  EndIf
-  gQMsgDepth = gQMsgDepth - 1
-  If gQMsgDepth = 0 And *gQMsgDrain <> 0 And gQMsgBusy = 0
-    gQMsgBusy = 1
-    gQMsgDrain()
-    gQMsgBusy = 0
-  EndIf
-EndProcedure
-
-Procedure UartMessageAbandon()
-  gQMsgDepth = 0
-EndProcedure
-
-Procedure.i UartMessageDepth()
-  ProcedureReturn gQMsgDepth
-EndProcedure
-
-Procedure.i UartMessageActive()
-  If gQMsgDepth > 0 And *gQMsgDrain <> 0
-    ProcedureReturn 1
-  EndIf
-  ProcedureReturn 0
-EndProcedure
-
-Procedure.i UartMessageGet()
-  Define c.i
-  If gQMsgTail = gQMsgHead
-    ProcedureReturn -1
-  EndIf
-  c = gQMsg[gQMsgTail] & $FF
-  gQMsgTail = gQMsgTail + 1
-  If gQMsgTail >= #Q_MSG_BYTES
-    gQMsgTail = 0
-  EndIf
-  ProcedureReturn c
-EndProcedure
-
-Procedure.i UartMessageLost()
-  ProcedureReturn gQMsgLost
-EndProcedure
-
-Procedure.i UartMessageBytes()
-  ProcedureReturn gQMsgBytes
-EndProcedure
-
-Procedure qcon_MessagePut(c.i)
-  Define nxt.i
-  Define n.i
-  gQMsgBytes = gQMsgBytes + 1
-  nxt = gQMsgHead + 1
-  If nxt >= #Q_MSG_BYTES
-    nxt = 0
-  EndIf
-  If nxt = gQMsgTail
-    gQMsgLost = gQMsgLost + 1
-    ProcedureReturn
-  EndIf
-  gQMsg[gQMsgHead] = c & $FF
-  gQMsgHead = nxt
-  n = gQMsgHead - gQMsgTail
-  If n < 0
-    n = n + #Q_MSG_BYTES
-  EndIf
-  If gQMsgBusy = 0
-    If c = 10 Or n > (#Q_MSG_BYTES - 2048)
-      gQMsgBusy = 1
-      gQMsgDrain()
-      gQMsgBusy = 0
-    EndIf
-  EndIf
-EndProcedure
+XIncludeFile "Anvil/Core/console_messages.pbi"
 
 ; ======================================================================
 ;  THE WRITE HALF - the same five names RaspberryPi4/Lib/uart.pi4 exports.
@@ -284,11 +192,9 @@ EndProcedure
 Procedure UartWrite(c.i)
   ; A message goes to the message log and nowhere else. See THE MESSAGE
   ; CONTEXT above.
-  If gQMsgDepth > 0
-    If *gQMsgDrain <> 0
-      qcon_MessagePut(c & $FF)
-      ProcedureReturn 1
-    EndIf
+  If UartMessageActive()<>0
+    UartMessagePut(c & $FF)
+    ProcedureReturn 1
   EndIf
   c = c & $FF
   If gQLogLen < #Q_LOG_MAX

@@ -66,3 +66,11 @@ export manifest. Its origin revision and digest are recorded in
 `PROVENANCE.json`. This is runtime source for the guest, not a second compiler
 or private compiler implementation. `.pmi` files receive the same public-source
 boundary and hygiene checks as `.pbi` files.
+
+
+The Zentaji console also explicitly includes `Shared/A64/string_out.pmi`, the
+existing pure-source 64-bit integer/text output library, with its exact shipped
+bytes preserved. Its historical folder name does not impose an ARM ABI: it
+calls the composition's PrintChar procedure and contains no assembly or register
+access. PROVENANCE records the source revision/hash and requires the file, so
+PMF_ROOT can keep all guest runtime resolution inside the standalone checkout.

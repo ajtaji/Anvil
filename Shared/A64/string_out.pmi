@@ -1,0 +1,163 @@
+; ======================================================================
+; string_out.pmi - Print and PrintN on the 64-bit boards
+; ----------------------------------------------------------------------
+;
+;     XIncludeFile "Shared/A64/console_uart.pmi"   ; PrintChar on the board's console
+;     XIncludeFile "Shared/A64/string_out.pmi"     ; this file
+;
+;     PrintN("count = " )
+;     Print(total) : PrintN()
+;
+; THE OUTPUT LIBRARY OF THE FIVE 64-BIT BOARDS - the Raspberry Pi 3, 4 and
+; 5, the ROCK Pi 4C and the Arduino UNO Q - one copy for all five, like
+; Shared/A64/string.pmi beside it.
+;
+; Print and PrintN are the COMPILER's: it looks at the argument's type and
+; calls one of the procedures below by its lower-case name -
+;
+;   text (a literal, a .s)                 -> str_print_at(address)
+;   a whole number                         -> PrintDec(v)
+;   an unsigned 64-bit value (a .x)        -> PrintDecU(v)
+;   PrintN, after the value                -> PrintNl()
+;   a .f                                   -> FloatPrintText / FloatText of
+;                                             Shared/A64/string_f32.pmi,
+;                                             then str_print_at
+;   a .d                                   -> PrintDouble of
+;                                             Shared/A64/mathd.pmi, which
+;                                             prints through str_print_at
+;
+; - so every one of them ends up here, and every character leaves through
+; ONE procedure, PrintChar(c). That is the whole design: this file formats,
+; and PrintChar is the wire. Shared/A64/console_uart.pmi gives PrintChar on
+; each board's own serial console; a program that wants its text somewhere
+; else - a screen, a buffer it reads back, a network packet - declares its
+; own PrintChar(c) and includes this file without the console. Nothing
+; here names a register.
+;
+; THE ANSWERS ARE THE 32-BIT FAMILIES' (RP2040/Lib/string_out.pico, the
+; Uno R4's, the Due's, the Black Pill's) at this family's width: PrintDec is
+; signed and prints -9223372036854775808 to 9223372036854775807, PrintDecU
+; is unsigned and prints 0 to 18446744073709551615. A .n needs no PrintDecU
+; here - its register holds the value zero-extended, so PrintDec prints it
+; as it is - which is why the compiler sends only a .x there.
+;
+; PRINT DOES NOT END THE LINE. PrintN does, with CR and LF, because the
+; usual reader is a terminal. There is nothing to flush: a UART character
+; has left once PrintChar returns.
+;
+; REQUIRES: a procedure PrintChar(c), from Shared/A64/console_uart.pmi or
+; the program. A library never includes a library, so that line is the
+; main file's.
+; ======================================================================
+
+; The raw-address text walk behind Print("literal") and Print(s).
+Procedure str_print_at(p.i)
+  Protected c.w
+  c = PeekA(p) & 255
+  While c <> 0
+    PrintChar(c)
+    p = p + 1
+    c = PeekA(p) & 255
+  Wend
+EndProcedure
+
+; PrintDec(v) - a SIGNED whole number in base 10, 64 bits wide.
+;
+; The digits are taken off on the NEGATIVE side, whose range is one larger,
+; so -9223372036854775808 prints with no special case: a positive v is
+; negated first, every remainder is zero or negative and its magnitude is
+; the digit, and the sign is written from v itself. The 32-bit families'
+; PrintDec, one width up.
+Procedure PrintDec(v.q)
+  Dim dig.a[24]
+  Define n.q
+  Define k.q
+  Define r.q
+  n = v
+  If n > 0
+    n = 0 - n
+  EndIf
+  k = 0
+  Repeat
+    r = n % 10          ; zero or negative
+    If r < 0
+      r = 0 - r
+    EndIf
+    dig[k] = 48 + r
+    k = k + 1
+    n = n / 10
+  Until n = 0
+  If v < 0
+    PrintChar(45)       ; '-'
+  EndIf
+  While k > 0
+    k = k - 1
+    PrintChar(dig[k])
+  Wend
+EndProcedure
+
+; PrintDecU(v) - an UNSIGNED 64-bit number in base 10, 0 to
+; 18446744073709551615. A value with bit 63 set has its last digit taken off
+; first with the zero-filling halving - v / 10 read unsigned is
+; ((v >> 1) & $7FFFFFFFFFFFFFFF) / 5, which is below 2^63 - and the rest is
+; an ordinary non-negative number (the 32-bit families' PrintDecU, one width
+; up).
+Procedure PrintDecU(v.q)
+  Dim dig.a[24]
+  Define k.q
+  Define p.q
+  k = 0
+  If v < 0
+    p = ((v >> 1) & $7FFFFFFFFFFFFFFF) / 5
+    dig[0] = 48 + (v - p * 10)         ; 0..9: the last digit
+    k = 1
+    v = p
+  EndIf
+  Repeat
+    dig[k] = 48 + (v % 10)
+    k = k + 1
+    v = v / 10
+  Until v = 0
+  While k > 0
+    k = k - 1
+    PrintChar(dig[k])
+  Wend
+EndProcedure
+
+; PrintDecN(v) - PrintDec and then the end of the line, in one call.
+Procedure PrintDecN(v.q)
+  PrintDec(v)
+  PrintChar(13)
+  PrintChar(10)
+EndProcedure
+
+; PrintHex(v, digits) - exactly DIGITS hex digits, upper case, leading zeros
+; kept, no "$": PrintHex(255, 4) prints 00FF. digits is 1 to 16 (a 64-bit
+; value has sixteen); a number outside that range is taken as the nearer
+; end.
+Procedure PrintHex(v.q, digits.q)
+  Define i.q
+  Define d.q
+  If digits < 1
+    digits = 1
+  EndIf
+  If digits > 16
+    digits = 16
+  EndIf
+  i = digits - 1
+  While i >= 0
+    d = (v >> (i * 4)) & $F
+    If d < 10
+      PrintChar(48 + d)
+    Else
+      PrintChar(55 + d)      ; 'A' is 65, and 55 + 10 = 65
+    EndIf
+    i = i - 1
+  Wend
+EndProcedure
+
+; PrintNl() - the end of a line: CR then LF.
+Procedure PrintNl()
+  PrintChar(13)
+  PrintChar(10)
+EndProcedure

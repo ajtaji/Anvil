@@ -19,6 +19,17 @@ Procedure.i PrepareIdle()
   PokeQ(#ZEN_IDLE_INTC+$F008,2)
   ProcedureReturn ZentajiPromptIdlePrepare(2000)
 EndProcedure
+Global testDrained.i,testDrainCalls.i
+Procedure TestConsoleDrain()
+ Protected c.i
+ testDrainCalls=testDrainCalls+1
+ Repeat
+  c=UartMessageGet()
+  If c<0 : Break : EndIf
+  PokeA($D0000+testDrained,c) : testDrained=testDrained+1
+ ForEver
+EndProcedure
+Procedure TestConsoleHoldDrain() : testDrainCalls=testDrainCalls+1 : EndProcedure
 Procedure.i EditedLine()
   Dim ev.a[#AIE_EVSZ]
   Protected c.i,kind.i,rc.i
@@ -62,7 +73,49 @@ Procedure.i Main(scenario.i)
     ProcedureReturn 42
   EndIf
   If UartAttach()<>1 Or UartRunning()<>1 : ProcedureReturn 5 : EndIf
-  If scenario=0
+  If scenario=14
+    UartMessageBegin() : UartWrite(65) : UartMessageEnd()
+    If UartMessageBytes()<>0 Or UartMessageActive()<>0 Or UartMessageDepth()<>0 : ProcedureReturn 34 : EndIf
+  ElseIf scenario=15
+    UartMessageSetDrain(@TestConsoleDrain)
+    UartMessageBegin() : UartWrite(65) : UartMessageBegin() : UartWrite(66) : UartMessageEnd()
+    If UartMessageDepth()<>1 Or testDrainCalls<>0 Or testDrained<>0 : ProcedureReturn 35 : EndIf
+    UartWriteNl()
+    If testDrainCalls<>1 Or testDrained<>4 Or PeekL($D0000)<>$0A0D4241 : ProcedureReturn 36 : EndIf
+    UartMessageEnd() : UartWrite(67)
+    If testDrainCalls<>2 Or UartMessageBytes()<>4 Or UartMessageLost()<>0 : ProcedureReturn 37 : EndIf
+  ElseIf scenario=16
+    UartMessageSetDrain(@TestConsoleHoldDrain) : UartMessageBegin()
+    For n=1 To 8200 : UartWrite(n&255) : Next
+    UartMessageEnd()
+    If UartMessageBytes()<>8200 Or UartMessageLost()<>9 Or testDrainCalls<1 : ProcedureReturn 38 : EndIf
+    For n=1 To 8191
+      If UartMessageGet()<>(n&255) : ProcedureReturn 39 : EndIf
+    Next
+    If UartMessageGet()<>-1 : ProcedureReturn 40 : EndIf
+  ElseIf scenario=17
+    UartMessageSetDrain(@TestConsoleDrain) : UartMessageBegin() : UartWrite(66)
+    UartMessageAbandon() : UartWrite(70) : UartMessageEnd()
+    If UartMessageDepth()<>0 Or testDrainCalls<>0 Or UartMessageGet()<>66 : ProcedureReturn 41 : EndIf
+  ElseIf scenario=18
+    UartMessageSetDrain(@TestConsoleDrain) : UartMessageBegin() : UartWrite(65)
+    UartMessageSetDrain(0) : UartWrite(66) : UartMessageEnd()
+    If testDrained<>0 Or UartMessageBytes()<>1 Or UartMessageActive()<>0 : ProcedureReturn 147 : EndIf
+    UartMessageSetDrain(@TestConsoleDrain) : UartMessageBegin() : UartMessageEnd()
+    If testDrained<>1 Or PeekA($D0000)<>65 Or testDrainCalls<>1 : ProcedureReturn 43 : EndIf
+  ElseIf scenario=19
+    UartMessageSetDrain(@TestConsoleHoldDrain) : UartMessageBegin()
+    For n=1 To 7000 : UartWrite(n&255) : Next
+    For n=1 To 6000
+      If UartMessageGet()<>(n&255) : ProcedureReturn 44 : EndIf
+    Next
+    For n=7001 To 13000 : UartWrite(n&255) : Next
+    UartMessageEnd()
+    For n=6001 To 13000
+      If UartMessageGet()<>(n&255) : ProcedureReturn 45 : EndIf
+    Next
+    If UartMessageGet()<>-1 Or UartMessageLost()<>0 Or UartMessageBytes()<>13000 : ProcedureReturn 46 : EndIf
+  ElseIf scenario=0
     UartWriteStr("Zentaji café") : UartWriteNl() : UartWrite(0) : UartWrite(255)
     If ZentajiConsoleDrain()<>1 Or UartDropped()<>0 : ProcedureReturn 6 : EndIf
   ElseIf scenario=1
@@ -137,7 +190,7 @@ def main():
         p=subprocess.run([str(x) for x in args],cwd=ROOT,env=env,capture_output=True,text=True,encoding='utf-8',errors='replace',timeout=60)
         assert p.returncode==0,(p.returncode,p.stdout[-3000:],p.stderr)
         return p.stdout
-    expected={0:'Zentaji café'.encode()+b'\r\n\0\xff',2:b'ab\x08 \x08C',10:b'A',12:b'Hi',13:b'AB'}
+    expected={0:'Zentaji café'.encode()+b'\r\n\0\xff',2:b'ab\x08 \x08C',10:b'A',12:b'Hi',13:b'AB',14:b'A',15:b'C',17:b'F',18:b'B'}
     incoming={1:b'\0\x7f\xff',2:b'ab\x08C\r\n',4:b'Q',6:b'Q',8:b'AB',9:b'AB',12:b'Hi\x03',13:b'A\r\nB\r',20:b'Q',21:b'Q'}
     with tempfile.TemporaryDirectory(prefix='anvil-zen-console-') as tmp:
         td=Path(tmp);src=td/'console.zentaji';image=td/'console.zex'
@@ -162,21 +215,21 @@ def main():
             assert bytes(m.serial[0].out)==want,(scenario,bytes(m.serial[0].out),want)
             serial=[s.split(' ',1)[1] for s in native.splitlines() if s.startswith('SERIAL0 ')]
             assert (serial[0] if serial else '')==want.hex().upper(),(scenario,serial,want)
-        for scenario in range(14):
+        for scenario in range(20):
             m=machine(scenario);c=m.cores[0];kept=list(c.r[128:253]);vectors=list(c.v[32:])
             assert not L.capture(m,str(td))
-            native=run([L.EXE,td/'machine.txt','--max','2000000','--ram',td/'final.bin']);m.run(2000000)
+            native=run([L.EXE,td/'machine.txt','--max','4000000','--ram',td/'final.bin']);m.run(4000000)
             match(m,native,scenario)
             assert c.r[128:253]==kept and c.v[32:]==vectors and c.r[255]==0xF0000
-        print('PASS 14 actual console/input/editor native/twin state/RAM/output cases: byte/UTF8, nondestructive ready, CRLF/edit/cancel, bounded pressure/drain, baud/adoption/detach, DMA ownership and timer-backed input')
+        print('PASS 20 actual console/input/editor/message-routing native/twin state/RAM/output cases: byte/UTF8, nondestructive ready, CRLF/edit/cancel, bounded pressure/drain, baud/adoption/detach, DMA ownership and timer-backed input; unbound/nested/newline/partial diversion, drop-newest overflow, wrap, fatal abandon and unbind/rebind')
         results=[]
         for scenario in (20,21):
             m=machine(scenario);assert not L.capture(m,str(td));rec=td/'recorded.txt'
-            live,wall,cpu=S.run([str(zt/('zenwin.exe' if os.name=='nt' else 'zenwin')),str(td/'machine.txt'),'--headless','--live','--mute','--record',str(rec),'--max','2000000'],timeout=30)
-            native=run([L.EXE,rec,'--max','2000000','--ram',td/'final.bin'])
+            live,wall,cpu=S.run([str(zt/('zenwin.exe' if os.name=='nt' else 'zenwin')),str(td/'machine.txt'),'--headless','--live','--mute','--record',str(rec),'--max','4000000'],timeout=30)
+            native=run([L.EXE,rec,'--max','4000000','--ram',td/'final.bin'])
             assert states(live)==states(native)
             m.clock_samples=deque((int(s.split()[1][1:],16),int(s.split()[2]),int(s.split()[3]) if len(s.split())>3 else -1) for s in rec.read_text().splitlines() if s.startswith('clock '))
-            m.clock_complete=True;m.run(2000000);match(m,native,scenario);results.append((wall,cpu))
+            m.clock_complete=True;m.run(4000000);match(m,native,scenario);results.append((wall,cpu))
         wall=results[1][0]-results[0][0];cpu=max(0,results[1][1]-results[0][1])
         assert wall>=1.8 and cpu<0.4,(wall,cpu)
         print(f'PASS real console blocking RX live: startup-adjusted wall={wall:.6f}s cpu={cpu:.6f}s; timed input wakes the real backend, exact recorded native/twin replay')

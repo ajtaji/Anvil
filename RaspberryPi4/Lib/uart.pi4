@@ -1089,105 +1089,7 @@ EndProcedure
 ;  OVERFLOW DROPS THE NEWEST AND COUNTS IT, like the two taps above. The
 ;  drain is called on every line and before the ring fills, so this is a
 ;  backstop for a drain that could not run, not an expected path.
-Global Dim uart_msg.a[#UART_MIRROR_BYTES]
-Global uart_msgDepth.i
-Global uart_msgHead.i
-Global uart_msgTail.i
-Global uart_msgLost.i
-Global uart_msgBytes.i         ; bytes ever diverted, for the gate and `messages`
-Global *uart_msgDrain
-Global uart_msgBusy.i
-
-; Register the message log's drain, or 0 to stop diverting. The drain MUST
-; NOT print: it runs inside UartWrite. It is re-entry guarded regardless.
-Procedure UartMessageSetDrain(*fn)
-  *uart_msgDrain = *fn
-EndProcedure
-
-Procedure UartMessageBegin()
-  uart_msgDepth = uart_msgDepth + 1
-EndProcedure
-
-; Close one bracket. Leaving the outermost one hands whatever the context
-; wrote to the drain, so a message that did not end in a newline is not
-; left sitting in the ring until the next one arrives and joins it.
-Procedure UartMessageEnd()
-  If uart_msgDepth <= 0
-    uart_msgDepth = 0
-    ProcedureReturn
-  EndIf
-  uart_msgDepth = uart_msgDepth - 1
-  If uart_msgDepth = 0 And *uart_msgDrain <> 0 And uart_msgBusy = 0
-    uart_msgBusy = 1
-    uart_msgDrain()
-    uart_msgBusy = 0
-  EndIf
-EndProcedure
-
-; Leave every bracket at once. For the fatal-exception path only.
-Procedure UartMessageAbandon()
-  uart_msgDepth = 0
-EndProcedure
-
-Procedure.i UartMessageDepth()
-  ProcedureReturn uart_msgDepth
-EndProcedure
-
-; 1 while a byte written now would be diverted.
-Procedure.i UartMessageActive()
-  If uart_msgDepth > 0 And *uart_msgDrain <> 0
-    ProcedureReturn 1
-  EndIf
-  ProcedureReturn 0
-EndProcedure
-
-Procedure.i UartMessageGet()
-  Define c.i
-  If uart_msgTail = uart_msgHead
-    ProcedureReturn -1
-  EndIf
-  c = uart_msg[uart_msgTail] & $FF
-  uart_msgTail = uart_msgTail + 1
-  If uart_msgTail >= #UART_MIRROR_BYTES
-    uart_msgTail = 0
-  EndIf
-  ProcedureReturn c
-EndProcedure
-
-Procedure.i UartMessageLost()
-  ProcedureReturn uart_msgLost
-EndProcedure
-
-Procedure.i UartMessageBytes()
-  ProcedureReturn uart_msgBytes
-EndProcedure
-
-Procedure uart_MessagePut(c.i)
-  Define nxt.i
-  Define n.i
-  uart_msgBytes = uart_msgBytes + 1
-  nxt = uart_msgHead + 1
-  If nxt >= #UART_MIRROR_BYTES
-    nxt = 0
-  EndIf
-  If nxt = uart_msgTail
-    uart_msgLost = uart_msgLost + 1
-    ProcedureReturn
-  EndIf
-  uart_msg[uart_msgHead] = c & $FF
-  uart_msgHead = nxt
-  n = uart_msgHead - uart_msgTail
-  If n < 0
-    n = n + #UART_MIRROR_BYTES
-  EndIf
-  If uart_msgBusy = 0
-    If c = 10 Or n > (#UART_MIRROR_BYTES - 2048)
-      uart_msgBusy = 1
-      uart_msgDrain()
-      uart_msgBusy = 0
-    EndIf
-  EndIf
-EndProcedure
+XIncludeFile "Anvil/Core/console_messages.pbi"
 
 
 ; ======================================================================
@@ -1227,11 +1129,9 @@ Procedure UartWrite(c.i)
   Define n.i
   ; A MESSAGE NEVER TOUCHES THE WIRE, THE SCREEN OR THE NETWORK TAP. See
   ; THE MESSAGE CONTEXT above. One compare when no bracket is open.
-  If uart_msgDepth > 0
-    If *uart_msgDrain <> 0
-      uart_MessagePut(c)
-      ProcedureReturn 1
-    EndIf
+  If UartMessageActive()<>0
+    UartMessagePut(c)
+    ProcedureReturn 1
   EndIf
   CompilerIf #PMF_CHIP = 2712
   ; The debug-connector tee (Uart10Tee). A log port, so it sees every

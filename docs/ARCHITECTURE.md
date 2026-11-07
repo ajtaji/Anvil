@@ -445,3 +445,35 @@ The extraction preserves both helper procedure bodies exactly across all three
 existing ARM transports. Counted full monitor builds pass with signed production
 Forge `7d68c0c3d`: Pi 4 build496, Pi 3 build106 and UNO Q build104. These are desk
 compilation proofs; no physical deployment or card release was performed.
+
+
+## Shared message routing and actual Zentaji ReadLine (2026-11-07)
+
+`Anvil/Core/console_messages.pbi` owns the background-message byte ring and
+nested bracket policy previously repeated by the three ARM transports. All
+four consoles now use it. Registration is separate from the concrete unbound
+callback target: absent registration preserves ordinary diagnostic output.
+Overflow drops newest and counts it; line/high-water and outermost-close drains,
+fatal abandon and callback guards retain the existing policy. CPU/device output
+is still the selected transport's responsibility.
+
+Zentaji selects the shipped pure-source 64-bit formatters in
+`Shared/A64/string_out.pmi` over its PrintChar sink. There are no ARM instructions
+in that library; standalone provenance records its exact origin and digest.
+Forge's Zentaji Print/PrintN routing creates ordinary calls before shared
+recursion/callback analysis, including the newline call. The compiler does not
+choose a device or format bytes internally.
+
+The actual complete shared parse/ReadLine, event queue, editor, scheduler and
+message log now execute together on Zentaji. Five native/twin full-state/RAM
+cases verify editing, parsing, CRLF, Ctrl-C, normalized keyboard Tab refusal,
+truncation and forced service turns during sustained input. The two-second live
+ReadLine proof uses actual serial/timer/WFI hardware and measured additional
+CPU0.078125s over1.998580s wall, with exact recorded native/twin replay. Only
+unavailable service/device providers are counted test adapters. This is neither
+a full Anvil image nor a ROM-to-monitor boot proof.
+
+Counted full ARM monitor builds pass with signed production Forge `2f134c743`:
+Pi4 build497, Pi3 build107 and UNO Q build105. These are desk artifacts, not
+physical deployments or card releases. Startup/vectors, storage, the command
+composition and production payload/service ABI still block full Zentaji boot.

@@ -1,8 +1,8 @@
 ; Serial port 0 is the monitor console. No reset, RX drain, baud change or
 ; counter clear occurs on adoption. The owner must exclude block/DMA users.
-; Bracketed background-message routing and the compiler Print router are
-; separate console policy; they are not silently emulated by this transport.
+; Background-message routing is shared monitor policy above the transport.
 XIncludeFile "Zentaji/Board/prompt_idle.pbi"
+XIncludeFile "Anvil/Core/console_messages.pbi"
 #ZEN_CONSOLE = $FFFF000000100000
 #ZEN_CONSOLE_POLLS = 4096
 Global zenConsoleUp.i=0
@@ -62,6 +62,7 @@ Procedure.i ZentajiConsolePut(c.i)
 EndProcedure
 
 Procedure UartWrite(c.i)
+  If UartMessageActive()<>0 : UartMessagePut(c) : ProcedureReturn : EndIf
   If ZentajiConsolePut(c)=0 : zenConsoleDropped=zenConsoleDropped+1 : EndIf
 EndProcedure
 
@@ -125,3 +126,7 @@ Procedure UartOff()
   Define ignored.i=UartDropped()
   zenConsoleUp=0
 EndProcedure
+
+; Compiler-routed formatting is the existing transport-neutral guest library.
+Procedure PrintChar(c.i) : UartWrite(c) : EndProcedure
+XIncludeFile "Shared/A64/string_out.pmi"
