@@ -2963,3 +2963,12 @@ EndProcedure
 ; These operations preserve shared input ordering and return after bounded
 ; work. Device register access and renderer selection stay in the board.
 ; Prompt idle/wake operations are specified in Anvil/Hal/prompt_idle.pbi.
+
+; PAYLOAD ARCHITECTURE CONTRACT (selected before Anvil/Core/pmfboot.pbi)
+; HwPmfArchitectureId()           positive compiler-owned PMFBOOT ISA identity
+; HwPmfStackAlignment()           positive power-of-two initial SP alignment
+; HwPmfInitialStackBytes()        positive aligned minimum initial stack extent
+; HwPmfLegacyV1Allowed()          1 only for the exact historic v1 executable ABI
+; HwPmfTargetId() remains the board's independent positive identity. Both ISA
+; and board must match before loading; unknown/zero backend identities refuse.
+; A non-ARM backend does not inherit AArch64's numeric ID, stack or v1 policy.

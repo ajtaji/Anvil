@@ -15,8 +15,8 @@ answer - RaspberryPi4/Board/hw_id.pi4 - is 2711 / 2712 the same way), then
 runs it under tools/a64/a64_interp.py through pi5_desk's Machine with the
 container fields poked into the procedure's globals.
 
-Mutation control: with the 2712 arm removed from pmfboot.pbi, the -t pi5
-build must refuse 2712 and the gate must go red.
+Mutation control: replacing the backend target with the container target
+must admit wrong-board images and make the gate go red.
 
     py -3 tools/a64/pmfboot_2712_check.py --compiler PureMetalForge.exe
 """
@@ -61,6 +61,8 @@ def driver(text: str) -> str:
         "Global gPmfTarget.i\nGlobal gPmfStack.i\n"
         "Procedure PutAddr(a.i)\n  PrintDec(a)\nEndProcedure\n"
         "Procedure.i HwPmfTargetId()\n  ProcedureReturn #PMF_CHIP\nEndProcedure\n"
+        + 'XIncludeFile "Anvil/Core/payload_identity.pbi"\n'
+        + 'XIncludeFile "Anvil/Kernel/AArch64/payload_contract.pbi"\n'
         + lift(text) +
         "Procedure.i Probe(target.i)\n"
         "  gPmfReserved = 0\n  gPmfExtReservedOk = 1\n  gPmfArchitecture = #PMF_ARCH_AARCH64\n"
@@ -125,21 +127,20 @@ def main() -> int:
     if n:
         print("pmfboot_2712_check: FAIL - %d admission case(s) wrong" % n)
         return 1
-    # Mutation: the 2712 arm removed - the -t pi5 monitor must then refuse 2712.
-    arm = re.search(r"  CompilerIf #PMF_CHIP = 2712\n    If gPmfTarget = #PMF_TARGET_BCM2712\n"
-                    r"      knownTarget = 1\n    EndIf\n  CompilerEndIf\n", text)
-    if not arm:
-        print("pmfboot_2712_check: FAIL - the 2712 admission arm is not where the mutation expects it")
+    # Mutation: ignore the independently selected board identity.
+    binding = "expectedTarget = HwPmfTargetId()"
+    if text.count(binding) != 1:
+        print("pmfboot_2712_check: FAIL - target binding not found exactly once")
         return 1
     try:
-        red = gate(cc, text.replace(arm.group(0), ""), work / "mutant", verbose=False)
+        red = gate(cc, text.replace(binding, "expectedTarget = gPmfTarget"), work / "mutant", verbose=False)
     except d.GateFail as e:
         print("pmfboot_2712_check: FAIL - mutant would not run: %s" % e)
         return 1
     if red == 0:
-        print("pmfboot_2712_check: FAIL - the mutant (2712 arm removed) still passed")
+        print("pmfboot_2712_check: FAIL - the mutant (board identity ignored) still passed")
         return 1
-    print("  mutant (2712 arm removed): %d case(s) red, as required" % red)
+    print("  mutant (board identity ignored): %d case(s) red, as required" % red)
     print("pmfboot_2712_check: PASS - 8 admission cases on two chips, mutation red. Desk only: silicon owed.")
     return 0
 

@@ -1,3 +1,5 @@
+XIncludeFile "Anvil/Core/payload_identity.pbi"
+
 ; ======================================================================
 ;  pmfboot.pi4 - THE PAYLOAD CONTAINER ENGINE.
 ;
@@ -244,7 +246,7 @@
 #PMF_FLAG_WANTS_SERVICES = 4   ; the payload expects the SERVICE TABLE in x0
                                ; (Anvil/Hal/abi.pbi). Bit 2. MUTUALLY
                                ; EXCLUSIVE WITH BIT 1 - see PmfCheckFlags.
-#PMF_STACK_ABI_BYTES = 16      ; AAPCS64 initial SP must address aligned memory
+#PMF_STACK_ABI_BYTES = 16      ; legacy AArch64 alias; admission uses the backend contract
 
 ; The setting names, in one place. Every one of them is read in exactly
 ; one procedure below, and having the strings here rather than inline
@@ -484,71 +486,50 @@ EndProcedure
 ;  after this common format check (for example BCM2837 for a Pi 3 slot).
 ; ======================================================================
 Procedure.i PmfCheckV2Metadata()
-  Define knownTarget.i
+  Define expectedArch.i
   Define expectedTarget.i
+  Define alignment.i
+  Define initialBytes.i
+  Define verdict.i
 
   If gPmfReserved <> 0 Or gPmfExtReservedOk = 0
     PrintN("!! this version-2 container has nonzero reserved metadata bytes.")
-    PrintN("   They are required to be zero, so the header is damaged or belongs")
-    PrintN("   to a format this monitor does not know. Nothing was loaded.")
+    PrintN("   They are required to be zero. Nothing was loaded.")
     ProcedureReturn 0
   EndIf
-
-  If gPmfArchitecture <> #PMF_ARCH_AARCH64
-    Print("!! this version-2 container names architecture ID ")
-    PrintDec(gPmfArchitecture)
-    PrintN(", but this")
-    Print("   monitor accepts AArch64 architecture ID ")
-    PrintDec(#PMF_ARCH_AARCH64)
-    PrintN(". Nothing was loaded.")
-    ProcedureReturn 0
-  EndIf
-
-  knownTarget = 0
-  Select gPmfTarget
-    Case #PMF_TARGET_BCM2837
-      knownTarget = 1
-    Case #PMF_TARGET_BCM2711
-      knownTarget = 1
-    Case #PMF_TARGET_QCM2290
-      knownTarget = 1
-  EndSelect
-  ; BCM2712 is a known target only to a monitor built for it (-t pi5). A
-  ; -t pi4 monitor calls it unknown, and a -t pi5 monitor refuses a 2711
-  ; image at the HwPmfTargetId() comparison below - both directions refused.
-  CompilerIf #PMF_CHIP = 2712
-    If gPmfTarget = #PMF_TARGET_BCM2712
-      knownTarget = 1
-    EndIf
-  CompilerEndIf
-  If knownTarget = 0
-    Print("!! this version-2 container names unknown target ID ")
-    PrintDec(gPmfTarget)
-    PrintN(".")
-    PrintN("   This monitor will not guess a board from a filename. Nothing was")
-    PrintN("   loaded; rebuild the payload with a supported compiler target.")
-    ProcedureReturn 0
-  EndIf
-
+  expectedArch = HwPmfArchitectureId()
   expectedTarget = HwPmfTargetId()
-  If gPmfTarget <> expectedTarget
-    Print("!! this version-2 container was compiled for target ID ")
-    PrintDec(gPmfTarget)
-    PrintN(", but this")
-    Print("   board requires target ID ")
-    PrintDec(expectedTarget)
-    PrintN(". Nothing was loaded. The image may be valid for its own board,")
-    PrintN("   but relabelling or copying it here cannot make its generated MMIO,")
-    PrintN("   memory map and startup code belong to this machine.")
+  alignment = HwPmfStackAlignment()
+  initialBytes = HwPmfInitialStackBytes()
+  If PmfStackContractValid(alignment, initialBytes) = 0
+    PrintN("!! this monitor has an invalid payload stack contract. Nothing was loaded.")
     ProcedureReturn 0
   EndIf
-
-  If gPmfStack <= 0 Or (gPmfStack & 15) <> 0
-    Print("!! this version-2 container names stack top ")
-    PutAddr(gPmfStack)
-    PrintN(", which is zero")
-    PrintN("   or not 16-byte aligned as the AArch64 ABI requires. Nothing was")
-    PrintN("   loaded; rebuild the payload rather than guessing a stack address.")
+  verdict = PmfIdentityCheck(gPmfArchitecture, gPmfTarget, gPmfStack, expectedArch, expectedTarget, alignment)
+  Select verdict
+    Case #PMF_ID_CONTRACT
+      PrintN("!! this monitor has no valid payload architecture/target contract.")
+    Case #PMF_ID_ARCH
+      Print("!! this container names architecture ID ")
+      PrintDec(gPmfArchitecture)
+      Print(", but this monitor requires ")
+      PrintDec(expectedArch)
+      PrintNl()
+    Case #PMF_ID_TARGET
+      Print("!! this container names target ID ")
+      PrintDec(gPmfTarget)
+      Print(", but this board requires ")
+      PrintDec(expectedTarget)
+      PrintNl()
+    Case #PMF_ID_STACK
+      Print("!! this container's stack top ")
+      PutAddr(gPmfStack)
+      Print(" is zero or not aligned to ")
+      PrintDec(alignment)
+      PrintN(" bytes as this architecture requires.")
+  EndSelect
+  If verdict <> #PMF_ID_OK
+    PrintN("   Nothing was loaded. A header cannot make another ISA or board's code compatible.")
     ProcedureReturn 0
   EndIf
 
@@ -582,6 +563,14 @@ Procedure.i PmfCheckHeader(fileLen.i)
     PrintN("   Rebuild the payload with this compiler, or use load and run with")
     PrintN("   the flat image and an address you supply yourself.")
     ProcedureReturn 0
+  EndIf
+
+  If gPmfVersion = #PMF_VERSION_V1
+    If HwPmfLegacyV1Allowed() = 0
+      PrintN("!! version-1 payloads have no architecture identity and are not supported here.")
+      PrintN("   Rebuild with explicit machine metadata. Nothing was loaded.")
+      ProcedureReturn 0
+    EndIf
   EndIf
 
   If gPmfHdrLen <> expectedHdr
@@ -742,6 +731,7 @@ Procedure.i PmfCheckPlacement()
   Define bssHi.i
   Define stackLo.i
   Define stackHi.i
+  Define initialBytes.i
 
   imageHi = gPmfLoad + gPmfImgLen - 1
   If PmfCheckRange(gPmfLoad, gPmfLoad + gPmfImgLen - 1, "image") = 0
@@ -767,20 +757,25 @@ Procedure.i PmfCheckPlacement()
   EndIf
 
   ; PMF v2 records a stack top, not an extent. Prove the ABI-required first
-  ; 16 bytes below that top are in a payload stack window, then reject any
+  ; initial bytes below that top are in a payload stack window, then reject any
   ; overlap with image or BSS. This prevents an invalid initial SP from
   ; targeting monitor-owned or unmapped bytes; it does not claim to bound
   ; later stack growth, which the current PMF format cannot describe.
   If gPmfVersion = #PMF_VERSION_V2
-    If gPmfStack < #PMF_STACK_ABI_BYTES
-      PrintN("!! this container's stack top is too low for the required aligned")
-      PrintN("   AArch64 stack area. Nothing was loaded.")
+    initialBytes = HwPmfInitialStackBytes()
+    If PmfStackContractValid(HwPmfStackAlignment(), initialBytes) = 0
+      PrintN("!! this monitor has an invalid payload stack contract. Nothing was loaded.")
       ProcedureReturn 0
     EndIf
-    stackLo = gPmfStack - #PMF_STACK_ABI_BYTES
+    If gPmfStack < initialBytes
+      PrintN("!! this container's stack top is too low for the required aligned")
+      PrintN("   payload stack area. Nothing was loaded.")
+      ProcedureReturn 0
+    EndIf
+    stackLo = gPmfStack - initialBytes
     stackHi = gPmfStack - 1
     If HwPmfStackAllowed(stackLo, stackHi) = 0
-      Print("!! this container's initial 16-byte stack area, ")
+      Print("!! this container's initial stack area, ")
       PutAddr(stackLo)
       Print(" to ")
       PutAddr(stackHi)

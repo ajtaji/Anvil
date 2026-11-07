@@ -93,6 +93,9 @@ Global gPmfReserved.i
 Global gPmfExtReservedOk.i
 Global gMonHitLo.i
 Global gMonHitHi.i
+Global gTestLegacyAllowed.i = 1
+Global gTestStackAlignment.i = 16
+Global gTestStackExtent.i = 16
 Global gQAddrSafe.i
 
 Procedure str_print_at(*s) : EndProcedure
@@ -228,6 +231,9 @@ EndProcedure
 
 Procedure Main()
   Define fail.i
+  gTestLegacyAllowed = 1
+  gTestStackAlignment = 16
+  gTestStackExtent = 16
 
   ; Exact v1 path: offset 96 is already image data. Poison it and prove
   ; it is neither parsed nor judged as a v2 extension.
@@ -240,9 +246,27 @@ Procedure Main()
     fail = fail + 1
   EndIf
 
+  ; No-ISA-tag v1 must follow the backend's explicit compatibility policy.
+  gTestLegacyAllowed = 0
+  If GateCheck(100) <> 0 : fail = fail + 1 : EndIf
+  gTestLegacyAllowed = 1
+
   GateReset(#PMF_VERSION_V2, #PMF_HDR_LEN_V2)
   GateV2(#PMF_TARGET_BCM2711, $1F00000)
   If GateCheck(132) = 0 : fail = fail + 1 : EndIf
+  ; A different ISA's stack geometry must be used by both admission and placement.
+  gTestStackAlignment = 8
+  gTestStackExtent = 32
+  GateV2(#PMF_TARGET_BCM2711, $1F00008)
+  If GateCheck(132) = 0 : fail = fail + 1 : EndIf
+  If GatePlacement(#PMF_VERSION_V2, $1200000, 4, $1300000, 16, $7F00010) <> 0
+    fail = fail + 1
+  EndIf
+  gTestStackAlignment = 16
+  gTestStackExtent = 24
+  If GateCheck(132) <> 0 : fail = fail + 1 : EndIf
+  gTestStackExtent = 16
+
 
   ; A known target is not enough: this is emitted as a Pi 4 fixture, so a
   ; perfectly valid BCM2837 identity must still be refused by the board seam.
@@ -381,6 +405,16 @@ def main() -> int:
         "PmfCheckFlags", "PmfCheckV2Metadata", "PmfCheckHeader",
         "PmfCheckRange", "PmfCheckPlacement",
     )) + "\n\n" + pi4_stack_hook + "\n\n" + pi3_stack_hook + "\n\n" + unoq_stack_hook
+    backend = (ROOT / "Anvil/Kernel/AArch64/payload_contract.pbi").read_text(encoding="utf-8")
+    # Hardware-adapter test doubles exercise another architecture's policies;
+    # the reader bodies above remain the exact production source.
+    for name, value in (("HwPmfLegacyV1Allowed", "gTestLegacyAllowed"),
+                        ("HwPmfStackAlignment", "gTestStackAlignment"),
+                        ("HwPmfInitialStackBytes", "gTestStackExtent")):
+        original = procedure(backend, name)
+        backend = backend.replace(original, f"Procedure.i {name}()\n  ProcedureReturn {value}\nEndProcedure")
+    bodies = ((ROOT / "Anvil/Core/payload_identity.pbi").read_text(encoding="utf-8")
+              + "\n" + backend + "\n" + bodies)
     bodies = re.sub(r"\bPrintN\b", "GatePrintN", bodies)
     bodies = re.sub(r"\bPrint\b", "GatePrint", bodies)
 
@@ -421,7 +455,7 @@ def main() -> int:
 
     print("PASS: emitted production reader accepts exact v1 and exact v2")
     print("PASS: v1 does not parse offset 96; strict v2 rejects wrong-known target, bad IDs/stack/reserved/length")
-    print("PASS: placement rejects monitor/outside-window/overlap/overflow ranges and validates the v2 initial stack area")
+    print("PASS: placement rejects monitor/outside-window/overlap/overflow ranges; backend stack alignment/extent and legacy-v1 refusal are honored")
     return 0
 
 

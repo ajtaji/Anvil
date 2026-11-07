@@ -308,3 +308,35 @@ conventions, relocation handling, privilege/context entry and return, exception
 frames, multicore coordination, and the real Zentaji hardware backend. The
 existing AArch64-only checks inside PMFBOOT/module validation must move behind
 explicit architecture contracts without accepting another ISA's image.
+
+## Payload architecture admission (2026-11-07)
+
+PMFBOOT v2 admission now obtains the required ISA identity, stack alignment
+and initial stack extent from the selected backend. The shared
+`Anvil/Core/payload_identity.pbi` validates those values and requires the
+container's architecture and target to match the independently selected
+architecture and board. Its decision code contains no CPU/board enumeration.
+`Anvil/Kernel/AArch64/payload_contract.pbi` preserves the existing ID 1,
+16-byte stack alignment and initial extent for the current ARM compositions.
+
+PMFBOOT v1 has no architecture field. `HwPmfLegacyV1Allowed()` makes accepting
+that historic executable ABI explicit; a new ISA must not inherit ARM v1
+acceptance merely because it can parse a header. Reserved-byte, image range,
+BSS, digest and placement checks remain in the common engine. No new compiler
+architecture ID is allocated by this refactor, and a test-only identity does
+not advertise a production backend.
+
+The initial stack-window check uses the backend's extent, rather than a
+literal 16 bytes. This proves the first required area only; PMFBOOT still has
+no field describing the maximum later stack growth. The service-table calling
+convention, payload entry/return code, module ISA/relocation handling and
+exception-frame/context code still require architecture backends.
+
+`tools/payload_identity_check.py` executes 24 explicit identity/stack outcomes
+and 11 geometry cases on Zentaji. The production-reader fixture exercises
+backend-specific alignment, extent and legacy refusal as well as the existing
+v1/v2 and placement checks. Pi 4/Pi 5 admission remains mutually exclusive;
+a mutant that substitutes the container's target for the board's fails six
+cases. The existing full boot-container test still executes a valid ARM
+payload and refuses corrupted/overlapping/conflicting-pointer containers.
+These desk proofs are separate from physical boot acceptance.
