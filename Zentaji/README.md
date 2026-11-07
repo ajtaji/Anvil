@@ -229,11 +229,13 @@ is nonblocking and refuses while DMA is pending or ownership/completion identity
 is uncertain. Successful close restores the acquired disabled configuration and
 resets the emptied private queue indices. Mode 0 is closed, 1 ready, 2 quarantined.
 
-**Durability is unfinished in the emulator.** Guest write/readback works, but the
-current deterministic runner acknowledges FLUSH without updating its host image.
-The native loader discards the backing path and FLUSH is a no-op; FUA is also
-ignored. This must be fixed before filesystem write completion can promise host
-persistence. The ROM now resets its empty owned queues after both boot READs
+Persistent emulator `disk` bindings now sync FUA writes and FLUSH to the host
+image before successful completion. A host I/O failure returns status4 and raises
+MCHECK on the latched queue producer core; partial host writes may have occurred.
+Use exclusive ownership of the image. Explicit `disk-memory` bindings isolate
+writes for debugger snapshots/history. Recordings preserve initial disk bytes
+in separate sidecars and persistence outcomes; replay never writes source images.
+Linux execution and physical power-loss behavior remain unverified. The ROM now resets its empty owned queues after both boot READs
 complete, then disables and clears their descriptors before entry. The driver can
 therefore acquire that same boot disk without treating disable as cancellation.
 
@@ -245,8 +247,9 @@ Twenty actual Forge/reference-assembly/native/twin cases compare complete state,
 RAM and independently expected medium bytes. They cover unaligned and cross-4KB
 I/O, full and partial writes, phase wrap, read-only/bounds/context/ownership
 refusals, flush, device errors, timeout quarantine, late DMA, caller-buffer reuse,
-corrupt completions and actual core1 execution. The host backing comparison
-reports the durability gap separately; the transport pass does not close it.
+corrupt completions and actual core1 execution. Scenario6 uses an actual persistent binding and requires the complete host image
+to equal the independent expected medium after FUA writes and FLUSH. Other
+transport cases use explicit private memory bindings.
 
 A further case compiles the unchanged full `Anvil/Storage/fat32.pbi`, binds these
 real disk callbacks, and runs under Anvil's owned supervisor startup, stack and
@@ -254,8 +257,8 @@ vectors. It mounts an MBR partition, walks root/allocation metadata with expecte
 corrupt-chain refusals, reads a fragmented file, rewinds, reads chunks and checks
 EOF/not-found behavior. Native/twin state and RAM match, independent expected file
 bytes match, and the read-only medium stays unchanged. This is a component proof
-with direct owned startup, not ROM disk boot, the full storage facade, exFAT,
-a writable filesystem durability proof or the complete monitor command loop.
+with direct owned startup, not the full storage facade, exFAT,
+a writable filesystem transaction proof or the complete monitor command loop.
 
 
 ```text
@@ -269,5 +272,6 @@ closes, reopens and reads again. Full native/twin state and RAM match; independe
 header/payload bytes match; final queues are empty and disabled; host images stay
 unchanged. The fixture uses the production Forge startup (including its global
 initialization) and a bounded one-million-instruction allowance. The native tools
-must include the ROM queue-reset fix. This closes boot-disk reuse, not durable
-writable backing or the complete monitor/storage composition.
+must include the ROM queue-reset fix. This closes boot-disk reuse; it does not link the complete monitor/storage
+composition. Durable writable backing is covered separately by the persistence
+and actual driver checks.

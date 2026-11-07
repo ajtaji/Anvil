@@ -133,7 +133,10 @@ def main():
                 m.cores[0].state='PARKED';c.pc=int.from_bytes(image.read_bytes()[8:16],'little');c.r[255]=2<<20;c.state='RUNNING'
             for r in range(128,253):c.r[r]=0x10000+r*13
             for r in range(32,64):c.v[r]=sum((r*100+j)<<(64*j) for j in range(8))
-            assert not L.capture(m,str(td));native=run([L.EXE,td/'machine.txt','--max','4000000','--ram',td/'final.bin']);m.run(4000000)
+            assert not L.capture(m,str(td))
+            if scenario==6:
+                cfg=td/'machine.txt';cfg.write_text(cfg.read_text().replace('disk-memory ','disk '),encoding='utf-8')
+            native=run([L.EXE,td/'machine.txt','--max','4000000','--ram',td/'final.bin']);m.run(4000000)
             assert c.state=='HALTED' and c.r[1]==42,(scenario,c.state,c.r[1],c.cr)
             assert (td/'final.bin').read_bytes()==m.ram,scenario
             line=next(s[6:] for s in native.splitlines() if s.startswith('STATE '));assert line.split(' ',1)[1]==L.state_line(m,0,-1).split(' ',1)[1],scenario
@@ -152,7 +155,8 @@ def main():
             assert bytes(m.disks[0].image)==want,scenario
             if scenario==6:
                 persisted=(td/'disk0.img').read_bytes()
-                print('PASS host backing persisted after FLUSH' if persisted==want else 'GAP deterministic runner FLUSH: guest disk bytes changed correctly, backing image remains unchanged on host',flush=True)
+                assert persisted==want,'guest write/FLUSH did not persist exact host image bytes'
+                print('PASS exact host backing persisted after actual driver FUA writes and FLUSH',flush=True)
             assert all(other.state=='PARKED' for other in m.cores if other is not c),scenario
         print('PASS 20 actual Forge/reference/native/twin full-state/RAM/medium cases: aligned/unaligned and cross-4KB 512-sector I/O, partial/full writes, queue phase wrap, read-only/bounds/ownership/refusals, flush/device errors, timeout quarantine and late DMA retirement/reopen, corrupted tag/phase, owner mismatch and actual core1 execution')
         # Reuse the existing independent FAT fixture, not a second filesystem.

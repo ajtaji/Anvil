@@ -6,8 +6,8 @@
 ; 512-byte writes use read/modify/write for partial 4KB blocks; exclusive medium
 ; ownership excludes other writers during that sequence. Acquisition requires a
 ; quiesced predecessor: disabled/empty registers alone cannot fence old DMA.
-; The current emulator FLUSH/FUA do not persist host files; completion currently
-; proves virtual-medium access only. A failed write can
+; Persistent emulator bindings sync FUA/FLUSH; explicit disk-memory bindings
+; isolate writes for snapshots. A failed write can
 ; still complete later. This is not an atomic multi-sector transaction.
 ; Normal supervisor context with IE=0 and a qualified bounded idle source is
 ; required. The board owns INTC routing (line9 may wake early) and the idle timer.
