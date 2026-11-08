@@ -4,6 +4,7 @@
 
 #ANVIL_VULKAN_BACKEND_V3D = 1
 #ANVIL_VULKAN_BACKEND_SOFTWARE = 2
+#ANVIL_VULKAN_BACKEND_ZENTAJI = 3
 
 CompilerIf #ANVIL_VULKAN_BACKEND = #ANVIL_VULKAN_BACKEND_V3D
   CompilerIf #ANVIL_VULKAN_BACKEND_PRESENT <> #ANVIL_VULKAN_BACKEND_V3D
@@ -12,6 +13,10 @@ CompilerIf #ANVIL_VULKAN_BACKEND = #ANVIL_VULKAN_BACKEND_V3D
 CompilerElseIf #ANVIL_VULKAN_BACKEND = #ANVIL_VULKAN_BACKEND_SOFTWARE
   CompilerIf #ANVIL_VULKAN_BACKEND_PRESENT <> #ANVIL_VULKAN_BACKEND_SOFTWARE
     CompilerError "Selected software backend does not match the explicitly included implementation"
+  CompilerEndIf
+CompilerElseIf #ANVIL_VULKAN_BACKEND = #ANVIL_VULKAN_BACKEND_ZENTAJI
+  CompilerIf #ANVIL_VULKAN_BACKEND_PRESENT <> #ANVIL_VULKAN_BACKEND_ZENTAJI
+    CompilerError "Selected Zentaji backend does not match the explicitly included implementation"
   CompilerEndIf
 CompilerElse
   CompilerError "#ANVIL_VULKAN_BACKEND must select exactly one Vulkan backend"

@@ -54,7 +54,7 @@ copy\destinationBase = target : copy\destinationBytes = 256
 copy\width = 8 : copy\height = 8 : copy\destinationLayout = #AVK_SW_IMAGE_LAYOUT
 If avkBackendSubmitImageCopy(@copy) <> #ANVIL_VK_JOB_DONE : ProcedureReturn 71 : EndIf
 If (PeekL(target) & $FFFFFF) <> $112233 Or PeekA(target + 3) <> $FF : ProcedureReturn 72 : EndIf
-If Check(avkBackendSubmitClear(target, 256, 8, 8, 32, $FF445566) = #ANVIL_VK_JOB_DONE And (PeekL(target + 252) & $FFFFFF) = $445566) = 0 : ProcedureReturn 8 : EndIf
+If Check(avkBackendSubmitClear(target, 256, 8, 8, 32, $FF445566, 0) = #ANVIL_VK_JOB_DONE And (PeekL(target + 252) & $FFFFFF) = $445566) = 0 : ProcedureReturn 8 : EndIf
 
 ; The software backend reports the bounded tiled transfer capabilities too.
 ; Its declared software layout is linear, so this exercises the same closed

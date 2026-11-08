@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import subprocess
 import tempfile
 from pathlib import Path
@@ -10,7 +11,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 SELECTOR = ROOT / "Anvil/Graphics/Vulkan/vk_backend_select.pbi"
-SOFTWARE_FIXTURE = ROOT / "Anvil/Graphics/Vulkan/vk_backend_software_test.pi4"
+SOFTWARE_FIXTURE = ROOT / "Anvil/Graphics/Vulkan/Tests/vk_backend_software_test.pbi"
 PI4_BOARD = ROOT / "RaspberryPi4/Board/board.pi4"
 
 
@@ -20,6 +21,10 @@ def source_checks(selector: str, fixture: str, board: str) -> list[str]:
         errors.append("V3D selector value missing")
     if "#ANVIL_VULKAN_BACKEND_SOFTWARE = 2" not in selector:
         errors.append("software selector value missing")
+    if "#ANVIL_VULKAN_BACKEND_ZENTAJI = 3" not in selector:
+        errors.append("Zentaji selector value missing")
+    if "CompilerElseIf #ANVIL_VULKAN_BACKEND = #ANVIL_VULKAN_BACKEND_ZENTAJI" not in selector:
+        errors.append("selector Zentaji branch missing")
     if selector.count("CompilerIf #ANVIL_VULKAN_BACKEND =") != 1:
         errors.append("selector does not have one primary branch")
     if "CompilerElseIf #ANVIL_VULKAN_BACKEND = #ANVIL_VULKAN_BACKEND_SOFTWARE" not in selector:
@@ -43,12 +48,36 @@ def compile_fixture(compiler: Path) -> tuple[bool, str]:
             return False, "temporary directory escaped the system temporary root"
         command = [
             str(compiler), "--compile", str(SOFTWARE_FIXTURE), "-t", "pi4",
-            "--load-addr", "0x500000", "--stack-addr", "0x4F00000",
+            "--load-addr", "0x500000", "--stack-addr", "0x8000000",
             "--entry-returns", "-o", str(output),
         ]
-        result = subprocess.run(command, cwd=ROOT, text=True, capture_output=True)
+        result = subprocess.run(command, cwd=ROOT, env=dict(os.environ,PMF_ROOT=str(ROOT)), text=True, capture_output=True)
     detail = (result.stdout + result.stderr).strip()
     return result.returncode == 0 and "pmfc:" in detail, detail
+
+
+
+def compile_identities(compiler: Path) -> tuple[bool, str]:
+    with tempfile.TemporaryDirectory(prefix="vulkan-backend-identities-") as temp_name:
+        folder=Path(temp_name)
+        src=folder/"identity.zentaji";out=folder/"identity.zex"
+        for selected in (1,2,3,4):
+            for present in (1,2,3):
+                src.write_bytes((f"#ANVIL_VULKAN_BACKEND = {selected}\n#ANVIL_VULKAN_BACKEND_PRESENT = {present}\n"
+                    'XIncludeFile "Anvil/Graphics/Vulkan/vk_backend_select.pbi"\n'
+                    'Procedure.q Main()\nProcedureReturn 0\nEndProcedure\n').replace('\n','\r\n').encode('utf-8'))
+                out.unlink(missing_ok=True)
+                p=subprocess.run([str(compiler),"--compile",str(src),"-o",str(out)],cwd=ROOT,
+                    env=dict(os.environ,PMF_ROOT=str(ROOT)),text=True,capture_output=True,
+                    encoding='utf-8',errors='replace',timeout=60)
+                expected=selected==present
+                detail=p.stdout+p.stderr
+                if (p.returncode==0)!=expected or out.is_file()!=expected:
+                    return False,f"identity selected={selected} present={present}: {detail}"
+                if not expected:
+                    message='must select exactly one' if selected==4 else 'does not match'
+                    if message not in detail:return False,detail
+    return True,"12 real compiler identity/mismatch/unknown-value cases"
 
 
 def run_self_test() -> int:
@@ -58,6 +87,8 @@ def run_self_test() -> int:
     if source_checks(selector, fixture, board):
         return 1
     mutants = [
+        (selector.replace("#ANVIL_VULKAN_BACKEND_ZENTAJI = 3", "#ANVIL_VULKAN_BACKEND_ZENTAJI = 2"), fixture, board),
+        (selector.replace("CompilerElseIf #ANVIL_VULKAN_BACKEND = #ANVIL_VULKAN_BACKEND_ZENTAJI", "CompilerElseIf 0"), fixture, board),
         (selector.replace("#ANVIL_VULKAN_BACKEND_SOFTWARE = 2", "#ANVIL_VULKAN_BACKEND_SOFTWARE = 1"), fixture, board),
         (selector.replace("CompilerElseIf #ANVIL_VULKAN_BACKEND = #ANVIL_VULKAN_BACKEND_SOFTWARE", "CompilerElseIf 0"), fixture, board),
         (selector, fixture.replace("#ANVIL_VULKAN_BACKEND = 2", "#ANVIL_VULKAN_BACKEND = 1"), board),
@@ -65,7 +96,7 @@ def run_self_test() -> int:
     ]
     if any(not source_checks(*candidate) for candidate in mutants):
         return 2
-    print("PASS: backend selector baseline and four hostile mutations")
+    print(f"PASS: backend selector baseline and {len(mutants)} hostile mutations")
     return 0
 
 
@@ -91,7 +122,12 @@ def main() -> int:
             print(detail)
             return 1
         print("PASS: software backend selector fixture compiled")
-    print("PASS: software backend selector and Pi4 V3D default")
+        ok,detail=compile_identities(args.compiler)
+        if not ok:
+            print(detail)
+            return 1
+        print("PASS: "+detail)
+    print("PASS: V3D/software/Zentaji selector and Pi4 V3D default")
     return 0
 
 
