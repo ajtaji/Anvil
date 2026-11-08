@@ -1,5 +1,6 @@
 """Exercise the actual Zentaji CPU call boundary, independently of board policy."""
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -92,8 +93,18 @@ def main():
         wrapped,meta,assembly,_=B.pack(image.read_bytes(),zt/('zasm.exe' if os.name=='nt' else 'zasm'),source_map=json.loads(Path(str(image)+'.zmap').read_text(encoding='utf-8-sig')))
         owned=A.Asm();owned.assemble(assembly)
         assert meta['image_end']<0x280008
+        app_source=td/'app.zentaji';app=td/'app.zex'
+        app_source.write_text('Procedure.q Main(argument.q)\nPokeQ($281000,argument)\nPokeQ($281008,PeekQ($281008)+1)\nProcedureReturn $8877665544332211\nEndProcedure\n')
+        run([cc,'--compile',app_source,'--load-addr','0x280008','--stack-addr','0x2F0000','--entry-returns','-o',app])
+        compiled=app.read_bytes();ar=A.Asm();load,body=ar.assemble(Path(str(app)+'.asm').read_text(encoding='utf-8-sig'))
+        assert compiled==zexpack.header(load,load,body,stack=0x2F0000)+body and load==0x280008 and load+len(body)<0x281000
+        pmf=Path(str(app)+'.pmf').read_bytes()
+        assert pmf[:8]==b'PMFBOOT\0' and struct.unpack_from('<II',pmf,8)==(2,128)
+        assert struct.unpack_from('<5Q',pmf,16)==(load,load,len(body),load+len(body),0)
+        assert struct.unpack_from('<II',pmf,56)==(1,0) and pmf[64:96]==hashlib.sha256(body).digest()
+        assert struct.unpack_from('<IIQ',pmf,96)==(2,1,0x2F0000) and not any(pmf[112:128]) and pmf[128:]==body
         count=0
-        for scenario,rom in [(n,False) for n in range(19)]+[(20,False),(21,False),(0,True),(13,True)]:
+        for scenario,rom in [(n,False) for n in range(19)]+[(20,False),(21,False),(0,True),(13,True),(22,False),(22,True)]:
             lines=['.org $280008','LIQ r16,$281000','ST64 r1,[r16]','LD64 r17,[r16+8]','ADDI r17,r17,1','ST64 r17,[r16+8]']
             # Validate every promised entry register and FP mode before clobbering it.
             for r in range(2,16):lines+=['BNEI r%d,0,payload_bad'%r]
@@ -110,6 +121,7 @@ def main():
             if scenario==21:lines+=['LI r17,16','MTCR r0,r17,STATUS']
             lines+=['JR r254','payload_bad:','LI r1,$BAD','HALT r1']
             payload=A.Asm();address,code=payload.assemble('\n'.join(lines)+'\n')
+            if scenario==22:address,code=load,pmf[128:]
             files=[['anvil.zex',bytearray(wrapped),True]] if rom else []
             m=I.Machine(ram_size=8<<20,cores=2,hostfiles=files,display_modes=[(1,1,60000)])
             if rom:m.power_on(0,0)
@@ -150,11 +162,14 @@ def main():
             state=next(s[6:] for s in out.splitlines() if s.startswith('STATE '));assert state.split(' ',1)[1]==L.state_line(m,0,-1).split(' ',1)[1]
             assert m.cores[1].state=='PARKED'
             calls=struct.unpack_from('<Q',m.ram,0x281008)[0]
-            if scenario in (0,13):assert len(snapshots)==2 and pending is None and calls==2 and arguments==[0x1122334455667788,0]
-            elif scenario>=20:assert not snapshots and pending is not None and calls==1 and c.r[255]==3 and arguments==[0x1122334455667788]
+            if scenario in (0,13,22):assert len(snapshots)==2 and pending is None and calls==2 and arguments==[0x1122334455667788,0]
+            elif scenario in (20,21):assert not snapshots and pending is not None and calls==1 and c.r[255]==3 and arguments==[0x1122334455667788]
             else:assert not snapshots and pending is None and calls==0 and not arguments
             count+=1
+            if scenario==22:
+                assert bytes(m.ram[load:load+len(body)])==body
             print('PASS payload boundary scenario=%d ROM=%s: native/twin full state/RAM, calls=%d'%(scenario,rom,calls),flush=True)
+        print('PASS real placed compiler PMF body through owned CPU boundary twice, direct and ROM: args/results/caller stack restored; harness placement, not shared-loader integration')
         print('PASS %d actual CPU-boundary cases: entry arguments/stack/FP state, complete kept-register restoration despite foreign SP/vectors, repeat/nested entry, refusal before jump and unsafe-return fail-stop'%count)
 
 
