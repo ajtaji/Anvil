@@ -1185,7 +1185,7 @@ StackAddress $8000000
 ;      #ANVIL_BUILD = 1        ; pmf:build off
 ;  The IDE's Compiler > Build Number... window writes that word for you.
 ; ======================================================================
-#ANVIL_BUILD = 498        ; pmf:build
+#ANVIL_BUILD = 499        ; pmf:build
 
 ;  The two optional siblings, written by the same successful build. They
 ;  are INTEGERS because `#NAME = <literal>` takes a number and nothing
@@ -1194,7 +1194,7 @@ StackAddress $8000000
 ;  for. YYYYMMDD and HHMMSS read correctly as decimal numbers anyway, and
 ;  CmdVersion() prints them with their separators put back.
 #ANVIL_BUILD_DATE = 20261108   ; pmf:builddate
-#ANVIL_BUILD_TIME = 000035     ; pmf:buildtime
+#ANVIL_BUILD_TIME = 002701     ; pmf:buildtime
 
 ; ======================================================================
 ;  THE LIBRARIES. A library never includes a library - the main file
@@ -3354,42 +3354,11 @@ Procedure Main()
     ElseIf WordIs("autoboot") <> 0 Or LetterIs(97) <> 0   ; a
       CmdAuto()
 
-    ElseIf WordIs("mount") <> 0 Or WordIs("fatload") <> 0 Or WordIs("load") <> 0 Or LetterIs(102) <> 0   ; f
-      CmdFat()
-
-    ; fatls / ls - list the mounted FAT root directory. Core logic, gated
-    ; on #CAP_STORAGE through RequireCap (Anvil/Hal/hal.pbi), so this same
-    ; line compiles and dispatches on a board with no storage, where it
-    ; degrades to the honest "not available" refusal. ls is the generic
-    ; front-end name U-Boot uses; both land in the same handler.
-    ElseIf WordIs("fatls") <> 0 Or WordIs("ls") <> 0
-      CmdFatls()
-
-    ; cat - print a small text file off the boot medium without loading
-    ; it into a payload window. Core logic, gated on #CAP_STORAGE through
-    ; RequireCap like fatls above, and it reads and never writes. It
-    ; exists because reading four lines of configuration out of a hex
-    ; dump is how a character gets transcribed wrongly.
-    ElseIf WordIs("cat") <> 0
-      CmdCat()
+    ElseIf DispatchStorageCommand() <> 0
+      ; The portable storage family owns its names and aliases once.
 
     ElseIf WordIs("baud") <> 0
       CmdBaud()
-
-    ElseIf WordIs("save") <> 0
-      CmdSave()
-
-    ; mkdir / rm / rename - directory-level changes on the storage medium,
-    ; write-gated through the same seam as save. Whole words only: md is
-    ; the memory dump. See Anvil/Core/fs_cmd.pbi.
-    ElseIf WordIs("mkdir") <> 0
-      CmdMkdir()
-    ElseIf WordIs("rmdir") <> 0
-      CmdRmdir()
-    ElseIf WordIs("rm") <> 0 Or WordIs("del") <> 0
-      CmdRemove()
-    ElseIf WordIs("rename") <> 0 Or WordIs("mv") <> 0
-      CmdRename()
 
     ElseIf WordIs("reset") <> 0 Or WordIs("reboot") <> 0 Or LetterIs(114) <> 0   ; r
       CmdReset()

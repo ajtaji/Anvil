@@ -87,3 +87,14 @@ backend performs registration after its range/floor checks. Shared clock policy
 does not require `#PMF_CHIP`, and a new architecture must not impersonate an ARM
 chip to include it. This registration is a provider contract, not a hardware
 probe or automatic assertion that a virtual RTC holds correct civil time.
+
+
+## Shared command vocabulary
+
+Storage command names and aliases are dispatched by `DispatchStorageCommand()`
+in the shared `Anvil/Core/fs_cmd.pbi`, after the caller establishes the ordinary
+parsed word state. Pi4, Pi3, Arduino Q and the Zentaji command composition use
+that procedure; board loops continue to own their other command families and
+startup. A new architecture supplies memory/storage seams and reuses the shared
+handlers rather than copying the word chain or filesystem logic. Rock Pi's
+separate recovery-console composition has not been migrated by this change.

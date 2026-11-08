@@ -1090,3 +1090,30 @@ Procedure CmdRename()
   PrintN(".")
   PrintN("The volume was flushed and the block writer disarmed.")
 EndProcedure
+
+
+; One storage command vocabulary for every architecture/board composition.
+; The caller has parsed gWordAt/gWordLen and left gPos after the command word.
+; Return 0 without consuming arguments when another command family must try.
+Procedure.i DispatchStorageCommand()
+ If WordIs("mount")<>0 Or WordIs("load")<>0 Or WordIs("fatload")<>0 Or LetterIs(102)<>0
+  CmdFat()
+ ElseIf WordIs("save")<>0
+  CmdSave()
+ ElseIf WordIs("mkdir")<>0
+  CmdMkdir()
+ ElseIf WordIs("rmdir")<>0
+  CmdRmdir()
+ ElseIf WordIs("rm")<>0 Or WordIs("del")<>0
+  CmdRemove()
+ ElseIf WordIs("rename")<>0 Or WordIs("mv")<>0
+  CmdRename()
+ ElseIf WordIs("fatls")<>0 Or WordIs("ls")<>0 Or WordIs("dir")<>0
+  CmdFatls()
+ ElseIf WordIs("cat")<>0
+  CmdCat()
+ Else
+  ProcedureReturn 0
+ EndIf
+ ProcedureReturn 1
+EndProcedure

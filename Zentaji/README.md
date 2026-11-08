@@ -14,7 +14,7 @@ guest library, with its source revision and hash in `PROVENANCE.json`.
 The board's interrupt owner must reserve the calling core's timer and configure
 line 1 as a level source, enabled above that core's interrupt threshold. Anvil
 must already be running in its required supervisor context. Then call
-`ZentajiPromptIdlePrepare(maxMicroseconds)` with a 50ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã…â€œ2000 microsecond deadline.
+`ZentajiPromptIdlePrepare(maxMicroseconds)` with a 50ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã¢â‚¬Å“2000 microsecond deadline.
 It refuses an active timer, a nonzero period or pending timer status, an
 inadmissible interrupt, a busy interrupt context, or a second reservation.
 It reads the machine frequency and rounds the interval down; an interval
@@ -391,3 +391,56 @@ Each case compares complete state/RAM, an unchanged persistent host image and
 exact serial output. Report output distinguishes a mounted volume, a pending
 mount and no mounted partition after a failed switch. This does not prove
 physical power-loss behavior or the final monitor/payload integration.
+
+
+## Live memory layout and shared file commands
+
+`Board/memory.pbi` binds once to the validated owned-startup context. The payload
+window starts at the next 4 KB page after the complete loaded image/BSS/vector
+slab and ends before Anvil's supervisor stack. Three enumerated exclusions
+protect the low prefix and image, the complete stack, and the ROM's top 1 MB
+workspace. Addresses derive from the actual image and fitted RAM; no ARM memory
+map or fixed Anvil image-size allowance is used. A composition without a valid
+binding admits no payload window. The stage address is the window's first byte.
+
+The unchanged shared `memrange.pbi` walks those windows/exclusions. The address
+backend admits ordinary fitted RAM for raw inspection, classifies positive
+addresses beyond fitted RAM as absent, and leaves MMIO/ROM apertures unknown.
+The shared `addrsafe.pbi` retains its deliberate one-address force policy; that
+does not turn a device aperture into an admitted file-load payload window.
+
+```text
+python tools/zentaji_memory_check.py --compiler <Forge executable> --zen-tools <tools/zentaji directory>
+python tools/zentaji_commands_check.py --compiler <Forge executable> --zen-tools <tools/zentaji directory>
+```
+
+The memory gate executes real owned startup with 2 MB, 4 MB and uneven RAM sizes,
+and through the actual ROM on disk 15. Native/twin full state and RAM agree.
+Independent extents from the packed image and actual RAM check every reported
+region/window edge; shared policy refuses negative, reversed, crossing and
+monitor/stack/ROM-workspace intervals. The gate writes and checks both admitted
+window endpoints and verifies the shared map's output.
+
+The command gate boots from the actual ROM on disk 15 into the owned supervisor
+startup, binds the live memory/storage backends and runs the real shared
+ReadLine/editor/parser, settings store and file-command implementation. Typed
+commands create a folder, save 1800 staged bytes to a quoted long path, clear the
+stage and load the file back, list its folder, report a missing file, and refuse
+a load over the running monitor. The independent oracle verifies the complete
+persisted exFAT result, allocation accounting, hashes and timestamps; the staged
+RAM bytes and monitor instruction bytes are independently checked. Native/twin
+full state, RAM and host disk match, with expected command echoes/results.
+
+`DispatchStorageCommand()` in `Anvil/Core/fs_cmd.pbi` now owns the storage word
+and alias policy used by Pi4, Pi3, Arduino Q and this Zentaji composition:
+`mount/load/fatload/f`, `save`, `mkdir`, `rmdir`, `rm/del`, `rename/mv`,
+`fatls/ls/dir`, and `cat`. Unknown words return 0 so the next family can try.
+This preserves the old aliases and makes `dir` available on Pi4 and `mount`/`cat`
+available on Pi3 and Arduino Q through their existing file backends.
+
+This remains a component command composition, not the complete production
+monitor: it reuses the documented counted service adapters from the prompt
+gate for unavailable display, mouse, network, radio maintenance and log-file
+notification. Production service registration, the rest of the command loop,
+settings-at-boot policy and the Zentaji application/service ABI are still owed.
+The shared file handlers and filesystem implementation have no test substitutes.
