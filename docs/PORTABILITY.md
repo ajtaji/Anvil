@@ -98,3 +98,18 @@ that procedure; board loops continue to own their other command families and
 startup. A new architecture supplies memory/storage seams and reuses the shared
 handlers rather than copying the word chain or filesystem logic. Rock Pi's
 separate recovery-console composition has not been migrated by this change.
+
+
+## Optional prompt service registration
+
+The parser, scheduler and output-cancellation code use
+`Anvil/Core/prompt_services.pbi` instead of naming a board's screen/input/network
+functions or reading its display/keyboard globals. A composition registers
+bounded work, input/ownership and transport-pump providers independently, or
+leaves them absent. The pump is separate from generic work so a network service
+can check cancellation without acquiring a recursive call path through another
+maintenance lane. Callback entry and rebinding guards preserve serialization.
+Pi4, Pi3 and Arduino Q wire their existing services after privileged entry capture;
+Zentaji's serial command composition currently leaves the optional providers
+unregistered. Capabilities and payload-service availability remain separate
+contracts, and registration does not grant an architecture an ARM identity.

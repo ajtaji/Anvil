@@ -1,3 +1,4 @@
+XIncludeFile "Anvil/Core/prompt_services.pbi"
 
 ; ======================================================================
 ;  Receive with a deadline.
@@ -138,7 +139,7 @@ Procedure.i OutBreakByte()
   Define c.i
   If UartReadReady() <> 0
     c = UartRead()
-    NetConsoleClaimLocal()
+    AnvilPromptInput(#APS_CLAIM_LOCAL)
     ProcedureReturn c
   EndIf
   If gBreakNetPump = 0
@@ -148,13 +149,13 @@ Procedure.i OutBreakByte()
     ; that says is a message, not part of the answer the running command
     ; is printing. See THE MESSAGE CONTEXT in RaspberryPi4/Lib/uart.pi4.
     UartMessageBegin()
-    NetConsolePump()
+    AnvilPromptPump()
     UartMessageEnd()
     gBreakNetPump = 0
   EndIf
   ; Even a re-entrant caller may consume a byte already admitted to the
   ; exact-owner ring; only recursively driving the hardware pump is barred.
-  ProcedureReturn NetConsoleGetc()
+  ProcedureReturn AnvilPromptInput(#APS_NET_INPUT)
 EndProcedure
 
 ; ----------------------------------------------------------------------

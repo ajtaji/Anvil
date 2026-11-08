@@ -12,16 +12,19 @@ Procedure WifiMaintenanceBind(*provider)
   *wifiMaintenanceProvider = *provider
 EndProcedure
 
-Procedure WifiMaintenanceTick()
-  Define ignored.i
-  If *wifiMaintenanceProvider <> 0
-    ignored = wifiMaintenanceProvider(#WIFI_MAINTENANCE_TICK)
-  EndIf
+Procedure.i wifi_MaintenanceAbsent(operation.i)
+ ProcedureReturn 0
+EndProcedure
+Procedure WifiMaintenanceInvoke(operation.i)
+ Protected *provider=@wifi_MaintenanceAbsent
+ Protected ignored.i
+ If *wifiMaintenanceProvider<>0 : *provider=*wifiMaintenanceProvider : EndIf
+ ignored=provider(operation)
 EndProcedure
 
+Procedure WifiMaintenanceTick()
+ WifiMaintenanceInvoke(#WIFI_MAINTENANCE_TICK)
+EndProcedure
 Procedure WifiMaintenanceCheckNow()
-  Define ignored.i
-  If *wifiMaintenanceProvider <> 0
-    ignored = wifiMaintenanceProvider(#WIFI_MAINTENANCE_CHECK_NOW)
-  EndIf
+ WifiMaintenanceInvoke(#WIFI_MAINTENANCE_CHECK_NOW)
 EndProcedure

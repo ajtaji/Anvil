@@ -75,6 +75,14 @@ Procedure.i msg_Secs()
   ProcedureReturn (now - gBootTicks) / hz
 EndProcedure
 
+Procedure msg_AbsentLineHook(*text,length.i,number.i)
+EndProcedure
+Procedure msg_NotifyLine(*text,length.i,number.i)
+ Protected *sink=@msg_AbsentLineHook
+ If *gMsgLineHook<>0 : *sink=*gMsgLineHook : EndIf
+ sink(*text,length,number)
+EndProcedure
+
 ; Keep the line being built. Blank lines are not messages - a PrintN("")
 ; that only ended a line has already been accounted for.
 Procedure msg_Commit()
@@ -123,9 +131,7 @@ Procedure msg_Commit()
   gMsgText[base + gMsgCurLen] = 0
   gMsgNoOf[gMsgNext] = gMsgNo
   gMsgSecsOf[gMsgNext] = msg_Secs()
-  If *gMsgLineHook <> 0
-    gMsgLineHook(@gMsgCur[0], gMsgCurLen, gMsgNo)
-  EndIf
+  msg_NotifyLine(@gMsgCur[0], gMsgCurLen, gMsgNo)
   gMsgLines = gMsgLines + 1
   gMsgNext = gMsgNext + 1
   If gMsgNext >= #MSG_SLOTS

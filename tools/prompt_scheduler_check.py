@@ -9,6 +9,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 from pmf_compiler import resolve_compiler
+from prompt_services_fixture import LANE_BINDING
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -178,6 +179,8 @@ Procedure.i Main()
   ProcedureReturn 42
 EndProcedure
 '''
+
+FIXTURE=FIXTURE.replace('Procedure.i Main()',LANE_BINDING+'Procedure.i Main()\n AnvilPromptServicesBind(@TestPromptServices) : AnvilPromptPumpBind(@TestPromptPump)')
 
 
 def main():

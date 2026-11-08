@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 from pmf_compiler import resolve_compiler
+from prompt_services_fixture import FULL_BINDING
 ROOT=Path(__file__).resolve().parents[1]
 SOURCE=r'''
 #CAP_TOUCH=0
@@ -80,10 +81,12 @@ Procedure.i Main(scenario.i)
  ProcedureReturn 42
 EndProcedure
 '''
+SOURCE=SOURCE.replace('Procedure.i Main(scenario.i)',FULL_BINDING+'Procedure.i Main(scenario.i)\n AnvilPromptServicesBind(@TestPromptServices) : AnvilPromptPumpBind(@TestPromptPump) : AnvilPromptInputsBind(@TestPromptInputs)')
+
 
 
 def main():
-    ap=argparse.ArgumentParser(description=__doc__);ap.add_argument('--compiler');ap.add_argument('--zen-tools',type=Path,required=True)
+    ap=argparse.ArgumentParser(description=__doc__);ap.add_argument('--compiler');ap.add_argument('--zen-tools',type=Path,required=True);ap.add_argument('--live-only',action='store_true')
     a=ap.parse_args();cc=resolve_compiler(a.compiler);zt=a.zen_tools.resolve();sys.path.insert(0,str(zt))
     import zen_interp as I
     import zen_lockstep_check as L
@@ -124,15 +127,15 @@ def main():
             assert serial[0]==output.hex().upper(),scenario
             assert c.r[128:253]==[0x10000+r*13 for r in range(128,253)] and c.r[255]==0xF0000,scenario
             assert c.v[32:]==[sum((r*100+j)<<(64*j) for j in range(8)) for r in range(32,64)],scenario
-        for scenario in range(5):
+        for scenario in ([] if a.live_only else range(5)):
             m=machine(scenario);assert not L.capture(m,str(td));native=run([L.EXE,td/'machine.txt','--max','4000000','--ram',td/'final.bin']);m.run(4000000);match(m,native,scenario)
-        print('PASS 5 real ReadLine/parser/input/editor/scheduler/message-log cases: cross-line CRLF, exact editing output, case-insensitive word/full-width hex parse, Ctrl-C, tab refusal off the prompt, bounded truncation and fair background service')
+        if not a.live_only:print('PASS 5 real ReadLine/parser/input/editor/scheduler/message-log cases: cross-line CRLF, exact editing output, case-insensitive word/full-width hex parse, Ctrl-C, tab refusal off the prompt, bounded truncation and fair background service')
         results=[]
         for scenario in (20,21):
-            m=machine(scenario);assert not L.capture(m,str(td));rec=td/'recorded.txt'
+            m=machine(scenario);assert not L.capture(m,str(td));rec=td/('recorded%d.txt'%scenario)
             live,wall,cpu=S.run([str(zt/('zenwin.exe' if os.name=='nt' else 'zenwin')),str(td/'machine.txt'),'--headless','--live','--mute','--record',str(rec),'--max','4000000'],timeout=30)
             native=run([L.EXE,rec,'--max','4000000','--ram',td/'final.bin']);assert states(live)==states(native)
-            m.clock_samples=deque((int(s.split()[1][1:],16),int(s.split()[2]),int(s.split()[3]) if len(s.split())>3 else -1) for s in rec.read_text().splitlines() if s.startswith('clock '))
+            m.clock_samples=deque((int(s.split()[1][1:],16),int(s.split()[2]),int(s.split()[3]) if len(s.split())>3 else -1) for s in rec.read_text().splitlines() if s.startswith(('clock ','work ')))
             m.clock_complete=True;m.run(4000000);match(m,native,scenario);results.append((wall,cpu))
         wall=results[1][0]-results[0][0];cpu=max(0,results[1][1]-results[0][1]);assert wall>=1.8 and cpu<0.4,(wall,cpu)
         print(f'PASS actual shared ReadLine live: startup-adjusted wall={wall:.6f}s cpu={cpu:.6f}s; active services/messages, real timer/WFI, exact recorded native/twin replay')

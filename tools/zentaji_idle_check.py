@@ -14,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 from pmf_compiler import resolve_compiler
+from prompt_services_fixture import LANE_BINDING
 
 ROOT=Path(__file__).resolve().parents[1]
 
@@ -133,10 +134,12 @@ ProcedureReturn 42
 EndProcedure
 '''
 
+SOURCE=SOURCE.replace('Procedure.i Main(scenario.i)',LANE_BINDING+'Procedure.i Main(scenario.i)\n AnvilPromptServicesBind(@TestPromptServices) : AnvilPromptPumpBind(@TestPromptPump)')
+
 
 def main():
     ap=argparse.ArgumentParser(description=__doc__)
-    ap.add_argument('--compiler');ap.add_argument('--zen-tools',type=Path,required=True)
+    ap.add_argument('--compiler');ap.add_argument('--zen-tools',type=Path,required=True);ap.add_argument('--live-only',action='store_true')
     a=ap.parse_args();cc=resolve_compiler(a.compiler);zt=a.zen_tools.resolve()
     sys.path.insert(0,str(zt))
     import zen_interp as I
@@ -172,7 +175,7 @@ def main():
             assert (td/'final.bin').read_bytes()==m.ram
             expected=L.state_line(m,0,-1).split(' ',1)[1]
             assert len(states(native))==1 and states(native)[0][6:].split(' ',1)[1]==expected
-        for owner in (0,1):
+        for owner in ([] if a.live_only else (0,1)):
             for scenario in range(16):
                 m=machine(scenario,owner);c=m.cores[owner]
                 kept=list(c.r[128:253]);vectors=list(c.v[32:])
@@ -182,15 +185,16 @@ def main():
                 try:match(m,native,owner)
                 except AssertionError as e:raise AssertionError((scenario,owner,native[-1500:])) from e
                 assert c.r[128:253]==kept and c.v[32:]==vectors and c.r[255]==0xF0000
-        print('PASS 32 actual backend/shared-scheduler native/twin state/RAM cases: cores0/1, reservation/admission, deadline and early wake, IE preservation, input/work, other timers and refusal without overwrites')
+        if not a.live_only:print('PASS 32 actual backend/shared-scheduler native/twin state/RAM cases: cores0/1, reservation/admission, deadline and early wake, IE preservation, input/work, other timers and refusal without overwrites')
         results=[]
         for scenario in (20,21):
-            m=machine(scenario);assert not L.capture(m,str(td));rec=td/'recorded.txt'
-            live,wall,cpu=S.run([str(zt/('zenwin.exe' if os.name=='nt' else 'zenwin')),str(td/'machine.txt'),'--headless','--live','--mute','--record',str(rec),'--max','1000000'],timeout=30)
-            native=run([L.EXE,rec,'--max','1000000','--ram',td/'final.bin'])
+            m=machine(scenario);assert not L.capture(m,str(td));rec=td/('recorded%d.txt'%scenario)
+            live,wall,cpu=S.run([str(zt/('zenwin.exe' if os.name=='nt' else 'zenwin')),str(td/'machine.txt'),'--headless','--live','--mute','--record',str(rec),'--max','2000000'],timeout=30)
+            native=run([L.EXE,rec,'--max','2000000','--ram',td/'final.bin'])
+            assert ' exit=2A ' in native,('live did not reach guest halt',native[-1800:])
             assert states(live)==states(native)
-            m.clock_samples=deque((int(s.split()[1][1:],16),int(s.split()[2]),int(s.split()[3]) if len(s.split())>3 else -1) for s in rec.read_text().splitlines() if s.startswith('clock '))
-            m.clock_complete=True;m.run(1000000);match(m,native,0)
+            m.clock_samples=deque((int(s.split()[1][1:],16),int(s.split()[2]),int(s.split()[3]) if len(s.split())>3 else -1) for s in rec.read_text().splitlines() if s.startswith(('clock ','work ')))
+            m.clock_complete=True;m.run(2000000);match(m,native,0)
             results.append((wall,cpu))
         wall=results[1][0]-results[0][0];cpu=max(0,results[1][1]-results[0][1])
         assert wall>=1.8,(wall,cpu)

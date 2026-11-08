@@ -2,6 +2,7 @@
 ; board identification. The selected hardware backend implements the contract
 ; in Anvil/Hal/prompt_idle.pbi.
 XIncludeFile "Anvil/Hal/prompt_idle.pbi"
+XIncludeFile "Anvil/Core/prompt_services.pbi"
 
 Global anvil_promptServiceSlot.i = 0
 Global anvil_promptWindowStart.q = 0
@@ -63,37 +64,33 @@ Procedure AnvilPromptServiceOne()
   UartMessageBegin()
   Select anvil_promptServiceSlot
     Case 0
-      MouseTick()
-      TouchTick()
-      CompilerIf #CAP_TOUCH = 1
-        TouchKeyboardServiceTick()
-      CompilerEndIf
+      AnvilPromptService(#APS_POINTER)
     Case 1
-      ScreenServiceTick()
+      AnvilPromptService(#APS_SCREEN)
     Case 2
       WifiMaintenanceTick()
-      NetDhcpTick()
+      AnvilPromptService(#APS_DHCP)
       CompilerIf #CAP_NET = 1
-        NtpServiceTick()
+        AnvilPromptService(#APS_NTP)
       CompilerEndIf
     Case 3
       CompilerIf #CAP_PWM = 1
         If HwPwmKind() <> #HW_PWM_KIND_SOFT
-          FanTick()
+          AnvilPromptService(#APS_FAN)
         EndIf
       CompilerElse
-        FanTick()
+        AnvilPromptService(#APS_FAN)
       CompilerEndIf
-      HwTempSampleTick()
+      AnvilPromptService(#APS_TEMPERATURE)
       HwPromptBoardService()
     Case 4
-      NetConsoleRearm()
-      NetConsolePump()
-      NetConsoleLlTick()
+      AnvilPromptService(#APS_NET_REARM)
+      AnvilPromptPump()
+      AnvilPromptService(#APS_NET_LINKLOCAL)
       CompilerIf #CAP_NET = 1
-        HttpServerPoll()
+        AnvilPromptService(#APS_HTTP)
       CompilerElse
-        TcpTick()
+        AnvilPromptService(#APS_TCP)
       CompilerEndIf
   EndSelect
   UartMessageEnd()

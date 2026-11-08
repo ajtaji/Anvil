@@ -49,9 +49,9 @@ StackAddress $1F00000
 ;  other two Pi 3 board files, so three programs on one board keep three
 ;  numbers and none of them moves when another is built.
 ; ----------------------------------------------------------------------
-#ANVIL_BUILD = 109 ; pmf:build
+#ANVIL_BUILD = 110 ; pmf:build
 #ANVIL_BUILD_DATE = 20261108 ; pmf:builddate
-#ANVIL_BUILD_TIME = 002741 ; pmf:buildtime
+#ANVIL_BUILD_TIME = 004317 ; pmf:buildtime
 
 ; ======================================================================
 ;  1. THIS BOARD'S LOW-LEVEL LIBRARIES.
@@ -1250,6 +1250,53 @@ Procedure CmdPi3Wifi()
   PrintN("  Identity/EROM read only; no radio core reset or firmware/NVRAM/CLM upload was made.")
 EndProcedure
 
+; This board wires its existing bounded services to the portable prompt.
+Procedure.i BoardPromptServices(operation.i)
+ Select operation
+  Case #APS_POINTER
+   MouseTick() : TouchTick()
+   CompilerIf #CAP_TOUCH=1
+    TouchKeyboardServiceTick()
+   CompilerEndIf
+  Case #APS_SCREEN : ScreenServiceTick()
+  Case #APS_ATTACH
+   If gMouseTried=0 And gScreen<>0 : MouseTryAttach() : EndIf
+  Case #APS_DHCP : NetDhcpTick()
+  Case #APS_NTP
+   CompilerIf #CAP_NET=1
+    NtpServiceTick()
+   CompilerEndIf
+  Case #APS_FAN : FanTick()
+  Case #APS_TEMPERATURE : HwTempSampleTick()
+  Case #APS_NET_REARM : NetConsoleRearm()
+  Case #APS_NET_LINKLOCAL : NetConsoleLlTick()
+  Case #APS_HTTP
+   CompilerIf #CAP_NET=1
+    HttpServerPoll()
+   CompilerEndIf
+  Case #APS_TCP
+   CompilerIf #CAP_NET=0
+    TcpTick()
+   CompilerEndIf
+ EndSelect
+ ProcedureReturn 0
+EndProcedure
+
+Procedure.i BoardPromptInputs(operation.i)
+ Select operation
+  Case #APS_KEYBOARD
+   If gKbdH<>0 : ProcedureReturn KeyboardChar() : EndIf
+  Case #APS_CLAIM_LOCAL : NetConsoleClaimLocal()
+  Case #APS_NET_INPUT : ProcedureReturn NetConsoleGetc()
+ EndSelect
+ ProcedureReturn 0
+EndProcedure
+
+Procedure.i BoardPromptPump(operation.i)
+ NetConsolePump()
+ ProcedureReturn 0
+EndProcedure
+
 Procedure Main()
   Define clock.i
   Define c.i
@@ -1408,6 +1455,9 @@ Procedure Main()
   ;  "pmf> " IS LOAD-BEARING: five characters, a trailing space, no
   ;  newline. Host tools match on it. Do not tidy it.
   ; ==================================================================
+  AnvilPromptServicesBind(@BoardPromptServices)
+  AnvilPromptInputsBind(@BoardPromptInputs)
+  AnvilPromptPumpBind(@BoardPromptPump)
   Repeat
     Print("pmf> ")
     UartDrain()

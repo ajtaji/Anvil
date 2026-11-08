@@ -14,7 +14,7 @@ guest library, with its source revision and hash in `PROVENANCE.json`.
 The board's interrupt owner must reserve the calling core's timer and configure
 line 1 as a level source, enabled above that core's interrupt threshold. Anvil
 must already be running in its required supervisor context. Then call
-`ZentajiPromptIdlePrepare(maxMicroseconds)` with a 50ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã¢â‚¬Å“2000 microsecond deadline.
+`ZentajiPromptIdlePrepare(maxMicroseconds)` with a 50ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦ÃƒÂ¢Ã¢â€šÂ¬Ã…â€œ2000 microsecond deadline.
 It refuses an active timer, a nonzero period or pending timer status, an
 inadmissible interrupt, a busy interrupt context, or a second reservation.
 It reads the machine frequency and rounds the interval down; an interval
@@ -439,8 +439,54 @@ This preserves the old aliases and makes `dir` available on Pi4 and `mount`/`cat
 available on Pi3 and Arduino Q through their existing file backends.
 
 This remains a component command composition, not the complete production
-monitor: it reuses the documented counted service adapters from the prompt
-gate for unavailable display, mouse, network, radio maintenance and log-file
-notification. Production service registration, the rest of the command loop,
-settings-at-boot policy and the Zentaji application/service ABI are still owed.
+monitor. It now uses the production optional-service registration with no
+registered display, mouse, keyboard, network, radio-maintenance or file-log
+provider. No counted service adapters remain in this command image. The real
+`rxbreak.pbi` supplies output cancellation. The test operator sends each line
+after observing the prompt and replays that same timed UART schedule natively;
+pipelining a later command through an interruptible listing correctly cancels it.
 The shared file handlers and filesystem implementation have no test substitutes.
+The top-level production board entry, remaining command families, settings at
+boot and the Zentaji application/service ABI remain unfinished.
+
+
+## Optional prompt services
+
+`Anvil/Core/prompt_services.pbi` supplies explicit synchronous registration for
+background work (`AnvilPromptServicesBind`), optional input/console ownership
+(`AnvilPromptInputsBind`), and the transport pump (`AnvilPromptPumpBind`). A zero
+provider unregisters that part. Unbound work and pump calls do nothing; optional
+keyboard input reports no byte (0), and network input reports no byte (-1).
+Presence getters describe registration, not hardware discovery or capabilities.
+Serial input, input events, the editor, message log, clock accounting and the
+qualified timer/WFI backend remain real shared/board implementations.
+
+Pi4, Pi3 and Arduino Q register their existing services inside Main after the
+firmware-entry capture, before the prompt. Pointer/touch service, display,
+DHCP/NTP, fan/temperature and network maintenance retain their scheduler lanes.
+The input provider retains keyboard admission and local/remote console ownership.
+The pump has a separate callable target because cancellation during a networking
+service must not recursively reenter link-local/DHCP or generic maintenance.
+Input can be read while work or pumping is active; provider registration cannot
+change during any callback. Each dispatcher refuses recursive entry, and invalid
+operation IDs report `APS_ERR_OPERATION`; active-entry/rebinding refusals report
+`APS_ERR_ACTIVE` through `AnvilPromptServicesLastError()`.
+
+Wi-Fi maintenance and the message log's optional file notification also have
+concrete unbound call targets. Their raw registration pointers remain zero when
+unregistered, and no connection or file-copy capability is invented. The message
+log still keeps and exposes its lines with no file sink.
+
+```text
+python tools/zentaji_prompt_services_check.py --compiler <Forge executable> --zen-tools <tools/zentaji directory>
+```
+
+This checks absent defaults, registered work/input/pump routing, input during
+work/pumping, active rebinding refusal, independent unregister and invalid IDs.
+It also executes the real UART cancellation code: any-byte and Ctrl-C behavior,
+sticky abort without consuming extra bytes, rearm and exact output. A real
+unbound ReadLine wait checks startup-adjusted host CPU below 20% of one core over
+two seconds, with exact recorded native/twin state/RAM replay and a real message
+log with no file hook. The qualified timer/WFI wake path is unchanged. This is a
+Windows headless execution proof; visible device input and Linux are still owed.
+The existing registered-adapter prompt and idle gates remain separate regressions.

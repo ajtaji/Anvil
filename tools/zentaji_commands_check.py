@@ -9,10 +9,20 @@ import sys
 import tempfile
 from pmf_compiler import resolve_compiler
 import zentaji_boot_image as B
-import zentaji_prompt_check as P
 import zentaji_exfat_oracle as E
 ROOT=Path(__file__).resolve().parents[1]
-SOURCE=P.SOURCE.split('Procedure.i Main(')[0]+r'''
+SOURCE=r'''
+#CAP_TOUCH=0
+#CAP_PWM=0
+#CAP_NET=0
+IncludeFile "Zentaji/Board/console.pbi"
+IncludeFile "Anvil/Core/state.pbi"
+IncludeFile "Anvil/Core/input_events.pbi"
+IncludeFile "Anvil/Core/text_edit.pbi"
+Global gBootTicks.i
+IncludeFile "Anvil/Core/messages.pbi"
+IncludeFile "Anvil/Core/parse.pbi"
+IncludeFile "Anvil/Core/rxbreak.pbi"
 #CAP_STORAGE=1
 IncludeFile "Anvil/Kernel/Zentaji/boot_context.pbi"
 IncludeFile "Anvil/Hal/hal.pbi"
@@ -41,12 +51,14 @@ Procedure.i Main(table.i,source.i,context.i)
  If ZentajiMemoryBind(context)<>1 Or ZentajiStorageFromBoot(context,1)<>1 : ProcedureReturn 1 : EndIf
  PokeQ(#ZEN_IDLE_INTC+$120,3) : PokeQ(#ZEN_IDLE_INTC+$220,3) : PokeQ(#ZEN_IDLE_INTC+$228,1) : PokeQ(#ZEN_IDLE_INTC+$F008,514)
  If ZentajiPromptIdlePrepare(2000)<>1 Or UartInit(0)<>1 Or WallClockInit()<>1 Or WallClockSet(1794009600,#WALLCLOCK_SRC_MANUAL)<>1 : ProcedureReturn 2 : EndIf
- WifiMaintenanceBind(@TestWifi) : *gMsgLineHook=@TestLogLine : MessagesStart()
+ If AnvilPromptServicesPresent()<>0 Or AnvilPromptInputsPresent()<>0 Or AnvilPromptPumpPresent()<>0 : ProcedureReturn 8 : EndIf
+ MessagesStart()
  stage=HwStageAddr()
  For n=0 To 1799 : PokeA(stage+n,(n*7+n/512+31)&255) : Next
  For command=0 To 5
   Print("pmf> ") : ReadLine()
   gPos=0 : SkipSpace() : gWordAt=gPos : SkipWord() : gWordLen=gPos-gWordAt
+  OutBreakArm()
   If DispatchStorageCommand()<>1 : ProcedureReturn 3 : EndIf
   If command=1
    For n=0 To 1799 : PokeA(stage+n,0) : Next
@@ -88,11 +100,26 @@ def main():
         medium=E.build(4096);medium[:64]=boot[:64];medium[4096:len(boot)]=boot[4096:]
         commands=['mkdir Folder','save "Folder/Long file name.bin" %X 708'%stage,'load "Folder/Long file name.bin" %X'%stage,'ls Folder','cat "Folder/Missing.txt"','load "Folder/Long file name.bin" 1000']
         m=I.Machine(ram_size=8<<20,cores=2,disks={15:(bytearray(medium),False)},display_modes=[(1,1,60000)]);m.power_on(1,15)
-        m.serial[0].incoming=[(0,b) for b in ('\r'.join(commands)+'\r').encode()]
         assert not L.capture(m,str(td));cfg=td/'machine.txt';cfg.write_text(cfg.read_text().replace('disk-memory ','disk '),encoding='utf-8')
+        scheduled=[]
+        def operator(core):
+            # Observe only at complete slice boundaries. Choose a future tick
+            # beyond that slice, so preloading the same schedule cannot change
+            # any earlier instruction/device boundary in the native replay.
+            if len(scheduled)>=len(commands):return
+            if bytes(m.serial[0].out).count(b'pmf> ')<=len(scheduled):return
+            tick=max(m.time,core.cr[I.CR['CYCLE']])+100
+            line=commands[len(scheduled)]+'\r'
+            scheduled.append([(tick,b) for b in line.encode()])
+            m.serial[0].incoming.extend(scheduled[-1])
+        m.on_slice=operator
+        m.run(16000000);m.on_slice=None;c=m.cores[0]
+        assert len(scheduled)==len(commands) and c.state=='HALTED' and c.r[1]==42,(c.state,c.r[1],bytes(m.serial[0].out)[-2000:])
+        with cfg.open('a',encoding='utf-8') as stream:
+            for line in scheduled:
+                for tick,byte in line:stream.write('serial 0 $%X %02X\n'%(tick,byte))
         out=run([L.EXE,cfg,'--max','16000000','--ram',td/'final.bin'])
         assert ' exit=2A ' in out,('native failed',out[-2500:])
-        m.run(16000000);c=m.cores[0];assert c.state=='HALTED' and c.r[1]==42,(c.state,c.r[1],bytes(m.serial[0].out)[-2000:])
         assert (td/'final.bin').read_bytes()==m.ram
         state=next(s[6:] for s in out.splitlines() if s.startswith('STATE '));assert state.split(' ',1)[1]==L.state_line(m,0,-1).split(' ',1)[1]
         assert (td/'disk15.img').read_bytes()==bytes(m.disks[15].image)

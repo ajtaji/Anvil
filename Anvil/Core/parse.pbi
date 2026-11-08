@@ -24,7 +24,7 @@ Procedure.i AnvilPromptAdmitUart()
     ProcedureReturn 0
   EndIf
   c = UartRead()
-  NetConsoleClaimLocal()
+  AnvilPromptInput(#APS_CLAIM_LOCAL)
   InputFeedByte(#AIS_PHYSICAL, c)
   ProcedureReturn 1
 EndProcedure
@@ -102,7 +102,7 @@ Procedure ReadLine()
   ; The prompt is already written, so the one thing the screen service can
   ; say - that screen memory is quarantined - is a message here.
   UartMessageBegin()
-  ScreenServiceTick()
+  AnvilPromptService(#APS_SCREEN)
   UartMessageEnd()
   ; ATTACH HERE, NOT DEEPER IN. The first version did it inside
   ; MouseTick(), which meant the "looking for a mouse" lines landed
@@ -111,16 +111,14 @@ Procedure ReadLine()
   ;
   ; AND WHAT IT PRINTS IS A MESSAGE. The prompt is already out, so anything
   ; the search says would land after it; see THE MESSAGE CONTEXT below.
-  If gMouseTried = 0 And gScreen <> 0
-    UartMessageBegin()
-    MouseTryAttach()
-    UartMessageEnd()
-  EndIf
+  UartMessageBegin()
+  AnvilPromptService(#APS_ATTACH)
+  UartMessageEnd()
   Repeat
     CompilerIf #CAP_PWM = 1
       If HwPwmKind() = #HW_PWM_KIND_SOFT
         UartMessageBegin()
-        FanTick()
+        AnvilPromptService(#APS_FAN)
         UartMessageEnd()
       EndIf
     CompilerEndIf
@@ -137,7 +135,7 @@ Procedure ReadLine()
       ; remote session is only displaced when somebody actually types.
       If src = #AIS_TOUCH_KEYBOARD
         If kind = #AIE_TEXT Or kind = #AIE_KEY_DOWN
-          NetConsoleClaimLocal()
+          AnvilPromptInput(#APS_CLAIM_LOCAL)
         EndIf
       EndIf
       Select kind
@@ -189,18 +187,16 @@ Procedure ReadLine()
     ; UartRead() is admitted nonblocking at the top of this turn, before
     ; queue delivery or any screen/network service. No renderer waits in
     ; this path; the board screen hook only enqueues producer bytes.
-    If gKbdH <> 0
-      c = KeyboardChar()
-      If c > 0
-        NetConsoleClaimLocal()
-        InputFeedByte(#AIS_PHYSICAL, c)
-        inputBurst = inputBurst + 1
-        If inputBurst >= 8
-          inputBurst = 0
-          AnvilPromptServiceOne()
-        EndIf
-        Continue
+    c = AnvilPromptInput(#APS_KEYBOARD)
+    If c > 0
+      AnvilPromptInput(#APS_CLAIM_LOCAL)
+      InputFeedByte(#AIS_PHYSICAL, c)
+      inputBurst = inputBurst + 1
+      If inputBurst >= 8
+        inputBurst = 0
+        AnvilPromptServiceOne()
       EndIf
+      Continue
     EndIf
     ; THE NETWORK CONSOLE IS A THIRD SOURCE OF CHARACTERS. Pump sends
     ; whatever was printed to the peer and takes in datagrams; a byte
@@ -245,7 +241,7 @@ Procedure ReadLine()
     ;
     ;  The editor's echo is outside it by construction: the typed byte is
     ;  applied at the top of the loop, never in here.
-    c = NetConsoleGetc()
+    c = AnvilPromptInput(#APS_NET_INPUT)
     If c >= 0
       ; A BYTE FROM THE PEER DOES NOT CLAIM LOCAL OWNERSHIP, and that
       ; asymmetry with the two reads above is the whole point of

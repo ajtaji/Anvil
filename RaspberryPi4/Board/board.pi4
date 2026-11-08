@@ -1185,7 +1185,7 @@ StackAddress $8000000
 ;      #ANVIL_BUILD = 1        ; pmf:build off
 ;  The IDE's Compiler > Build Number... window writes that word for you.
 ; ======================================================================
-#ANVIL_BUILD = 499        ; pmf:build
+#ANVIL_BUILD = 500        ; pmf:build
 
 ;  The two optional siblings, written by the same successful build. They
 ;  are INTEGERS because `#NAME = <literal>` takes a number and nothing
@@ -1194,7 +1194,7 @@ StackAddress $8000000
 ;  for. YYYYMMDD and HHMMSS read correctly as decimal numbers anyway, and
 ;  CmdVersion() prints them with their separators put back.
 #ANVIL_BUILD_DATE = 20261108   ; pmf:builddate
-#ANVIL_BUILD_TIME = 002701     ; pmf:buildtime
+#ANVIL_BUILD_TIME = 004239     ; pmf:buildtime
 
 ; ======================================================================
 ;  THE LIBRARIES. A library never includes a library - the main file
@@ -2527,6 +2527,53 @@ CompilerIf #PMF_CHIP = 2712
   EndProcedure
 CompilerEndIf
 
+; This board wires its existing bounded services to the portable prompt.
+Procedure.i BoardPromptServices(operation.i)
+ Select operation
+  Case #APS_POINTER
+   MouseTick() : TouchTick()
+   CompilerIf #CAP_TOUCH=1
+    TouchKeyboardServiceTick()
+   CompilerEndIf
+  Case #APS_SCREEN : ScreenServiceTick()
+  Case #APS_ATTACH
+   If gMouseTried=0 And gScreen<>0 : MouseTryAttach() : EndIf
+  Case #APS_DHCP : NetDhcpTick()
+  Case #APS_NTP
+   CompilerIf #CAP_NET=1
+    NtpServiceTick()
+   CompilerEndIf
+  Case #APS_FAN : FanTick()
+  Case #APS_TEMPERATURE : HwTempSampleTick()
+  Case #APS_NET_REARM : NetConsoleRearm()
+  Case #APS_NET_LINKLOCAL : NetConsoleLlTick()
+  Case #APS_HTTP
+   CompilerIf #CAP_NET=1
+    HttpServerPoll()
+   CompilerEndIf
+  Case #APS_TCP
+   CompilerIf #CAP_NET=0
+    TcpTick()
+   CompilerEndIf
+ EndSelect
+ ProcedureReturn 0
+EndProcedure
+
+Procedure.i BoardPromptInputs(operation.i)
+ Select operation
+  Case #APS_KEYBOARD
+   If gKbdH<>0 : ProcedureReturn KeyboardChar() : EndIf
+  Case #APS_CLAIM_LOCAL : NetConsoleClaimLocal()
+  Case #APS_NET_INPUT : ProcedureReturn NetConsoleGetc()
+ EndSelect
+ ProcedureReturn 0
+EndProcedure
+
+Procedure.i BoardPromptPump(operation.i)
+ NetConsolePump()
+ ProcedureReturn 0
+EndProcedure
+
 Procedure Main()
   Define c.i
   Define hz.i
@@ -2946,6 +2993,9 @@ Procedure Main()
   IPv6ServiceBind(@IPv6CywGeneration,@IPv6CywPrepare)
   NetSetIPv6StatusHook(@IPv6ServiceSay)
   NetSetIPv6CommandHook(@IPv6ServiceCommand)
+  AnvilPromptServicesBind(@BoardPromptServices)
+  AnvilPromptInputsBind(@BoardPromptInputs)
+  AnvilPromptPumpBind(@BoardPromptPump)
   MessagesStart()
   MsgLogStart()                                    ; and every kept line to MSGLOG.TXT on the stick
 
