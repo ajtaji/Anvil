@@ -3028,3 +3028,9 @@ EndProcedure
 ;                               on refusal. returns is the container's bit0.
 ; HwPayloadServicesClose()       closes/reset handles and scoped state, including
 ;                               failed admission. No table is invented when absent.
+
+; Payload module services are composition-owned. A resident module registry
+; supplies the real adapter; a composition without one answers Has=0/Fn=0
+; and Fill=SVC_ENOSYS. The service table must not import registry internals.
+; HwPayloadModuleHas(seam) / HwPayloadModuleFn(seam,index)
+; HwPayloadModuleFill(seam,index,fn)

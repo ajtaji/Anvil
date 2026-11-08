@@ -678,9 +678,9 @@ restored caller CPU state and unchanged compiled image bytes, with exact full
 native/twin state/RAM agreement. The harness places that PMF body; it does not
 substitute a product PMF reader or claim public boot-command integration.
 
-The production monitor now admits ordinary PMFBOOT applications. Service-table
-binding remains unfinished, so the compiler's service flag is explicitly refused
-before image placement when no provider is present.
+The production monitor now admits ordinary and service-backed PMFBOOT
+applications through the actual shared ABI. See [ABI_ZENTAJI](../docs/ABI_ZENTAJI.md)
+for its native calling convention and current device providers.
 
 
 ## Shared bootloader and ordinary payloads
@@ -696,20 +696,24 @@ range before the copy. Raw `run` is still outside this board's command set.
 
 The container engine no longer names the service table's private globals or
 file-handle implementation. `HwPayloadServicesReady/Open/Close` belongs to the
-selected composition. The real shared ABI supplies that owner for existing ARM
-boards. Zentaji currently reports no provider, so a wants-services PMF refuses
-before its payload bytes are loaded. This is an unavailable ABI, not a fabricated
-table. Entry returns an explicit success/refusal result; ARM marks actual CPU
+selected composition. Both existing ARM boards and Zentaji use the real shared
+ABI owner. Zentaji service-backed apps retain resident serial/timer/storage
+ownership and receive all 208 actual shared slots, with unchanged error and
+capability policy. Entry returns an explicit success/refusal result; ARM marks actual CPU
 entry at its branch, preventing a board refusal from being reported as a boot.
 
-The board flushes/releases its selected storage, drains/detaches serial and
-releases the idle timer before entering ordinary trusted supervisor code.
+For ordinary trusted supervisor code, the board flushes/releases its selected
+storage, drains/detaches serial and releases the idle timer before entry.
 After CPU-state restoration it checks the owned timer/interrupt configuration,
 re-adopts serial/timer and reacquires the same storage. A changed timer or
 foreign disk owner stops the machine with a bounded raw-serial sentence and
 exit0x5B02/0x5B03. It does not overwrite live foreign hardware to manufacture a
 successful return. Payloads must leave devices they touch quiesced. This is not
 arbitrary DMA cancellation or isolation from malicious supervisor code.
+Service-backed apps instead retain the resident owners and must use the shared
+services. Return verifies the owned hardware and closes every service file handle;
+a subsequent app receives a fresh scope. Optional hardware and module providers
+remain unavailable rather than fabricated.
 
 `boot status/ok/clear` and the boot.file/boot.delay settings use the existing
 shared settings/countdown/reboot-loop policy. Configure the saved target with
@@ -720,13 +724,14 @@ is persisted before automatic entry. A returned application is acknowledged by
 
 ```text
 python tools/zentaji_boot_check.py --compiler <Forge executable> --zen-tools <tools/zentaji directory>
+python tools/zentaji_boot_check.py --only services --compiler <Forge executable> --zen-tools <tools/zentaji directory>
 python tools/zentaji_autoboot_check.py --compiler <Forge executable> --zen-tools <tools/zentaji directory>
 python tools/zentaji_board_ram_check.py --zen-tools <tools/zentaji directory>
 ```
 
 The boot gate consumes the counted image and a real compiler PMF. It exercises
 actual ROM disk15 -> command -> shared file/memory/hash/entry paths, repeated
-return, metadata/stack/alignment/length/digest/service refusals, truncated memory
+return, metadata/stack/alignment/length/digest refusals, real service-table calls, truncated memory
 source bounds and unsafe hardware return. It compares complete native/twin CPU
 state, RAM, exact persisted medium and immutable monitor instructions. The
 power-cycle gate provisions settings through real commands, then checks automatic

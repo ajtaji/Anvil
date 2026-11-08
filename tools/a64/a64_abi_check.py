@@ -146,6 +146,7 @@ from pmf_compiler import resolve_compiler  # noqa: E402
 
 ABI = ROOT / "Anvil" / "Hal" / "abi.pbi"
 ABI_VERSION = ROOT / "Anvil" / "Hal" / "abi_version.pbi"
+SERVICE_ERRORS = ROOT / "Anvil" / "Hal" / "service_errors.pbi"
 SEAMS = ROOT / "Anvil" / "Hal" / "seams.pbi"
 HAL = ROOT / "Anvil" / "Hal" / "hal.pbi"
 PMFBOOT = ROOT / "Anvil" / "Core" / "pmfboot.pbi"
@@ -184,8 +185,8 @@ ABI_MAJOR = 1
 # IP layers had merged.  Neither moved an existing slot.  1.6 filled TLS (80..83, 87) and 1.7 the
 # file-handle group's directory-by-path slots (196, 197): minor bumps, nothing moved.
 # 1.8/1.9 filled graphics/input38/39;1.10 fills entropy175/176.
-ABI_MINOR = 10
-SLOT_COUNT = 200
+ABI_MINOR = 15
+SLOT_COUNT = 208
 HDR_BYTES = 16
 MAGIC = 0x53564E41              # 'ANVS'
 
@@ -207,6 +208,7 @@ GROUPS = [
     (168, "crypto",   16),
     (184, "par",       8),
     (192, "fileh",     8),
+    (200, "udp",       8),
 ]
 
 INSTALLED = {
@@ -286,9 +288,14 @@ INSTALLED = {
     # ABI 1.6: TLS.  84 (HTTP) and 88..95 stay reserved.
     80: "SvcTlsOpen", 81: "SvcTlsSend", 82: "SvcTlsRecv", 83: "SvcTlsClose",
     87: "SvcTlsState",
+    88: "SvcTcpOpen6", 89: "SvcDnsResolve6", 90: "SvcTlsOpenAlpn",
+    91: "SvcTlsAlpn", 92: "SvcTlsDrain",
 
     # ABI 1.7: a directory by its path, with long names (file-handle group slots 4, 5).
     196: "SvcDirHOpen", 197: "SvcDirHNext",
+    200: "SvcUdpOpen", 201: "SvcUdpSendTo", 202: "SvcUdpReceive",
+    203: "SvcUdpPeek", 204: "SvcUdpStatus", 205: "SvcUdpClose",
+    206: "SvcUdpService", 207: "SvcUdpDiscard",
 }
 
 SVC_ERRS = {
@@ -363,7 +370,7 @@ def read_consts(body: str) -> dict[str, int]:
 def published() -> dict[str, int]:
     """abi_version.pbi, seams.pbi and abi.pbi together - the published ABI."""
     merged: dict[str, int] = {}
-    for path in (ABI_VERSION, SEAMS, ABI):
+    for path in (ABI_VERSION, SEAMS, SERVICE_ERRORS, ABI):
         merged.update(read_consts(text(path)))
     return merged
 
@@ -428,7 +435,7 @@ def check_static() -> list[str]:
              "spi": "#SVC_BASE_SPI", "uart": "#SVC_BASE_UART",
              "veh": "#SVC_BASE_VEH", "gnss": "#SVC_BASE_GNSS",
              "crypto": "#SVC_BASE_CRYPTO", "par": "#SVC_BASE_PAR",
-             "fileh": "#SVC_BASE_FILEH"}
+             "fileh": "#SVC_BASE_FILEH", "udp": "#SVC_BASE_UDP"}
     for base, g, _res in GROUPS:
         if abi.get(names[g]) != base:
             fail(problems, f"{names[g]} is {abi.get(names[g])}, expected {base}")
@@ -513,6 +520,10 @@ def compile_to(source: pathlib.Path, out: pathlib.Path, extra: list[str]) -> dic
     if r.returncode != 0 or "pmfc: OK" not in r.stdout or not out.exists():
         raise BuildFailed("The build of %s failed, so nothing about it was "
                           "tested. The compiler said:\n%s" % (source.name, r.stdout[-4000:]))
+    return read_symbols(out)
+
+
+def read_symbols(out: pathlib.Path) -> dict[str, int]:
     syms: dict[str, int] = {}
     symfile = pathlib.Path(str(out) + ".sym")
     if symfile.exists():
@@ -624,13 +635,22 @@ def anvil_image() -> tuple[pathlib.Path, dict[str, int]]:
     key = tuple(sorted((str(p), hash(t)) for p, t in OVERRIDE.items()))
     if key not in _ANVIL:
         work = CTX["work"] / ("anvil_%d" % len(_ANVIL))
-        src = materialise(BOARD, work / "src")
-        out = work / "anvil.img"
-        syms = compile_to(src, out, [])
-        # A whole board file was compiled and the image exists: count it.
-        counted = build_count.record_build(src, "pi4", out, by="tools/a64/a64_abi_check.py",
-                                           compiler=CTX["compiler"])
-        print("     build count: %s" % counted.message)
+        if OVERRIDE:
+            # Deliberately damaged controls remain disposable diagnostics.
+            src = materialise(BOARD, work / "src")
+            out = work / "anvil.img"
+            syms = compile_to(src, out, [])
+        else:
+            # Judge the counted published product. Its identity is reserved
+            # before compilation and all artifacts are published atomically.
+            built = subprocess.run([sys.executable,"-B",str(ROOT/"tools/build.py"),
+                                    "pi4","--compiler",CTX["compiler"]],
+                                   cwd=ROOT,capture_output=True,text=True)
+            if built.returncode:
+                raise BuildFailed("Counted Pi4 build failed:\n"+built.stdout[-4000:]+built.stderr[-1000:])
+            out = ROOT/"build/pi4/anvil.img"
+            syms = read_symbols(out)
+            print("     consumed counted published build/pi4/anvil.img")
         _ANVIL[key] = (out, syms)
     return _ANVIL[key]
 
@@ -1176,7 +1196,7 @@ def guard_source(settings_include: str) -> tuple[str, list[tuple[str, int]]]:
     case that silently stopped running is a length mismatch and not a
     pass."""
     abi = text(ABI)
-    consts = [l for l in abi.splitlines() if SVC_CONST_RE.match(l.strip())]
+    consts = [l for l in (text(SERVICE_ERRORS)+"\n"+abi).splitlines() if SVC_CONST_RE.match(l.strip())]
     if not any(l.strip().startswith("#SVC_EPERM") for l in consts):
         raise SystemExit("abi.pbi no longer states #SVC_EPERM as a plain number; "
                          "the guarded-key part will not invent one")
@@ -1275,6 +1295,7 @@ def guard_source(settings_include: str) -> tuple[str, list[tuple[str, int]]]:
         # Ticks()/TickHz() before it - the order board.pi4 and
         # pi4SettingsSelfTest.pi4 use.
         'XIncludeFile "RaspberryPi4/Lib/timer.pi4"',
+        "Procedure.i HwMicros() : ProcedureReturn Micros() : EndProcedure",
         'XIncludeFile "Anvil/Core/wallclock.pbi"',
         'XIncludeFile "Anvil/Storage/hwfile.pbi"',
         'XIncludeFile "%s"' % settings_include,
@@ -1451,7 +1472,7 @@ MUTANTS = {
     "collide-errs": (
         "#SVC_ENOCAP    = -101",
         "#SVC_ENOCAP    = -2",
-        "static", ABI,
+        "static", SERVICE_ERRORS,
     ),
     "probe-veh-conditional": (
         # THE WRITE OF A JUDGED WORD MADE CONDITIONAL ON A DRAWING PROPERTY.

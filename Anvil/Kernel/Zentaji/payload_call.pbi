@@ -80,7 +80,7 @@ Procedure.i ZentajiPayloadEnter(context.i,entry.i,argument.i,stack.i,stackBytes.
  If PeekQ(context+8)<>2 : ProcedureReturn ZentajiPayloadFail(#ZEN_PAYLOAD_E_UNAVAILABLE) : EndIf
  *zenPayloadCaller=PeekQ(context+#ZEN_BOOT_PAYLOAD_CALL)
  zenPayloadActive=1
- zenPayloadResult=zenPayloadCaller(entry,argument,stack)
+ zenPayloadResult=CallFunctionFast(zenPayloadCaller,entry,argument,stack)
  *zenPayloadCaller=@ZentajiPayloadUnavailable
  zenPayloadActive=0 : zenPayloadError=0
  ProcedureReturn 1

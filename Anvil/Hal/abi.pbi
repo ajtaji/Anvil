@@ -82,7 +82,7 @@
 ;  the service vocabulary does not make machine code portable across ISAs.
 ;  The existing AArch64 register, stack and interrupt contract is preserved
 ;  in docs/ABI_AARCH64.md. This refactor changes no slot, layout or signature
-;  and does not claim an implemented Zentaji service-table backend.
+;  Zentaji native integer calls are documented in docs/ABI_ZENTAJI.md.
 ;
 ;  GETTING OUT, three ways, all explicit:
 ;    SvcReturn()  back to the prompt. Does not return. REQUIRES
@@ -353,6 +353,7 @@ XIncludeFile "Anvil/Hal/service_errors.pbi"
 #SVC_BOARD_UNOQ    = 2
 #SVC_BOARD_PI3     = 3
 #SVC_BOARD_PI5     = 4
+#SVC_BOARD_ZENTAJI = 5
 
 ; ----------------------------------------------------------------------
 ;  THE SLOT MAP. Fixed group bases with spare room.
@@ -417,6 +418,7 @@ XIncludeFile "Anvil/Hal/service_errors.pbi"
 ; NEW AT 1.4. Several files open at once - see GROUP 16 below. Eight
 ; reserved, four used; entry_count rises 192 to 200.
 #SVC_BASE_FILEH   = 192
+#SVC_BASE_UDP     = 200
 
 ; ======================================================================
 ;  THE TABLE ITSELF.
@@ -556,7 +558,7 @@ Procedure.i SvcCapGet(cap.i)
   ;  gets 0 - the honest "this board does not offer it".
   ; ------------------------------------------------------------------
   If cap = #SVCCAP_PWM Or cap = #SVCCAP_THERMAL
-    If HwSeamCore(cap) <> 0 Or ModSeamHas(cap) <> 0
+    If HwSeamCore(cap) <> 0 Or HwPayloadModuleHas(cap) <> 0
       ProcedureReturn 1
     EndIf
     ProcedureReturn 0
@@ -967,7 +969,7 @@ EndProcedure
 ; init call, so the registry already knows whose call this is.
 Procedure.i SvcSeamFill(seam.i, index.i, fn.i)
   gSvcDetail = 0
-  ProcedureReturn ModSeamFill(seam, index, fn)
+  ProcedureReturn HwPayloadModuleFill(seam, index, fn)
 EndProcedure
 
 ; Slot 15. Reading back what fills a seam - a module that needs another
@@ -982,7 +984,7 @@ EndProcedure
 ; can fall back to whatever it did before the module existed.
 Procedure.i SvcSeamGet(seam.i, index.i)
   gSvcDetail = 0
-  ProcedureReturn ModSeamFn(seam, index)
+  ProcedureReturn HwPayloadModuleFn(seam, index)
 EndProcedure
 
 ; Slot38, appended inside the console group's spare slots at ABI1.8.
@@ -2269,39 +2271,49 @@ Procedure.i SvcUsbEnumerate()
   If SvcRequireCap(#CAP_USB, "usb", "this board exposes no USB host to Anvil") = 0
     ProcedureReturn #SVC_ENOCAP
   EndIf
+  CompilerIf #CAP_USB = 1
   ProcedureReturn HwUsbEnumerate()
+  CompilerEndIf
 EndProcedure
 
 Procedure.i SvcUsbDevCount()
   If SvcRequireCap(#CAP_USB, "usb", "this board exposes no USB host to Anvil") = 0
     ProcedureReturn #SVC_ENOCAP
   EndIf
+  CompilerIf #CAP_USB = 1
   ProcedureReturn HwUsbTree()
+  CompilerEndIf
 EndProcedure
 
 Procedure.i SvcUsbDevKind(i.i)
   If SvcRequireCap(#CAP_USB, "usb", "this board exposes no USB host to Anvil") = 0
     ProcedureReturn #SVC_ENOCAP
   EndIf
+  CompilerIf #CAP_USB = 1
   ProcedureReturn HwUsbDevKind(i)
+  CompilerEndIf
 EndProcedure
 
 Procedure.i SvcUsbStorageReady()
   If SvcRequireCap(#CAP_USB, "usb", "this board exposes no USB host to Anvil") = 0
     ProcedureReturn #SVC_ENOCAP
   EndIf
+  CompilerIf #CAP_USB = 1
   ProcedureReturn HwUsbStorageReady()
+  CompilerEndIf
 EndProcedure
 
 Procedure.i SvcUsbReadBlock(lba.i, *buf)
   If SvcRequireCap(#CAP_USB, "usb", "this board exposes no USB host to Anvil") = 0
     ProcedureReturn #SVC_ENOCAP
   EndIf
+  CompilerIf #CAP_USB = 1
   If *buf = 0 Or lba < 0
     gSvcDetail = "a zero buffer pointer or a negative block address"
     ProcedureReturn #SVC_EARG
   EndIf
   ProcedureReturn HwUsbReadBlock(lba, *buf)
+  CompilerEndIf
 EndProcedure
 
 ; Slot 100. WRITING A BLOCK. Reading one exists and writing one does not;
@@ -2314,8 +2326,10 @@ Procedure.i SvcUsbWriteBlock(lba.i, *buf)
   If SvcRequireCap(#CAP_USB, "usb", "this board exposes no USB host to Anvil") = 0
     ProcedureReturn #SVC_ENOCAP
   EndIf
+  CompilerIf #CAP_USB = 1
   gSvcDetail = "no board in this Anvil can write a raw block to a mass-storage device yet"
   ProcedureReturn #SVC_ENOSYS
+  CompilerEndIf
 EndProcedure
 
 ; ======================================================================
@@ -2325,42 +2339,54 @@ Procedure.i SvcGpioCount()
   If SvcRequireCap(#CAP_GPIO, "gpio", "this board exposes no general-purpose I/O pins to Anvil") = 0
     ProcedureReturn #SVC_ENOCAP
   EndIf
+  CompilerIf #CAP_GPIO = 1
   ProcedureReturn HwGpioCount()
+  CompilerEndIf
 EndProcedure
 
 Procedure.i SvcGpioModeGet(pin.i)
   If SvcRequireCap(#CAP_GPIO, "gpio", "this board exposes no general-purpose I/O pins to Anvil") = 0
     ProcedureReturn #SVC_ENOCAP
   EndIf
+  CompilerIf #CAP_GPIO = 1
   ProcedureReturn HwGpioModeGet(pin)
+  CompilerEndIf
 EndProcedure
 
 Procedure.i SvcGpioLevelGet(pin.i)
   If SvcRequireCap(#CAP_GPIO, "gpio", "this board exposes no general-purpose I/O pins to Anvil") = 0
     ProcedureReturn #SVC_ENOCAP
   EndIf
+  CompilerIf #CAP_GPIO = 1
   ProcedureReturn HwGpioLevelGet(pin)
+  CompilerEndIf
 EndProcedure
 
 Procedure.i SvcGpioPullGet(pin.i)
   If SvcRequireCap(#CAP_GPIO, "gpio", "this board exposes no general-purpose I/O pins to Anvil") = 0
     ProcedureReturn #SVC_ENOCAP
   EndIf
+  CompilerIf #CAP_GPIO = 1
   ProcedureReturn HwGpioPullGet(pin)
+  CompilerEndIf
 EndProcedure
 
 Procedure.i SvcGpioMode(pin.i, mode.i)
   If SvcRequireCap(#CAP_GPIO, "gpio", "this board exposes no general-purpose I/O pins to Anvil") = 0
     ProcedureReturn #SVC_ENOCAP
   EndIf
+  CompilerIf #CAP_GPIO = 1
   ProcedureReturn HwGpioMode(pin, mode)
+  CompilerEndIf
 EndProcedure
 
 Procedure.i SvcGpioWrite(pin.i, level.i)
   If SvcRequireCap(#CAP_GPIO, "gpio", "this board exposes no general-purpose I/O pins to Anvil") = 0
     ProcedureReturn #SVC_ENOCAP
   EndIf
+  CompilerIf #CAP_GPIO = 1
   ProcedureReturn HwGpioWrite(pin, level)
+  CompilerEndIf
 EndProcedure
 
 ; ======================================================================
@@ -2375,56 +2401,72 @@ Procedure.i SvcI2cDefaultBus()
   If SvcRequireCap(#CAP_I2C, "i2c", "this board exposes no I2C bus to Anvil") = 0
     ProcedureReturn #SVC_ENOCAP
   EndIf
+  CompilerIf #CAP_I2C = 1
   ProcedureReturn HwI2cDefaultBus()
+  CompilerEndIf
 EndProcedure
 
 Procedure.i SvcI2cUp(bus.i)
   If SvcRequireCap(#CAP_I2C, "i2c", "this board exposes no I2C bus to Anvil") = 0
     ProcedureReturn #SVC_ENOCAP
   EndIf
+  CompilerIf #CAP_I2C = 1
   ProcedureReturn HwI2cUp(bus)
+  CompilerEndIf
 EndProcedure
 
 Procedure.i SvcI2cProbe(bus.i, addr.i)
   If SvcRequireCap(#CAP_I2C, "i2c", "this board exposes no I2C bus to Anvil") = 0
     ProcedureReturn #SVC_ENOCAP
   EndIf
+  CompilerIf #CAP_I2C = 1
   ProcedureReturn HwI2cProbe(bus, addr)
+  CompilerEndIf
 EndProcedure
 
 Procedure.i SvcI2cRead(bus.i, addr.i, *buf, n.i)
   If SvcRequireCap(#CAP_I2C, "i2c", "this board exposes no I2C bus to Anvil") = 0
     ProcedureReturn #SVC_ENOCAP
   EndIf
+  CompilerIf #CAP_I2C = 1
   ProcedureReturn HwI2cRead(bus, addr, *buf, n)
+  CompilerEndIf
 EndProcedure
 
 Procedure.i SvcI2cWrite(bus.i, addr.i, *buf, n.i)
   If SvcRequireCap(#CAP_I2C, "i2c", "this board exposes no I2C bus to Anvil") = 0
     ProcedureReturn #SVC_ENOCAP
   EndIf
+  CompilerIf #CAP_I2C = 1
   ProcedureReturn HwI2cWrite(bus, addr, *buf, n)
+  CompilerEndIf
 EndProcedure
 
 Procedure.i SvcI2cSetSpeed(bus.i, hz.i)
   If SvcRequireCap(#CAP_I2C, "i2c", "this board exposes no I2C bus to Anvil") = 0
     ProcedureReturn #SVC_ENOCAP
   EndIf
+  CompilerIf #CAP_I2C = 1
   ProcedureReturn HwI2cSetSpeed(bus, hz)
+  CompilerEndIf
 EndProcedure
 
 Procedure.i SvcI2cGetSpeed(bus.i)
   If SvcRequireCap(#CAP_I2C, "i2c", "this board exposes no I2C bus to Anvil") = 0
     ProcedureReturn #SVC_ENOCAP
   EndIf
+  CompilerIf #CAP_I2C = 1
   ProcedureReturn HwI2cGetSpeed(bus)
+  CompilerEndIf
 EndProcedure
 
 Procedure.i SvcI2cPin(bus.i, which.i)
   If SvcRequireCap(#CAP_I2C, "i2c", "this board exposes no I2C bus to Anvil") = 0
     ProcedureReturn #SVC_ENOCAP
   EndIf
+  CompilerIf #CAP_I2C = 1
   ProcedureReturn HwI2cPin(bus, which)
+  CompilerEndIf
 EndProcedure
 
 ; ======================================================================
@@ -2959,14 +3001,14 @@ Procedure BuildServiceTable()
   CompilerEndIf
 
   CompilerIf #CAP_NET = 1
-  gSvcTab[#SVC_HDR_WORDS + 200] = @SvcUdpOpen
-  gSvcTab[#SVC_HDR_WORDS + 201] = @SvcUdpSendTo
-  gSvcTab[#SVC_HDR_WORDS + 202] = @SvcUdpReceive
-  gSvcTab[#SVC_HDR_WORDS + 203] = @SvcUdpPeek
-  gSvcTab[#SVC_HDR_WORDS + 204] = @SvcUdpStatus
-  gSvcTab[#SVC_HDR_WORDS + 205] = @SvcUdpClose
-  gSvcTab[#SVC_HDR_WORDS + 206] = @SvcUdpService
-  gSvcTab[#SVC_HDR_WORDS + 207] = @SvcUdpDiscard
+  gSvcTab[#SVC_HDR_WORDS + #SVC_BASE_UDP + 0] = @SvcUdpOpen
+  gSvcTab[#SVC_HDR_WORDS + #SVC_BASE_UDP + 1] = @SvcUdpSendTo
+  gSvcTab[#SVC_HDR_WORDS + #SVC_BASE_UDP + 2] = @SvcUdpReceive
+  gSvcTab[#SVC_HDR_WORDS + #SVC_BASE_UDP + 3] = @SvcUdpPeek
+  gSvcTab[#SVC_HDR_WORDS + #SVC_BASE_UDP + 4] = @SvcUdpStatus
+  gSvcTab[#SVC_HDR_WORDS + #SVC_BASE_UDP + 5] = @SvcUdpClose
+  gSvcTab[#SVC_HDR_WORDS + #SVC_BASE_UDP + 6] = @SvcUdpService
+  gSvcTab[#SVC_HDR_WORDS + #SVC_BASE_UDP + 7] = @SvcUdpDiscard
   CompilerEndIf
 
   ; --- usb, base 96 ---------------------------------------------------

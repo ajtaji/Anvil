@@ -14,7 +14,7 @@ ROOT=Path(__file__).resolve().parents[1]
 
 
 def main():
-    ap=argparse.ArgumentParser(description=__doc__);ap.add_argument('--compiler');ap.add_argument('--zen-tools',type=Path,required=True);ap.add_argument('--case');ap.add_argument('--only',choices=['valid','all'],default='all')
+    ap=argparse.ArgumentParser(description=__doc__);ap.add_argument('--compiler');ap.add_argument('--zen-tools',type=Path,required=True);ap.add_argument('--case');ap.add_argument('--only',choices=['valid','services','ordinary','all'],default='all')
     a=ap.parse_args();cc=resolve_compiler(a.compiler);zt=a.zen_tools.resolve();sys.path.insert(0,str(zt))
     import zen_interp as I
     import zen_lockstep_check as L
@@ -32,26 +32,43 @@ def main():
         return p.stdout
     with tempfile.TemporaryDirectory(prefix='anvil-pmf-boot-') as tmp:
         td=Path(tmp);src=td/'app.zentaji';app=td/'app.zex'
-        def compile(damage=''):
-            src.write_text('Procedure.q Main(argument.q)\nIf argument<>0 : ProcedureReturn $BAD : EndIf\nPokeQ($600000,PeekQ($600000)+1)\n'+damage+'\nProcedureReturn $1122334455667788\nEndProcedure\n')
-            run([cc,'--compile',src,'--load-addr',hex(load),'--stack-addr','0x2F0000','--entry-returns','-o',app])
+        def compile(damage='',services=False):
+            source='Procedure.q Main(argument.q)\nIf argument<>0 : ProcedureReturn $BAD : EndIf\nPokeQ($600000,PeekQ($600000)+1)\n'+damage+'\nProcedureReturn $1122334455667788\nEndProcedure\n'
+            if services:
+                source='Procedure.q Main(table.i)\nProtected i.i,h.i,now.i\n'
+                source+='If PeekL(table)<>$53564E41 Or PeekL(table+4)<>1 Or PeekL(table+8)<15 Or PeekL(table+12)<>208 : ProcedureReturn $BAD01 : EndIf\n'
+                source+='For i=0 To 207\nIf PeekQ(table+16+i*8)=0 : ProcedureReturn $BAD02 : EndIf\nNext\n'
+                checks=[(0,[],1),(1,[],15),(2,[],5),(4,['0'],1),(4,['1'],0),(4,['16'],0),(10,[],0),(108,[],-101),(170,[],-100),(8,[],-100),(14,['15','0','0'],-100),(15,['15','0'],0),(176,[],-101)]
+                for code,(slot,args,want) in enumerate(checks,16):
+                    source+='If CallFunctionFast(PeekQ(table+16+%d*8)%s)<>%d : ProcedureReturn $%X : EndIf\n'%(slot,(','+','.join(args)) if args else '',want,0xBAD00+code)
+                source+='now=CallFunctionFast(PeekQ(table+16+16*8))\nIf now<0 Or CallFunctionFast(PeekQ(table+16+16*8))<now : ProcedureReturn $BAD30 : EndIf\n'
+                source+='PokeQ($600010,$636261)\nIf CallFunctionFast(PeekQ(table+16+168*8),$600010,3,$600100)<>0 Or PeekQ($600100)<>$EACF018FBF1678BA : ProcedureReturn $BAD31 : EndIf\n'
+                source+='PokeQ($600010,$1122334455667788)\nIf CallFunctionFast(PeekQ(table+16+54*8),"RESULT.BIN",$600010,8)<>1 : ProcedureReturn $BAD32 : EndIf\n'
+                source+='For i=1 To 8\nh=CallFunctionFast(PeekQ(table+16+192*8),"APP.PMF")\nIf h<>i : ProcedureReturn $BAD40+i : EndIf\nNext\n'
+                source+='If CallFunctionFast(PeekQ(table+16+192*8),"APP.PMF")<>-103 : ProcedureReturn $BAD50 : EndIf\n'
+                source+='If CallFunctionFast(PeekQ(table+16+194*8),1,0,$600080,8)<>8 Or PeekQ($600080)<>$00544F4F42464D50 : ProcedureReturn $BAD51 : EndIf\n'
+                source+='PokeQ($600000,PeekQ($600000)+1)\n'+damage+'\nProcedureReturn $1122334455667788\nEndProcedure\n'
+            src.write_text(source,encoding='utf-8')
+            run([cc,'--compile',src,'--load-addr',hex(load),'--stack-addr','0x2F0000','--entry-returns',*(['--wants-services'] if services else []),'-o',app])
             raw=app.read_bytes();ref=A.Asm();org,body=ref.assemble(Path(str(app)+'.asm').read_text(encoding='utf-8-sig'))
             assert raw==zexpack.header(org,org,body,stack=0x2F0000)+body and org==load
             pmf=Path(str(app)+'.pmf').read_bytes();assert pmf[128:]==body and pmf[64:96]==hashlib.sha256(body).digest()
             assert struct.unpack_from('<IIQ',pmf,96)==(2,1,0x2F0000)
             return pmf
-        valid=compile();timer_bad=compile('PokeQ($FFFF00000005F000,1)');disk_bad=compile('PokeQ($FFFF0000002F0010,3)')
+        valid=compile();service=compile(services=True);service_timer=compile('PokeQ($FFFF00000005F000,1)',services=True);service_disk=compile('PokeQ($FFFF0000002F0010,0)',services=True);timer_bad=compile('PokeQ($FFFF00000005F000,1)');disk_bad=compile('PokeQ($FFFF0000002F0010,3)')
         def altered(offset,value,fmt='<I'):
             pmf=bytearray(valid);struct.pack_into(fmt,pmf,offset,value);return bytes(pmf)
         cases=[('file-repeat',valid,['boot APP.PMF','boot APP.PMF','ls','halt'],2,0,None),('memory',valid,['load APP.PMF','boot mem %X'%stage,'halt'],1,0,None)]
-        if a.only=='all':
-            cases += [('conflicting-arguments',altered(56,6),['boot APP.PMF','halt'],0,0,b'Only one is possible'),('services',altered(56,5),['boot APP.PMF','halt'],0,0,b'no payload service-table provider'),('foreign-isa',altered(96,1),['boot APP.PMF','halt'],0,0,b'architecture ID'),('foreign-target',altered(100,99),['boot APP.PMF','halt'],0,0,b'target ID'),('stack-outside',altered(104,0x900000,'<Q'),['boot APP.PMF','halt'],0,0,b'not in a payload stack window'),('entry-alignment',altered(24,load+1,'<Q'),['boot APP.PMF','halt'],0,0,b'not aligned for this CPU'),('monitor-overlap',altered(16,0x1000,'<Q'),['boot APP.PMF','halt'],0,0,b'monitor'),('truncated',valid[:-1],['boot APP.PMF','halt'],0,0,b'file on the'),('digest-mismatch',valid[:-1]+bytes([valid[-1]^1]),['boot APP.PMF','halt'],0,0,b'SHA-256'),('timer-return',timer_bad,['boot APP.PMF'],1,0x5B02,None),('foreign-disk-return',disk_bad,['boot APP.PMF'],1,0x5B03,None)]
+        if a.only in ('all','services','ordinary'):
+            cases += [('conflicting-arguments',altered(56,6),['boot APP.PMF','halt'],0,0,b'Only one is possible'),('services-repeat',service,['boot APP.PMF','boot APP.PMF','ls','halt'],2,0,None),('services-timer',service_timer,['boot APP.PMF'],1,0x5B02,None),('services-disk',service_disk,['boot APP.PMF'],1,0x5B03,None),('foreign-isa',altered(96,1),['boot APP.PMF','halt'],0,0,b'architecture ID'),('foreign-target',altered(100,99),['boot APP.PMF','halt'],0,0,b'target ID'),('stack-outside',altered(104,0x900000,'<Q'),['boot APP.PMF','halt'],0,0,b'not in a payload stack window'),('entry-alignment',altered(24,load+1,'<Q'),['boot APP.PMF','halt'],0,0,b'not aligned for this CPU'),('monitor-overlap',altered(16,0x1000,'<Q'),['boot APP.PMF','halt'],0,0,b'monitor'),('truncated',valid[:-1],['boot APP.PMF','halt'],0,0,b'file on the'),('digest-mismatch',valid[:-1]+bytes([valid[-1]^1]),['boot APP.PMF','halt'],0,0,b'SHA-256'),('timer-return',timer_bad,['boot APP.PMF'],1,0x5B02,None),('foreign-disk-return',disk_bad,['boot APP.PMF'],1,0x5B03,None)]
             v1=bytearray(valid[:96]);struct.pack_into('<II',v1,8,1,96)
             cases.append(('legacy-v1',bytes(v1)+valid[128:],['boot APP.PMF','halt'],0,0,b'version-1 payloads'))
             tiny=bytearray(valid[:128]);struct.pack_into('<Q',tiny,32,1);tiny[64:96]=hashlib.sha256(valid[128:129]).digest()
             cases.append(('partial-instruction',bytes(tiny)+valid[128:129],['boot APP.PMF','halt'],0,0,b'complete instruction'))
             cases += [('memory-short-header',valid,['boot mem 7FFFA0','halt'],0,0,b'beyond the RAM fitted'),('memory-short-body',valid,['boot mem 7FFF00','halt'],0,0,b'beyond the RAM fitted')]
         for name,pmf,commands,want_calls,exit_code,phrase in cases:
+            if a.only=='services' and not name.startswith('services'):continue
+            if a.only=='ordinary' and name.startswith('services'):continue
             if a.case and a.case not in name:continue
             medium=E.build(4096);E.seed_file(medium,pmf,'APP.PMF');boot=zexpack.disk_image(image);assert len(boot)<=4096*512
             medium[:64]=boot[:64];medium[4096:len(boot)]=boot[4096:]
@@ -85,7 +102,10 @@ def main():
             assert (td/'final.bin').read_bytes()==m.ram,name
             state=next(s[6:] for s in out.splitlines() if s.startswith('STATE '));assert state.split(' ',1)[1]==L.state_line(m,0,-1).split(' ',1)[1],name
             assert m.cores[1].state=='PARKED' and (td/'disk15.img').read_bytes()==bytes(m.disks[15].image),name
-            assert bytes(m.disks[15].image)==bytes(medium),('read-only boot changed medium bytes',name)
+            if name.startswith('services'):
+                result=E.root_files(bytes(m.disks[15].image))
+                assert result=={'APP.PMF':pmf,'RESULT.BIN':struct.pack('<Q',0x1122334455667788)},result.keys()
+            else:assert bytes(m.disks[15].image)==bytes(medium),('read-only boot changed medium bytes',name)
             for row in mapping['code']:
                 pc=int(row['pc'],16);n=row['size'];assert m.ram[pc:pc+n]==image[64+pc-meta['load']:64+pc-meta['load']+n],('monitor instruction changed',name,pc)
             print('PASS published Anvil PMF %s: real ROM disk15/command/file/hash/CPU path; calls=%d exit=%X, exact native/twin state/RAM/persisted medium and immutable monitor instructions'%(name,want_calls,exit_code),flush=True)

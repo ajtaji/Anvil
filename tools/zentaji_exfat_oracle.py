@@ -123,3 +123,36 @@ def seed_file(image,payload,name='SEED.BIN'):
     image[(part+26)*512:(part+26)*512+16]=((1<<(clusters+3))-1).to_bytes(16,'little')
     image[part*512+112]=(clusters+3)*100//128
     image[(part+29)*512:(part+29)*512+len(payload)]=payload
+
+
+def root_files(medium):
+    """Read/check the small proof volume independently of the guest filesystem."""
+    u32=lambda at:struct.unpack_from('<I',medium,at)[0]
+    part=u32(454);boot=part*512
+    assert part==4096 and struct.unpack_from('<H',medium,boot+106)[0]&0xa==0
+    value=checksum(medium[boot:boot+11*512],skip=(106,107,112))
+    assert medium[boot+11*512:boot+12*512]==struct.pack('<I',value)*128
+    heap=(part+26)*512;fat=(part+24)*512;used=set()
+    def stream(first,flags,length):
+        out=bytearray();cl=first
+        for _ in range((length+511)//512):
+            assert 2<=cl<130 and cl not in used,('cluster ownership',cl)
+            used.add(cl);out+=medium[heap+(cl-2)*512:heap+(cl-1)*512]
+            cl=cl+1 if flags&2 else u32(fat+cl*4)
+        if not flags&2:assert cl>=0xfffffff8
+        return bytes(out[:length])
+    bitmap=stream(2,0,16);stream(3,0,250);raw=stream(4,0,512)
+    result={};index=64
+    while index<len(raw) and raw[index]:
+        if not raw[index]&128:index+=32;continue
+        assert raw[index]==0x85
+        rows=raw[index:index+(raw[index+1]+1)*32];index+=len(rows)
+        assert checksum(rows,16,(2,3))==struct.unpack_from('<H',rows,2)[0]
+        ext=rows[32:64];assert ext[0]==0xc0 and ext[1]&1
+        name=b''.join(rows[i+2:i+32] for i in range(64,len(rows),32))[:ext[3]*2].decode('utf-16le')
+        assert checksum(name.upper().encode('utf-16le'),16)==struct.unpack_from('<H',ext,4)[0]
+        length=struct.unpack_from('<Q',ext,24)[0];assert struct.unpack_from('<Q',ext,8)[0]==length
+        assert name not in result
+        result[name]=stream(struct.unpack_from('<I',ext,20)[0],ext[1],length)
+    assert used=={cl for cl in range(2,130) if bitmap[(cl-2)//8]&(1<<((cl-2)%8))},'bitmap leaks/crosslinks'
+    return result

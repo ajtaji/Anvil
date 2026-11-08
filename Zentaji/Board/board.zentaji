@@ -1,12 +1,26 @@
 ; Zentaji serial/storage monitor composition. The ROM loads the owned startup
 ; envelope; Main receives its validated table/source/context, never ARM registers.
-#ANVIL_BUILD = 7 ; pmf:build
+#ANVIL_BUILD = 9 ; pmf:build
 #ANVIL_BUILD_DATE = 20261108 ; pmf:builddate
-#ANVIL_BUILD_TIME = 024427 ; pmf:buildtime
+#ANVIL_BUILD_TIME = 031412 ; pmf:buildtime
 #CAP_TOUCH=0
 #CAP_PWM=0
 #CAP_NET=0
 #CAP_STORAGE=1
+#CAP_GPIO=0
+#CAP_I2C=0
+#CAP_MMC=0
+#CAP_USB=0
+#CAP_BOOT_EL1=0
+#CAP_CONSOLE=0
+#CAP_GNSS=0
+#CAP_UART=0
+#CAP_SPI=0
+#CAP_VEHLINK=0
+#CAP_RTC=1
+#CAP_PARALLEL=0
+#ANVIL_PAYLOAD_NET=0
+#SVC_BOARD_ID=5
 XIncludeFile "Zentaji/Board/console.pbi"
 XIncludeFile "Anvil/Core/state.pbi"
 XIncludeFile "Anvil/Core/input_events.pbi"
@@ -17,6 +31,7 @@ XIncludeFile "Anvil/Core/messages.pbi"
 XIncludeFile "Anvil/Core/parse.pbi"
 XIncludeFile "Anvil/Core/rxbreak.pbi"
 XIncludeFile "Anvil/Hal/hal.pbi"
+XIncludeFile "Anvil/Hal/seams.pbi"
 XIncludeFile "Anvil/Core/format.pbi"
 XIncludeFile "Anvil/Kernel/Zentaji/boot_context.pbi"
 XIncludeFile "Zentaji/Board/memory.pbi"
@@ -38,6 +53,9 @@ XIncludeFile "Anvil/Core/layout_cmd.pbi"
 XIncludeFile "Anvil/Core/shotarm.pbi"
 XIncludeFile "Anvil/Core/sha256.pbi"
 XIncludeFile "Anvil/Kernel/Zentaji/payload_contract.pbi"
+XIncludeFile "Zentaji/Board/services.pbi"
+XIncludeFile "Anvil/Hal/abi_version.pbi"
+XIncludeFile "Anvil/Hal/abi.pbi"
 XIncludeFile "Zentaji/Board/payload.pbi"
 XIncludeFile "Anvil/Core/pmfboot.pbi"
 XIncludeFile "Anvil/Core/bootfile_cmd.pbi"
@@ -50,7 +68,7 @@ Procedure ZentajiShellHelp()
  PrintN("  settings, printenv, setenv, saveenv, env, setexpr, time, force")
  PrintN("  halt                 cleanly release storage and stop this monitor")
  PrintN("  boot <file> / mem <address>, boot status/ok/clear")
- PrintN("Service-table payloads and raw run commands are not available yet.")
+ PrintN("PMF service-table applications are supported; raw run is not available.")
 EndProcedure
 Procedure.i HwCommandLoopHook(phase.i)
  If phase=#ACMD_AFTER_PROMPT : UartDrain() : EndIf

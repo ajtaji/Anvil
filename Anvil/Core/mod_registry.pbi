@@ -517,3 +517,8 @@ Procedure.i ModSeamReleaseOwner(owner.i)
   Wend
   ProcedureReturn released
 EndProcedure
+
+; Payload ABI adapter for compositions with this actual module registry.
+Procedure.i HwPayloadModuleHas(seam.i) : ProcedureReturn ModSeamHas(seam) : EndProcedure
+Procedure.i HwPayloadModuleFill(seam.i,index.i,fn.i) : ProcedureReturn ModSeamFill(seam,index,fn) : EndProcedure
+Procedure.i HwPayloadModuleFn(seam.i,index.i) : ProcedureReturn ModSeamFn(seam,index) : EndProcedure

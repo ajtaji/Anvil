@@ -2,17 +2,22 @@
 ; Core0-only resident entropy provider. Registration is kernel-owned.
 ; Return vocabulary matches ABI errors; no dependency on a board or network.
 #RANDOM_SERVICE_MAX = 4096
-Global *randomSvcReadyFn,*randomSvcGenerateFn
+; Typed unavailable targets keep an explicit native calling convention even
+; before a provider is registered; they do not supply entropy or readiness.
+Procedure.i randomSvcUnboundReady() : ProcedureReturn -101 : EndProcedure
+Procedure.i randomSvcUnboundGenerate(dst.i,n.i) : ProcedureReturn -101 : EndProcedure
+Global *randomSvcReadyFn=@randomSvcUnboundReady,*randomSvcGenerateFn=@randomSvcUnboundGenerate
+Global randomServiceBound.i
 Global randomServiceBusy.i
 Procedure.i RandomServiceBind(ready.i,generate.i)
   If ready<=0 Or generate<=0 : ProcedureReturn -102 : EndIf
-  If randomSvcReadyFn<>0 Or randomServiceBusy<>0 : ProcedureReturn -103 : EndIf
-  randomSvcReadyFn=ready : randomSvcGenerateFn=generate
+  If randomServiceBound<>0 Or randomServiceBusy<>0 : ProcedureReturn -103 : EndIf
+  randomSvcReadyFn=ready : randomSvcGenerateFn=generate : randomServiceBound=1
   ProcedureReturn 0
 EndProcedure
 Procedure.i RandomServiceReady()
   Define rc.i
-  If randomSvcReadyFn=0 : ProcedureReturn -101 : EndIf
+  If randomServiceBound=0 : ProcedureReturn -101 : EndIf
   If randomServiceBusy<>0 : ProcedureReturn -103 : EndIf
   randomServiceBusy=1 : rc=randomSvcReadyFn() : randomServiceBusy=0
   If rc=0 Or rc=1 : ProcedureReturn rc : EndIf
@@ -21,7 +26,7 @@ EndProcedure
 Procedure.i RandomServiceBytes(dst.i,n.i)
   Define rc.i,i.i
   If dst<=0 Or n<1 Or n>#RANDOM_SERVICE_MAX : ProcedureReturn -102 : EndIf
-  If randomSvcGenerateFn=0 : ProcedureReturn -101 : EndIf
+  If randomServiceBound=0 : ProcedureReturn -101 : EndIf
   If randomServiceBusy<>0 : ProcedureReturn -103 : EndIf
   randomServiceBusy=1
   rc=randomSvcReadyFn()
