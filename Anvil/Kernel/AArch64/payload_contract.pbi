@@ -14,3 +14,5 @@ EndProcedure
 Procedure.i HwPmfLegacyV1Allowed()
   ProcedureReturn 1
 EndProcedure
+
+Procedure.i HwPmfInstructionAlignment() : ProcedureReturn 4 : EndProcedure

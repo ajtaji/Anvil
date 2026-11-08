@@ -2986,7 +2986,7 @@ EndProcedure
 ; A non-ARM backend does not inherit AArch64's numeric ID, stack or v1 policy.
 
 ; PORTABLE PAYLOAD ENTRY CONTRACT
-; HwPayloadRun(entry.i, argument.i) enter through the selected ISA/board backend
+; HwPayloadRun(entry.i, argument.i, stack.i, stackBytes.i) enter through the selected ISA/board backend
 ; The argument is the service-table address or zero. The backend maps it to
 ; its entry calling convention and owns stack/context transfer, device
 ; quiesce and recovery. On every return, including refusal before the jump,
@@ -3017,3 +3017,14 @@ EndProcedure
 ; HwIdImageHashable()       1 only when HwIdImageBase/Len is a file-equivalent
 ;                          range after startup; 0 when it contains mutable data.
 ; Core banner/version logic must not invent ARM exception levels for other ISAs.
+
+; HwPmfInstructionAlignment()    positive power-of-two code alignment for load/entry;
+;                               an entry must include a complete instruction.
+; HwPayloadRun returns1 only after actual entry and safe return,0 on refusal.
+; The v2 stack and minimum initial extent are passed explicitly; legacy v1
+; passes0,0 and only backends admitting its exact historic ABI may accept it.
+; HwPayloadServicesReady()       1 only with an actual service-table provider.
+; HwPayloadServicesOpen(returns)  opens that scope and returns its valid table,0
+;                               on refusal. returns is the container's bit0.
+; HwPayloadServicesClose()       closes/reset handles and scoped state, including
+;                               failed admission. No table is invented when absent.

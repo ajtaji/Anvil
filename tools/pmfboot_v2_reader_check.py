@@ -105,6 +105,7 @@ Procedure GatePrintN(*s) : EndProcedure
 Procedure PrintDec(v.i) : EndProcedure
 Procedure PutAddr(v.i) : EndProcedure
 Procedure PutHex8(v.i) : EndProcedure
+Procedure.i HwPayloadServicesReady() : ProcedureReturn 1 : EndProcedure
 Procedure.i HwPmfTargetId() : ProcedureReturn #PMF_TARGET_BCM2711 : EndProcedure
 Procedure.i HwPayWindows() : ProcedureReturn 2 : EndProcedure
 Procedure.i HwPayLo(i.i)

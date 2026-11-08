@@ -22,6 +22,10 @@ def compile_and_publish(compiler,source,output,*,root,publication_factory):
         if not zasm.is_file():raise SystemExit('The external compiler package is missing its Zentaji ASM assembler: '+str(zasm))
         mapping=json.loads(Path(str(raw)+'.zmap').read_text(encoding='utf-8-sig'))
         image,meta,assembly,source_map=B.pack(raw.read_bytes(),zasm,source_map=mapping)
+        # The generic wrapper requires only stack/image separation. This
+        # board also requires a full page in its rounded payload window.
+        meta['startup_minimum_ram_bytes']=meta['minimum_ram_bytes']
+        meta['minimum_ram_bytes']=max(meta['minimum_ram_bytes'],((meta['image_end']+4095)&-4096)+4096+meta['stack_bytes']+meta['rom_reserved_bytes'])
         contents=[(output,image),
             (Path(str(output)+'.boot.json'),(json.dumps(meta,indent=2,sort_keys=True)+'\n').encode()),
             (Path(str(output)+'.asm'),assembly.encode()),

@@ -1,8 +1,8 @@
 ; Zentaji serial/storage monitor composition. The ROM loads the owned startup
 ; envelope; Main receives its validated table/source/context, never ARM registers.
-#ANVIL_BUILD = 3 ; pmf:build
+#ANVIL_BUILD = 7 ; pmf:build
 #ANVIL_BUILD_DATE = 20261108 ; pmf:builddate
-#ANVIL_BUILD_TIME = 014248 ; pmf:buildtime
+#ANVIL_BUILD_TIME = 024427 ; pmf:buildtime
 #CAP_TOUCH=0
 #CAP_PWM=0
 #CAP_NET=0
@@ -35,6 +35,12 @@ XIncludeFile "Anvil/Core/crc.pbi"
 XIncludeFile "Zentaji/Board/identity.pbi"
 XIncludeFile "Anvil/Core/flow_cmd.pbi"
 XIncludeFile "Anvil/Core/layout_cmd.pbi"
+XIncludeFile "Anvil/Core/shotarm.pbi"
+XIncludeFile "Anvil/Core/sha256.pbi"
+XIncludeFile "Anvil/Kernel/Zentaji/payload_contract.pbi"
+XIncludeFile "Zentaji/Board/payload.pbi"
+XIncludeFile "Anvil/Core/pmfboot.pbi"
+XIncludeFile "Anvil/Core/bootfile_cmd.pbi"
 XIncludeFile "Anvil/Core/command_loop.pbi"
 
 Procedure ZentajiShellHelp()
@@ -43,7 +49,8 @@ Procedure ZentajiShellHelp()
  PrintN("  mount, load, save, ls/dir, cat, mkdir, rmdir, rm/del, rename/mv")
  PrintN("  settings, printenv, setenv, saveenv, env, setexpr, time, force")
  PrintN("  halt                 cleanly release storage and stop this monitor")
- PrintN("Applications and raw execution are not available in this composition yet.")
+ PrintN("  boot <file> / mem <address>, boot status/ok/clear")
+ PrintN("Service-table payloads and raw run commands are not available yet.")
 EndProcedure
 Procedure.i HwCommandLoopHook(phase.i)
  If phase=#ACMD_AFTER_PROMPT : UartDrain() : EndIf
@@ -80,6 +87,8 @@ Procedure.i HwCommandDispatch(c.i)
   CmdTime()
  ElseIf WordIs("force")<>0
   CmdForce()
+ ElseIf WordIs("boot")<>0
+  CmdBoot()
  ElseIf WordIs("halt")<>0
   SkipSpace()
   If gLine[gPos]<>0
@@ -95,7 +104,10 @@ Procedure.i HwCommandDispatch(c.i)
  ProcedureReturn 1
 EndProcedure
 Procedure.i Main(table.i,source.i,context.i)
- If ZentajiMemoryBind(context)<>1 : ProcedureReturn 1 : EndIf
+ If ZentajiMemoryBind(context)<>1
+  ZentajiPayloadRecoveryFailed($5B04,"Startup memory layout failed (0x5B04): check the owned context and increase RAM to leave at least 4KB for payload staging.")
+  ProcedureReturn 1
+ EndIf
  If table<>PeekQ(context+#ZEN_BOOT_TABLE) Or source<>PeekQ(context+#ZEN_BOOT_SOURCE) : ProcedureReturn 1 : EndIf
  ; This board owns core0's timer/IRQ routing. No other core is started here.
  PokeQ(#ZEN_IDLE_INTC+$120,3) : PokeQ(#ZEN_IDLE_INTC+$220,3)
@@ -118,10 +130,8 @@ Procedure.i Main(table.i,source.i,context.i)
    UartWriteStr(SettingsErrorText()) : PrintNl()
   EndIf
  EndIf
- If SettingsHas("boot.file")<>0
-  PrintN("The saved boot.file is not started: application loading is not available yet.")
- EndIf
  If TimeBoot()=0 : UartWriteStr(TimeBootErrorText()) : PrintNl() : EndIf
+ BootFileWait()
  PrintN("Type help for the available commands.")
  AnvilCommandLoop()
  PrintN("Anvil stopped.") : UartDrain()

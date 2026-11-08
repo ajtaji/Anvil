@@ -3087,3 +3087,5 @@ Procedure.i SvcTableAddr()
   EndIf
   ProcedureReturn @gSvcTab[0]
 EndProcedure
+
+XIncludeFile "Anvil/Hal/payload_service_owner.pbi"

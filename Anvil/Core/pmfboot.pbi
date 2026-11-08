@@ -75,7 +75,7 @@ XIncludeFile "Anvil/Core/payload_identity.pbi"
 ;    ------  ----  ---------------------------------------------------
 ;    Version 1 ends here (96 bytes total), and then the image.
 ;
-;     96      4    arch      compiler architecture ID: 1 = AArch64
+;     96      4    arch      compiler architecture ID: 1=AArch64, 2=Zentaji
 ;    100      4    target    compiler target ID: BCM2837=2837,
 ;                            BCM2711=2711, BCM2712=2712, QCM2290=2290
 ;    104      8    stack     initial stack top compiled into the image
@@ -215,6 +215,8 @@ XIncludeFile "Anvil/Core/payload_identity.pbi"
 ; Compiler-owned, append-only identifiers. These are metadata values,
 ; not board names guessed from a filename or source suffix.
 #PMF_ARCH_AARCH64  = 1
+#PMF_ARCH_ZENTAJI = 2
+#PMF_TARGET_ZENTAJI = 1
 #PMF_TARGET_BCM2837 = 2837
 #PMF_TARGET_BCM2711 = 2711
 #PMF_TARGET_BCM2712 = 2712
@@ -454,8 +456,8 @@ Procedure.i PmfCheckFlags()
   EndIf
 
   If wantsDtb <> 0 And wantsSvc <> 0
-    PrintN("!! this container asks for BOTH a device tree and the service table in")
-    PrintN("   x0, and there is only one x0. Nothing was loaded and nothing was")
+    PrintN("!! this container asks for BOTH a device tree and the service table as")
+    PrintN("   its entry argument. Only one is possible. Nothing was loaded and nothing was")
     PrintN("   entered.")
     Print("   Its flags word is ")
     PutHex8(gPmfFlags)
@@ -472,6 +474,11 @@ Procedure.i PmfCheckFlags()
     ProcedureReturn 0
   EndIf
 
+  If wantsSvc<>0 And HwPayloadServicesReady()=0
+    PrintN("!! this monitor has no payload service-table provider. Nothing was loaded.")
+    PrintN("   Build a payload without --wants-services or use a monitor with that ABI.")
+    ProcedureReturn 0
+  EndIf
   ProcedureReturn 1
 EndProcedure
 
@@ -727,12 +734,22 @@ Procedure.i PmfCheckRange(lo.i, hi.i, *what)
 EndProcedure
 
 Procedure.i PmfCheckPlacement()
+  Define alignment.i
   Define imageHi.i
   Define bssHi.i
   Define stackLo.i
   Define stackHi.i
   Define initialBytes.i
 
+  alignment=HwPmfInstructionAlignment()
+  If alignment<=0 Or (alignment & (alignment-1))<>0
+    PrintN("!! this monitor has an invalid instruction alignment contract. Nothing was loaded.")
+    ProcedureReturn 0
+  EndIf
+  If (gPmfLoad & (alignment-1))<>0 Or (gPmfEntry & (alignment-1))<>0
+    PrintN("!! the container load or entry is not aligned for this CPU. Nothing was loaded.")
+    ProcedureReturn 0
+  EndIf
   imageHi = gPmfLoad + gPmfImgLen - 1
   If PmfCheckRange(gPmfLoad, gPmfLoad + gPmfImgLen - 1, "image") = 0
     ProcedureReturn 0
@@ -799,10 +816,10 @@ Procedure.i PmfCheckPlacement()
   ; hash proves the image bytes; an entry outside them is a branch into
   ; memory this container never described, and the hash says nothing at
   ; all about what is there.
-  If gPmfEntry < gPmfLoad Or gPmfEntry > (gPmfLoad + gPmfImgLen - 1)
+  If gPmfEntry < gPmfLoad Or gPmfEntry > imageHi - alignment + 1
     Print("!! this container's entry point, ")
     PutAddr(gPmfEntry)
-    PrintN(", is outside the image it")
+    PrintN(", does not have a complete instruction inside the image it")
     Print("   describes, which runs ")
     PutAddr(gPmfLoad)
     Print(" to ")
@@ -952,8 +969,8 @@ XIncludeFile "Anvil/Hal/neon_service_api.pbi"
 XIncludeFile "Anvil/Hal/graphics_service.pbi"
 XIncludeFile "Anvil/Hal/input_service.pbi"
 
-Procedure PmfEnter()
-  Define graphicsRc.i,inputRc.i
+Procedure.i PmfEnter()
+  Define graphicsRc.i,inputRc.i,entered.i,stack.i,stackBytes.i
   Define entryArgument.i = 0
   gEntry = gPmfEntry
   gHaveEntry = 1
@@ -987,24 +1004,16 @@ Procedure PmfEnter()
   ;  HwPayloadRun owns argument staging and cleanup, including entry refusal.
   ;  The common engine does not select a register or touch a trampoline global.
   ; ------------------------------------------------------------------
-  ; What SvcReturn is allowed to do. Anvil/Hal/abi.pbi is included before
-  ; this file - it has to be, because this procedure calls
-  ; BuildServiceTable - so it cannot read #PMF_FLAG_RETURNS itself. One
-  ; assignment here, from the container's own flags word, is the whole
-  ; coupling and there is no second spelling of bit 0 to drift.
-  gSvcMayReturn = 0
-  If (gPmfFlags & #PMF_FLAG_RETURNS) <> 0
-    gSvcMayReturn = 1
-  EndIf
-
   If (gPmfFlags & #PMF_FLAG_WANTS_SERVICES) <> 0
-    BuildServiceTable()
-    SvcFileHReset()              ; no file handle outlives the payload that opened it
-    CompilerIf #CAP_NET = 1
-      UdpServiceCloseAll()
-    CompilerEndIf
+    entryArgument=HwPayloadServicesOpen(Bool((gPmfFlags & #PMF_FLAG_RETURNS)<>0))
+    If entryArgument=0
+      HwPayloadServicesClose()
+      PrintN("!! the payload service-table scope could not be opened. Nothing was entered.")
+      ProcedureReturn 0
+    EndIf
     graphicsRc=GraphicsServiceEnter()
     If graphicsRc<>0
+      HwPayloadServicesClose()
       PrintN("!! resident graphics cleanup is still outstanding, so this payload was not entered.")
       Print("   Graphics status: ") : PrintDec(graphicsRc) : PrintNl()
       ProcedureReturn 0
@@ -1012,20 +1021,20 @@ Procedure PmfEnter()
     inputRc=InputServiceEnter()
     If inputRc<>0
       GraphicsServiceLeave()
+      HwPayloadServicesClose()
       PrintN("!! resident input cleanup is still outstanding, so this payload was not entered.")
       Print("   Input status: ") : PrintDec(inputRc) : PrintNl()
       ProcedureReturn 0
     EndIf
-    entryArgument = SvcTableAddr()
     Print("This payload asked for the service table, so it is entered with entry argument = ")
     PutAddr(entryArgument)
     PrintNl()
     Print("  (ABI ")
-    PrintDec(#SVC_ABI_MAJOR)
+    PrintDec(PmfRd32(entryArgument+4))
     Print(".")
-    PrintDec(#SVC_ABI_MINOR)
+    PrintDec(PmfRd32(entryArgument+8))
     Print(", ")
-    PrintDec(#SVC_SLOT_COUNT)
+    PrintDec(PmfRd32(entryArgument+12))
     PrintN(" slots). It can call back into this monitor.")
   Else
     entryArgument = 0
@@ -1035,7 +1044,10 @@ Procedure PmfEnter()
   ; so present it now rather than waiting for a prompt a healthy payload is
   ; not required to give back.
   ScreenServiceTick()
-  HwPayloadRun(gPmfEntry, entryArgument)
+  If gPmfVersion=#PMF_VERSION_V2
+    stack=gPmfStack : stackBytes=HwPmfInitialStackBytes()
+  EndIf
+  entered=HwPayloadRun(gPmfEntry, entryArgument, stack, stackBytes)
   If (gPmfFlags & #PMF_FLAG_WANTS_SERVICES) <> 0
     ; GPU targets retire this scope before their platform bus-master recovery.
     ; The idempotent fallback also covers targets with no graphics device and
@@ -1050,11 +1062,10 @@ Procedure PmfEnter()
       PrintN("!! the payload returned with a resident graphics owner still quarantined.")
       Print("   Graphics status: ") : PrintDec(graphicsRc) : PrintNl()
     EndIf
-    SvcFileHReset()              ; and none is left open behind it
-    CompilerIf #CAP_NET = 1
-      UdpServiceCloseAll()
-    CompilerEndIf
+    HwPayloadServicesClose()
   EndIf
+  ProcedureReturn entered
+
 EndProcedure
 
 ; ======================================================================
@@ -1145,8 +1156,7 @@ Procedure.i PmfBootAt(container.i)
   EndIf
 
   PmfZeroBss()
-  PmfEnter()
-  ProcedureReturn 1
+  ProcedureReturn PmfEnter()
 EndProcedure
 
 ; ======================================================================
@@ -1331,8 +1341,7 @@ Procedure.i PmfBootFile(*name)
   EndIf
 
   PmfZeroBss()
-  PmfEnter()
-  ProcedureReturn 1
+  ProcedureReturn PmfEnter()
 EndProcedure
 
 ; ======================================================================

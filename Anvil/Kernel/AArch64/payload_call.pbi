@@ -101,6 +101,10 @@ Procedure PayloadCall()
 
     ; BLR: x30 is the instruction after this one, so a payload built
     ; --entry-returns comes back here.
+    movz x10, #1
+    adrp x11, global_gpayloaddidenter
+    add x11, x11, #:lo12:global_gpayloaddidenter
+    str x10, [x11]
     blr  x9
 
     ; --- it came back ------------------------------------------------

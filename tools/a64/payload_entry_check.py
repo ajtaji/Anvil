@@ -267,10 +267,20 @@ def gate_board(cc: str, target: str, override: dict, work: pathlib.Path) -> list
     # ALWAYS a private copy, the unmutated run too: a board whose source
     # carries `; pmf:build` has its build count raised by every successful
     # compile, and a gate must not edit the tree it is judging.
-    tree = overlay(override, work)
     notes = []
-    mon = work / ("%s.img" % target)
-    compile_(cc, tree, src, target, args, mon)
+    if override:
+        # Deliberately mutated diagnostics keep a disposable source overlay.
+        tree=overlay(override,work)
+        mon=work/("%s.img"%target)
+        compile_(cc,tree,src,target,args,mon)
+    else:
+        # The accepted run consumes the counted published product, including
+        # its real source identity and ledger, not a second monitor build.
+        tree=ROOT
+        work.mkdir(parents=True,exist_ok=True)
+        built=subprocess.run([sys.executable,"-B",str(ROOT/"tools/build.py"),target,"--compiler",cc],cwd=ROOT,capture_output=True,text=True)
+        if built.returncode:raise Fail("counted %s build failed:\n%s\n%s"%(target,built.stdout[-2500:],built.stderr[-1000:]))
+        mon=ROOT/"build"/target/("kernel8.img" if target=="pi3" else "anvil.img")
     probe_src = work / "payload_entry_probe.pi4"
     abi = (tree / "Anvil/Hal/abi.pbi").read_text(encoding="utf-8")
     ver = (tree / "Anvil/Hal/abi_version.pbi").read_text(encoding="utf-8")
@@ -324,8 +334,10 @@ def gate_board(cc: str, target: str, override: dict, work: pathlib.Path) -> list
     def peek64(name):
         return struct.unpack("<Q", m.peek(sym[name], 8))[0]
 
-    m.call("BuildServiceTable")
-    table = m.call("SvcTableAddr")
+    check(m.call("HwPayloadServicesReady")==1,"%s: the real service-table owner is available"%target,notes)
+    table=m.call("HwPayloadServicesOpen",1)
+    check(table!=0 and table==m.call("SvcTableAddr"),"%s: the HAL owner opened the actual table"%target,notes)
+    check(m.call("HwPayloadServicesOpen",1)==0,"%s: nested service-table scope is refused"%target,notes)
     check(table != 0 and (struct.unpack("<Q", m.peek(table, 8))[0] & 0xFFFFFFFF) == magic,
           "%s: the monitor's own BuildServiceTable filled a table with the ABI magic" % target,
           notes)
@@ -339,16 +351,20 @@ def gate_board(cc: str, target: str, override: dict, work: pathlib.Path) -> list
             m.cpu.x[i] = POISON | i
         daif_before = regs.regs[SysRegs.DAIF]
         c = m.cpu
-        c.pc = procs["runat"]
+        c.pc = procs["hwpayloadrun"]
         c.sp = driver_sp
         c.x[30] = RETURN
         c.x[0] = addr
+        c.x[1] = table
+        c.x[2] = pstack
+        c.x[3] = 16
         n = 0
         while c.pc != RETURN:
             n += 1
             if n > 5_000_000:
                 raise Fail("%s: RunAt never came back from the %s" % (target, what))
             m.step()
+        check(c.x[0]==1 and peek64("global_gpayloaddidenter")==1,"%s: the portable gateway reports actual entry and return"%target,notes)
         after = (c.sp, regs.regs[SysRegs.DAIF], peek64("global_ggox0"))
 
         def rest():
@@ -389,6 +405,10 @@ def gate_board(cc: str, target: str, override: dict, work: pathlib.Path) -> list
         check(regs.regs.get(SysRegs.VBAR_EL3, 0) not in (0, WRECK_SP),
               "%s: VBAR_EL3 is the monitor's vectors again (%#x), not the payload's %#x"
               % (target, regs.regs.get(SysRegs.VBAR_EL3, 0), WRECK_SP), notes)
+    check(m.call("HwPayloadRun",0,table,0,0)==0,"%s: the board's zero-entry refusal propagates through the portable gateway"%target,notes)
+    check(peek64("global_gpayloaddidenter")==0 and peek64("global_ggox0")==0 and peek64("global_ggorc")==0,"%s: refusal clears entry/result/argument state"%target,notes)
+    m.call("HwPayloadServicesClose")
+    check(peek64("global_gsvcmayreturn")==0 and peek64("global_svcpayloadscope")==0,"%s: the real service owner closes its scope and return permission"%target,notes)
     return notes
 
 

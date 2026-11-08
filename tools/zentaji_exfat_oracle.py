@@ -110,7 +110,8 @@ def check(medium,initial,payload,epoch_min=1794009600,epoch_max=None):
 def seed_file(image,payload,name='SEED.BIN'):
     """Seed an independent contiguous file; the guest must use its file APIs."""
     part=struct.unpack_from('<I',image,454)[0]
-    assert len(payload)==1800 and len(name)<=15
+    assert 1<=len(payload)<=125*512 and 1<=len(name)<=15
+    clusters=(len(payload)+511)//512
     entries=bytearray(96);entries[0]=0x85;entries[1]=2
     struct.pack_into('<H',entries,4,32)
     entries[32]=0xc0;entries[33]=3;entries[35]=len(name)
@@ -119,6 +120,6 @@ def seed_file(image,payload,name='SEED.BIN'):
     entries[64]=0xc1;entries[66:66+len(name)*2]=name.encode('utf-16le')
     struct.pack_into('<H',entries,2,checksum(entries,16,(2,3)))
     root=(part+28)*512;image[root+64:root+160]=entries
-    image[(part+26)*512]=127
-    image[part*512+112]=7*100//128
+    image[(part+26)*512:(part+26)*512+16]=((1<<(clusters+3))-1).to_bytes(16,'little')
+    image[part*512+112]=(clusters+3)*100//128
     image[(part+29)*512:(part+29)*512+len(payload)]=payload

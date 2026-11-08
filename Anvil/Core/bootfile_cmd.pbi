@@ -241,10 +241,9 @@ Procedure BootFileWait()
     quarter = (hz * #BOOT_DOT) / 1000
     dots = 0
     While (Ticks() - t0) < (hz * secs)
-      If UartReadReady() <> 0
+      If OutBreakByte() >= 0
         ; CONSUMED, deliberately - left in the FIFO it would become the
         ; first character of the first command. auto.pi4 does the same.
-        c = UartRead()
         PrintNl()
         Print("Stopped by a keypress. ")
         UartWriteStr(@gPmfName[0])
@@ -259,6 +258,8 @@ Procedure BootFileWait()
         dots = dots + 1
         ScreenServiceTick()
       EndIf
+      AnvilPromptServiceOne()
+      AnvilSchedulerIdleIfSafe()
     Wend
   EndIf
   PrintNl()
@@ -526,6 +527,18 @@ Procedure CmdBoot()
     If AddrAllowed(a, a + 95, 0, "boot mem", "booted") = 0
       ProcedureReturn
     EndIf
+
+    If PmfRd32(a+#PMF_OFF_VERSION)=#PMF_VERSION_V2
+      If a>$7FFFFFFFFFFFFFFF-127 : PrintN("!! the version-2 header address overflows RAM addressing.") : ProcedureReturn : EndIf
+      If AddrAllowed(a,a+127,0,"boot mem","read")=0 : ProcedureReturn : EndIf
+    EndIf
+    PmfParseAt(a)
+    If PmfCheckHeader(0)=0 : ProcedureReturn : EndIf
+    If a>$7FFFFFFFFFFFFFFF-gPmfHdrLen-gPmfImgLen
+      PrintN("!! the complete source container address overflows RAM addressing.")
+      ProcedureReturn
+    EndIf
+    If AddrAllowed(a,a+gPmfHdrLen+gPmfImgLen-1,0,"boot mem","read")=0 : ProcedureReturn : EndIf
 
     ; --- boot mem <addr> shot -----------------------------------------
     ; ONE LINE THAT ARMS AND BOOTS, because a host tool driving a board

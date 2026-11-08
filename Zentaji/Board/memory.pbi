@@ -22,7 +22,7 @@ Procedure.i ZentajiMemoryBind(context.i)
  bottom=PeekQ(context+#ZEN_BOOT_STACK_BOTTOM)
  If last>$7FFFFFFFFFFFFFFF-4095 : ProcedureReturn 0 : EndIf
  nextPage=(last+4095)&-4096
- If nextPage>=bottom : ProcedureReturn 0 : EndIf
+ If nextPage>=bottom Or bottom-nextPage<4096 : ProcedureReturn 0 : EndIf
  zenMemoryRam=PeekQ(context+#ZEN_BOOT_RAM)
  zenMemoryFirst=PeekQ(context+#ZEN_BOOT_LOAD) : zenMemoryLast=last
  zenMemoryPayload=nextPage
