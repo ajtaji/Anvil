@@ -1155,6 +1155,18 @@
 ;              HwMonLo()/HwMonHi(): the core asks where the monitor is
 ;              rather than assuming, because the answer is the board's.
 ;
+;    Monitor ownership facts (NO CAPABILITY):
+;                 HwMonBytes()           bytes in the live loaded monitor
+;                                        extent, equal to Hi-Lo+1 after binding.
+;                                        Includes its inline mutable data and
+;                                        owned startup/vector/context storage.
+;                 HwMonStack()           the owned monitor stack TOP, exclusive.
+;                                        Payload stacks must use separate admitted
+;                                        RAM, not this stack or its live frames.
+;              These are measured loader/backend facts, never guessed addresses.
+;              Shared code uses them with HwMonLo()/HwMonHi() and the payload
+;              windows; image size and monitor stack ownership are distinct.
+;
 ;    HwMemory* (NO CAPABILITY - see below)  HOW MUCH MEMORY THIS BOARD
 ;              HAS. One number, in BYTES, and where it came from:
 ;                 HwMemoryBytes()        the TOTAL DRAM fitted to this

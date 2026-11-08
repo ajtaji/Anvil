@@ -39,7 +39,7 @@ ProcedureNaked TestFault()
  EndASM
 EndProcedure
 Procedure.i Main(table.i,source.i,context.i,zero.i)
- Protected sp.i,saved.i
+ Protected sp.i,saved.i,call.i
  If table<>$FFFF000000010000 Or source<>PeekQ(context+#ZEN_BOOT_SOURCE) Or zero<>0 Or ZentajiBootContextValid(context)<>1 : ProcedureReturn 1 : EndIf
  If ProbeEvec()<>PeekQ(context+#ZEN_BOOT_VECTORS) : ProcedureReturn 2 : EndIf
  sp=ProbeSp()
@@ -49,6 +49,22 @@ Procedure.i Main(table.i,source.i,context.i,zero.i)
  PokeQ(context+#ZEN_BOOT_VECTORS,$7FFFFFFFFFFFF000)
  If ZentajiBootContextValid(context)<>0 : ProcedureReturn 5 : EndIf
  PokeQ(context+#ZEN_BOOT_VECTORS,saved)
+ call=PeekQ(context+#ZEN_BOOT_PAYLOAD_CALL)
+ PokeQ(context+#ZEN_BOOT_PAYLOAD_CALL,0)
+ If ZentajiBootContextValid(context)<>0 : ProcedureReturn 6 : EndIf
+ PokeQ(context+8,1)
+ If ZentajiBootContextValid(context)<>1 : ProcedureReturn 7 : EndIf
+ PokeQ(context+#ZEN_BOOT_PAYLOAD_CALL,call)
+ If ZentajiBootContextValid(context)<>0 : ProcedureReturn 8 : EndIf
+ PokeQ(context+8,2)
+ If ZentajiBootContextValid(context)<>1 : ProcedureReturn 9 : EndIf
+ PokeQ(context+#ZEN_BOOT_PAYLOAD_CALL,call+1)
+ If ZentajiBootContextValid(context)<>0 : ProcedureReturn 10 : EndIf
+ PokeQ(context+#ZEN_BOOT_PAYLOAD_CALL,PeekQ(context+#ZEN_BOOT_VECTORS))
+ If ZentajiBootContextValid(context)<>0 : ProcedureReturn 11 : EndIf
+ PokeQ(context+#ZEN_BOOT_PAYLOAD_CALL,context)
+ If ZentajiBootContextValid(context)<>0 : ProcedureReturn 12 : EndIf
+ PokeQ(context+#ZEN_BOOT_PAYLOAD_CALL,call)
  FAULT
  ProcedureReturn 42
 EndProcedure
@@ -100,6 +116,7 @@ def main():
                 assert target==ref.sym['ANVIL_ZEN_FAULT'] and not any(data[at+16:at+64])
             variants[name]=(wrapped,meta,ref)
         image,meta,ref=variants['normal']
+        assert meta['context_version']==2 and meta['payload_call']==ref.sym['ANVIL_ZEN_PAYLOAD_CALL']
         def direct(image,ram=2<<20,cores=2):
             m=I.Machine(ram_size=ram,cores=cores,display_modes=[(16,16,60000)]);m.load_image(image)
             m.cores[0].r[255]=0xDEADBEF0
@@ -122,7 +139,7 @@ def main():
         for ram in [2<<20,(2<<20)+7,8<<20]:
             m=direct(image,ram);c=check('direct-ram-'+str(ram),m,serial=b'')
             ctx=meta['context'];q=lambda off:int.from_bytes(m.ram[ctx+off:ctx+off+8],'little')
-            assert [q(x) for x in (0,8,16,24,32,40,48,56,64,72,80,88,96,104,112,120)]==[0x4E455A4C49564E41,1,128,I.DEV+0x10000,2,ram,0xDEADBEF0,((ram&-16)-1048576)-65536,(ram&-16)-1048576,meta['vectors'],meta['compiled_entry'],0,meta['load'],meta['image_end'],65536,0]
+            assert [q(x) for x in (0,8,16,24,32,40,48,56,64,72,80,88,96,104,112,120)]==[0x4E455A4C49564E41,2,128,I.DEV+0x10000,2,ram,0xDEADBEF0,((ram&-16)-1048576)-65536,(ram&-16)-1048576,meta['vectors'],meta['compiled_entry'],0,meta['load'],meta['image_end'],65536,ref.sym['ANVIL_ZEN_PAYLOAD_CALL']]
             assert c.cr[I.CR['EVEC']]==meta['vectors'] and c.r[255]==(ram&-16)-1048576
         for name,reason,mutate,ram in [
             ('wrong-table',1,lambda m:setattr(m.cores[0],'r',[0 if i==1 else x for i,x in enumerate(m.cores[0].r)]),2<<20),

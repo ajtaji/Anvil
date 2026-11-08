@@ -32,6 +32,7 @@ def main():
     assert compiled==zexpack.header(origin,origin,data)+data
     wrapper=A.Asm();org,wrapped=wrapper.assemble(Path(str(artifact)+'.asm').read_text())
     assert org==meta['load'] and image[64:]==wrapped
+    assert meta['context_version']==2 and meta['payload_call']==wrapper.sym['ANVIL_ZEN_PAYLOAD_CALL']
     version=build_count.current('zentaji');stage=(meta['image_end']+4095)&-4096
     expected=bytes((n*7+n//512+31)&255 for n in range(1800))
     def run(args):

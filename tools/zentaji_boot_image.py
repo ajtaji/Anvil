@@ -60,9 +60,14 @@ def pack(image,zasm,stack_bytes=65536,source_map=None):
         startup_map=json.loads(Path(str(binary)+'.zmap').read_text(encoding='utf-8-sig'))
     if payload[:h['size']]!=image[64:]:raise ValueError('compiled payload changed during wrapping')
     if any(payload[h['size']:h['size']+h['bss']]):raise ValueError('original BSS was not preserved as zero')
+    context=h['load']+len(payload)-128
+    magic,version,size=struct.unpack_from('<QQQ',payload,len(payload)-128)
+    payload_call=struct.unpack_from('<Q',payload,len(payload)-8)[0]
+    if (magic,version,size)!=(0x4E455A4C49564E41,2,128) or payload_call%8 or not vector+4096<=payload_call<context:
+        raise ValueError('assembled startup does not publish a valid version2 call boundary')
     entry=vector+4096
     output=MAGIC+struct.pack('<QQQQQQII',entry,h['load'],len(payload),0,0,0,zlib.crc32(payload)&0xffffffff,0)+payload
-    meta=dict(schema=1,architecture='Zentaji',privilege='supervisor',load=h['load'],entry=entry,compiled_entry=h['entry'],vectors=vector,context=h['load']+len(payload)-128,image_end=h['load']+len(payload),stack_bytes=stack_bytes,minimum_ram_bytes=max(2097152,(h['load']+len(payload)+stack_bytes+1048576+15)&-16),rom_reserved_bytes=1048576,compiled_sha256=hashlib.sha256(image).hexdigest(),image_sha256=hashlib.sha256(output).hexdigest(),startup_sha256=hashlib.sha256(STARTUP.read_bytes()).hexdigest())
+    meta=dict(schema=1,architecture='Zentaji',privilege='supervisor',load=h['load'],entry=entry,compiled_entry=h['entry'],vectors=vector,context=context,context_version=version,payload_call=payload_call,image_end=h['load']+len(payload),stack_bytes=stack_bytes,minimum_ram_bytes=max(2097152,(h['load']+len(payload)+stack_bytes+1048576+15)&-16),rom_reserved_bytes=1048576,compiled_sha256=hashlib.sha256(image).hexdigest(),image_sha256=hashlib.sha256(output).hexdigest(),startup_sha256=hashlib.sha256(STARTUP.read_bytes()).hexdigest())
     rows=[];sources={}
     if source_map is not None:
         if not isinstance(source_map,dict) or type(source_map.get('version')) is not int or source_map['version']!=1 or source_map.get('image')!=meta['compiled_sha256']:raise ValueError('compiler source map does not match the input image')
