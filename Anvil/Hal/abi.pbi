@@ -1046,12 +1046,10 @@ EndProcedure
 ; A SEPARATE PROCEDURE, called by both slot 17 and slot 18, so that "what
 ; time is it" and "how much do you trust it" cannot answer differently.
 ;
-; BCM2712 (Pi 5) HAS ONE: the firmware's battery-backed RTC, through the
-; board's HwClock* backend (RaspberryPi4/Board/hw_clock.pi4), which the
-; board includes before this file and only on 2712. Every other target
-; compiles the line it always had.
+; The composition declares whether a hardware clock provider is present.
+; CPU/chip selection and RTC sampling belong to that provider, not this ABI.
 Procedure.i SvcClockProv()
-  CompilerIf #PMF_CHIP = 2712
+  CompilerIf #CAP_RTC = 1
   ProcedureReturn HwClockProvenance()
   CompilerElse
   ProcedureReturn #HW_CLK_UNSET
@@ -1085,7 +1083,7 @@ Procedure.i SvcUtc(*out)
     PokeB(*out + i, 0)
     i = i + 1
   Wend
-  CompilerIf #PMF_CHIP = 2712
+  CompilerIf #CAP_RTC = 1
   ProcedureReturn HwClockUtc(*out)
   CompilerElse
   ProcedureReturn SvcClockProv()
@@ -1108,19 +1106,21 @@ EndProcedure
 ; authoritative sync", which is not a large uncertainty - it is no
 ; measurement at all, and the caller must not treat it as a number.
 Procedure.i SvcClockUncertaintyMs()
-  If SvcClockProv() = #HW_CLK_UNSET
-    ; -1 IS NOT A LARGE UNCERTAINTY. It is no measurement at all, and a
-    ; caller that averaged it into a bound would be inventing a number.
-    ProcedureReturn -1
-  EndIf
+  CompilerIf #CAP_RTC = 1
+  ProcedureReturn HwClockUncertaintyMs()
+  CompilerElse
   ProcedureReturn -1
+  CompilerEndIf
 EndProcedure
 
-; Slot 20. SvcTicks() at the last authoritative sync, or -1 if never.
+; Slot 20. Native monotonic microseconds at authoritative sync, or -1.
 Procedure.i SvcUtcLastSyncTicks()
+  CompilerIf #CAP_RTC = 1
+  ProcedureReturn HwClockLastSyncTicks()
+  CompilerElse
   ProcedureReturn -1
+  CompilerEndIf
 EndProcedure
-
 
 ; ======================================================================
 ;  GROUP 2 - CONSOLE, base 24

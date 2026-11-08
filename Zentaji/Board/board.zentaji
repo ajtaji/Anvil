@@ -1,8 +1,8 @@
 ; Zentaji serial/storage monitor composition. The ROM loads the owned startup
 ; envelope; Main receives its validated table/source/context, never ARM registers.
-#ANVIL_BUILD = 9 ; pmf:build
+#ANVIL_BUILD = 10 ; pmf:build
 #ANVIL_BUILD_DATE = 20261108 ; pmf:builddate
-#ANVIL_BUILD_TIME = 031412 ; pmf:buildtime
+#ANVIL_BUILD_TIME = 034053 ; pmf:buildtime
 #CAP_TOUCH=0
 #CAP_PWM=0
 #CAP_NET=0
@@ -53,6 +53,7 @@ XIncludeFile "Anvil/Core/layout_cmd.pbi"
 XIncludeFile "Anvil/Core/shotarm.pbi"
 XIncludeFile "Anvil/Core/sha256.pbi"
 XIncludeFile "Anvil/Kernel/Zentaji/payload_contract.pbi"
+XIncludeFile "Zentaji/Board/rtc_clock.pbi"
 XIncludeFile "Zentaji/Board/services.pbi"
 XIncludeFile "Anvil/Hal/abi_version.pbi"
 XIncludeFile "Anvil/Hal/abi.pbi"
@@ -149,6 +150,7 @@ Procedure.i Main(table.i,source.i,context.i)
   EndIf
  EndIf
  If TimeBoot()=0 : UartWriteStr(TimeBootErrorText()) : PrintNl() : EndIf
+ If ZentajiClockSeed()=0 : PrintN("RTC time is unavailable; the software clock keeps its existing source.") : EndIf
  BootFileWait()
  PrintN("Type help for the available commands.")
  AnvilCommandLoop()

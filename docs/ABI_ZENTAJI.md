@@ -35,6 +35,11 @@ return and failed admission close them. Unsupported services retain their
 existing ENOCAP/ENOSYS policy and every reserved slot is nonzero. No graphics,
 normalized input, network, spare UART, GPIO, I2C, SPI, parallel jobs, entropy or
 module provider is installed. Serial port 0 remains the monitor console; a
-pixel-console or spare-UART capability is not invented for it. The physical RTC
-backend exists, but the shared UTC service still needs portable clock binding.
+pixel-console or spare-UART capability is not invented for it. UTC/provenance slots read the RTC
+through the declared hardware capability. Each UTC record uses a single latched
+seconds/nanoseconds sample and contains seven 32-bit fields, including truncated
+milliseconds. Manual time/timezone changes affect the monitor software clock;
+the application UTC service continues to report the hardware RTC. Invalid samples
+return UNSET with a zeroed record. Uncertainty and authoritative-sync time remain
+unknown (-1). No RTC alarm, timezone or NVRAM register is written.
 The built-in interactive Zentaji-only Forge is still future work.

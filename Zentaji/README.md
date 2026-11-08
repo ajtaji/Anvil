@@ -312,9 +312,9 @@ All compositions start with RTC admission off. Revocation makes an existing RTC
 anchor untrusted while retaining its value/provenance for inspection. Manual and
 SNTP provenance remain independent. Init/Clear do not unregister hardware. The
 Pi5 provider registers after validating its RTC reading; the shared core no
-longer selects RTC policy by ARM chip ID. The Zentaji fixture exercises admission,
-invalid registration and revocation as policy tests; it does not claim to seed
-wall time from a validated Zentaji RTC. `HwMicros()` now derives bounded signed
+longer selects RTC policy by ARM chip ID. The original Zentaji fixture exercises admission,
+invalid registration and revocation as policy tests. The board now also has the
+actual RTC binding described below. `HwMicros()` now derives bounded signed
 microseconds from hardware TIME/TIME_HZ for shared services and profiling, with
 checked arithmetic; the fixture checks it against independent tick brackets.
 
@@ -745,3 +745,34 @@ extent; `startup_minimum_ram_bytes` retains the generic architecture floor.
 The exact board minimum admits the prompt/staging window, not every application:
 each PMF must also fit its own image and initial stack. Below the board floor,
 startup reports 0x5B04 and stops instead of claiming a usable prompt.
+
+
+## RTC-backed services
+
+`Board/rtc_clock.pbi` reads the version1 RTC: reading SECONDS latches NANOS.
+The provider validates 1980 <= UTC < 2100 and 0 <= nanoseconds < one second,
+then uses the shared civil conversion to fill the existing seven-field UTC
+record. A rejected sample leaves all 28 record bytes zero. The service does not
+apply the monitor's manually configured time or timezone to hardware UTC.
+No RTC/alarm/timezone/NVRAM register is written, and no oscillator bound or
+GNSS sync is invented: uncertainty and last-authoritative-sync remain -1.
+
+The board seeds its software wall clock after saved settings have been loaded.
+That anchor has whole-second precision; the service samples hardware subseconds
+directly. The existing manual `time` command and saved-floor semantics remain
+separate from the hardware source. Shared service dispatch now selects the
+composition's `CAP_RTC` provider, with no ARM chip ID in the clock slots.
+
+```text
+python tools/zentaji_clock_check.py --compiler <Forge executable> --zen-tools <tools/zentaji directory>
+python tools/zentaji_boot_check.py --case services-repeat --compiler <Forge executable> --zen-tools <tools/zentaji directory>
+```
+
+The component proof calls the actual RTC and shared slots, including a read whose
+SECONDS/NANOS accesses straddle a second boundary. It checks a disabled capability,
+null output, bounds and guards, and compares the production snapshot formatter
+with independent calendar results at leap days and date/nanosecond limits.
+Native and twin CPU state/RAM agree. The counted monitor proof reads UTC through
+an actual compiled PMF twice, after manual time/timezone changes, with independent
+RTC-time brackets and persisted file checks. These are deterministic headless
+proofs; live host civil time and Linux/visible-window execution remain separate.

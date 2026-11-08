@@ -1,5 +1,6 @@
 """Boot actual compiler PMFs through the published Anvil command/file loader."""
 import argparse
+import datetime
 import hashlib
 import json
 import os
@@ -38,7 +39,7 @@ def main():
                 source='Procedure.q Main(table.i)\nProtected i.i,h.i,now.i\n'
                 source+='If PeekL(table)<>$53564E41 Or PeekL(table+4)<>1 Or PeekL(table+8)<15 Or PeekL(table+12)<>208 : ProcedureReturn $BAD01 : EndIf\n'
                 source+='For i=0 To 207\nIf PeekQ(table+16+i*8)=0 : ProcedureReturn $BAD02 : EndIf\nNext\n'
-                checks=[(0,[],1),(1,[],15),(2,[],5),(4,['0'],1),(4,['1'],0),(4,['16'],0),(10,[],0),(108,[],-101),(170,[],-100),(8,[],-100),(14,['15','0','0'],-100),(15,['15','0'],0),(176,[],-101)]
+                checks=[(0,[],1),(1,[],15),(2,[],5),(4,['0'],1),(4,['1'],0),(4,['16'],0),(10,[],0),(108,[],-101),(170,[],-100),(8,[],-100),(14,['15','0','0'],-100),(15,['15','0'],0),(176,[],-101),(18,[],2),(19,[],-1),(20,[],-1)]
                 for code,(slot,args,want) in enumerate(checks,16):
                     source+='If CallFunctionFast(PeekQ(table+16+%d*8)%s)<>%d : ProcedureReturn $%X : EndIf\n'%(slot,(','+','.join(args)) if args else '',want,0xBAD00+code)
                 source+='now=CallFunctionFast(PeekQ(table+16+16*8))\nIf now<0 Or CallFunctionFast(PeekQ(table+16+16*8))<now : ProcedureReturn $BAD30 : EndIf\n'
@@ -47,6 +48,7 @@ def main():
                 source+='For i=1 To 8\nh=CallFunctionFast(PeekQ(table+16+192*8),"APP.PMF")\nIf h<>i : ProcedureReturn $BAD40+i : EndIf\nNext\n'
                 source+='If CallFunctionFast(PeekQ(table+16+192*8),"APP.PMF")<>-103 : ProcedureReturn $BAD50 : EndIf\n'
                 source+='If CallFunctionFast(PeekQ(table+16+194*8),1,0,$600080,8)<>8 Or PeekQ($600080)<>$00544F4F42464D50 : ProcedureReturn $BAD51 : EndIf\n'
+                source+='If CallFunctionFast(PeekQ(table+16+17*8),$600180)<>2 : ProcedureReturn $BAD52 : EndIf\n'
                 source+='PokeQ($600000,PeekQ($600000)+1)\n'+damage+'\nProcedureReturn $1122334455667788\nEndProcedure\n'
             src.write_text(source,encoding='utf-8')
             run([cc,'--compile',src,'--load-addr',hex(load),'--stack-addr','0x2F0000','--entry-returns',*(['--wants-services'] if services else []),'-o',app])
@@ -60,7 +62,7 @@ def main():
             pmf=bytearray(valid);struct.pack_into(fmt,pmf,offset,value);return bytes(pmf)
         cases=[('file-repeat',valid,['boot APP.PMF','boot APP.PMF','ls','halt'],2,0,None),('memory',valid,['load APP.PMF','boot mem %X'%stage,'halt'],1,0,None)]
         if a.only in ('all','services','ordinary'):
-            cases += [('conflicting-arguments',altered(56,6),['boot APP.PMF','halt'],0,0,b'Only one is possible'),('services-repeat',service,['boot APP.PMF','boot APP.PMF','ls','halt'],2,0,None),('services-timer',service_timer,['boot APP.PMF'],1,0x5B02,None),('services-disk',service_disk,['boot APP.PMF'],1,0x5B03,None),('foreign-isa',altered(96,1),['boot APP.PMF','halt'],0,0,b'architecture ID'),('foreign-target',altered(100,99),['boot APP.PMF','halt'],0,0,b'target ID'),('stack-outside',altered(104,0x900000,'<Q'),['boot APP.PMF','halt'],0,0,b'not in a payload stack window'),('entry-alignment',altered(24,load+1,'<Q'),['boot APP.PMF','halt'],0,0,b'not aligned for this CPU'),('monitor-overlap',altered(16,0x1000,'<Q'),['boot APP.PMF','halt'],0,0,b'monitor'),('truncated',valid[:-1],['boot APP.PMF','halt'],0,0,b'file on the'),('digest-mismatch',valid[:-1]+bytes([valid[-1]^1]),['boot APP.PMF','halt'],0,0,b'SHA-256'),('timer-return',timer_bad,['boot APP.PMF'],1,0x5B02,None),('foreign-disk-return',disk_bad,['boot APP.PMF'],1,0x5B03,None)]
+            cases += [('conflicting-arguments',altered(56,6),['boot APP.PMF','halt'],0,0,b'Only one is possible'),('services-repeat',service,['time set 1794009600','time zone fixed:+05:30','boot APP.PMF','boot APP.PMF','ls','halt'],2,0,None),('services-timer',service_timer,['boot APP.PMF'],1,0x5B02,None),('services-disk',service_disk,['boot APP.PMF'],1,0x5B03,None),('foreign-isa',altered(96,1),['boot APP.PMF','halt'],0,0,b'architecture ID'),('foreign-target',altered(100,99),['boot APP.PMF','halt'],0,0,b'target ID'),('stack-outside',altered(104,0x900000,'<Q'),['boot APP.PMF','halt'],0,0,b'not in a payload stack window'),('entry-alignment',altered(24,load+1,'<Q'),['boot APP.PMF','halt'],0,0,b'not aligned for this CPU'),('monitor-overlap',altered(16,0x1000,'<Q'),['boot APP.PMF','halt'],0,0,b'monitor'),('truncated',valid[:-1],['boot APP.PMF','halt'],0,0,b'file on the'),('digest-mismatch',valid[:-1]+bytes([valid[-1]^1]),['boot APP.PMF','halt'],0,0,b'SHA-256'),('timer-return',timer_bad,['boot APP.PMF'],1,0x5B02,None),('foreign-disk-return',disk_bad,['boot APP.PMF'],1,0x5B03,None)]
             v1=bytearray(valid[:96]);struct.pack_into('<II',v1,8,1,96)
             cases.append(('legacy-v1',bytes(v1)+valid[128:],['boot APP.PMF','halt'],0,0,b'version-1 payloads'))
             tiny=bytearray(valid[:128]);struct.pack_into('<Q',tiny,32,1);tiny[64:96]=hashlib.sha256(valid[128:129]).digest()
@@ -77,6 +79,11 @@ def main():
             if name=='memory-short-header':m.ram[(8<<20)-96:]=valid[:96]
             if name=='memory-short-body':m.ram[(8<<20)-256:(8<<20)-128]=valid[:128]
             assert not L.capture(m,str(td));cfg=td/'machine.txt';cfg.write_text(cfg.read_text().replace('disk-memory ','disk '))
+            rtc_reads=[];rtc_read=m.rtc.rd
+            def observe_rtc(core,reg):
+                if reg==0x40:rtc_reads.append(m.time_now())
+                return rtc_read(core,reg)
+            m.rtc.rd=observe_rtc
             scheduled=[]
             def operator(core):
                 if len(scheduled)>=len(commands) or bytes(m.serial[0].out).count(b'pmf> ')<=len(scheduled):return
@@ -103,6 +110,10 @@ def main():
             state=next(s[6:] for s in out.splitlines() if s.startswith('STATE '));assert state.split(' ',1)[1]==L.state_line(m,0,-1).split(' ',1)[1],name
             assert m.cores[1].state=='PARKED' and (td/'disk15.img').read_bytes()==bytes(m.disks[15].image),name
             if name.startswith('services'):
+                assert len(rtc_reads)==1+want_calls*2,(name,rtc_reads)
+                tick=rtc_reads[-1];dt=datetime.datetime.fromtimestamp(1767225600+tick//100000000,datetime.timezone.utc)
+                expected=(dt.year,dt.month,dt.day,dt.hour,dt.minute,dt.second,(tick%100000000)*1000//100000000)
+                assert struct.unpack_from('<7i',m.ram,0x600180)==expected,(name,expected)
                 result=E.root_files(bytes(m.disks[15].image))
                 assert result=={'APP.PMF':pmf,'RESULT.BIN':struct.pack('<Q',0x1122334455667788)},result.keys()
             else:assert bytes(m.disks[15].image)==bytes(medium),('read-only boot changed medium bytes',name)

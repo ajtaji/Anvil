@@ -30,6 +30,7 @@ import argparse
 import datetime
 import os
 import pathlib
+import re
 import shutil
 import sys
 import tempfile
@@ -41,6 +42,7 @@ import rtc_fw_check as r                           # noqa: E402
 REL_HW = "RaspberryPi4/Board/hw_clock.pi4"
 REL_WC = "Anvil/Core/wallclock.pbi"
 REL_HAL = "Anvil/Hal/hal.pbi"
+REL_ABI = "Anvil/Hal/abi.pbi"
 INCLUDES = ["RaspberryPi4/Lib/timer.pi4", REL_WC, r.REL_MBX, r.REL_LIB, REL_HW]
 HAL_NAMES = ("#HW_CLK_UNSET", "#HW_CLK_RESTORED", "#HW_CLK_RTC", "#HW_CLK_GNSS")
 REC = 0x2800000
@@ -50,14 +52,23 @@ RTC_EPOCH = 1790000000            # 2026-09-21 14:13:20 UTC
 def driver(override):
     hal = d.source(REL_HAL, override)
     consts = "\n".join("%s = %d" % (n, d.const_in(hal, n, REL_HAL)) for n in HAL_NAMES)
+    abi = d.source(REL_ABI, override)
+    clock_slots=[]
+    for name in ('SvcClockProv','SvcUtc','SvcClockProvenance','SvcClockUncertaintyMs','SvcUtcLastSyncTicks'):
+        found=re.search(r'^Procedure\.i '+name+r'\(.*?^EndProcedure',abi,re.M|re.S)
+        if not found:d.die('missing shared clock slot '+name)
+        clock_slots.append(found.group())
     return ("; hw_clock_check driver - generated\n" + consts + "\n" +
             "".join('XIncludeFile "%s"\n' % i for i in INCLUDES) +
+            'XIncludeFile "Anvil/Hal/service_errors.pbi"\n' +
+            "#CAP_RTC=1\nGlobal gSvcDetail.i\n" + "\n".join(clock_slots) + "\n" +
             "Global gate_never.i\n"
             "If gate_never = 1\n"
             "  MailboxInit() : HwClockSeed() : HwClockSeedResult() : HwClockProvenance()\n"
             "  HwClockUtc(0) : HwClockUncertaintyMs() : HwClockLastSyncTicks()\n"
             "  HwClockNotifyGnss(0) : HwClockRtcRaw() : WallClockSource() : WallClockTrusted()\n"
             "  WallClockSourceText() : WallClockSet(0, 0) : WallClockClear() : WallClockRtcAdmit(0)\n"
+            "  SvcUtc(0) : SvcClockProvenance() : SvcClockUncertaintyMs() : SvcUtcLastSyncTicks()\n"
             "EndIf\n")
 
 
@@ -96,7 +107,7 @@ def gate(cc, override, workdir):
     # --- a good RTC, seeded lazily by the first question -------------------
     m, vc, call = machine(RTC_EPOCH)
     m.poke(REC, b"\xAA" * 28)
-    prov = call("HwClockUtc", REC)
+    prov = call("SvcUtc", REC)
     check(prov == H["#HW_CLK_RTC"], "provenance %d, want #HW_CLK_RTC" % prov)
     check(len(vc.messages) == 1 and vc.messages[0][2] == (r.REG_TIME, 0),
           "the lazy seed was not one GET_RTC_REG {0,0}: %r" % vc.messages)
@@ -108,9 +119,9 @@ def gate(cc, override, workdir):
     check(call("WallClockSource") == W["#WALLCLOCK_SRC_RTC"], "wall clock source is not RTC")
     check(call("WallClockTrusted") == 1, "an RTC time is not trusted")
     check("RTC" in m.cstr(call("WallClockSourceText")), "source text does not name the RTC")
-    check(call("HwClockProvenance") == H["#HW_CLK_RTC"] and len(vc.messages) == 1,
+    check(call("SvcClockProvenance") == H["#HW_CLK_RTC"] and len(vc.messages) == 1,
           "the lazy seed ran more than once")
-    check(call("HwClockUncertaintyMs") == -1 and call("HwClockLastSyncTicks") == -1,
+    check(call("SvcClockUncertaintyMs") == -1 and call("SvcUtcLastSyncTicks") == -1,
           "an uncertainty or sync time was invented")
     check(call("HwClockNotifyGnss", REC) == 0, "a GNSS fix was accepted on a board without GNSS")
 
@@ -119,31 +130,36 @@ def gate(cc, override, workdir):
     check(call("WallClockSource") == W["#WALLCLOCK_SRC_RTC"] and
           call("WallClockTrusted") == 0, "revocation lost provenance or retained trust")
     m.poke(REC, b"\xAA" * 28)
-    check(call("HwClockUtc", REC) == H["#HW_CLK_UNSET"] and record(m) == [0] * 7,
+    check(call("SvcUtc", REC) == H["#HW_CLK_UNSET"] and record(m) == [0] * 7,
           "revoked RTC still exposed a usable HAL UTC record")
     check(call("WallClockRtcAdmit", 1) == 1 and
-          call("HwClockUtc", REC) == H["#HW_CLK_RTC"] and len(vc.messages) == 1,
+          call("SvcUtc", REC) == H["#HW_CLK_RTC"] and len(vc.messages) == 1,
           "re-admission did not restore the retained RTC anchor")
 
     # --- boot order: TimeBoot's RESTORED after the seed downgrades it -------
     check(call("WallClockSet", 1780000000, W["#WALLCLOCK_SRC_RESTORED"]) == 1, "restore refused")
-    check(call("HwClockProvenance") == H["#HW_CLK_RESTORED"], "RESTORED not reported as a floor")
-    check(call("HwClockSeed") == S["#HWCLK_SEED_OK"] and call("HwClockProvenance") == H["#HW_CLK_RTC"],
+    check(call("SvcClockProvenance") == H["#HW_CLK_RESTORED"], "RESTORED not reported as a floor")
+    check(call("HwClockSeed") == S["#HWCLK_SEED_OK"] and call("SvcClockProvenance") == H["#HW_CLK_RTC"],
           "a seed after the restore did not win")
 
     # --- flat battery: 1970 + uptime is refused by name ---------------------
     m, vc, call = machine(4321)
     m.poke(REC, b"\xAA" * 28)
-    check(call("HwClockUtc", REC) == H["#HW_CLK_UNSET"], "a 1970 RTC produced a time")
+    check(call("SvcUtc", REC) == H["#HW_CLK_UNSET"], "a 1970 RTC produced a time")
     check(record(m) == [0] * 7, "the record was not zeroed when there is no time")
     check(call("HwClockSeedResult") == S["#HWCLK_SEED_FLOOR"], "a flat battery was not named FLOOR")
     check(call("WallClockSource") == W["#WALLCLOCK_SRC_NONE"], "a 1970 RTC anchored the wall clock")
     check(call("HwClockRtcRaw") == 4321, "the raw reading was not kept")
+    # The backend itself also promises zeroing; the shared slot's own
+    # pre-clear must not hide a broken direct-provider contract in this gate.
+    m.poke(REC, b"\xAA" * 28)
+    check(call("HwClockUtc", REC) == H["#HW_CLK_UNSET"] and record(m) == [0] * 7,
+          "the direct provider did not zero an unavailable record")
 
     # --- firmware that does not answer -------------------------------------
     m, vc, call = machine(RTC_EPOCH)
     vc.fault = "error"
-    check(call("HwClockProvenance") == H["#HW_CLK_UNSET"], "a failed mailbox produced a provenance")
+    check(call("SvcClockProvenance") == H["#HW_CLK_UNSET"], "a failed mailbox produced a provenance")
     check(call("HwClockSeedResult") == S["#HWCLK_SEED_MAILBOX"], "a failed mailbox was not named")
     return checks[0]
 
