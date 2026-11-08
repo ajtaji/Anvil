@@ -2,9 +2,46 @@
 
 The counted Zentaji board now boots Anvil through the machine ROM and owned
 supervisor startup. It uses the shared command loop, serial console, clock,
-settings and FAT32/exFAT storage code. Ordinary PMFBOOT applications now load
-from files or memory and return. Service-table integration and self-hosted Forge
+settings and FAT32/exFAT storage code. Ordinary and service-backed PMFBOOT
+applications load from files or memory and return. Hardware text output mirrors
+serial on admitted display profiles; keyboard/mouse input and self-hosted Forge
 remain unfinished. The shared monitor owns scheduler and command policy.
+
+## Native text output
+
+`Board/text.pbi` uses the machine's text PUTC, CLEAR and hardware scrolling.
+The console decodes its UTF-8 byte stream to BMP cells; unsupported supplementary
+characters and malformed completed sequences render the replacement character.
+Serial receives the original bytes. Message diversion happens before either
+transport, so background messages retain the shared routing policy.
+
+Before loading settings or admitting payloads, `Board/memory.pbi` reserves a
+page-rounded cell extent below the supervisor stack. Its size is the largest
+grid over every advertised mode and every hardware font. The complete extent
+is initialised, including cells that later mode/font changes can expose. The
+memory HAL reports it as owned and removes it from the payload/staging window.
+This boot-time decision is immutable. A profile with no usable grid or insufficient
+RAM for both text and the existing 4KB staging minimum retains serial output.
+
+Services retain the resident text/display owner. Ordinary payloads receive both
+disabled and must return them quiescent; Anvil refuses to overwrite a live
+foreign layer or display. Changed resident ownership fails with 0x5B05 rather
+than resuming a false prompt. Text mode does not claim the pixel graphics
+capability or change the service table. Native keyboard/mouse input and the
+application-facing text interface are separate remaining work.
+
+```text
+python tools/zentaji_text_check.py --compiler <Forge executable> --zen-tools <tools/zentaji directory>
+python tools/zentaji_monitor_check.py --zen-tools <tools/zentaji directory>
+python tools/zentaji_boot_check.py --compiler <Forge executable> --zen-tools <tools/zentaji directory> --native-text --case text
+```
+
+The component proof executes the actual compiled console and memory HAL, with
+independent expected cells, protection and guard checks, native/twin CPU/RAM
+comparison and headless frame hashes. It covers UTF-8/controls/scroll, retained
+mode/font growth, release/reacquisition, ownership refusals and serial fallback.
+The monitor and boot checks use the counted ROM-loaded product. No visible host
+window or physical input proof is implied.
 
 `Board/clock.pbi` supplies `Ticks()` from the CPU's TIME register and `TickHz()`
 from the timer device's read-only frequency. `Board/prompt_idle.pbi` selects the

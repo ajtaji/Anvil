@@ -22,11 +22,16 @@ trusting the returned application stack. SvcReturn itself still returns ENOSYS
 when returns-to-monitor was declared, or EFLAG otherwise.
 
 For service-backed applications Anvil retains serial, idle timer and selected
-storage ownership. Services are synchronous, with one caller and no callbacks
+storage ownership, plus native text/display ownership when admitted at boot.
+Services are synchronous, with one caller and no callbacks
 into the application. Applications must use services instead of reconfiguring
 these devices. Return checks owned timer/interrupt/serial/storage state before
-resuming the prompt; unsafe recovery fail-stops. Ordinary applications without
-services retain their separate release/reacquire policy. This is a trusted
+resuming the prompt; native text/display changes fail-stop with 0x5B05.
+Ordinary applications without services release the text layer and display output,
+then must return both disabled with interrupts disabled. Anvil checks that state
+before reacquiring and clearing its protected text buffer. The reservation stays
+outside all payload/staging windows throughout either kind of application.
+This is a trusted
 supervisor ABI, not isolation from malicious code or arbitrary DMA recovery.
 
 The board provides shared lifecycle/error/capability, monotonic time, SHA-256,
@@ -35,7 +40,10 @@ return and failed admission close them. Unsupported services retain their
 existing ENOCAP/ENOSYS policy and every reserved slot is nonzero. No graphics,
 normalized input, network, spare UART, GPIO, I2C, SPI, parallel jobs, entropy or
 module provider is installed. Serial port 0 remains the monitor console; a
-pixel-console or spare-UART capability is not invented for it. UTC/provenance slots read the RTC
+hardware text mirror renders monitor output on admitted display profiles. Text
+does not advertise the arbitrary-pixel CAP_CONSOLE API, add service slots or
+provide native keyboard/mouse input. A versioned application text/input interface
+and the self-hosted editor/compiler remain future work. UTC/provenance slots read the RTC
 through the declared hardware capability. Each UTC record uses a single latched
 seconds/nanoseconds sample and contains seven 32-bit fields, including truncated
 milliseconds. Manual time/timezone changes affect the monitor software clock;

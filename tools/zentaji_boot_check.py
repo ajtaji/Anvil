@@ -16,6 +16,7 @@ ROOT=Path(__file__).resolve().parents[1]
 
 def main():
     ap=argparse.ArgumentParser(description=__doc__);ap.add_argument('--compiler');ap.add_argument('--zen-tools',type=Path,required=True);ap.add_argument('--case');ap.add_argument('--only',choices=['valid','services','ordinary','all'],default='all')
+    ap.add_argument('--native-text',action='store_true',help='admit hardware text and its ownership cases')
     a=ap.parse_args();cc=resolve_compiler(a.compiler);zt=a.zen_tools.resolve();sys.path.insert(0,str(zt))
     import zen_interp as I
     import zen_lockstep_check as L
@@ -61,6 +62,10 @@ def main():
         def altered(offset,value,fmt='<I'):
             pmf=bytearray(valid);struct.pack_into(fmt,pmf,offset,value);return bytes(pmf)
         cases=[('file-repeat',valid,['boot APP.PMF','boot APP.PMF','ls','halt'],2,0,None),('memory',valid,['load APP.PMF','boot mem %X'%stage,'halt'],1,0,None)]
+        if a.native_text:
+            text_bad=compile('PokeQ($FFFF0000001A0040,1)')
+            service_text_bad=compile('PokeQ($FFFF0000001A0048,0)',services=True)
+            cases += [('text-file-repeat',valid,['boot APP.PMF','boot APP.PMF','halt'],2,0,None),('services-text-repeat',service,['boot APP.PMF','boot APP.PMF','halt'],2,0,None),('text-live-return',text_bad,['boot APP.PMF'],1,0x5B05,None),('services-text-cells',service_text_bad,['boot APP.PMF'],1,0x5B05,None)]
         if a.only in ('all','services','ordinary'):
             cases += [('conflicting-arguments',altered(56,6),['boot APP.PMF','halt'],0,0,b'Only one is possible'),('services-repeat',service,['time set 1794009600','time zone fixed:+05:30','boot APP.PMF','boot APP.PMF','ls','halt'],2,0,None),('services-timer',service_timer,['boot APP.PMF'],1,0x5B02,None),('services-disk',service_disk,['boot APP.PMF'],1,0x5B03,None),('foreign-isa',altered(96,1),['boot APP.PMF','halt'],0,0,b'architecture ID'),('foreign-target',altered(100,99),['boot APP.PMF','halt'],0,0,b'target ID'),('stack-outside',altered(104,0x900000,'<Q'),['boot APP.PMF','halt'],0,0,b'not in a payload stack window'),('entry-alignment',altered(24,load+1,'<Q'),['boot APP.PMF','halt'],0,0,b'not aligned for this CPU'),('monitor-overlap',altered(16,0x1000,'<Q'),['boot APP.PMF','halt'],0,0,b'monitor'),('truncated',valid[:-1],['boot APP.PMF','halt'],0,0,b'file on the'),('digest-mismatch',valid[:-1]+bytes([valid[-1]^1]),['boot APP.PMF','halt'],0,0,b'SHA-256'),('timer-return',timer_bad,['boot APP.PMF'],1,0x5B02,None),('foreign-disk-return',disk_bad,['boot APP.PMF'],1,0x5B03,None)]
             v1=bytearray(valid[:96]);struct.pack_into('<II',v1,8,1,96)
@@ -74,7 +79,8 @@ def main():
             if a.case and a.case not in name:continue
             medium=E.build(4096);E.seed_file(medium,pmf,'APP.PMF');boot=zexpack.disk_image(image);assert len(boot)<=4096*512
             medium[:64]=boot[:64];medium[4096:len(boot)]=boot[4096:]
-            m=I.Machine(ram_size=8<<20,cores=2,disks={15:(bytearray(medium),False)},display_modes=[(1,1,60000)]);m.power_on(1,15)
+            modes=[(320,160,60000),(640,480,60000)] if a.native_text else [(1,1,60000)]
+            m=I.Machine(ram_size=8<<20,cores=2,disks={15:(bytearray(medium),False)},display_modes=modes);m.power_on(1,15)
             m.ram[load:load+len(valid)-128]=b'\xA5'*(len(valid)-128)
             if name=='memory-short-header':m.ram[(8<<20)-96:]=valid[:96]
             if name=='memory-short-body':m.ram[(8<<20)-256:(8<<20)-128]=valid[:128]
@@ -87,6 +93,8 @@ def main():
             scheduled=[]
             def operator(core):
                 if len(scheduled)>=len(commands) or bytes(m.serial[0].out).count(b'pmf> ')<=len(scheduled):return
+                if a.native_text:
+                    assert m.text.layer==1 and m.display.ctrl==1 and m.text.err==0,(name,m.text.layer,m.display.ctrl,m.text.err)
                 tick=max(m.time,core.cr[I.CR['CYCLE']])+100
                 line=[(tick,b) for b in (commands[len(scheduled)]+'\r').encode()];scheduled.append(line);m.serial[0].incoming.extend(line)
             m.on_slice=operator;m.run(30000000);m.on_slice=None;c=m.cores[0]

@@ -41,7 +41,7 @@ def main():
         return p.stdout
     with tempfile.TemporaryDirectory(prefix='anvil-production-zen-') as tmp:
         td=Path(tmp)
-        for diskboot in (True,False):
+        for diskboot,native_text in ((True,False),(False,False),(False,True)):
             if diskboot:
                 medium=E.build(4096);E.seed_file(medium,expected)
                 boot=zexpack.disk_image(image);assert len(boot)<=4096*512
@@ -51,11 +51,21 @@ def main():
             else:
                 medium=None;disks={};files=[['anvil.zex',bytearray(image),False]]
                 commands=['version full','map','halt']
-            m=I.Machine(ram_size=8<<20,cores=2,disks=disks,hostfiles=files,display_modes=[(1,1,60000)]);m.power_on(int(diskboot),15 if diskboot else 0)
+            modes=[(320,160,60000),(640,480,60000)] if native_text else [(1,1,60000)]
+            m=I.Machine(ram_size=8<<20,cores=2,disks=disks,hostfiles=files,display_modes=modes);m.power_on(int(diskboot),15 if diskboot else 0)
             assert not L.capture(m,str(td));cfg=td/'machine.txt';cfg.write_text(cfg.read_text().replace('disk-memory ','disk '),encoding='utf-8')
-            scheduled=[];starts=[]
+            scheduled=[];starts=[];frames=[];advance=m.display.advance
+            def observe(t):
+                advance(t);frames.append('FRAME %d %08X'%(m.display.vsyncs,m.display.crc()))
+            m.display.advance=observe
             def operator(core):
                 if len(scheduled)>=len(commands) or bytes(m.serial[0].out).count(b'pmf> ')<=len(scheduled):return
+                if native_text:
+                    assert m.text.layer==1 and m.display.ctrl==1 and m.text.err==0
+                    assert m.text.cells==(8<<20)-(1<<20)-65536-12288
+                    cells=bytes(m.ram[m.text.cells:m.text.cells+m.text.cols*m.text.rows*4])
+                    text=''.join(chr(int.from_bytes(cells[n:n+2],'little')) for n in range(0,len(cells),4))
+                    assert 'pmf> ' in text,repr(text)
                 tick=max(m.time,core.cr[I.CR['CYCLE']])+100;starts.append(tick)
                 line=[(tick,b) for b in (commands[len(scheduled)]+'\r').encode()]
                 scheduled.append(line);m.serial[0].incoming.extend(line)
@@ -66,6 +76,10 @@ def main():
                     for tick,byte in line:stream.write('serial 0 $%X %02X\n'%(tick,byte))
             out=run([L.EXE,cfg,'--max','30000000','--ram',td/'final.bin']);assert ' exit=0 ' in out,out[-1800:]
             assert (td/'final.bin').read_bytes()==m.ram
+            if native_text:
+                assert frames and m.text.layer==0 and m.display.ctrl==0
+                shown=run([zt/'zenwin.exe',cfg,'--headless','--max','30000000'])
+                assert [line for line in shown.splitlines() if line.startswith('FRAME ')]==frames
             state=next(s[6:] for s in out.splitlines() if s.startswith('STATE '));assert state.split(' ',1)[1]==L.state_line(m,0,-1).split(' ',1)[1]
             output=bytes(m.serial[0].out)
             for phrase in (('build %d date '%version).encode(),b'64-bit Zentaji',b'Zentaji supervisor mode',b'No image CRC is claimed',b'THE MEMORY MAP',b'Anvil stopped.'):
@@ -84,7 +98,7 @@ def main():
             else:
                 assert b'no configured version-1 block device' in output
                 assert bytes(m.hostfile.files[0][1])==image==(td/'hf0.bin').read_bytes()
-                print('PASS published build%d ROM hostfile: no disk, honest storage refusal, usable loop/version/map/halt, full native/twin state/RAM and unchanged boot file'%version,flush=True)
+                print('PASS published build%d ROM hostfile: no disk, honest storage refusal, usable loop/version/map/halt, full native/twin state/RAM and unchanged boot file'%version+('; protected native text prompt and exact headless frames' if native_text else ''),flush=True)
 
 
 if __name__=='__main__':main()

@@ -1,8 +1,8 @@
 ; Zentaji serial/storage monitor composition. The ROM loads the owned startup
 ; envelope; Main receives its validated table/source/context, never ARM registers.
-#ANVIL_BUILD = 10 ; pmf:build
+#ANVIL_BUILD = 12 ; pmf:build
 #ANVIL_BUILD_DATE = 20261108 ; pmf:builddate
-#ANVIL_BUILD_TIME = 034053 ; pmf:buildtime
+#ANVIL_BUILD_TIME = 043809 ; pmf:buildtime
 #CAP_TOUCH=0
 #CAP_PWM=0
 #CAP_NET=0
@@ -128,6 +128,8 @@ Procedure.i Main(table.i,source.i,context.i)
   ProcedureReturn 1
  EndIf
  If table<>PeekQ(context+#ZEN_BOOT_TABLE) Or source<>PeekQ(context+#ZEN_BOOT_SOURCE) : ProcedureReturn 1 : EndIf
+ ; Text admission is optional on small profiles; serial remains available.
+ ZentajiMemoryTextInit(table)
  ; This board owns core0's timer/IRQ routing. No other core is started here.
  PokeQ(#ZEN_IDLE_INTC+$120,3) : PokeQ(#ZEN_IDLE_INTC+$220,3)
  PokeQ(#ZEN_IDLE_INTC+$228,1) : PokeQ(#ZEN_IDLE_INTC+$F008,514)
@@ -155,6 +157,7 @@ Procedure.i Main(table.i,source.i,context.i)
  PrintN("Type help for the available commands.")
  AnvilCommandLoop()
  PrintN("Anvil stopped.") : UartDrain()
+ If ZentajiTextRelease()=0 : ZentajiPayloadRecoveryFailed($5B05,"Monitor exit failed (0x5B05): native text or display ownership changed.") : EndIf
  If ZentajiPromptIdleRelease()=0 : ProcedureReturn 4 : EndIf
  UartOff()
  ProcedureReturn 0

@@ -3,6 +3,7 @@
 ; Background-message routing is shared monitor policy above the transport.
 XIncludeFile "Zentaji/Board/prompt_idle.pbi"
 XIncludeFile "Anvil/Core/console_messages.pbi"
+XIncludeFile "Zentaji/Board/text.pbi"
 #ZEN_CONSOLE = $FFFF000000100000
 #ZEN_CONSOLE_POLLS = 4096
 Global zenConsoleUp.i=0
@@ -63,6 +64,7 @@ EndProcedure
 
 Procedure UartWrite(c.i)
   If UartMessageActive()<>0 : UartMessagePut(c) : ProcedureReturn : EndIf
+  ZentajiTextByte(c)
   If ZentajiConsolePut(c)=0 : zenConsoleDropped=zenConsoleDropped+1 : EndIf
 EndProcedure
 
