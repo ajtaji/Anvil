@@ -74,3 +74,16 @@ bytes preserved. Its historical folder name does not impose an ARM ABI: it
 calls the composition's PrintChar procedure and contains no assembly or register
 access. PROVENANCE records the source revision/hash and requires the file, so
 PMF_ROOT can keep all guest runtime resolution inside the standalone checkout.
+
+
+## Clock provenance across architectures
+
+`Anvil/Core/wallclock.pbi` uses only the monotonic `Ticks()`/`TickHz()` seam.
+Hardware RTC provenance is admitted by a board through `WallClockRtcAdmit(1)`
+after validating its provider. It starts disabled and can be revoked with 0;
+revocation removes RTC trust without erasing the inspected anchor. Its HAL UTC
+record is withheld and zeroed until re-admission. The Pi5
+backend performs registration after its range/floor checks. Shared clock policy
+does not require `#PMF_CHIP`, and a new architecture must not impersonate an ARM
+chip to include it. This registration is a provider contract, not a hardware
+probe or automatic assertion that a virtual RTC holds correct civil time.

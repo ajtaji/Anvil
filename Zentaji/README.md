@@ -275,3 +275,52 @@ initialization) and a bounded one-million-instruction allowance. The native tool
 must include the ROM queue-reset fix. This closes boot-disk reuse; it does not link the complete monitor/storage
 composition. Durable writable backing is covered separately by the persistence
 and actual driver checks.
+
+
+## Shared file services and portable clock policy
+
+```text
+python tools/zentaji_storage_check.py --compiler <Forge executable> --zen-tools <tools/zentaji directory>
+```
+
+This composes the complete unchanged FAT32, exFAT, filesystem dispatch and
+HwFile/HwDir libraries with the actual Zentaji queue driver, supervisor startup,
+HAL vocabulary, console and portable wall clock. The executed volume is FAT32;
+exFAT is compiled and participates in detection/fallback, but an actual exFAT
+volume remains a separate proof. The fixture assigns the documented mounted,
+writable and writer values after mounting; it does not introduce a second file
+implementation or claim a production board composition.
+
+The guest creates a file, reads sequential and random offsets, shrinks it,
+creates a folder, renames into a long path, grows the file, creates/removes an
+empty folder and deletes another file. It verifies writer disarming, read-only
+admission without disk submission, not-found, cross-volume rename refusal and
+refused partition switching while a file is open. Directory enumeration and
+allocation/root walks use their real APIs and callbacks. Each write uses an
+ordinary persistent host disk binding. Full native/twin state and RAM and the
+host image match. An independent byte-level oracle checks MBR/BPB, both FATs,
+LFN ordering/checksum, dot links, exact file bytes, six reachable allocations
+without leaks, FSInfo free count, clean status and the UTC write timestamp.
+This is a component proof, not the complete monitor, a ROM-launched file command
+or physical power-loss test.
+
+The shared wall clock now admits RTC provenance through
+`WallClockRtcAdmit(0|1)`, explicitly controlled by a validated hardware provider.
+All compositions start with RTC admission off. Revocation makes an existing RTC
+anchor untrusted while retaining its value/provenance for inspection. Manual and
+SNTP provenance remain independent. Init/Clear do not unregister hardware. The
+Pi5 provider registers after validating its RTC reading; the shared core no
+longer selects RTC policy by ARM chip ID. The Zentaji fixture exercises admission,
+invalid registration and revocation as policy tests; it does not claim to seed
+wall time from a validated Zentaji RTC. `HwMicros()` now derives bounded signed
+microseconds from hardware TIME/TIME_HZ for shared services and profiling, with
+checked arithmetic; the fixture checks it against independent tick brackets.
+
+The compiler prerequisites are natural scalar record alignment and static
+DataSection integer/fixed-text tables, including ordinary `?label` addresses.
+They preserve the shared libraries' table definitions. Large generated assembly
+uses a linear line reader and dense source metadata; all original include paths,
+lines and hashes remain represented in instruction maps. General managed strings,
+compound record fields, floating Data and Read/Restore remain distinct compiler
+work. Board storage lifecycle, actual exFAT execution and full monitor/command
+composition remain unfinished.

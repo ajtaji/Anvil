@@ -30,15 +30,9 @@ EnableExplicit
 #WALLCLOCK_SRC_MANUAL   = 1
 #WALLCLOCK_SRC_RESTORED = 2
 #WALLCLOCK_SRC_SNTP  = 3
-; A battery-backed real-time clock said so. BCM2712 (Pi 5) only: its
-; firmware RTC (RaspberryPi4/Lib/rtc_fw.pi4) is the only RTC any Anvil
-; board has. Every line that ADMITS this source sits under
-; CompilerIf #PMF_CHIP = 2712, so every other target's image is the one
-; it was before the constant existed (the constant alone emits nothing).
-; It is TRUSTED - a clock that kept counting through power-off is a
-; time, not the RESTORED floor - but it is not SNTP: WallClockSourceText
-; names it, and the seeder (RaspberryPi4/Board/hw_clock.pi4) refuses any
-; reading below #WALLCLOCK_EPOCH_MIN, which is what a flat battery gives.
+; A registered hardware RTC provider said so. Architecture and board identity
+; do not establish provenance. The board validates its RTC and explicitly calls
+; WallClockRtcAdmit(1) before seeding this source; all compositions start denied.
 #WALLCLOCK_SRC_RTC   = 4
 
 #WALLCLOCK_ZONE_UTC     = 0
@@ -103,6 +97,7 @@ Global wallclock_lastStep.i   = 0     ; seconds the last set moved the clock by
 Global wallclock_zone.i       = 0     ; local offset from UTC, in seconds
 Global wallclock_zoneSet.i    = 0     ; distinguishes default UTC from configured UTC
 Global wallclock_zoneMode.i   = #WALLCLOCK_ZONE_UTC
+Global wallclock_rtcAdmitted.i = 0   ; hardware provider policy, not a CPU/chip id
 Global wallclock_err.i        = 0     ; #WALLCLOCK_ERR_*
 
 ; The broken-down date, filled by WallClockToCivil() and read through the six
@@ -268,22 +263,31 @@ EndProcedure
 ;  it says how wrong the old answer was, and therefore how wrong every
 ;  timestamp already written is.
 ; ----------------------------------------------------------------------
+; Board-owned RTC admission. Revocation immediately removes trust from an RTC
+; anchor, but retains its value/provenance for inspection. Init/Clear do not
+; unregister hardware. A manual or network anchor is independent of this flag.
+Procedure.i WallClockRtcAdmit(enabled.i)
+  If enabled<>0 And enabled<>1
+    wallclock_err=#WALLCLOCK_ERR_SOURCE : ProcedureReturn 0
+  EndIf
+  wallclock_rtcAdmitted=enabled
+  wallclock_err=#WALLCLOCK_ERR_NONE
+  ProcedureReturn 1
+EndProcedure
+
 Procedure.i WallClockSet(epoch.i, source.i)
   Define before.i
 
   wallclock_err = #WALLCLOCK_ERR_NONE
 
-  CompilerIf #PMF_CHIP = 2712
   If source < #WALLCLOCK_SRC_MANUAL Or source > #WALLCLOCK_SRC_RTC
     wallclock_err = #WALLCLOCK_ERR_SOURCE
     ProcedureReturn 0
   EndIf
-  CompilerElse
-  If source < #WALLCLOCK_SRC_MANUAL Or source > #WALLCLOCK_SRC_SNTP
+  If source=#WALLCLOCK_SRC_RTC And wallclock_rtcAdmitted=0
     wallclock_err = #WALLCLOCK_ERR_SOURCE
     ProcedureReturn 0
   EndIf
-  CompilerEndIf
   If epoch < #WALLCLOCK_EPOCH_MIN Or epoch >= #WALLCLOCK_EPOCH_MAX
     wallclock_err = #WALLCLOCK_ERR_RANGE
     ProcedureReturn 0
@@ -653,11 +657,9 @@ Procedure.i WallClockTrusted()
   If wallclock_src = #WALLCLOCK_SRC_MANUAL Or wallclock_src = #WALLCLOCK_SRC_SNTP
     ProcedureReturn 1
   EndIf
-  CompilerIf #PMF_CHIP = 2712
-  If wallclock_src = #WALLCLOCK_SRC_RTC
+  If wallclock_src = #WALLCLOCK_SRC_RTC And wallclock_rtcAdmitted<>0
     ProcedureReturn 1
   EndIf
-  CompilerEndIf
   ProcedureReturn 0
 EndProcedure
 
@@ -1363,11 +1365,10 @@ Procedure.i WallClockSourceText()
     Case #WALLCLOCK_SRC_SNTP
       ProcedureReturn "SNTP/network reply (not authenticated)"
   EndSelect
-  CompilerIf #PMF_CHIP = 2712
   If wallclock_src = #WALLCLOCK_SRC_RTC
-    ProcedureReturn "battery-backed RTC"
+    If wallclock_rtcAdmitted=0 : ProcedureReturn "RTC provider not admitted" : EndIf
+    ProcedureReturn "hardware RTC"
   EndIf
-  CompilerEndIf
   ProcedureReturn "never set"
 EndProcedure
 
@@ -1589,7 +1590,7 @@ Procedure.i WallClockErrorText()
     Case #WALLCLOCK_ERR_RANGE
       ProcedureReturn "Clock error 2: the time is outside 1980-01-01 through 2099-12-31; check the supplied date."
     Case #WALLCLOCK_ERR_SOURCE
-      ProcedureReturn "Clock error 3: the source is not manual, restored, or SNTP; check the source tag."
+      ProcedureReturn "Clock error 3: the source is invalid or its RTC provider is not registered; check the source tag and provider."
     Case #WALLCLOCK_ERR_CIVIL
       ProcedureReturn "Clock error 4: the civil fields do not name one unambiguous date and time; check the requested local time."
     Case #WALLCLOCK_ERR_NOT_SET

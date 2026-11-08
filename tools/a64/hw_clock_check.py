@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Desk gate: the Pi 5 HwClock* backend - RaspberryPi4/Board/hw_clock.pi4,
-the #PMF_CHIP = 2712 RTC source in Anvil/Core/wallclock.pbi, over
+the registered RTC source in Anvil/Core/wallclock.pbi, over
 RaspberryPi4/Lib/rtc_fw.pi4 and the real mailbox.pi4.
 
 The -t pi5 compiled code runs under tools/a64/a64_interp.py against the
@@ -57,7 +57,7 @@ def driver(override):
             "  MailboxInit() : HwClockSeed() : HwClockSeedResult() : HwClockProvenance()\n"
             "  HwClockUtc(0) : HwClockUncertaintyMs() : HwClockLastSyncTicks()\n"
             "  HwClockNotifyGnss(0) : HwClockRtcRaw() : WallClockSource() : WallClockTrusted()\n"
-            "  WallClockSourceText() : WallClockSet(0, 0) : WallClockClear()\n"
+            "  WallClockSourceText() : WallClockSet(0, 0) : WallClockClear() : WallClockRtcAdmit(0)\n"
             "EndIf\n")
 
 
@@ -114,6 +114,17 @@ def gate(cc, override, workdir):
           "an uncertainty or sync time was invented")
     check(call("HwClockNotifyGnss", REC) == 0, "a GNSS fix was accepted on a board without GNSS")
 
+    # Revoking a provider retains the inspected anchor but withholds HAL UTC.
+    check(call("WallClockRtcAdmit", 0) == 1, "RTC revocation refused")
+    check(call("WallClockSource") == W["#WALLCLOCK_SRC_RTC"] and
+          call("WallClockTrusted") == 0, "revocation lost provenance or retained trust")
+    m.poke(REC, b"\xAA" * 28)
+    check(call("HwClockUtc", REC) == H["#HW_CLK_UNSET"] and record(m) == [0] * 7,
+          "revoked RTC still exposed a usable HAL UTC record")
+    check(call("WallClockRtcAdmit", 1) == 1 and
+          call("HwClockUtc", REC) == H["#HW_CLK_RTC"] and len(vc.messages) == 1,
+          "re-admission did not restore the retained RTC anchor")
+
     # --- boot order: TimeBoot's RESTORED after the seed downgrades it -------
     check(call("WallClockSet", 1780000000, W["#WALLCLOCK_SRC_RESTORED"]) == 1, "restore refused")
     check(call("HwClockProvenance") == H["#HW_CLK_RESTORED"], "RESTORED not reported as a floor")
@@ -150,10 +161,10 @@ MUTATIONS = [
      "  If s = #WALLCLOCK_SRC_RESTORED\n    ProcedureReturn #HW_CLK_RESTORED", "  If s = 99\n    ProcedureReturn #HW_CLK_RESTORED"),
     (REL_HW, "an uncertainty invented", "Procedure.i HwClockUncertaintyMs()\n  ProcedureReturn -1",
      "Procedure.i HwClockUncertaintyMs()\n  ProcedureReturn 1000"),
-    (REL_WC, "2712 WallClockSet still stops at SNTP",
-     "  CompilerIf #PMF_CHIP = 2712\n  If source < #WALLCLOCK_SRC_MANUAL Or source > #WALLCLOCK_SRC_RTC",
-     "  CompilerIf #PMF_CHIP = 2712\n  If source < #WALLCLOCK_SRC_MANUAL Or source > #WALLCLOCK_SRC_SNTP"),
-    (REL_WC, "RTC not trusted", "  If wallclock_src = #WALLCLOCK_SRC_RTC\n    ProcedureReturn 1",
+    (REL_WC, "RTC source excluded from registration policy",
+     "  If source < #WALLCLOCK_SRC_MANUAL Or source > #WALLCLOCK_SRC_RTC",
+     "  If source < #WALLCLOCK_SRC_MANUAL Or source > #WALLCLOCK_SRC_SNTP"),
+    (REL_WC, "RTC not trusted", "  If wallclock_src = #WALLCLOCK_SRC_RTC And wallclock_rtcAdmitted<>0\n    ProcedureReturn 1",
      "  If wallclock_src = -7\n    ProcedureReturn 1"),
 ]
 

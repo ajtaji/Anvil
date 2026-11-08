@@ -12,3 +12,17 @@ EndProcedure
 Procedure.q TickHz()
   ProcedureReturn PeekQ(#ZEN_IDLE_TIMERS+$48)
 EndProcedure
+
+; Shared services use microseconds for bounded work, derived from hardware TIME.
+; Split seconds/remainder before scaling so normal long uptimes do not overflow.
+; A clock outside the signed service domain refuses with -1.
+Procedure.q HwMicros()
+ Protected ticks.q,hz.q,seconds.q,fraction.q,whole.q
+ hz=TickHz() : ticks=Ticks()
+ If hz<=0 Or hz>$7FFFFFFFFFFFFFFF/1000000 Or ticks<0 : ProcedureReturn -1 : EndIf
+ seconds=ticks/hz
+ If seconds>$7FFFFFFFFFFFFFFF/1000000 : ProcedureReturn -1 : EndIf
+ whole=seconds*1000000 : fraction=((ticks%hz)*1000000)/hz
+ If fraction>$7FFFFFFFFFFFFFFF-whole : ProcedureReturn -1 : EndIf
+ ProcedureReturn whole+fraction
+EndProcedure

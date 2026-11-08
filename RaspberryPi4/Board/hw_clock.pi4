@@ -75,6 +75,7 @@ Procedure.i HwClockSeed()
     hwclk_seed = #HWCLK_SEED_RANGE
     ProcedureReturn hwclk_seed
   EndIf
+  WallClockRtcAdmit(1) ; validated provider, registered independently of CPU identity
   If WallClockSet(t, #WALLCLOCK_SRC_RTC) = 0
     hwclk_seed = #HWCLK_SEED_RANGE
     ProcedureReturn hwclk_seed
@@ -100,6 +101,9 @@ Procedure.i HwClockProvenance()
   EndIf
   s = WallClockSource()
   If s = #WALLCLOCK_SRC_RTC
+    If WallClockTrusted() = 0
+      ProcedureReturn #HW_CLK_UNSET
+    EndIf
     ProcedureReturn #HW_CLK_RTC
   EndIf
   If s = #WALLCLOCK_SRC_RESTORED
