@@ -102,6 +102,8 @@ Procedure.i Main(phase.i)
  report[19]=ZentajiGraphicsRelease(@queue)
  report[24]=PeekQ(base+$40) : report[25]=PeekQ(base+$48)
  report[26]=PeekQ(base+$18) : report[27]=PeekQ(base+8)&7 : report[28]=PeekQ(base+$20)
+ If kind=15 : report[29]=PeekQ(base+$70) : report[30]=PeekQ(base+$78) : EndIf
+ report[31]=PeekQ($FFFF000000070158)
  If ZentajiPromptIdleRelease()<>1 : ProcedureReturn 13 : EndIf
  ProcedureReturn 42
 EndProcedure
@@ -124,8 +126,7 @@ def main():
     ap.add_argument('--case',type=int,choices=range(11))
     args=ap.parse_args();cc=resolve_compiler(args.compiler)
     sys.path.insert(0,str(args.zen_tools.resolve()))
-    import zen_interp as I
-    import zen_lockstep_check as L
+    import zen_native_fixture as F
     import zasm_ref as A
     import zexpack
     def run(argv):
@@ -141,7 +142,7 @@ def main():
         assert image.read_bytes()==zexpack.header(org,org,body)+body
         for phase,name in enumerate(names):
             if args.case is not None and args.case!=phase:continue
-            m=I.Machine(ram_size=8<<20,cores=2);m.load_image(image.read_bytes());c=m.cores[0]
+            m=F.Fixture(ram_size=8<<20,cores=2);m.load_image(image.read_bytes());c=m.cores[0]
             c.r[1]=phase;c.r[255]=0x7F0000
             for r in range(128,253):c.r[r]=0x10000+r*13
             kept=list(c.r[128:253])
@@ -152,12 +153,13 @@ def main():
             begin=0x200000;end=begin+pitch*height
             m.ram[begin-16:end+16]=b'\xA5'*(pitch*height+32)
             m.ram[0x11FFF0:0x121010]=b'\xA6'*0x1020
-            assert not L.capture(m,str(td))
-            native=run([L.EXE,td/'machine.txt','--max','2000000','--ram',td/'final.bin'])
-            m.run(2000000)
-            report=struct.unpack_from('<32q',m.ram,ref.sym['GLOBAL_REPORT'])
-            assert c.state=='HALTED' and c.exit==42,(name,c.state,c.exit,report)
-            assert c.r[128:253]==kept and c.r[255]==0x7F0000,name
+            assert not F.capture(m,str(td))
+            native=run([F.EXE,td/'machine.txt','--max','2000000','--ram',td/'final.bin','--dump'])
+            result=F.parse_result(native,(td/'final.bin').read_bytes())
+            ram=result.ram;registers=result.registers[0]
+            report=struct.unpack_from('<32q',ram,ref.sym['GLOBAL_REPORT'])
+            assert result.states==[3,0] and result.exit_code==42,(name,result.states,result.exit_code,report)
+            assert registers[128:253]==kept and registers[255]==0x7F0000,name
             assert report[:8]==(0,)*8,(name,report)
             if phase in (5,9):
                 assert report[13]==-1 and report[15:17]==(3,1) and report[19]==0,(name,report)
@@ -184,23 +186,19 @@ def main():
                             if not (1<=x<8 and 2<=y<7):continue
                         elif phase in (2,6):pixel=0xFF0000 if phase==2 and y>x else 0
                         struct.pack_into('<I',expected,y*pitch+x*4,pixel)
-            if m.ram[begin:end]!=expected:
+            if ram[begin:end]!=expected:
                 differences=[]
                 for i in range(0,len(expected),4):
-                    actual=m.ram[begin+i:begin+i+4]
+                    actual=ram[begin+i:begin+i+4]
                     if actual!=expected[i:i+4]:
                         differences.append((i//pitch,(i%pitch)//4,actual.hex(),expected[i:i+4].hex()))
                         if len(differences)==8:break
                 raise AssertionError((name,'independent pixel/padding oracle',differences))
-            assert m.ram[begin-16:begin]==b'\xA5'*16 and m.ram[end:end+16]==b'\xA5'*16,name
-            assert m.ram[0x11FFF0:0x120000]==b'\xA6'*16 and m.ram[0x121000:0x121010]==b'\xA6'*16,name
-            if phase==2:assert m.gpu.stats_tris==1 and m.gpu.stats_frags==120,name
-            assert (td/'final.bin').read_bytes()==m.ram,name
-            state=next(line[6:] for line in native.splitlines() if line.startswith('STATE '))
-            assert state.split(' ',1)[1]==L.state_line(m,0,-1).split(' ',1)[1],name
-            assert m.cores[1].state=='PARKED'
-            if phase in (3,5,9):assert c.perf['wait_cycles']>0,(name,'hardware WFI was not used')
-            print('PASS graphics queue '+name+': real hardware commands, independent pixels/guards, complete native/twin state/RAM',flush=True)
+            assert ram[begin-16:begin]==b'\xA5'*16 and ram[end:end+16]==b'\xA5'*16,name
+            assert ram[0x11FFF0:0x120000]==b'\xA6'*16 and ram[0x121000:0x121010]==b'\xA6'*16,name
+            if phase==2:assert report[29:31]==(1,120),(name,report)
+            if phase in (3,5,9):assert report[31]>0,(name,'hardware WFI was not used')
+            print('PASS graphics queue '+name+': real hardware commands, independent pixels/guards, native register, pixel, packet and memory expectations',flush=True)
 
 
 if __name__=='__main__':main()

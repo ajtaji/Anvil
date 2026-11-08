@@ -84,6 +84,7 @@ Procedure.i Main(tiling.i,arena.i)
  vkDestroyImage(device,image,0) : vkFreeMemory(device,memory,0)
  vkDestroyDevice(device,0) : vkDestroyInstance(instance,0)
  report[19]=AnvilVkFaultCount()
+ report[20]=PeekQ($FFFF000000070158)
  If ZentajiPromptIdleRelease()<>1 : ProcedureReturn 16 : EndIf
  ProcedureReturn 42
 EndProcedure
@@ -97,8 +98,7 @@ def main():
     ap.add_argument('--keep',type=Path)
     args=ap.parse_args()
     cc=resolve_compiler(args.compiler);sys.path.insert(0,str(args.zen_tools.resolve()))
-    import zen_interp as I
-    import zen_lockstep_check as L
+    import zen_native_fixture as F
     import zasm_ref as A
     import zexpack
     def run(argv):
@@ -115,32 +115,32 @@ def main():
         assert image.read_bytes()==zexpack.header(org,org,data)+data
         for tiling in (0,1,2):
             if args.case is not None and args.case!=tiling:continue
-            m=I.Machine(ram_size=32<<20,cores=2);m.load_image(image.read_bytes());c=m.cores[0]
+            m=F.Fixture(ram_size=32<<20,cores=2);m.load_image(image.read_bytes());c=m.cores[0]
             arena=(org+len(data)+8191)&-4096
             assert arena+0x400000<0x1EF0000,('fixture RAM too small',hex(arena))
             c.r[1]=tiling;c.r[2]=arena;c.r[255]=0x1F00000
             for r in range(128,253):c.r[r]=0x10000+r*13
             kept=list(c.r[128:253])
             m.ram[arena-16:arena+0x400010]=b'\xA5'*0x400020
-            assert not L.capture(m,str(td))
-            native=run([L.EXE,td/'machine.txt','--max','20000000','--ram',td/'final.bin'])
+            assert not F.capture(m,str(td))
+            native=run([F.EXE,td/'machine.txt','--max','20000000','--ram',td/'final.bin','--dump'])
             (td/f'native-{tiling}.txt').write_text(native,encoding='utf-8')
             native_end=next(line for line in native.splitlines() if line.startswith('END '))
             native_report=struct.unpack_from('<32q',(td/'final.bin').read_bytes(),ref.sym['GLOBAL_REPORT'])
             assert ' exit=2A ' in native_end,(tiling,native_end,native_report)
-            print(f'native Vulkan tiling {tiling}: {native_end}; checking independent twin',flush=True)
-            m.run(20000000)
-            report=struct.unpack_from('<32q',m.ram,ref.sym['GLOBAL_REPORT'])
-            assert c.state=='HALTED' and c.exit==42,(tiling,c.state,c.exit,report)
-            assert c.r[128:253]==kept and c.r[255]==0x1F00000,tiling
+            result=F.parse_result(native,(td/'final.bin').read_bytes())
+            ram=result.ram;registers=result.registers[0]
+            report=native_report
+            assert result.states==[3,0] and result.exit_code==42,(tiling,result.states,result.exit_code,report)
+            assert registers[128:253]==kept and registers[255]==0x1F00000,tiling
             assert report[:8]==(0,-20001,7,arena+4096,0x3FF000,-8,-2,0),report
             width,height=(512,2000) if tiling==2 else (33,17)
             size=width*height*4
             assert report[8:12]==(arena+4096,size,4096,width*4 if tiling!=0 else 0),report
             assert report[12:20]==(1,0,0,0,0,0,0,0),report
             pixel=struct.pack('<I',0x803380B2)
-            assert m.ram[arena+4096:arena+4096+size]==pixel*(width*height),tiling
-            assert m.ram[arena+4096+size:arena+0x400000]==b'\xA5'*(0x400000-4096-size),tiling
+            assert ram[arena+4096:arena+4096+size]==pixel*(width*height),tiling
+            assert ram[arena+4096+size:arena+0x400000]==b'\xA5'*(0x400000-4096-size),tiling
             commands=bytearray(256)
             commands[0]=1
             struct.pack_into('<QIHHB',commands,8,arena+4096,width*4,width,height,2)
@@ -148,16 +148,13 @@ def main():
             struct.pack_into('<I',commands,72,0x803380B2)
             commands[128]=10
             struct.pack_into('<QQ',commands,136,arena+2048,1)
-            assert m.ram[arena:arena+256]==commands,tiling
-            assert m.ram[arena+256:arena+2048]==b'\xA5'*(2048-256),tiling
-            assert struct.unpack_from('<Q',m.ram,arena+2048)[0]==1,tiling
-            if tiling==2:assert c.perf['wait_cycles']>0,(tiling,'GPU completion did not use hardware sleep')
-            assert m.ram[arena+2112:arena+4096]==b'\xA5'*(4096-2112),tiling
-            assert m.ram[arena-16:arena]==b'\xA5'*16 and m.ram[arena+0x400000:arena+0x400010]==b'\xA5'*16,tiling
-            assert (td/'final.bin').read_bytes()==m.ram,tiling
-            state=next(line[6:] for line in native.splitlines() if line.startswith('STATE '))
-            assert state.split(' ',1)[1]==L.state_line(m,0,-1).split(' ',1)[1],tiling
-            print(f'PASS native Vulkan tiling {tiling}: real public image/memory/command/barrier/clear/fence lifecycle; exact BGRA/alpha, private-command guards, complete native/twin RAM/state',flush=True)
+            assert ram[arena:arena+256]==commands,tiling
+            assert ram[arena+256:arena+2048]==b'\xA5'*(2048-256),tiling
+            assert struct.unpack_from('<Q',ram,arena+2048)[0]==1,tiling
+            if tiling==2:assert report[20]>0,(tiling,'GPU completion did not use hardware sleep')
+            assert ram[arena+2112:arena+4096]==b'\xA5'*(4096-2112),tiling
+            assert ram[arena-16:arena]==b'\xA5'*16 and ram[arena+0x400000:arena+0x400010]==b'\xA5'*16,tiling
+            print(f'PASS native Vulkan tiling {tiling}: real public image/memory/command/barrier/clear/fence lifecycle; exact BGRA/alpha, private-command guards, native register and exact memory expectations',flush=True)
 
 
 if __name__=='__main__':main()

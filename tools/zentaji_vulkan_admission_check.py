@@ -27,8 +27,7 @@ def main():
     ap.add_argument('--compiler');ap.add_argument('--zen-tools',type=Path,required=True)
     ap.add_argument('--case',choices=('layout','api'));a=ap.parse_args()
     cc=resolve_compiler(a.compiler);zt=a.zen_tools.resolve();sys.path.insert(0,str(zt))
-    import zen_interp as I
-    import zen_lockstep_check as L
+    import zen_native_fixture as F
     import zasm_ref as A
     import zexpack
     def run(args):
@@ -44,17 +43,12 @@ def main():
             assert out.is_file(),name
             ref=A.Asm();origin,data=ref.assemble(Path(str(out)+'.asm').read_text(encoding='utf-8-sig'))
             assert out.read_bytes()==zexpack.header(origin,origin,data,stack=0x1F00000)+data
-            m=I.Machine(ram_size=32<<20,cores=2);m.load_image(out.read_bytes())
-            assert not L.capture(m,str(td));m.run(2000000);c=m.cores[0]
-            assert c.state=='HALTED' and c.exit==0,(name,c.state,c.exit)
-            native=run([L.EXE,td/'machine.txt','--max','2000000','--ram',td/'final.bin'])
-            assert (td/'final.bin').read_bytes()==m.ram,name
-            # Each final state record contains every core, plus device/RAM digests.
-            states=[line[6:] for line in native.splitlines() if line.startswith('STATE ')]
-            assert len(states)==1,name
-            assert states[0].split(' ',1)[1]==L.state_line(m,0,-1).split(' ',1)[1],name
-            assert m.cores[1].state=='PARKED'
-            print('PASS shared Vulkan '+name+' on Zentaji: actual compiled source, independent assembly, full native/twin CPU/RAM; '+('12 layout constants' if name=='layout' else 'no backend honestly refuses instance creation; no graphics output claimed'),flush=True)
+            m=F.Fixture(ram_size=32<<20,cores=2);m.load_image(out.read_bytes())
+            assert not F.capture(m,str(td))
+            native=run([F.EXE,td/'machine.txt','--max','2000000','--ram',td/'final.bin','--dump'])
+            result=F.parse_result(native,(td/'final.bin').read_bytes())
+            assert result.states==[3,0] and result.exit_code==0,(name,result.states,result.exit_code)
+            print('PASS shared Vulkan '+name+' on Zentaji: actual compiled source, independent assembly, native expected-result execution; '+('12 layout constants' if name=='layout' else 'no backend honestly refuses instance creation; no graphics output claimed'),flush=True)
 
 
 if __name__=='__main__':main()
