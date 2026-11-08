@@ -28,7 +28,7 @@ def main() -> int:
     if result:
         print(f"rxbreak_emitted_check: FAIL assertion {result} after {steps:,} A64 instructions")
         return 1
-    print(f"rxbreak_emitted_check: PASS - 23 assertions, {steps:,} A64 instructions")
+    print(f"rxbreak_emitted_check: PASS - 34 assertions, {steps:,} A64 instructions")
     return 0
 
 

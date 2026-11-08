@@ -3,9 +3,8 @@
 ;
 ;  Emitted-code gate for the normalized input dispatcher and the shared
 ;  line editor. Anvil/Core/input_events.pbi and Anvil/Core/text_edit.pbi
-;  are compiled UNCHANGED and executed; only the three leaves they stand
-;  on are scripted here - the tick counter, the echo port, and the
-;  board global the CRLF de-duplicator lives in.
+;  are compiled UNCHANGED and executed. Clock, echo/UART and idle-readiness
+;  leaves are scripted; the CRLF state comes from its real shared owner.
 ;
 ;  Main() returns the number of the first failing assertion, or 0.
 ;
@@ -39,11 +38,8 @@ XIncludeFile "Anvil/Core/state.pbi"
 
 #CAP_PWM = 0
 
-; The board global the line editor's CRLF de-duplication lives in. On a
-; real board it is declared by the board's display globals; it is here
-; for the same reason the tick counter is, and it is deliberately NOT
-; reset between lines - see the CRLF scenario.
-Global gLastCR.i = 0
+XIncludeFile "Anvil/Core/input_byte_state.pbi"
+; Use the real shared CRLF state; keep it across command lines.
 
 Global gate_ticks.i = 0
 Procedure.i Ticks()
@@ -55,6 +51,7 @@ Procedure.i TickHz()
 EndProcedure
 Global gate_el.i = 3
 Global gate_wfe_count.i
+Global gate_idle_ready.i,gate_idle_enabled.i
 Procedure.i MmuEl()
   ProcedureReturn gate_el
 EndProcedure
@@ -62,6 +59,17 @@ Procedure GateWfe()
   gate_wfe_count=gate_wfe_count+1
 EndProcedure
 
+; The backend is a scripted leaf; the actual shared scheduler stays unchanged.
+Procedure.i HwPromptIdleReady()
+  ProcedureReturn Bool(gate_idle_ready<>0 And gate_idle_enabled<>0 And gate_el=3)
+EndProcedure
+Procedure HwPromptIdleWait() : GateWfe() : EndProcedure
+XIncludeFile "Anvil/Core/prompt_services.pbi"
+Procedure.i GatePromptInputs(operation.i)
+  If operation=#APS_CLAIM_LOCAL : NetConsoleClaimLocal() : EndIf
+  If operation=#APS_NET_INPUT : ProcedureReturn -1 : EndIf
+  ProcedureReturn 0
+EndProcedure
 ;@@PROMPT_SCHEDULER_GLOBALS@@
 
 Global Dim gate_uart.a[256]
@@ -452,7 +460,7 @@ Procedure.i GateNoSleepWithPendingInput()
   InputCancelAll(#AIC_QUEUE_FULL)
   If InputEventsPop(@ev[0])<>1 : ProcedureReturn 22 : EndIf
   If InputEventsQueued()<>0 : ProcedureReturn 21 : EndIf
-  anvil_promptWfeReady=1 : anvil_promptWfeEnabled=1
+  gate_idle_ready=1 : gate_idle_enabled=1
   AnvilSchedulerIdleIfSafe()
   If gate_wfe_count=0 : ProcedureReturn 20 : EndIf
   If gate_wfe_count<>1 : ProcedureReturn 2 : EndIf
@@ -470,7 +478,7 @@ Procedure.i GateNoSleepWithPendingInput()
   gate_el=2
   AnvilSchedulerIdleIfSafe()
   If gate_wfe_count<>1 : ProcedureReturn 7 : EndIf
-  anvil_promptWfeEnabled=0 : gate_el=3
+  gate_idle_enabled=0 : gate_el=3
   ProcedureReturn 0
 EndProcedure
 
@@ -506,6 +514,7 @@ EndProcedure
 ; ======================================================================
 
 Procedure.i Main()
+  If AnvilPromptInputsBind(@GatePromptInputs)<>1 : ProcedureReturn 900 : EndIf
   Define rc.i
   Define i.i
   Define gen.i

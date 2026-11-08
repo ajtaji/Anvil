@@ -38,7 +38,7 @@ def settings(medium):
 
 
 def main():
-    ap=argparse.ArgumentParser(description=__doc__);ap.add_argument('--compiler');ap.add_argument('--zen-tools',type=Path,required=True);a=ap.parse_args();cc=resolve_compiler(a.compiler);sys.path.insert(0,str(a.zen_tools.resolve()))
+    ap=argparse.ArgumentParser(description=__doc__);ap.add_argument('--compiler');ap.add_argument('--zen-tools',type=Path,required=True);ap.add_argument('--keyboard-cancel',action='store_true');a=ap.parse_args();cc=resolve_compiler(a.compiler);sys.path.insert(0,str(a.zen_tools.resolve()))
     import zen_interp as I
     import zen_lockstep_check as L
     import zexpack
@@ -59,7 +59,7 @@ def main():
         for name,commands,expected,cancel in phases:
             m=I.Machine(ram_size=8<<20,cores=2,disks={15:(bytearray(medium),False)},display_modes=[(1,1,60000)]);m.power_on(1,15)
             assert not L.capture(m,str(td));cfg=td/'machine.txt';cfg.write_text(cfg.read_text().replace('disk-memory ','disk '))
-            schedule=[];sent=0;cancelled=False;waits=0
+            schedule=[];key_schedule=[];sent=0;cancelled=False;waits=0
             def operator(core):
                 nonlocal sent,cancelled,waits
                 output=bytes(m.serial[0].out)
@@ -67,7 +67,12 @@ def main():
                 if announcing and core.state=='WAITING':waits+=1
                 tick=max(m.time,core.cr[I.CR['CYCLE']])+100
                 if cancel and announcing and not cancelled:
-                    line=[(tick,120)];schedule.extend(line);m.serial[0].incoming.extend(line);cancelled=True
+                    if a.keyboard_cancel:
+                        for fields in ((27,1,0,0,120),(27,0,0,0,0)):
+                            m.input_feed(tick,'key',*fields);key_schedule.append((tick,fields))
+                    else:
+                        line=[(tick,120)];schedule.extend(line);m.serial[0].incoming.extend(line)
+                    cancelled=True
                 if sent<len(commands) and output.count(b'pmf> ')>sent:
                     line=[(tick,b) for b in (commands[sent]+'\r').encode()];schedule.extend(line);m.serial[0].incoming.extend(line);sent+=1
             m.on_slice=operator;m.run(30000000);m.on_slice=None;c=m.cores[0];output=bytes(m.serial[0].out)
@@ -78,6 +83,7 @@ def main():
             if cancel:assert cancelled and b'Stopped by a keypress.' in output and b'counter was NOT touched' in output
             with cfg.open('a') as stream:
                 for tick,byte in schedule:stream.write('serial 0 $%X %02X\n'%(tick,byte))
+                for tick,fields in key_schedule:stream.write('key $%X %s\n'%(tick,' '.join(str(x) for x in fields)))
             out=run([L.EXE,cfg,'--max','30000000','--ram',td/'final.bin'])
             assert (td/'final.bin').read_bytes()==m.ram
             state=next(s[6:] for s in out.splitlines() if s.startswith('STATE '));assert state.split(' ',1)[1]==L.state_line(m,0,-1).split(' ',1)[1]
@@ -85,7 +91,7 @@ def main():
             medium=bytearray(m.disks[15].image);pairs=settings(medium)
             assert pairs['boot.file']=='APP.PMF' and pairs['boot.delay']=='1' and pairs['boot.maxfails']=='1'
             assert pairs.get('boot.fails','0')==('1' if name=='automatic-return' else '0'),(name,pairs)
-            print('PASS %s: real persisted settings/power-on ROM/boot policy, app calls=%d, countdown WFI slices=%d; independent on-disk counter and exact native/twin state/RAM/host medium'%(name,expected,waits),flush=True)
+            print('PASS %s: real persisted settings/power-on ROM/boot policy, app calls=%d, countdown WFI slices=%d; independent on-disk counter and exact native/twin state/RAM/host medium'%(name,expected,waits)+('; native keyboard cancellation' if cancel and a.keyboard_cancel else ''),flush=True)
 
 
 if __name__=='__main__':main()

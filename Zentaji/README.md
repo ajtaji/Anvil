@@ -4,8 +4,9 @@ The counted Zentaji board now boots Anvil through the machine ROM and owned
 supervisor startup. It uses the shared command loop, serial console, clock,
 settings and FAT32/exFAT storage code. Ordinary and service-backed PMFBOOT
 applications load from files or memory and return. Hardware text output mirrors
-serial on admitted display profiles; keyboard/mouse input and self-hosted Forge
-remain unfinished. The shared monitor owns scheduler and command policy.
+serial on admitted display profiles. Native keyboard/mouse input uses the shared
+event pipeline and resident service; self-hosted Forge remains unfinished. The
+shared monitor owns scheduler and command policy.
 
 ## Native text output
 
@@ -27,8 +28,8 @@ Services retain the resident text/display owner. Ordinary payloads receive both
 disabled and must return them quiescent; Anvil refuses to overwrite a live
 foreign layer or display. Changed resident ownership fails with 0x5B05 rather
 than resuming a false prompt. Text mode does not claim the pixel graphics
-capability or change the service table. Native keyboard/mouse input and the
-application-facing text interface are separate remaining work.
+capability or change the service table. The application-facing text interface
+is separate remaining work.
 
 ```text
 python tools/zentaji_text_check.py --compiler <Forge executable> --zen-tools <tools/zentaji directory>
@@ -42,6 +43,65 @@ comparison and headless frame hashes. It covers UTF-8/controls/scroll, retained
 mode/font growth, release/reacquisition, ownership refusals and serial fallback.
 The monitor and boot checks use the counted ROM-loaded product. No visible host
 window or physical input proof is implied.
+
+## Native keyboard and mouse
+
+`Board/input.pbi` owns one bounded drain of the machine's keyboard queue. It
+uses native HID usages and host-resolved characters, including the supplied
+auto-repeat marker. It adds no synthetic repeat timer or second keyboard layout.
+The prompt receives the existing normalized ASCII/navigation events. Keyboard
+events also cancel long commands and autoboot through the shared cancellation
+mux; releases and cancellation notices alone do not abort commands. Payload
+focus protects its event queue from that command consumer.
+The portable prompt accepts a distinct queued-event admission result, claims
+local ownership for accepted physical text/navigation, and skips byte translation
+for those already-normalized events. Num Lock changes close an old keypad
+navigation state before new text is admitted and preserve its matching release.
+
+The existing slot39 NativeInputApi1.0 provider is independent of graphics. It
+offers keyboard/mouse events, validated payload request buffers, monotonically
+owned contexts, focus generations and bounded nonblocking polling. Raw HID edges
+and typed events retain separate lanes; repeats add typed events without fake
+physical edges. Open, flush, overflow, close and payload return fence held state
+and stale queued input. Mouse positions clamp to current display pixels; the
+existing wire carries three buttons and signed16-bit wheel steps. Unicode text,
+side buttons and gamepads are not silently reinterpreted as that wire format.
+No gamepad state, rumble, capture mode or input interrupt enable is installed.
+
+Service payloads retain the hardware owner, with automatic NUI cleanup before
+the prompt resumes. Ordinary payloads receive it quiescent. A return that leaves
+mouse capture or input interrupts enabled halts with0x5B06; the monitor does not
+overwrite the foreign owner to appear recovered. Geometry changes produce one
+cancellation and require the client to close/reopen. The prompt continues using
+the qualified timer/WFI idle backend. Application polling remains nonblocking.
+
+```text
+python tools/zentaji_input_check.py --compiler <Forge executable> --zen-tools <tools/zentaji directory>
+python tools/zentaji_input_boot_check.py --compiler <Forge executable> --zen-tools <tools/zentaji directory>
+python tools/zentaji_autoboot_check.py --compiler <Forge executable> --zen-tools <tools/zentaji directory> --keyboard-cancel
+```
+
+The input component compiles the production backend, NUI/focus owners and
+cancellation code. Recorded device events prove exact typed/physical/pointer
+results, held fences, hardware overflow, quarantine recovery, geometry changes,
+explicit flush, bounded pumping and command cancellation, with complete
+native/twin CPU/RAM/device digests. The product checks boot separately compiled
+applications from disk through the ROM, real PMF/SHA loader and actual slot39;
+they also cover return with an input session open and unsafe hardware returns.
+The monitor check includes keyboard-only commands, caret editing, sleep
+cancellation and exact headless frames. Visible host input and Linux execution
+remain separate proofs.
+
+During ARM regression, the test interpreter's unsigned-offset load decoder was
+found treating LDRSW as a store. The compiler's emitted words were correct.
+The oracle now decodes both opc bits; raw-word sign/width/SP/ZR/alias/offset tests
+verify values and absence of memory writes, and reject the former store and a
+zero-extension defect. `tools/rxbreak_emitted_check.py` exercises normalized
+keyboard cancellation and payload-focus preservation using that repaired oracle.
+The editor regression gate now follows the shared touch/CRLF owners, portable
+prompt callbacks and scheduler, and the current payload-entry method. Its clock,
+echo and idle-readiness leaves remain scripted; the dispatcher/editor/accounting
+procedures are production code and their fault mutations remain required.
 
 `Board/clock.pbi` supplies `Ticks()` from the CPU's TIME register and `TickHz()`
 from the timer device's read-only frequency. `Board/prompt_idle.pbi` selects the

@@ -2,8 +2,8 @@
 """Compile and execute the production input dispatcher / line editor gate.
 
 The real Anvil/Core/input_events.pbi and Anvil/Core/text_edit.pbi are built
-and run; only the tick counter, the echo port and one board global are
-scripted. Eight mutants of the real sources must each be rejected, and a
+and run; the clock, echo/UART and idle-readiness leaves are scripted. The
+shared CRLF owner is included directly. Eight mutants of the real sources must each be rejected, and a
 set of source checks covers the seams the emitted gate cannot see (the
 contact-state vocabulary shared with the HAL, the single hardware drain,
 and the network console's local-claim asymmetry).
@@ -107,19 +107,18 @@ MUTATIONS = {
 # service that quietly moved would show up on a bench as a stalled protocol
 # months later.
 SERVICE_ORDER = [
-    "ScreenServiceTick",       # the prompt and the last command's output
-    "FanTick",                  # software PWM, kept ahead of idle service
-    "AnvilPromptAdmitUart",    # admit PL011 data before queue work
-    "InputEventsPop",          # deliver oldest already-accepted event
-    "NetConsoleClaimLocal",    # ... an ACCEPTED soft keystroke is local input
-    "KeyboardChar",
-    "NetConsoleClaimLocal",
-    "InputFeedByte",
-    "NetConsoleGetc",
-    "InputFeedByte",           # ... and a peer's byte claims nothing
+    "AnvilPromptService(#APS_SCREEN)", "AnvilPromptService(#APS_ATTACH)",
+    "AnvilPromptService(#APS_FAN)", "AnvilPromptAdmitUart()", "InputEventsPop(",
+    "AnvilPromptInput(#APS_CLAIM_LOCAL)", "AnvilPromptServiceOne()",
+    "AnvilPromptInput(#APS_KEYBOARD)", "AnvilPromptInput(#APS_CLAIM_LOCAL)",
+    "InputFeedByte(#AIS_PHYSICAL", "AnvilPromptServiceOne()",
+    "AnvilPromptInput(#APS_NET_INPUT)", "InputFeedByte(#AIS_NETWORK",
+    "AnvilPromptServiceOne()", "AnvilPromptServiceOne()", "AnvilSchedulerIdleIfSafe()",
 ]
+SERVICE_PATTERN = (r"AnvilPrompt(?:Service|Input)\(#APS_\w+\)|"
+                   r"AnvilPrompt(?:AdmitUart|Pump|ServiceOne)\(\)|InputEventsPop\(|"
+                   r"InputFeedByte\(#AIS_\w+|AnvilSchedulerIdleIfSafe\(\)")
 
-SERVICE_NAMES = set(SERVICE_ORDER)
 
 # THE PAYLOAD-ENTRY SEAM, ONE ROW PER BOARD. The file that holds RunAt, the
 # call inside it that actually hands the machine over, and the files a
@@ -130,7 +129,7 @@ SERVICE_NAMES = set(SERVICE_ORDER)
 # rather than for what they are called.
 PAYLOAD_ENTRY = {
     "ArduinoQ/Board/qstubs_q.unoq": (
-        "QCall(",
+        "PayloadEnter(",
         ("Anvil/Core/input_events.pbi",),
     ),
     "RaspberryPi4/Board/cache.pi4": (
@@ -148,16 +147,16 @@ PAYLOAD_ENTRY = {
 SOURCE_MUTATIONS = {
     "q_no_cancel": (
         "ArduinoQ/Board/qstubs_q.unoq",
-        "  InputPayloadSuspend()\n  QCall(a, 0, 0, 0, 0, 0)\n",
-        "  QCall(a, 0, 0, 0, 0, 0)\n",
+        "  InputPayloadSuspend()\n",
+        "",
         "ArduinoQ/Board/qstubs_q.unoq",
         "the UNO Q entering a payload with the input dispatcher still holding "
         "queued bytes and captures",
     ),
     "q_cancel_too_late": (
         "ArduinoQ/Board/qstubs_q.unoq",
-        "  InputPayloadSuspend()\n  QCall(a, 0, 0, 0, 0, 0)\n",
-        "  QCall(a, 0, 0, 0, 0, 0)\n  InputPayloadSuspend()\n",
+        ("  InputPayloadSuspend()\n", "  PayloadEnter(a)\n"),
+        ("", "  PayloadEnter(a)\n  InputPayloadSuspend()\n"),
         "ArduinoQ/Board/qstubs_q.unoq",
         "a cancellation moved to the far side of the jump, where it cancels "
         "nothing that was ever at risk",
@@ -306,7 +305,9 @@ def source_checks(override: dict[str, str] | None = None) -> list[str]:
         return read(rel)
 
     fails: list[str] = []
-    hal = rd("Anvil/Hal/hal.pbi")
+    hal = rd("Anvil/Hal/touch_event.pbi")
+    if 'XIncludeFile "Anvil/Hal/touch_event.pbi"' not in rd("Anvil/Hal/hal.pbi"):
+        fails.append("HAL no longer includes the shared touch-event contract")
     events = rd(EVENTS)
     hw_touch = rd("RaspberryPi4/Board/hw_touch.pi4")
     cursor = strip_comments(rd("RaspberryPi4/Board/cursor_input.pi4"))
@@ -325,7 +326,7 @@ def source_checks(override: dict[str, str] | None = None) -> list[str]:
         b = constant(events, ait_name)
         if a != b:
             fails.append(
-                f"{hal_name} is {a} in Anvil/Hal/hal.pbi but {ait_name} is {b} in "
+                f"{hal_name} is {a} in Anvil/Hal/touch_event.pbi but {ait_name} is {b} in "
                 f"{EVENTS}. RaspberryPi4/Board/cursor_input.pi4 copies the state "
                 f"straight across, so a finger going down would be reported as a "
                 f"different gesture entirely."
@@ -374,7 +375,7 @@ def source_checks(override: dict[str, str] | None = None) -> list[str]:
     #    keyboard.
     body = parse[parse.index("Procedure ReadLine()") : parse.index("EndProcedure", parse.index("Procedure ReadLine()"))]
     admission_source = procedure_body(parse, "AnvilPromptAdmitUart") or ""
-    claims = body.count("NetConsoleClaimLocal()") + admission_source.count("NetConsoleClaimLocal()")
+    claims = body.count("AnvilPromptInput(#APS_CLAIM_LOCAL)") + admission_source.count("AnvilPromptInput(#APS_CLAIM_LOCAL)")
     if claims != 3:
         fails.append(
             f"Anvil/Core/parse.pbi's ReadLine claims local console ownership "
@@ -382,14 +383,14 @@ def source_checks(override: dict[str, str] | None = None) -> list[str]:
             f"keyboard read, and an accepted soft keystroke - so that a byte from "
             f"the remote peer never displaces its own session."
         )
-    network = body[body.index("NetConsoleGetc()") :]
+    network = body[body.index("AnvilPromptInput(#APS_NET_INPUT)") :]
     if "InputFeedByte(#AIS_NETWORK" not in network:
         fails.append(
             "Anvil/Core/parse.pbi no longer tags the network console's bytes as "
             "network input, so the console's ownership rules cannot tell a remote "
             "byte from a local keystroke."
         )
-    if "NetConsoleClaimLocal()" in network:
+    if "AnvilPromptInput(#APS_CLAIM_LOCAL)" in network:
         fails.append(
             "Anvil/Core/parse.pbi claims LOCAL console ownership on a byte that "
             "came from the network peer, which would end the peer's own session on "
@@ -430,8 +431,7 @@ def source_checks(override: dict[str, str] | None = None) -> list[str]:
             )
 
     # 6. The service order.
-    calls = re.findall(r"\b([A-Z][A-Za-z0-9_]*)\s*\(", body)
-    seen = [c for c in calls if c in SERVICE_NAMES]
+    seen = re.findall(SERVICE_PATTERN, body)
     if seen != SERVICE_ORDER:
         fails.append(
             "Anvil/Core/parse.pbi's ReadLine no longer services the monitor in the "
@@ -494,12 +494,13 @@ def build(compiler: Path, work: Path, mutation: str = "") -> Path:
         )
     probe_text = probe.read_text(encoding="utf-8")
     parse_source = read("Anvil/Core/parse.pbi")
+    scheduler_source = read("Anvil/Core/prompt_scheduler.pbi")
     globals_marker = ";@@PROMPT_SCHEDULER_GLOBALS@@"
     idle_marker = ";@@PROMPT_IDLE_PROC@@"
     if probe_text.count(globals_marker) != 1 or probe_text.count(idle_marker) != 1:
         raise SystemExit("input editor gate: prompt-idle fixture marker missing/duplicated")
     scheduler_globals = "\n".join(
-        line for line in parse_source.splitlines()
+        line for line in scheduler_source.splitlines()
         if line.startswith("Global anvil_prompt")
     )
     probe_text = probe_text.replace(globals_marker, scheduler_globals)
@@ -513,22 +514,18 @@ def build(compiler: Path, work: Path, mutation: str = "") -> Path:
     # including the closing `)`; reuse it verbatim to preserve the signature.
     admission = "Procedure.i AnvilPromptAdmitUart(" + admission + "\nEndProcedure"
     probe_text = probe_text.replace(marker, admission)
-    account = procedure_body(parse_source, "AnvilSchedulerAccount")
-    idle = procedure_body(parse_source, "AnvilSchedulerIdleIfSafe")
-    cpu_whole = procedure_body(parse_source, "AnvilCpuUsagePercent")
-    cpu_hundredths = procedure_body(parse_source, "AnvilCpuUsageHundredths")
+    account = procedure_body(scheduler_source, "AnvilSchedulerAccount")
+    idle = procedure_body(scheduler_source, "AnvilSchedulerIdleIfSafe")
+    cpu_whole = procedure_body(scheduler_source, "AnvilCpuUsagePercent")
+    cpu_hundredths = procedure_body(scheduler_source, "AnvilCpuUsageHundredths")
     if account is None or idle is None or cpu_whole is None or cpu_hundredths is None:
         raise SystemExit("input editor gate: production prompt idle accounting/guard is missing")
     idle_proc = "Procedure.i AnvilCpuUsagePercent(" + cpu_whole + "\nEndProcedure\n\n"
     idle_proc += "Procedure.i AnvilCpuUsageHundredths(" + cpu_hundredths + "\nEndProcedure\n\n"
     idle_proc += "Procedure AnvilSchedulerAccount(" + account + "\nEndProcedure\n\n"
     idle_proc += "Procedure AnvilSchedulerIdleIfSafe(" + idle + "\nEndProcedure"
-    idle_proc, replaced = re.subn(
-        r"Asm\s+wfe\s+EndAsm", "GateWfe()", idle_proc, count=1,
-        flags=re.IGNORECASE,
-    )
-    if replaced != 1:
-        raise SystemExit("input editor gate: production idle WFE site changed unexpectedly")
+    if "HwPromptIdleReady()" not in idle_proc or "HwPromptIdleWait()" not in idle_proc:
+        raise SystemExit("input editor gate: portable idle backend seam is missing")
     probe.write_text(probe_text.replace(idle_marker, idle_proc), encoding="utf-8")
     command = [
         str(staged), "--compile",
@@ -581,13 +578,13 @@ def main() -> int:
     # nothing asked that question.
     for mutation, (rel, fixed, broken, board, why) in SOURCE_MUTATIONS.items():
         text = read(rel)
-        if text.count(fixed) != 1:
-            print(
-                f"input_editor_emitted_check: FAIL - the {mutation} site in {rel} "
-                f"has drifted, so the mutant would prove nothing."
-            )
+        replacements = list(zip(fixed, broken)) if isinstance(fixed, tuple) else [(fixed, broken)]
+        if any(text.count(old) != 1 for old, _ in replacements):
+            print(f"input_editor_emitted_check: FAIL - source mutant {mutation} site drifted in {rel}")
             return 1
-        caught = source_checks({rel: text.replace(fixed, broken, 1)})
+        for old, new in replacements:
+            text = text.replace(old, new, 1)
+        caught = source_checks({rel: text})
         if not any(sentence.startswith(board) for sentence in caught):
             print(
                 f"input_editor_emitted_check: FAIL - the {mutation} mutant ({why}) "

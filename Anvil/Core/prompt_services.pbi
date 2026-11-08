@@ -19,6 +19,10 @@
 #APS_TCP=15
 #APS_ERR_OPERATION=1
 #APS_ERR_ACTIVE=2
+; KEYBOARD result: 0 none, 1..255 transport byte, 256 accepted normalized
+; text/key-down events already queued. The latter claims local ownership but
+; must not be fed through the byte translator a second time.
+#APS_INPUT_QUEUED=256
 Global anvil_promptPumpBound.i
 Global anvil_promptPumpActive.i
 Global anvil_promptInputsBound.i

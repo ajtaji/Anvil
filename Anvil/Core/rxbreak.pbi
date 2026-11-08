@@ -1,4 +1,5 @@
 XIncludeFile "Anvil/Core/prompt_services.pbi"
+XIncludeFile "Anvil/Core/input_events.pbi"
 
 ; ======================================================================
 ;  Receive with a deadline.
@@ -137,10 +138,29 @@ EndProcedure
 ; OutBreak while servicing a network turn of its own.
 Procedure.i OutBreakByte()
   Define c.i
+  Define n.i
+  Dim event.q[4]
   If UartReadReady() <> 0
     c = UartRead()
     AnvilPromptInput(#APS_CLAIM_LOCAL)
     ProcedureReturn c
+  EndIf
+  ; Native producers may enqueue named/text events instead of returning a
+  ; transport byte. The command owner consumes them once; a resident payload
+  ; keeps its separate input focus and must not have its events stolen here.
+  If InputFocus()<>#AIF_PAYLOAD
+    c=AnvilPromptInput(#APS_KEYBOARD)
+    If c>0 And c<>#APS_INPUT_QUEUED : AnvilPromptInput(#APS_CLAIM_LOCAL) : ProcedureReturn c : EndIf
+    For n=1 To #AIE_QMAX
+      If InputEventsPop(@event[0])=0 : Break : EndIf
+      c=PeekL(@event[0]+#AIE_EV_KIND)
+      If c=#AIE_TEXT Or c=#AIE_KEY_DOWN
+        If PeekL(@event[0]+#AIE_EV_SRC)<>#AIS_NETWORK : AnvilPromptInput(#APS_CLAIM_LOCAL) : EndIf
+        If c=#AIE_TEXT : ProcedureReturn PeekL(@event[0]+#AIE_EV_CODE) : EndIf
+        If PeekL(@event[0]+#AIE_EV_CODE)=#AIK_CANCEL_COMMAND : ProcedureReturn 3 : EndIf
+        ProcedureReturn 0
+      EndIf
+    Next
   EndIf
   If gBreakNetPump = 0
     gBreakNetPump = 1

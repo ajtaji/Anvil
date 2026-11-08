@@ -27,6 +27,9 @@ Services are synchronous, with one caller and no callbacks
 into the application. Applications must use services instead of reconfiguring
 these devices. Return checks owned timer/interrupt/serial/storage state before
 resuming the prompt; native text/display changes fail-stop with 0x5B05.
+The keyboard/mouse owner is retained for services; return closes any open input
+session and fences held input. Foreign mouse capture or device interrupt enables
+fail-stop with 0x5B06 before that hardware is reused.
 Ordinary applications without services release the text layer and display output,
 then must return both disabled with interrupts disabled. Anvil checks that state
 before reacquiring and clearing its protected text buffer. The reservation stays
@@ -38,12 +41,22 @@ The board provides shared lifecycle/error/capability, monotonic time, SHA-256,
 settings and file/handle services. A new scope resets all eight file handles;
 return and failed admission close them. Unsupported services retain their
 existing ENOCAP/ENOSYS policy and every reserved slot is nonzero. No graphics,
-normalized input, network, spare UART, GPIO, I2C, SPI, parallel jobs, entropy or
+network, spare UART, GPIO, I2C, SPI, parallel jobs, entropy or
 module provider is installed. Serial port 0 remains the monitor console; a
 hardware text mirror renders monitor output on admitted display profiles. Text
-does not advertise the arbitrary-pixel CAP_CONSOLE API, add service slots or
-provide native keyboard/mouse input. A versioned application text/input interface
-and the self-hosted editor/compiler remain future work. UTC/provenance slots read the RTC
+does not advertise the arbitrary-pixel CAP_CONSOLE API or add service slots.
+Slot39 supplies the existing NativeInputApi1.0 protocol: keyboard and mouse,
+validated payload buffers, bounded nonblocking polling, focus generations,
+physical HID edges, ASCII text/navigation, three mouse buttons and wheel steps.
+Host-marked repeats produce typed events without synthetic repeats or duplicate
+physical down edges. Held keys/buttons are fenced at open/flush/return; queue
+overflow cancels rather than trusting lost releases. A geometry change emits a
+cancellation and requires close/reopen. Coordinates clamp to the display; wheel
+steps clamp to the existing signed16-bit wire range. Non-ASCII text and mouse
+side buttons do not silently change this existing ABI. Gamepad/rumble lanes are
+unclaimed. Ordinary payloads receive the input device quiescent and must restore
+uncaptured mode with device interrupts disabled. The application text interface
+and self-hosted editor/compiler remain future work. UTC/provenance slots read the RTC
 through the declared hardware capability. Each UTC record uses a single latched
 seconds/nanoseconds sample and contains seven 32-bit fields, including truncated
 milliseconds. Manual time/timezone changes affect the monitor software clock;

@@ -16,6 +16,8 @@ Global gate_pumpDepth.i
 Global gate_pumpMax.i
 Global gate_msgDepth.i         ; the message bracket, counted
 Global gate_pumpInMsg.i        ; pumps that ran inside one
+Global gate_keyboardByte.i
+Global gate_queuedInput.i
 
 ; Print/PrintN compiler hooks. The gate cares only about cancellation
 ; state, not the prose sent after an abort.
@@ -77,6 +79,27 @@ EndProcedure
 
 XIncludeFile "Anvil/Core/rxbreak.pbi"
 
+Procedure.i GatePromptInputs(operation.i)
+ Protected c.i
+ If operation=#APS_CLAIM_LOCAL : NetConsoleClaimLocal() : EndIf
+ If operation=#APS_NET_INPUT : ProcedureReturn NetConsoleGetc() : EndIf
+ If operation=#APS_KEYBOARD
+  If gate_queuedInput<>0
+   gate_queuedInput=0 : GateEvent(#AIE_TEXT,122) : ProcedureReturn #APS_INPUT_QUEUED
+  EndIf
+  c=gate_keyboardByte : gate_keyboardByte=0 : ProcedureReturn c
+ EndIf
+ ProcedureReturn 0
+EndProcedure
+Procedure.i GatePromptPump(operation.i)
+ NetConsolePump() : ProcedureReturn 0
+EndProcedure
+Procedure.i GateEvent(kind.i,code.i)
+ Dim ev.q[4]
+ InputEventInit(@ev[0],kind,#AIS_PHYSICAL,code,0)
+ ProcedureReturn InputEventsPush(@ev[0])
+EndProcedure
+
 Procedure GateResetSources()
   gate_uartReady = 0
   gate_netPending = 0
@@ -89,6 +112,10 @@ Procedure GateResetSources()
 EndProcedure
 
 Procedure.i Main()
+  Dim ev.q[4]
+  Define n.i
+  If AnvilPromptInputsBind(@GatePromptInputs)<>1 Or AnvilPromptPumpBind(@GatePromptPump)<>1 : ProcedureReturn 32 : EndIf
+  InputFocusSet(#AIF_COMMAND_LINE)
   GateResetSources()
   gToTicks = 0
   If RxTimeoutTicks() <> 2000 : ProcedureReturn 20 : EndIf
@@ -165,5 +192,29 @@ Procedure.i Main()
   If OutBreakCtrlC() <> 1 : ProcedureReturn 16 : EndIf
   If gate_pumpCalls <> 0 Or gate_netHave <> 0 : ProcedureReturn 17 : EndIf
   gBreakNetPump = 0
+  GateResetSources()
+  If GateEvent(#AIE_TEXT,100)<>0 Or InputEventsQueued()<>1 : ProcedureReturn 24 : EndIf
+  If OutBreakByte()<>100 Or gate_localClaims<>4 : ProcedureReturn 24 : EndIf
+  GateEvent(#AIE_KEY_DOWN,#AIK_ENTER)
+  If OutBreakByte()<>0 Or gate_localClaims<>5 : ProcedureReturn 25 : EndIf
+  GateEvent(#AIE_KEY_DOWN,#AIK_CANCEL_COMMAND)
+  If OutBreakByte()<>3 Or gate_localClaims<>6 : ProcedureReturn 26 : EndIf
+  GateEvent(#AIE_KEY_UP,#AIK_ENTER)
+  If OutBreakByte()<>-1 Or gate_localClaims<>6 : ProcedureReturn 27 : EndIf
+  InputFocusSet(#AIF_PAYLOAD) : GateEvent(#AIE_TEXT,97)
+  gate_keyboardByte=3
+  If OutBreakByte()<>-1 Or InputEventsQueued()<>2 Or gate_keyboardByte<>3 : ProcedureReturn 28 : EndIf
+  InputEventsPop(@ev[0])
+  If InputEventsPop(@ev[0])<>1 Or PeekL(@ev[0]+#AIE_EV_CODE)<>97 : ProcedureReturn 29 : EndIf
+  InputFocusSet(#AIF_COMMAND_LINE)
+  If OutBreakByte()<>3 Or gate_localClaims<>7 : ProcedureReturn 30 : EndIf
+  ; A full release-only queue is bounded and cannot abort a command.
+  For n=1 To #AIE_QMAX : InputEventsPop(@ev[0]) : Next
+  For n=1 To #AIE_QMAX : GateEvent(#AIE_KEY_UP,#AIK_ENTER) : Next
+  If OutBreakByte()<>-1 Or InputEventsQueued()<>0 : ProcedureReturn 31 : EndIf
+  gate_queuedInput=1
+  If OutBreakByte()<>122 Or InputEventsQueued()<>0 Or gate_localClaims<>8 : ProcedureReturn 33 : EndIf
+  InputEventInit(@ev[0],#AIE_TEXT,#AIS_NETWORK,121,0) : InputEventsPush(@ev[0])
+  If OutBreakByte()<>121 Or gate_localClaims<>8 : ProcedureReturn 34 : EndIf
   ProcedureReturn 0
 EndProcedure

@@ -63,6 +63,10 @@ Procedure.i HwPayloadRun(entry.i,argument.i,stack.i,stackBytes.i)
   PrintN("!! native text ownership is not ready; nothing was entered.")
   ProcedureReturn 0
  EndIf
+ If ZentajiInputHardwareOwned()=0
+  PrintN("!! native input ownership is not ready; nothing was entered.")
+  ProcedureReturn 0
+ EndIf
  If ShotArmed()<>0
   ShotTakeArm()
   PrintN("!! this Zentaji monitor has no frame-capture provider; nothing was entered.")
@@ -85,6 +89,7 @@ Procedure.i HwPayloadRun(entry.i,argument.i,stack.i,stackBytes.i)
  zenPayConfig=PeekQ(#ZEN_IDLE_INTC+$120) : zenPayRoute=PeekQ(#ZEN_IDLE_INTC+$220)
  zenPayRouteMask=PeekQ(#ZEN_IDLE_INTC+$228) : zenPayEnable=PeekQ(#ZEN_IDLE_INTC+$F008)
  zenPayThreshold=PeekQ(#ZEN_IDLE_INTC+$F010)
+ If ZentajiInputPayload(1,services)=0 : ZentajiPayloadRecoveryFailed($5B06,"Payload admission failed (0x5B06): native input ownership changed.") : EndIf
  If services=0
  If ZentajiTextRelease()=0 : ZentajiPayloadRecoveryFailed($5B05,"Payload admission failed (0x5B05): native text or display ownership changed.") : EndIf
  If ZentajiPromptIdleRelease()=0 : ZentajiPayloadRecoveryFailed($5B01,"Payload admission failed (0x5B01): monitor ownership could not be restored. Check storage, serial and timer state.") : EndIf
@@ -95,6 +100,7 @@ Procedure.i HwPayloadRun(entry.i,argument.i,stack.i,stackBytes.i)
  code=ZentajiPayloadLastError() : gGoRc=ZentajiPayloadReturnValue()
  ; The CPU boundary has restored owned SP/vectors/FP state with IE masked.
  ; Do not overwrite foreign live hardware to make recovery appear successful.
+ If ZentajiInputPayload(0,services)=0 : ZentajiPayloadRecoveryFailed($5B06,"Payload return failed (0x5B06): native input ownership changed. Release mouse capture and device interrupts before returning.") : EndIf
  If services=0
   If ZentajiTextResume()=0 : ZentajiPayloadRecoveryFailed($5B05,"Payload return failed (0x5B05): native text or display is still owned. Quiesce both devices before returning.") : EndIf
  Else

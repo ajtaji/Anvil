@@ -190,7 +190,7 @@ Procedure ReadLine()
     c = AnvilPromptInput(#APS_KEYBOARD)
     If c > 0
       AnvilPromptInput(#APS_CLAIM_LOCAL)
-      InputFeedByte(#AIS_PHYSICAL, c)
+      If c<>#APS_INPUT_QUEUED : InputFeedByte(#AIS_PHYSICAL, c) : EndIf
       inputBurst = inputBurst + 1
       If inputBurst >= 8
         inputBurst = 0

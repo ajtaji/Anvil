@@ -1544,13 +1544,25 @@ class A64:
         # the gate that came with this fix rebuilds every word from the
         # manual's own bit-field diagram instead of from either of them.
         if (ins & 0x3F000000) == 0x39000000:
-            size_code, load = (ins >> 30) & 3, (ins >> 22) & 1
+            size_code, opc = (ins >> 30) & 3, (ins >> 22) & 3
             size = 1 << size_code
+            # opc=10/11 are signed loads, not stores. Testing bit22 alone
+            # made LDRSW overwrite its source with the old destination value.
+            # ARM DDI0596: LDRSB/LDRSH opc10 -> X, opc11 -> W; LDRSW
+            # size10/opc10 -> X. size11/opc10 is PRFM, not a data access.
+            if size_code == 3 and opc == 2:
+                raise RuntimeError(f"unsupported PRFM unsigned offset at {here:#x}")
+            if opc == 3 and size_code >= 2:
+                raise RuntimeError(f"reserved integer load/store encoding 0x{ins:08X}")
             imm = ((ins >> 10) & 0xFFF) * size
             rn, rt = (ins >> 5) & 31, ins & 31
             addr = (self.sp if rn == 31 else self.x[rn]) + imm
-            if load: self.put(rt, self.load(addr, size), int(size == 8))
-            else: self.store(addr, self.reg(rt, int(size == 8)), size)
+            if opc == 0:
+                self.store(addr, self.reg(rt, int(size == 8)), size)
+            elif opc == 1:
+                self.put(rt, self.load(addr, size), int(size == 8))
+            else:
+                self.put(rt, sx(self.load(addr, size), size * 8), int(opc == 2))
             return
 
         # ADR.

@@ -1,8 +1,8 @@
 ; Zentaji serial/storage monitor composition. The ROM loads the owned startup
 ; envelope; Main receives its validated table/source/context, never ARM registers.
-#ANVIL_BUILD = 12 ; pmf:build
+#ANVIL_BUILD = 17 ; pmf:build
 #ANVIL_BUILD_DATE = 20261108 ; pmf:builddate
-#ANVIL_BUILD_TIME = 043809 ; pmf:buildtime
+#ANVIL_BUILD_TIME = 060512 ; pmf:buildtime
 #CAP_TOUCH=0
 #CAP_PWM=0
 #CAP_NET=0
@@ -57,6 +57,7 @@ XIncludeFile "Zentaji/Board/rtc_clock.pbi"
 XIncludeFile "Zentaji/Board/services.pbi"
 XIncludeFile "Anvil/Hal/abi_version.pbi"
 XIncludeFile "Anvil/Hal/abi.pbi"
+XIncludeFile "Zentaji/Board/input.pbi"
 XIncludeFile "Zentaji/Board/payload.pbi"
 XIncludeFile "Anvil/Core/pmfboot.pbi"
 XIncludeFile "Anvil/Core/bootfile_cmd.pbi"
@@ -72,6 +73,10 @@ Procedure ZentajiShellHelp()
  PrintN("PMF service-table applications are supported; raw run is not available.")
 EndProcedure
 Procedure.i HwCommandLoopHook(phase.i)
+ If phase=#ACMD_BEFORE_PROMPT
+  If ziInstalled<>0 And (ziUp=0 Or ZentajiInputHardwareOwned()=0) : ZentajiPayloadRecoveryFailed($5B06,"Prompt input failed (0x5B06): native input ownership changed.") : EndIf
+  ZentajiInputPromptResume()
+ EndIf
  If phase=#ACMD_AFTER_PROMPT : UartDrain() : EndIf
  If phase=#ACMD_AFTER_COMMAND And zenShellStop<>0 : ProcedureReturn 0 : EndIf
  ProcedureReturn 1
@@ -153,10 +158,12 @@ Procedure.i Main(table.i,source.i,context.i)
  EndIf
  If TimeBoot()=0 : UartWriteStr(TimeBootErrorText()) : PrintNl() : EndIf
  If ZentajiClockSeed()=0 : PrintN("RTC time is unavailable; the software clock keeps its existing source.") : EndIf
+ If ZentajiInputStart()=0 : PrintN("Native input is unavailable; serial input remains available.") : EndIf
  BootFileWait()
  PrintN("Type help for the available commands.")
  AnvilCommandLoop()
  PrintN("Anvil stopped.") : UartDrain()
+ If ZentajiInputPayload(1,0)=0 : ZentajiPayloadRecoveryFailed($5B06,"Monitor exit failed (0x5B06): native input ownership changed.") : EndIf
  If ZentajiTextRelease()=0 : ZentajiPayloadRecoveryFailed($5B05,"Monitor exit failed (0x5B05): native text or display ownership changed.") : EndIf
  If ZentajiPromptIdleRelease()=0 : ProcedureReturn 4 : EndIf
  UartOff()
