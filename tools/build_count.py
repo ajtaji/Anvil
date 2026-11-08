@@ -147,6 +147,7 @@ ROOT = Path(__file__).resolve().parents[1]
 # and a number bumped by all of them counts nothing (the compiler refuses that
 # by name, PMF-BLD-003).
 BOARDS = {
+    "zentaji": Path("Zentaji/Board/board.zentaji"),
     "pi3": Path("RaspberryPi3/Board/board.pi3"),
     "pi3-loader": Path("RaspberryPi3/Board/loader.pi3"),
     "pi3-updater": Path("RaspberryPi3/Board/updater.pi3"),

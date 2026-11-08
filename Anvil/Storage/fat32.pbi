@@ -6006,9 +6006,29 @@ Procedure.i fat_WalkEqual(a.i, b.i, bytes.i)
   ProcedureReturn 1
 EndProcedure
 
+; Concrete refusal signatures let a composition include this library without
+; installing traversal callbacks it does not use. No visitor is invented and
+; null public arguments retain their existing refusal before any I/O.
+Procedure.i fat_WalkRangeMissing(lba.i,blocks.i,context.i)
+ ProcedureReturn 0
+EndProcedure
+Procedure.i fat_WalkEntryMissing(*name,depth.i,lba.i,bytes.i,attr.i,context.i)
+ ProcedureReturn 0
+EndProcedure
+Procedure.i fat_WalkVisitRange(*callback,lba.i,blocks.i,context.i)
+ Protected *visitor=@fat_WalkRangeMissing
+ If *callback<>0 : *visitor=*callback : EndIf
+ ProcedureReturn visitor(lba,blocks,context)
+EndProcedure
+Procedure.i fat_WalkVisitEntry(*callback,*name,depth.i,lba.i,bytes.i,attr.i,context.i)
+ Protected *visitor=@fat_WalkEntryMissing
+ If *callback<>0 : *visitor=*callback : EndIf
+ ProcedureReturn visitor(*name,depth,lba,bytes,attr,context)
+EndProcedure
+
 Procedure.i fat_WalkRangeRefused(cluster.i)
   If fat_ClusterValid(cluster) = 0 : ProcedureReturn 1 : EndIf
-  ProcedureReturn Bool(fat_walkRange(fat_ClusterLba(cluster), FatBytesPerCluster() / 512, fat_walkContext) = 0)
+  ProcedureReturn Bool(fat_WalkVisitRange(*fat_walkRange, fat_ClusterLba(cluster), FatBytesPerCluster() / 512, fat_walkContext) = 0)
 EndProcedure
 
 Procedure.i fat_WalkRememberDir(cluster.i)
@@ -6146,7 +6166,7 @@ Procedure.i fat_WalkFiles()
                 Else
                   If bytes <> 0 And fat_ClusterValid(child) = 0 : ProcedureReturn 0 : EndIf
                   If (attr & $10) <> 0 And fat_ClusterValid(child) = 0 : ProcedureReturn 0 : EndIf
-                  owned = fat_walkEntry(p, depth, fat_ClusterLba(child), bytes, attr, fat_walkContext)
+                  owned = fat_WalkVisitEntry(*fat_walkEntry, p, depth, fat_ClusterLba(child), bytes, attr, fat_walkContext)
                   If owned = 0 : ProcedureReturn 0 : EndIf
                   If owned = 2
                     ; Only an already-validated regular file may be pruned.
@@ -6202,7 +6222,7 @@ Procedure.i FatWalkRoot(*rangeVisitor, context.i)
   cluster = FatRootCluster()
   For steps = 0 To 4095
     If fat_ClusterValid(cluster) = 0 : ProcedureReturn fat_Fail(#FAT_ERR_CHAINLOOP) : EndIf
-    If rangeVisitor(fat_ClusterLba(cluster), FatBytesPerCluster() / 512, context) = 0 : ProcedureReturn fat_Fail(#FAT_ERR_CHAINLOOP) : EndIf
+    If fat_WalkVisitRange(*rangeVisitor, fat_ClusterLba(cluster), FatBytesPerCluster() / 512, context) = 0 : ProcedureReturn fat_Fail(#FAT_ERR_CHAINLOOP) : EndIf
     following = fat_NextCluster(cluster)
     If following >= $0FFFFFF8 And following <= $0FFFFFFF : ProcedureReturn 1 : EndIf
     cluster = following

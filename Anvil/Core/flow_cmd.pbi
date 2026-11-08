@@ -153,13 +153,16 @@ Procedure CmdSleep()
     ; print that was cut short, and this is not printing anything. The
     ; byte is still EATEN, the same reason OutBreak eats it - otherwise
     ; the next ReadLine picks it up as a command nobody typed.
-    If UartReadReady() <> 0
-      UartRead()
+    If OutBreakByte() >= 0
       Print("Woke after about ")
       PrintDec((Ticks() - start) / hz)
       PrintN(" seconds, because a key was pressed.")
       ProcedureReturn
     EndIf
+    ; Service bounded work, then let the qualified backend wait on hardware.
+    ; Input and software-PWM admission are the same policy as the prompt.
+    AnvilPromptServiceOne()
+    AnvilSchedulerIdleIfSafe()
   Wend
 
   Print("Done - waited ")
@@ -323,7 +326,8 @@ Procedure PutIdLine()
   Print("PureMetal Forge - Anvil, the ")
   UartWriteStr(HwIdBoard())
   PrintN(" monitor. Version 2.0,")
-  PrintN("64-bit AArch64, running with no operating system underneath it.")
+  UartWriteStr(HwIdExecutionModel())
+  PrintN(", running with no operating system underneath it.")
 EndProcedure
 
 ; ----------------------------------------------------------------------
@@ -341,8 +345,7 @@ EndProcedure
 Procedure PutProcessorLine()
   Print("The processor is a ")
   UartWriteStr(HwIdCpu())
-  Print(" in AArch64 at exception level ")
-  PrintDec(HwIdEl())
+  HwIdSayProcessorMode()
   PrintN(".")
 EndProcedure
 
@@ -407,6 +410,12 @@ Procedure PutContentStamp(full.i)
   PutAddr(base + len - 1)
   PrintN(".")
   HwIdSayImageWhere()
+  If HwIdImageHashable()=0
+    PrintN("  This loaded image contains mutable runtime storage, so a file-equivalent")
+    PrintN("  content digest cannot be computed over that extent after startup.")
+    PrintN("  No image CRC is claimed; use the build artifact's recorded digest.")
+    ProcedureReturn
+  EndIf
 
   ; ------------------------------------------------------------------
   ;  THE DIGEST IS NOT COMPUTED UNLESS IT IS ASKED FOR, AND THAT WAS

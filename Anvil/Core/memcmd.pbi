@@ -2073,15 +2073,4 @@ EndProcedure
 ;  command whose whole output is the map is easier to read on a wire than
 ;  a section of a page of hardware prose.
 ; ----------------------------------------------------------------------
-Procedure CmdMap()
-  PrintN("THE MEMORY MAP, AS THIS IMAGE MEASURES IT")
-  PutMonitorMap()
-  PrintNl()
-  PrintN("Where a payload may go:")
-  PutWindows()
-  PrintN("  Nothing in this map is a constant this program was told. The")
-  PrintN("  monitor's extent is the size of the image the firmware loaded, and")
-  PrintN("  the low window begins above it, so both move when this program")
-  PrintN("  does. There is no maximum size.")
-  PrintN("ok")
-EndProcedure
+XIncludeFile "Anvil/Core/layout_cmd.pbi"

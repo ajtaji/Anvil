@@ -2997,3 +2997,11 @@ EndProcedure
 ;                             output/owner flush, input and command completion.
 ; These hooks implement board/session policy, not their own parser or loop.
 ; A stop after input must not dispatch a synthetic/deadman-completed line.
+
+
+; ARCHITECTURE-NEUTRAL IDENTITY PRESENTATION
+; HwIdExecutionModel()      address of the truthful width/ISA text fragment.
+; HwIdSayProcessorMode()    print the actual execution-context fragment.
+; HwIdImageHashable()       1 only when HwIdImageBase/Len is a file-equivalent
+;                          range after startup; 0 when it contains mutable data.
+; Core banner/version logic must not invent ARM exception levels for other ISAs.

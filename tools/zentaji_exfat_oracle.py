@@ -31,7 +31,7 @@ def build(part=1):
     return image
 
 
-def check(medium,initial,payload):
+def check(medium,initial,payload,epoch_min=1794009600,epoch_max=None):
     u16=lambda data,at:struct.unpack_from('<H',data,at)[0]
     u32=lambda data,at:struct.unpack_from('<I',data,at)[0]
     u64=lambda data,at:struct.unpack_from('<Q',data,at)[0]
@@ -94,9 +94,31 @@ def check(medium,initial,payload):
     actual={cl for cl in range(2,130) if bitmap[(cl-2)//8]&(1<<((cl-2)%8))}
     assert actual==allocated and len(allocated)==8,('bitmap leaks/crosslinks',actual,allocated)
     assert boot[112] in (len(actual)*100//128,255),'percent in use'
-    dt=datetime.datetime.fromtimestamp(1794009600,datetime.timezone.utc)
-    date=((dt.year-1980)<<9)|(dt.month<<5)|dt.day
-    time=(dt.hour<<11)|(dt.minute<<5)|(dt.second//2)
-    assert struct.unpack_from('<HH',file[5],12)==(time,date),'write timestamp'
+    if epoch_max is None:epoch_max=epoch_min
+    assert 0<=epoch_max-epoch_min<=60,'timestamp bracket is too wide'
+    packed=set()
+    for epoch in range(epoch_min,epoch_max+1):
+        dt=datetime.datetime.fromtimestamp(epoch,datetime.timezone.utc)
+        date=((dt.year-1980)<<9)|(dt.month<<5)|dt.day
+        time=(dt.hour<<11)|(dt.minute<<5)|(dt.second//2)
+        packed.add((time,date))
+    assert struct.unpack_from('<HH',file[5],12) in packed,'write timestamp'
     assert file[5][23]==0x80,'UTC offset validity'
     return 'exFAT boot sums/clean flags, preserved backup, entry-set/name hashes, upcase table, exact nested file, eight reachable bitmap allocations without leaks and independent UTC timestamp'
+
+
+def seed_file(image,payload,name='SEED.BIN'):
+    """Seed an independent contiguous file; the guest must use its file APIs."""
+    part=struct.unpack_from('<I',image,454)[0]
+    assert len(payload)==1800 and len(name)<=15
+    entries=bytearray(96);entries[0]=0x85;entries[1]=2
+    struct.pack_into('<H',entries,4,32)
+    entries[32]=0xc0;entries[33]=3;entries[35]=len(name)
+    struct.pack_into('<H',entries,36,checksum(name.upper().encode('utf-16le'),16))
+    struct.pack_into('<Q',entries,40,len(payload));struct.pack_into('<I',entries,52,5);struct.pack_into('<Q',entries,56,len(payload))
+    entries[64]=0xc1;entries[66:66+len(name)*2]=name.encode('utf-16le')
+    struct.pack_into('<H',entries,2,checksum(entries,16,(2,3)))
+    root=(part+28)*512;image[root+64:root+160]=entries
+    image[(part+26)*512]=127
+    image[part*512+112]=7*100//128
+    image[(part+29)*512:(part+29)*512+len(payload)]=payload

@@ -1,0 +1,131 @@
+; Zentaji serial/storage monitor composition. The ROM loads the owned startup
+; envelope; Main receives its validated table/source/context, never ARM registers.
+#ANVIL_BUILD = 1 ; pmf:build
+#ANVIL_BUILD_DATE = 20261108 ; pmf:builddate
+#ANVIL_BUILD_TIME = 011136 ; pmf:buildtime
+#CAP_TOUCH=0
+#CAP_PWM=0
+#CAP_NET=0
+#CAP_STORAGE=1
+XIncludeFile "Zentaji/Board/console.pbi"
+XIncludeFile "Anvil/Core/state.pbi"
+XIncludeFile "Anvil/Core/input_events.pbi"
+XIncludeFile "Anvil/Core/text_edit.pbi"
+Global gBootTicks.i
+Global zenShellStop.i
+XIncludeFile "Anvil/Core/messages.pbi"
+XIncludeFile "Anvil/Core/parse.pbi"
+XIncludeFile "Anvil/Core/rxbreak.pbi"
+XIncludeFile "Anvil/Hal/hal.pbi"
+XIncludeFile "Anvil/Core/format.pbi"
+XIncludeFile "Anvil/Kernel/Zentaji/boot_context.pbi"
+XIncludeFile "Zentaji/Board/memory.pbi"
+XIncludeFile "Anvil/Core/memrange.pbi"
+XIncludeFile "Anvil/Core/addrsafe.pbi"
+XIncludeFile "Anvil/Core/wallclock.pbi"
+XIncludeFile "Zentaji/Board/disk.pbi"
+XIncludeFile "Zentaji/Board/storage.pbi"
+XIncludeFile "Anvil/Core/settings.pbi"
+XIncludeFile "Anvil/Core/datapath.pbi"
+XIncludeFile "Anvil/Core/fs_cmd.pbi"
+XIncludeFile "Anvil/Core/argfmt.pbi"
+XIncludeFile "Anvil/Core/settings_cmd.pbi"
+XIncludeFile "Anvil/Core/time_cmd.pbi"
+XIncludeFile "Anvil/Core/crc.pbi"
+XIncludeFile "Zentaji/Board/identity.pbi"
+XIncludeFile "Anvil/Core/flow_cmd.pbi"
+XIncludeFile "Anvil/Core/layout_cmd.pbi"
+XIncludeFile "Anvil/Core/command_loop.pbi"
+
+Procedure ZentajiShellHelp()
+ PrintN("Anvil Zentaji commands:")
+ PrintN("  version [full], map, echo [-n] <words>, sleep <seconds>, messages")
+ PrintN("  mount, load, save, ls/dir, cat, mkdir, rmdir, rm/del, rename/mv")
+ PrintN("  settings, printenv, setenv, saveenv, env, setexpr, time, force")
+ PrintN("  halt                 cleanly release storage and stop this monitor")
+ PrintN("Applications and raw execution are not available in this composition yet.")
+EndProcedure
+Procedure.i HwCommandLoopHook(phase.i)
+ If phase=#ACMD_AFTER_PROMPT : UartDrain() : EndIf
+ If phase=#ACMD_AFTER_COMMAND And zenShellStop<>0 : ProcedureReturn 0 : EndIf
+ ProcedureReturn 1
+EndProcedure
+Procedure.i HwCommandDispatch(c.i)
+ If DispatchStorageCommand()<>0 : ProcedureReturn 1 : EndIf
+ If WordIs("help")<>0 Or WordIs("commands")<>0 Or LetterIs(104)<>0 Or LetterIs(63)<>0
+  ZentajiShellHelp()
+ ElseIf WordIs("version")<>0 Or WordIs("ver")<>0
+  CmdVersion()
+ ElseIf WordIs("map")<>0
+  CmdMap()
+ ElseIf WordIs("echo")<>0
+  CmdEcho()
+ ElseIf WordIs("sleep")<>0
+  CmdSleep()
+ ElseIf WordIs("messages")<>0
+  CmdMessages()
+ ElseIf WordIs("settings")<>0
+  CmdSettings()
+ ElseIf WordIs("printenv")<>0
+  CmdEnvPrint()
+ ElseIf WordIs("setenv")<>0
+  CmdEnvSet()
+ ElseIf WordIs("saveenv")<>0
+  CmdSettingsSave()
+ ElseIf WordIs("env")<>0
+  CmdEnv()
+ ElseIf WordIs("setexpr")<>0
+  CmdSetexpr()
+ ElseIf WordIs("time")<>0
+  CmdTime()
+ ElseIf WordIs("force")<>0
+  CmdForce()
+ ElseIf WordIs("halt")<>0
+  SkipSpace()
+  If gLine[gPos]<>0
+   PrintN("halt takes no arguments; the monitor is still running.")
+  ElseIf ZentajiStorageDown()=0
+   UartWriteStr(ZentajiStorageErrorText()) : PrintNl()
+  Else
+   zenShellStop=1
+  EndIf
+ Else
+  ProcedureReturn 0
+ EndIf
+ ProcedureReturn 1
+EndProcedure
+Procedure.i Main(table.i,source.i,context.i)
+ If ZentajiMemoryBind(context)<>1 : ProcedureReturn 1 : EndIf
+ If table<>PeekQ(context+#ZEN_BOOT_TABLE) Or source<>PeekQ(context+#ZEN_BOOT_SOURCE) : ProcedureReturn 1 : EndIf
+ ; This board owns core0's timer/IRQ routing. No other core is started here.
+ PokeQ(#ZEN_IDLE_INTC+$120,3) : PokeQ(#ZEN_IDLE_INTC+$220,3)
+ PokeQ(#ZEN_IDLE_INTC+$228,1) : PokeQ(#ZEN_IDLE_INTC+$F008,514)
+ If ZentajiPromptIdlePrepare(2000)<>1 Or UartAttach()<>1 : ProcedureReturn 2 : EndIf
+ gBootTicks=Ticks()
+ MessagesStart()
+ If WallClockInit()<>1 : ProcedureReturn 3 : EndIf
+ PutBuildIdLine(#ANVIL_BUILD,#ANVIL_BUILD_DATE,#ANVIL_BUILD_TIME)
+ PutIdLine() : PutProcessorLine()
+ ; A host-file ROM boot has no selected disk. It explicitly uses disk0;
+ ; a disk ROM boot keeps the exact selected instance from the valid context.
+ If source=1
+  ZentajiStorageFromBoot(context,1)
+ Else
+  ZentajiStorageConfigure(0,1)
+ EndIf
+ If HwStorageUp()<>0
+  If SettingsLoad()=0 And SettingsLastError()<>#SET_ERR_NO_FILE
+   UartWriteStr(SettingsErrorText()) : PrintNl()
+  EndIf
+ EndIf
+ If SettingsHas("boot.file")<>0
+  PrintN("The saved boot.file is not started: application loading is not available yet.")
+ EndIf
+ If TimeBoot()=0 : UartWriteStr(TimeBootErrorText()) : PrintNl() : EndIf
+ PrintN("Type help for the available commands.")
+ AnvilCommandLoop()
+ PrintN("Anvil stopped.") : UartDrain()
+ If ZentajiPromptIdleRelease()=0 : ProcedureReturn 4 : EndIf
+ UartOff()
+ ProcedureReturn 0
+EndProcedure

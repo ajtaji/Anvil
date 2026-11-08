@@ -1,9 +1,9 @@
 # Zentaji backend bring-up
 
-The machine has a real clock, bounded prompt-idle backend and serial console transport. This is not yet
-a full Anvil monitor image or a self-hosted Forge build. Component ROM boot
-proofs are described below.
-The shared monitor remains the source of scheduler and command policy.
+The counted Zentaji board now boots Anvil through the machine ROM and owned
+supervisor startup. It uses the shared command loop, serial console, clock,
+settings and FAT32/exFAT storage code. Application loading and self-hosted Forge
+remain unfinished. The shared monitor owns scheduler and command policy.
 
 `Board/clock.pbi` supplies `Ticks()` from the CPU's TIME register and `TickHz()`
 from the timer device's read-only frequency. `Board/prompt_idle.pbi` selects the
@@ -521,5 +521,74 @@ unknown words and 24-byte display cap, all hook phases in order, and stopping
 before the prompt or after input without dispatch or state preparation. The
 ROM file-command gate also passes using the shared step and its existing
 independent RAM/disk oracle. These are bounded component proofs. A counted
-production Zentaji board entry and the remaining command/payload integration are
+production Zentaji board entry is now available below; payload integration is
 still unfinished.
+
+
+## Counted Zentaji monitor image
+
+`Board/board.zentaji` is the production composition. Build it explicitly:
+
+```text
+python tools/build.py zentaji --compiler <Forge executable>
+```
+
+The usual board build reservation and ledger apply. Forge compiles the actual
+board with the Zentaji backend and callable entry; the external native ASM
+assembler wraps the owned supervisor startup. The six published files are
+`build/zentaji/anvil.zex`, its `.boot.json`, `.asm` and `.zmap`, plus
+`.compiled.zex` and `.compiled.asm`. Publication and build identity roll back
+together on failure. The experimental target is explicit; `all` retains its
+existing ARM target selection. The multi-target host Forge build is unchanged.
+
+The ROM loads this ZEX as the chosen Anvil bootloader. A disk boot adopts the
+exact selected disk from the validated context; a host-file boot explicitly
+tries disk0. Missing storage reports its real failure and leaves the prompt
+usable. Settings and the saved clock floor use the shared file implementation.
+`halt` requires successful storage shutdown before releasing the idle timer and
+serial attachment. Build1 requires at least 2,410,016 RAM bytes, as recorded in
+its boot metadata; use the 8 MiB profile for these checks.
+
+The command set includes version, map, echo, sleep, messages, file commands,
+settings/environment, time and force. Help lists the admitted commands.
+Applications, raw execution, display, touch and networking are not admitted by
+this board yet. A saved `boot.file` is reported without starting it. PMFBOOT's
+Zentaji application identity, entry/return and service ABI remain next work.
+
+Identity presentation is a HAL seam: ARM keeps its AArch64/exception-level
+report; Zentaji reports the actual CPU status and supervisor context. The shared
+map command uses the live image/stack/ROM boundaries without importing raw-run
+commands. Zentaji refuses a file-equivalent content CRC because the loaded
+image includes mutable runtime storage; its published artifacts and source map
+still have exact file hashes.
+
+The shared `sleep` command now services the prompt scheduler and calls the
+qualified idle backend while waiting, with real UART cancellation. On Zentaji
+that means bounded timer deadlines and WFI rather than a busy poll.
+
+```text
+python tools/zentaji_monitor_check.py --zen-tools <tools/zentaji directory>
+python tools/zentaji_monitor_live_check.py --zen-tools <tools/zentaji directory>
+python tools/zentaji_build_rollback_check.py --compiler <Forge executable>
+```
+
+These gates consume the counted published image. They verify source-map identity
+and independent assembly, ROM disk15 and host-file boot, actual version/layout,
+time/sleep and file commands, clean halt, full native/twin state and RAM, and an
+independent exFAT allocation/content/timestamp oracle. The host-file case has no
+disk and verifies honest storage refusal. The publication test performs a real
+second compile and injects a failure at the third artifact rename, requiring all
+six previous artifacts, the board stamp and ledger to survive byte-for-byte.
+
+The Windows headless live proof compares six-second sessions using `sleep 0`
+and `sleep 2`, including ROM startup, real timer wakes and halt. Both consumed
+0.15625 seconds of host CPU in this run; the incremental cost was below the host
+accounting resolution. Recorded clock/work samples replay exactly through the
+native emulator and independent twin. This is not a Linux or physical-input
+proof, nor instruction-cost calibration.
+
+The shared FAT32 walker also has typed refusal targets for absent callbacks;
+public null callbacks still refuse before disk I/O. Real callbacks retain their
+range, visit and prune results. The focused FAT driver check and writable FAT32
+storage lifecycle gate cover the actual compiled library; no board-specific
+dummy visitors are needed by the production composition.

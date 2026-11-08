@@ -26,6 +26,11 @@ from rockpi4c_image import wrap as wrap_rockpi4c_image  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 TARGETS = {
+    "zentaji": {
+        "source": Path("Zentaji/Board/board.zentaji"),
+        "output": Path("build/zentaji/anvil.zex"),
+        "args": ["--entry-returns"],
+    },
     "pi4": {
         "source": Path("RaspberryPi4/Board/board.pi4"),
         "output": Path("build/pi4/anvil.img"),
@@ -145,6 +150,9 @@ def _stage_output(output: Path, token: str, *, preserve_suffix: bool = False) ->
 def _compile_and_publish(compiler: str, target: str, source: Path,
                          output: Path, spec: dict) -> PublishedArtifacts:
     """Compile to private names, validate/pack, then reversibly publish."""
+    if target=="zentaji":
+        from zentaji_build import compile_and_publish
+        return compile_and_publish(compiler,source,output,root=ROOT,publication_factory=PublishedArtifacts)
     token = f"{os.getpid()}-{uuid.uuid4().hex}"
     staged_output = _stage_output(
         output, token, preserve_suffix="--armstub" in spec["args"]
@@ -399,7 +407,10 @@ def main() -> int:
     with tempfile.TemporaryDirectory(prefix="anvil-compiler-") as temporary:
         isolated_compiler = staged_compiler(compiler, Path(temporary))
         for target in selected:
-            build(isolated_compiler, target)
+            # Zentaji needs the original signed native assembler beside Forge;
+            # it has no host board-pin profile to isolate. ARM paths retain the
+            # existing explicit board-profile staging.
+            build(compiler if target=="zentaji" else isolated_compiler, target)
     return 0
 
 
