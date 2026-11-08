@@ -186,6 +186,7 @@
 XIncludeFile "Anvil/Hal/neon_service_api.pbi"
 XIncludeFile "Anvil/Hal/graphics_service.pbi"
 XIncludeFile "Anvil/Hal/input_service.pbi"
+XIncludeFile "Anvil/Hal/text_service.pbi"
 XIncludeFile "Anvil/Hal/random_service.pbi"
 
 #SVC_MAGIC       = $53564E41   ; 'ANVS' little-endian: bytes 41 4E 56 53
@@ -419,6 +420,7 @@ XIncludeFile "Anvil/Hal/service_errors.pbi"
 ; reserved, four used; entry_count rises 192 to 200.
 #SVC_BASE_FILEH   = 192
 #SVC_BASE_UDP     = 200
+#SVC_BASE_TEXT    = 208
 
 ; ======================================================================
 ;  THE TABLE ITSELF.
@@ -1003,6 +1005,22 @@ Procedure.i SvcNeonGraphics(op.i,context.i,request.i,bytes.i)
     gSvcDetail=0
   EndIf
   ProcedureReturn rc
+EndProcedure
+
+; Appended text group, slot208. A text grid does not claim pixel CAP_CONSOLE.
+Procedure.i SvcNativeText(op.i,context.i,request.i,bytes.i)
+ Define rc.i
+ If TextServiceAvailable()=0
+  gSvcDetail="this Anvil has no registered cell-text provider"
+  ProcedureReturn #SVC_ENOSYS
+ EndIf
+ rc=TextServiceCall(op,context,request,bytes)
+ If rc<0
+  gSvcDetail="the resident text provider refused the request; the returned status identifies the failure"
+ Else
+  gSvcDetail=0
+ EndIf
+ ProcedureReturn rc
 EndProcedure
 
 ; Slot39. The provider and its lifetime owner remain in the kernel.
@@ -2943,6 +2961,7 @@ Procedure BuildServiceTable()
   CompilerEndIf
   gSvcTab[#SVC_HDR_WORDS + #NEON_SERVICE_SLOT] = @SvcNeonGraphics
   gSvcTab[#SVC_HDR_WORDS + #NUI_SERVICE_SLOT] = @SvcNativeInput
+  gSvcTab[#SVC_HDR_WORDS + #NTX_SERVICE_SLOT] = @SvcNativeText
 
   ; --- touch, base 40 -------------------------------------------------
   gSvcTab[#SVC_HDR_WORDS + #SVC_BASE_TOUCH + 0] = @SvcTouchPoll

@@ -185,8 +185,8 @@ ABI_MAJOR = 1
 # IP layers had merged.  Neither moved an existing slot.  1.6 filled TLS (80..83, 87) and 1.7 the
 # file-handle group's directory-by-path slots (196, 197): minor bumps, nothing moved.
 # 1.8/1.9 filled graphics/input38/39;1.10 fills entropy175/176.
-ABI_MINOR = 15
-SLOT_COUNT = 208
+ABI_MINOR = 16
+SLOT_COUNT = 216
 HDR_BYTES = 16
 MAGIC = 0x53564E41              # 'ANVS'
 
@@ -209,9 +209,11 @@ GROUPS = [
     (184, "par",       8),
     (192, "fileh",     8),
     (200, "udp",       8),
+    (208, "text",      8),
 ]
 
 INSTALLED = {
+    208: "SvcNativeText",
     0: "SvcAbiMajor", 1: "SvcAbiMinor", 2: "SvcBoardId", 3: "SvcBoardName",
     4: "SvcCapGet", 5: "SvcRequireCap", 6: "SvcPet", 7: "SvcBootOk",
     8: "SvcReturn", 9: "SvcReboot", 10: "SvcMmuState", 11: "SvcUptimeUs",
@@ -435,7 +437,7 @@ def check_static() -> list[str]:
              "spi": "#SVC_BASE_SPI", "uart": "#SVC_BASE_UART",
              "veh": "#SVC_BASE_VEH", "gnss": "#SVC_BASE_GNSS",
              "crypto": "#SVC_BASE_CRYPTO", "par": "#SVC_BASE_PAR",
-             "fileh": "#SVC_BASE_FILEH", "udp": "#SVC_BASE_UDP"}
+             "fileh": "#SVC_BASE_FILEH", "udp": "#SVC_BASE_UDP", "text": "#SVC_BASE_TEXT"}
     for base, g, _res in GROUPS:
         if abi.get(names[g]) != base:
             fail(problems, f"{names[g]} is {abi.get(names[g])}, expected {base}")

@@ -38,9 +38,9 @@ def main():
             source='Procedure.q Main(argument.q)\nIf argument<>0 : ProcedureReturn $BAD : EndIf\nPokeQ($600000,PeekQ($600000)+1)\n'+damage+'\nProcedureReturn $1122334455667788\nEndProcedure\n'
             if services:
                 source='Procedure.q Main(table.i)\nProtected i.i,h.i,now.i\n'
-                source+='If PeekL(table)<>$53564E41 Or PeekL(table+4)<>1 Or PeekL(table+8)<15 Or PeekL(table+12)<>208 : ProcedureReturn $BAD01 : EndIf\n'
+                source+='If PeekL(table)<>$53564E41 Or PeekL(table+4)<>1 Or PeekL(table+8)<15 Or PeekL(table+12)<208 : ProcedureReturn $BAD01 : EndIf\n'
                 source+='For i=0 To 207\nIf PeekQ(table+16+i*8)=0 : ProcedureReturn $BAD02 : EndIf\nNext\n'
-                checks=[(0,[],1),(1,[],15),(2,[],5),(4,['0'],1),(4,['1'],0),(4,['16'],0),(10,[],0),(108,[],-101),(170,[],-100),(8,[],-100),(14,['15','0','0'],-100),(15,['15','0'],0),(176,[],-101),(18,[],2),(19,[],-1),(20,[],-1)]
+                checks=[(0,[],1),(1,[],16),(2,[],5),(4,['0'],1),(4,['1'],0),(4,['16'],0),(10,[],0),(108,[],-101),(170,[],-100),(8,[],-100),(14,['15','0','0'],-100),(15,['15','0'],0),(176,[],-101),(18,[],2),(19,[],-1),(20,[],-1)]
                 for code,(slot,args,want) in enumerate(checks,16):
                     source+='If CallFunctionFast(PeekQ(table+16+%d*8)%s)<>%d : ProcedureReturn $%X : EndIf\n'%(slot,(','+','.join(args)) if args else '',want,0xBAD00+code)
                 source+='now=CallFunctionFast(PeekQ(table+16+16*8))\nIf now<0 Or CallFunctionFast(PeekQ(table+16+16*8))<now : ProcedureReturn $BAD30 : EndIf\n'

@@ -14,7 +14,7 @@ ROOT=Path(__file__).resolve().parents[1]
 APP=r'''XIncludeFile "Anvil/Hal/input_service_api.pbi"
 Procedure.q Main(table.i)
  Protected fn.i,handle.i,calls.i,i.i,rc.i,kind.i,total.i,texts.i,physical.i,pointer.i,wheel.i,wantX.i,wantY.i,wantWheel.i,n.i
- If PeekL(table)<>$53564E41 Or PeekL(table+4)<>1 Or PeekL(table+8)<15 Or PeekL(table+12)<>208 : ProcedureReturn $BAD01 : EndIf
+ If PeekL(table)<>$53564E41 Or PeekL(table+4)<>1 Or PeekL(table+8)<15 Or PeekL(table+12)<208 : ProcedureReturn $BAD01 : EndIf
  fn=PeekQ(table+16+#NUI_SERVICE_SLOT*8)
  If CallFunctionFast(fn,#NUI_QUERY,0,$600800,SizeOf(NativeInputApi))<>0 : ProcedureReturn $BAD02 : EndIf
  If PeekL($600800)<>#NUI_MAGIC Or PeekL($600804)<>1 Or PeekL($60080C)<>32 Or PeekQ($600810)<>3 Or PeekQ($600818)=0 : ProcedureReturn $BAD03 : EndIf

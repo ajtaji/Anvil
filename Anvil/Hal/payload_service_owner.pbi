@@ -4,6 +4,7 @@ Global svcPayloadScope.i
 Procedure.i HwPayloadServicesReady() : ProcedureReturn 1 : EndProcedure
 Procedure.i HwPayloadServicesOpen(mayReturn.i)
  If svcPayloadScope<>0 Or (mayReturn<>0 And mayReturn<>1) : ProcedureReturn 0 : EndIf
+ If TextServiceEnter()<>0 : ProcedureReturn 0 : EndIf
  gSvcMayReturn=mayReturn
  BuildServiceTable() : SvcFileHReset()
  CompilerIf #CAP_NET=1
@@ -14,6 +15,7 @@ Procedure.i HwPayloadServicesOpen(mayReturn.i)
 EndProcedure
 Procedure HwPayloadServicesClose()
  If svcPayloadScope<>0
+  TextServiceLeave()
   SvcFileHReset()
   CompilerIf #CAP_NET=1
    UdpServiceCloseAll()

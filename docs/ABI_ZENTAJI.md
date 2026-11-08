@@ -1,7 +1,7 @@
 # Zentaji payload services
 
-The shared Anvil table retains ABI 1.15: the 16-byte little-endian ANVS header
-and 208 eight-byte procedure slots. Zentaji uses PMFBOOT v2 ISA 2 / target 1.
+The shared Anvil table publishes ABI 1.16: the 16-byte little-endian ANVS header
+and 216 eight-byte procedure slots. Zentaji uses PMFBOOT v2 ISA 2 / target 1.
 Set wants-services and validate the header before calling any slot. These are
 Zentaji procedure addresses; machine code is specific to its ISA.
 
@@ -44,7 +44,14 @@ existing ENOCAP/ENOSYS policy and every reserved slot is nonzero. No graphics,
 network, spare UART, GPIO, I2C, SPI, parallel jobs, entropy or
 module provider is installed. Serial port 0 remains the monitor console; a
 hardware text mirror renders monitor output on admitted display profiles. Text
-does not advertise the arbitrary-pixel CAP_CONSOLE API or add service slots.
+does not advertise the arbitrary-pixel CAP_CONSOLE API. ABI1.16 appends the
+portable cell-text service at slot208; see [Native text](NATIVE_TEXT.md).
+Applications discover its dispatch through a versioned query, then open a
+session, write/fill cells, place a cursor, scroll and present via timer/WFI.
+The service validates request and nested source spans against real payload
+memory; the protected text-buffer address is never public. Closing or returning
+clears the whole protected reservation and restores monitor cursor/diagnostic
+routing, including cells hidden by a smaller mode or font.
 Slot39 supplies the existing NativeInputApi1.0 protocol: keyboard and mouse,
 validated payload buffers, bounded nonblocking polling, focus generations,
 physical HID edges, ASCII text/navigation, three mouse buttons and wheel steps.
@@ -56,7 +63,8 @@ steps clamp to the existing signed16-bit wire range. Non-ASCII text and mouse
 side buttons do not silently change this existing ABI. Gamepad/rumble lanes are
 unclaimed. Ordinary payloads receive the input device quiescent and must restore
 uncaptured mode with device interrupts disabled. The application text interface
-and self-hosted editor/compiler remain future work. UTC/provenance slots read the RTC
+is versioned independently of the input wire.
+The self-hosted editor/compiler remains future work. UTC/provenance slots read the RTC
 through the declared hardware capability. Each UTC record uses a single latched
 seconds/nanoseconds sample and contains seven 32-bit fields, including truncated
 milliseconds. Manual time/timezone changes affect the monitor software clock;

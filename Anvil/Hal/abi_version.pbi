@@ -139,6 +139,8 @@
 ; Existing 200-entry shape and every prior signature remain unchanged.
 ; 1.15 - appended slots200..207: cooperative IPv4/IPv6 datagram sockets.
 ; Every previous slot and signature is unchanged.
-#SVC_ABI_MINOR   = 15
-#SVC_SLOT_COUNT  = 208         ; Datagram group appended at 1.15.
+#SVC_ABI_MINOR   = 16
+; 1.16 - appended cell-text group208..215, NativeText dispatcher at208.
+; Every previous slot/signature remains unchanged; unbound returns ENOSYS.
+#SVC_SLOT_COUNT  = 216         ; Native text group appended at 1.16.
                                ; The boot code sizes its check by it.

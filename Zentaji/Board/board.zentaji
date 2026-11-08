@@ -1,8 +1,8 @@
 ; Zentaji serial/storage monitor composition. The ROM loads the owned startup
 ; envelope; Main receives its validated table/source/context, never ARM registers.
-#ANVIL_BUILD = 17 ; pmf:build
+#ANVIL_BUILD = 19 ; pmf:build
 #ANVIL_BUILD_DATE = 20261108 ; pmf:builddate
-#ANVIL_BUILD_TIME = 060512 ; pmf:buildtime
+#ANVIL_BUILD_TIME = 064437 ; pmf:buildtime
 #CAP_TOUCH=0
 #CAP_PWM=0
 #CAP_NET=0
@@ -58,6 +58,7 @@ XIncludeFile "Zentaji/Board/services.pbi"
 XIncludeFile "Anvil/Hal/abi_version.pbi"
 XIncludeFile "Anvil/Hal/abi.pbi"
 XIncludeFile "Zentaji/Board/input.pbi"
+XIncludeFile "Zentaji/Board/text_service.pbi"
 XIncludeFile "Zentaji/Board/payload.pbi"
 XIncludeFile "Anvil/Core/pmfboot.pbi"
 XIncludeFile "Anvil/Core/bootfile_cmd.pbi"
@@ -135,6 +136,7 @@ Procedure.i Main(table.i,source.i,context.i)
  If table<>PeekQ(context+#ZEN_BOOT_TABLE) Or source<>PeekQ(context+#ZEN_BOOT_SOURCE) : ProcedureReturn 1 : EndIf
  ; Text admission is optional on small profiles; serial remains available.
  ZentajiMemoryTextInit(table)
+ ZentajiTextServiceStart()
  ; This board owns core0's timer/IRQ routing. No other core is started here.
  PokeQ(#ZEN_IDLE_INTC+$120,3) : PokeQ(#ZEN_IDLE_INTC+$220,3)
  PokeQ(#ZEN_IDLE_INTC+$228,1) : PokeQ(#ZEN_IDLE_INTC+$F008,514)

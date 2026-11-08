@@ -44,6 +44,40 @@ mode/font growth, release/reacquisition, ownership refusals and serial fallback.
 The monitor and boot checks use the counted ROM-loaded product. No visible host
 window or physical input proof is implied.
 
+## Application text cells
+
+ABI1.16 supplies a portable, versioned text-grid service at slot208, separately
+from the pixel console and existing native input protocol. Applications query
+its format/dispatch, open a session and use bounded rectangle writes/fills,
+cursor placement, synchronous hardware scrolling and next-frame presentation.
+PRESENT uses the qualified timer/WFI owner and has a finite timeout, allowing
+an editor to poll input and sleep between frames. No kernel RAM address or raw
+device address is part of the application contract. See
+[Native text](../docs/NATIVE_TEXT.md) for layouts, operations and errors.
+
+The monitor retains its protected cell reservation. Diagnostics remain on serial
+while an application owns text. Close and return retire the session, clear its
+whole protected capacity (including rows hidden by a shrink) and restore the
+monitor cursor; foreign hardware state fails-stop0x5B05.
+The shared service-table owner manages scope on every architecture. Targets
+without a bound text provider honestly answer ENOSYS. This interface supports
+the planned built-in editor; the editor and genuine guest compiler remain work
+to do.
+
+```text
+python tools/zentaji_text_service_check.py --compiler <Forge executable> --zen-tools <tools/zentaji directory>
+python tools/zentaji_text_boot_check.py --compiler <Forge executable> --zen-tools <tools/zentaji directory>
+python tools/zentaji_text_live_check.py --compiler <Forge executable> --zen-tools <tools/zentaji directory>
+```
+
+The component proof executes actual provider/lifetime code with independent
+cell, status and memory-bound expectations, ring-origin/stride/resize cases,
+presentation/timeout, full native/twin CPU/RAM and exact headless frames. The
+product proof uses ROM disk boot and real separately compiled PMFs to discover
+the table/dispatch, render cells, present and return with both text/input open;
+a damaged text owner must fail-stop before any false prompt. These remain
+headless Windows proofs, with Linux and visible host interaction separate.
+
 ## Native keyboard and mouse
 
 `Board/input.pbi` owns one bounded drain of the machine's keyboard queue. It
@@ -795,7 +829,7 @@ The container engine no longer names the service table's private globals or
 file-handle implementation. `HwPayloadServicesReady/Open/Close` belongs to the
 selected composition. Both existing ARM boards and Zentaji use the real shared
 ABI owner. Zentaji service-backed apps retain resident serial/timer/storage
-ownership and receive all 208 actual shared slots, with unchanged error and
+ownership and receive all 216 actual shared slots, with unchanged error and
 capability policy. Entry returns an explicit success/refusal result; ARM marks actual CPU
 entry at its branch, preventing a board refusal from being reported as a boot.
 

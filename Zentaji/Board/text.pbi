@@ -3,7 +3,7 @@
 #ZEN_TEXT = $FFFF0000001A0000
 #ZEN_DISPLAY = $FFFF0000000C0000
 Global zenTextCells.i,zenTextCapacity.i,zenTextUp.i
-Global zenTextCode.i,zenTextNeed.i,zenTextMinimum.i
+Global zenTextCode.i,zenTextNeed.i,zenTextMinimum.i,zenTextApplication.i
 
 Procedure.i ZentajiTextRequired(table.i)
  Protected total.i,entries.i,offset.i,count.i,fonts.i,n.i,f.i,p.i,w.i,h.i,fw.i,fh.i,bytes.i,largest.i
@@ -94,7 +94,7 @@ EndProcedure
 
 Procedure ZentajiTextByte(byte.i)
  Protected code.i
- If zenTextUp=0 : ProcedureReturn : EndIf
+ If zenTextUp=0 Or zenTextApplication<>0 : ProcedureReturn : EndIf
  byte=byte&$FF
  If zenTextNeed<>0
   If byte>=$80 And byte<=$BF

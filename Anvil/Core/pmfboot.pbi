@@ -968,9 +968,10 @@ EndProcedure
 XIncludeFile "Anvil/Hal/neon_service_api.pbi"
 XIncludeFile "Anvil/Hal/graphics_service.pbi"
 XIncludeFile "Anvil/Hal/input_service.pbi"
+XIncludeFile "Anvil/Hal/text_service.pbi"
 
 Procedure.i PmfEnter()
-  Define graphicsRc.i,inputRc.i,entered.i,stack.i,stackBytes.i
+  Define graphicsRc.i,inputRc.i,textRc.i,entered.i,stack.i,stackBytes.i
   Define entryArgument.i = 0
   gEntry = gPmfEntry
   gHaveEntry = 1
@@ -1052,6 +1053,11 @@ Procedure.i PmfEnter()
     ; GPU targets retire this scope before their platform bus-master recovery.
     ; The idempotent fallback also covers targets with no graphics device and
     ; a platform refusal that returned before entering the payload.
+    textRc=TextServiceLeave()
+    If textRc<>0
+      PrintN("!! the payload returned with a resident text owner still quarantined.")
+      Print("   Text status: ") : PrintDec(textRc) : PrintNl()
+    EndIf
     inputRc=InputServiceLeave()
     If inputRc<>0
       PrintN("!! the payload returned with a resident input owner still quarantined.")

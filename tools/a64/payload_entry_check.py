@@ -262,6 +262,44 @@ class SysRegs:
         return step
 
 
+def initialize_globals(m, image, load, entry, target, notes):
+    """Run the published startup's actual initializers, stopping before Main.
+
+    This is a procedure-level gate, not a hardware boot model. Its memory is
+    already zero outside the loaded image. Elide only the compiler's recognized
+    BSS zero-store loop after proving that whole range is already zero; execute
+    its final CMP/branch and every initializer instruction. Never synthesize
+    provider pointers: a missing/wrong emitted initializer must fail this gate.
+    """
+    blob=image.read_bytes()
+    zero_loop=struct.pack("<5I",0xEB0A013F,0x54000082,0xF900013F,0x91002129,0x17FFFFFC)
+    offset=blob[:256].find(zero_loop)
+    skipped=False
+    c=m.cpu
+    c.pc=entry
+    c.sp=m.stack
+    c.x[30]=RETURN
+    for steps in range(200000):
+        if c.pc==m.procs["main"]:
+            break
+        if offset>=0 and c.pc==load+offset and not skipped:
+            lo,hi=c.x[9],c.x[10]
+            if not (load+len(blob)<=lo<=hi and lo%8==0 and hi%8==0 and hi-lo<=128<<20):
+                raise Fail("%s: emitted BSS range is not an admitted zero-only extent"%target)
+            if any(v and lo<=a<hi for a,v in c.memory.items()):
+                raise Fail("%s: BSS shortcut would erase nonzero model memory"%target)
+            c.x[9]=hi
+            skipped=True
+        m.step()
+    else:
+        raise Fail("%s: startup initializers did not reach Main within the bound"%target)
+    notes.append("%s: actual emitted globals initialized in%d instructions before Main; hardware Main not entered"%(target,steps))
+    symbols_=symbols(image)
+    for name,procedure in (("global_ntsdispatch","ntsunbound"),("global_ntsreset","ntsresetunbound")):
+        got=struct.unpack("<Q",m.peek(symbols_[name],8))[0]
+        check(got==m.procs[procedure],"%s: emitted %s names its real default procedure"%(target,name),notes)
+
+
 def gate_board(cc: str, target: str, override: dict, work: pathlib.Path) -> list:
     src, args, pload, pstack, el, _ = BOARDS[target]
     # ALWAYS a private copy, the unmutated run too: a board whose source
@@ -313,6 +351,7 @@ def gate_board(cc: str, target: str, override: dict, work: pathlib.Path) -> list
     m = d.Machine(mon, procs, lambda a, s, v: 0, load=load, stack=driver_sp)
     regs = SysRegs(el)
     m.step = regs.hook(m.cpu, m.step)
+    initialize_globals(m,mon,load,entry,target,notes)
     # DAIF at the instant the board's HwPayloadReturned() is entered: the
     # vectors may still be the payload's, so every interrupt must be masked.
     daif_at_return = []
@@ -338,6 +377,7 @@ def gate_board(cc: str, target: str, override: dict, work: pathlib.Path) -> list
     table=m.call("HwPayloadServicesOpen",1)
     check(table!=0 and table==m.call("SvcTableAddr"),"%s: the HAL owner opened the actual table"%target,notes)
     check(m.call("HwPayloadServicesOpen",1)==0,"%s: nested service-table scope is refused"%target,notes)
+    check(m.signed(m.call("SvcNativeText",0,0,0,40))==-100,"%s: an unbound cell-text provider honestly returns ENOSYS"%target,notes)
     check(table != 0 and (struct.unpack("<Q", m.peek(table, 8))[0] & 0xFFFFFFFF) == magic,
           "%s: the monitor's own BuildServiceTable filled a table with the ABI magic" % target,
           notes)
@@ -409,6 +449,7 @@ def gate_board(cc: str, target: str, override: dict, work: pathlib.Path) -> list
     check(peek64("global_gpayloaddidenter")==0 and peek64("global_ggox0")==0 and peek64("global_ggorc")==0,"%s: refusal clears entry/result/argument state"%target,notes)
     m.call("HwPayloadServicesClose")
     check(peek64("global_gsvcmayreturn")==0 and peek64("global_svcpayloadscope")==0,"%s: the real service owner closes its scope and return permission"%target,notes)
+    check(peek64("global_ntsscope")==0 and peek64("global_ntscontext")==0,"%s: generic service close retires the cell-text scope"%target,notes)
     return notes
 
 

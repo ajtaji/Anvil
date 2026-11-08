@@ -101,6 +101,7 @@ Procedure.i HwPayloadRun(entry.i,argument.i,stack.i,stackBytes.i)
  ; The CPU boundary has restored owned SP/vectors/FP state with IE masked.
  ; Do not overwrite foreign live hardware to make recovery appear successful.
  If ZentajiInputPayload(0,services)=0 : ZentajiPayloadRecoveryFailed($5B06,"Payload return failed (0x5B06): native input ownership changed. Release mouse capture and device interrupts before returning.") : EndIf
+ If services<>0 And TextServiceLeave()<>0 : ZentajiPayloadRecoveryFailed($5B05,"Payload return failed (0x5B05): resident text session could not release its owner.") : EndIf
  If services=0
   If ZentajiTextResume()=0 : ZentajiPayloadRecoveryFailed($5B05,"Payload return failed (0x5B05): native text or display is still owned. Quiesce both devices before returning.") : EndIf
  Else
