@@ -1,7 +1,8 @@
 # Zentaji backend bring-up
 
 The machine has a real clock, bounded prompt-idle backend and serial console transport. This is not yet
-a full Anvil monitor image, a ROM boot proof, or a self-hosted Forge build.
+a full Anvil monitor image or a self-hosted Forge build. Component ROM boot
+proofs are described below.
 The shared monitor remains the source of scheduler and command policy.
 
 `Board/clock.pbi` supplies `Ticks()` from the CPU's TIME register and `TickHz()`
@@ -13,7 +14,7 @@ guest library, with its source revision and hash in `PROVENANCE.json`.
 The board's interrupt owner must reserve the calling core's timer and configure
 line 1 as a level source, enabled above that core's interrupt threshold. Anvil
 must already be running in its required supervisor context. Then call
-`ZentajiPromptIdlePrepare(maxMicroseconds)` with a 50–2000 microsecond deadline.
+`ZentajiPromptIdlePrepare(maxMicroseconds)` with a 50ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã…â€œ2000 microsecond deadline.
 It refuses an active timer, a nonzero period or pending timer status, an
 inadmissible interrupt, a busy interrupt context, or a second reservation.
 It reads the machine frequency and rounds the interval down; an interval
@@ -187,8 +188,8 @@ publication rollback, input collisions and damaged maps are checked too.
 Actual host MCHECK injection, visible input and Linux remain unverified.
 
 Next are the production monitor command composition and startup integration,
-storage facade integration and durable host disk backing,
 the remaining runtime/compiler facilities and production payload/service ABI.
+Durable disk backing and the shared file-service lifecycle are implemented below.
 ROM must load Anvil, and Anvil must then reach the shared prompt and load
 applications. The built-in Forge must ultimately target Zentaji itself only.
 
@@ -285,11 +286,9 @@ python tools/zentaji_storage_check.py --compiler <Forge executable> --zen-tools 
 
 This composes the complete unchanged FAT32, exFAT, filesystem dispatch and
 HwFile/HwDir libraries with the actual Zentaji queue driver, supervisor startup,
-HAL vocabulary, console and portable wall clock. The executed volume is FAT32;
-exFAT is compiled and participates in detection/fallback, but an actual exFAT
-volume remains a separate proof. The fixture assigns the documented mounted,
-writable and writer values after mounting; it does not introduce a second file
-implementation or claim a production board composition.
+HAL vocabulary, console and portable wall clock. `Board/storage.pbi` owns disk
+selection, mount admission, the shared seam's mounted/writable/writer values,
+and clean shutdown. It does not introduce a second file implementation.
 
 The guest creates a file, reads sequential and random offsets, shrinks it,
 creates a folder, renames into a long path, grows the file, creates/removes an
@@ -322,5 +321,73 @@ They preserve the shared libraries' table definitions. Large generated assembly
 uses a linear line reader and dense source metadata; all original include paths,
 lines and hashes remain represented in instruction maps. General managed strings,
 compound record fields, floating Data and Read/Restore remain distinct compiler
-work. Board storage lifecycle, actual exFAT execution and full monitor/command
-composition remain unfinished.
+work. Full monitor/command composition remains unfinished.
+
+
+The exFAT path can also start at the real ROM rather than injecting the image:
+
+```text
+python tools/zentaji_storage_check.py --filesystem exfat --boot-disk 15 --compiler <Forge executable> --zen-tools <tools/zentaji directory>
+```
+
+The boot fixture places the selected Anvil executable in the disk boot area and
+an MBR exFAT partition at sector 4096. The ROM loads Anvil and hands over disk 15;
+the production lifecycle adopts that instance, mounts the partition, executes
+the same writable file operations, cleanly releases storage and reopens the
+persisted file. Native/twin full state, RAM and host image match. An independent
+oracle checks boot-region checksums and clean flags, unchanged backup and boot
+payload, file entry-set/name hashes, upcase-table checksum, exact file bytes,
+eight reachable bitmap allocations without leaks/crosslinks and UTC timestamps.
+FAT32 allocation walks run normally; exFAT explicitly refuses those two APIs
+until its format-specific corruption-safe walker exists. That limit is checked,
+not silently treated as successful enumeration.
+
+FAT32 also passes the complete writable proof using the production lifecycle,
+including invalid/unconfigured selection, repeated bring-up without disk
+submission, refusal to reconfigure an acquired medium, refusal to shut down an
+open file, clean shutdown, repeated shutdown and reopen. These are component
+compositions with actual device queues; no monitor command parser is substituted.
+
+## Board storage lifecycle
+
+Include `Board/storage.pbi` after the boot-context, console, disk, HAL and wall
+clock backends. `ZentajiStorageConfigure(disk, partition)` explicitly chooses
+instance 0..15 and partition 1..4. `ZentajiStorageFromBoot(context, partition)`
+uses the ROM-selected disk from a validated Anvil boot context; host-file boot
+requires explicit selection instead. Neither silently chooses another disk.
+The board must already have established normal supervisor context, serialized
+access and the qualified timer/WFI idle backend.
+
+`HwStorageUp()` acquires the selected queue driver and mounts through the shared
+filesystem facade. Its low-level counterpart `ZentajiStorageUp()` retains an
+error code/text without printing; the HAL entry prints the reason on failure.
+Repeated successful calls retain open files, mount jobs, current partitions and
+caches. The hardware read-only flag controls file-write admission. Shared
+HwFile operations arm the writer only around a change and disarm it afterwards.
+`HwStorageReport()` reports the selected device and currently mounted format.
+
+`ZentajiStorageDown()` refuses open files or a pending mount, explicitly flushes
+before unmounting, and releases the queues only after success. A failed flush
+retains ownership for diagnosis/retry. It clears file admission and callbacks
+after release, keeps the selection for reopening, and accepts repeated shutdown.
+Changed queue ownership disarms the file service and produces an explicit error;
+it does not reset a foreign owner or cancel quarantined DMA. Direct driver and
+filesystem clients must not bypass this lifecycle while it owns the medium.
+
+The component proof still does not link the full monitor command dispatcher or
+load and execute an application through Anvil's payload ABI.
+
+
+```text
+python tools/zentaji_storage_lifecycle_check.py --compiler <Forge executable> --zen-tools <tools/zentaji directory>
+```
+
+Four focused native/twin cases check invalid/non-disk boot contexts, a missing
+selected disk, refusal to adopt or close another queue owner, an invalid volume
+with an acquired disk retained for clean release, and a hardware read-only
+volume. Read-only writes fail before any command submission; pending mount jobs
+block shutdown and survive repeated bring-up until their owner cancels them.
+Each case compares complete state/RAM, an unchanged persistent host image and
+exact serial output. Report output distinguishes a mounted volume, a pending
+mount and no mounted partition after a failed switch. This does not prove
+physical power-loss behavior or the final monitor/payload integration.

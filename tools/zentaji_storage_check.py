@@ -16,10 +16,7 @@ IncludeFile "Zentaji/Board/console.pbi"
 IncludeFile "Zentaji/Board/disk.pbi"
 IncludeFile "Anvil/Hal/hal.pbi"
 IncludeFile "Anvil/Core/wallclock.pbi"
-IncludeFile "Anvil/Storage/fat32.pbi"
-IncludeFile "Anvil/Storage/exfat.pbi"
-IncludeFile "Anvil/Storage/filesystem.pbi"
-IncludeFile "Anvil/Storage/hwfile.pbi"
+IncludeFile "Zentaji/Board/storage.pbi"
 Global Dim payload.a[2048]
 Global Dim readbuf.a[4096]
 Global Dim listed.a[256]
@@ -37,7 +34,9 @@ Procedure.i Main(table.i,source.i,context.i)
  Protected n.i,tag.q,rc.i,count.i
  If ZentajiBootContextValid(context)<>1 : ProcedureReturn 1 : EndIf
  PokeQ(#ZEN_IDLE_INTC+$120,3) : PokeQ(#ZEN_IDLE_INTC+$220,3) : PokeQ(#ZEN_IDLE_INTC+$228,1) : PokeQ(#ZEN_IDLE_INTC+$F008,514)
- If ZentajiPromptIdlePrepare(50)<>1 Or ZentajiDiskOpen(0)<>1 : ProcedureReturn 2 : EndIf
+ If ZentajiPromptIdlePrepare(50)<>1 : ProcedureReturn 2 : EndIf
+ If ZentajiStorageUp()<>0 Or ZentajiStorageLastError()<>#ZEN_STORAGE_E_UNCONFIGURED : ProcedureReturn 27 : EndIf
+ If ZentajiStorageConfigure(16,1)<>0 Or ZentajiStorageConfigure(0,0)<>0 Or ZentajiStorageConfigure(0,1)<>1 : ProcedureReturn 28 : EndIf
  If WallClockInit()<>1 : ProcedureReturn 3 : EndIf
  If WallClockSet(1794009600,#WALLCLOCK_SRC_RTC)<>0 Or WallClockLastError()<>#WALLCLOCK_ERR_SOURCE : ProcedureReturn 24 : EndIf
  If WallClockRtcAdmit(2)<>0 Or WallClockRtcAdmit(1)<>1 Or WallClockSet(1794009600,#WALLCLOCK_SRC_RTC)<>1 Or WallClockTrusted()<>1 : ProcedureReturn 25 : EndIf
@@ -45,12 +44,14 @@ Procedure.i Main(table.i,source.i,context.i)
  If WallClockSet(1794009600,#WALLCLOCK_SRC_MANUAL)<>1 : ProcedureReturn 3 : EndIf
  clockReport[0]=Ticks() : clockReport[1]=HwMicros() : clockReport[2]=Ticks()
  ExFatProfileSetClock(@HwMicros)
- FsSetRangeReader(@ZentajiDiskRead) : FsSetRangeWriter(0) : FsSetBlockFlusher(@ZentajiDiskFlush)
- If FsMount(1)<>1 Or FsType()<>#FS_FAT : ProcedureReturn 4 : EndIf
- gHwFileMounted=1 : gHwFileWritable=1 : gHwFileWriter=@ZentajiDiskWrite
+ If HwStorageUp()<>1 Or FsType()<>#FS_FAT Or gHwFileMounted<>1 Or HwFileWritable()<>1 : ProcedureReturn 4 : EndIf
+ tag=zenDisk\tag
+ If HwStorageUp()<>1 Or zenDisk\tag<>tag Or ZentajiStorageConfigure(1,1)<>0 : ProcedureReturn 29 : EndIf
  For n=0 To 2047 : payload[n]=(n*7+n/512+31)&255 : Next
  If HwFileWriteAll("CHECK.BIN",@payload[0],1500)<>1 Or fs_writer<>0 : ProcedureReturn 5 : EndIf
  If HwFileOpen("CHECK.BIN")<>1 Or HwFileSize()<>1500 : ProcedureReturn 6 : EndIf
+ tag=zenDisk\tag
+ If ZentajiStorageDown()<>0 Or ZentajiStorageLastError()<>#ZEN_STORAGE_E_BUSY Or zenDisk\tag<>tag Or HwStorageUp()<>1 Or zenDisk\tag<>tag : ProcedureReturn 30 : EndIf
  If HwFileReadAt(0,@readbuf[0],300)<>300 Or HwFileReadAt(300,@readbuf[300],700)<>700 Or HwFileReadAt(100,@readbuf[1500],501)<>501 : ProcedureReturn 7 : EndIf
  HwFileClose()
  If HwFileWriteAll("CHECK.BIN",@payload[0],700)<>1 : ProcedureReturn 8 : EndIf
@@ -78,7 +79,10 @@ Procedure.i Main(table.i,source.i,context.i)
  Wend
  If rc<>0 Or count<>1 : ProcedureReturn 21 : EndIf
  If FsWalkRoot(@RangeVisit,0)<>1 Or FsWalkAllocations(@EntryVisit,@RangeVisit,0)<>1 Or visits<1 Or ranges<2 : ProcedureReturn 22 : EndIf
- If FsFlush()<>1 Or FsUnmount()<>1 Or ZentajiDiskClose()<>1 Or ZentajiPromptIdleRelease()<>1 : ProcedureReturn 23 : EndIf
+ If ZentajiStorageDown()<>1 Or gHwFileMounted<>0 Or HwFileWritable()<>0 Or gHwFileWriter<>0 Or FsType()<>#FS_NONE Or ZentajiDiskMode()<>0 : ProcedureReturn 23 : EndIf
+ If ZentajiStorageDown()<>1 Or HwStorageUp()<>1 Or HwFileOpen("Folder/Long file name.bin")<>1 Or HwFileSize()<>1800 : ProcedureReturn 31 : EndIf
+ HwFileClose()
+ If ZentajiStorageDown()<>1 Or ZentajiPromptIdleRelease()<>1 : ProcedureReturn 32 : EndIf
  ProcedureReturn 42
 EndProcedure
 '''
@@ -86,7 +90,11 @@ EndProcedure
 
 def main():
     ap=argparse.ArgumentParser(description=__doc__);ap.add_argument('--compiler');ap.add_argument('--zen-tools',type=Path,required=True)
-    a=ap.parse_args();cc=resolve_compiler(a.compiler);zt=a.zen_tools.resolve();sys.path.insert(0,str(zt));sys.path.insert(0,str(ROOT/'tools/a64'))
+    ap.add_argument('--filesystem',choices=('fat32','exfat'),default='fat32')
+    ap.add_argument('--boot-disk',type=int,choices=range(16),metavar='0..15')
+    a=ap.parse_args()
+    if a.boot_disk is not None and a.filesystem!='exfat':ap.error('--boot-disk currently requires --filesystem exfat')
+    cc=resolve_compiler(a.compiler);zt=a.zen_tools.resolve();sys.path.insert(0,str(zt));sys.path.insert(0,str(ROOT/'tools/a64'))
     import zen_interp as I
     import zen_lockstep_check as L
     import zasm_ref as A
@@ -97,22 +105,40 @@ def main():
         p=subprocess.run([str(x) for x in args],cwd=ROOT,env=env,capture_output=True,text=True,encoding='utf-8',errors='replace',timeout=timeout)
         assert p.returncode==0,(p.returncode,p.stdout[-5000:],p.stderr)
         return p.stdout
-    sparse=F.build()
-    for base in (F.FAT_LBA,F.FAT1_LBA):
-        for lba in range(base,base+F.FAT_SECS):sparse.s[lba]=bytearray(512)
-        for cluster,value in [(0,0x0FFFFFF8),(1,0x0FFFFFFF),(2,F.EOC)]:sparse.u32(base,cluster*4,value)
-    sparse.s[F.DATA_LBA]=bytearray(512)
-    F.fsinfo(sparse,F.PART_LBA,F.CLUSTERS-1,3)
-    sectors=(max(71104,max(sparse.s)+1)+7)&-8
-    medium=bytearray(sectors*512)
-    for lba,sector in sparse.s.items():medium[lba*512:(lba+1)*512]=sector
+    if a.filesystem=='exfat':
+        import zentaji_exfat_oracle as O
+        medium=O.build(4096 if a.boot_disk is not None else 1)
+    else:
+        import zentaji_storage_oracle as O
+        sparse=F.build()
+        for base in (F.FAT_LBA,F.FAT1_LBA):
+            for lba in range(base,base+F.FAT_SECS):sparse.s[lba]=bytearray(512)
+            for cluster,value in [(0,0x0FFFFFF8),(1,0x0FFFFFFF),(2,F.EOC)]:sparse.u32(base,cluster*4,value)
+        sparse.s[F.DATA_LBA]=bytearray(512)
+        F.fsinfo(sparse,F.PART_LBA,F.CLUSTERS-1,3)
+        sectors=(max(71104,max(sparse.s)+1)+7)&-8
+        medium=bytearray(sectors*512)
+        for lba,sector in sparse.s.items():medium[lba*512:(lba+1)*512]=sector
     with tempfile.TemporaryDirectory(prefix='anvil-zen-storage-') as tmp:
-        td=Path(tmp);src=td/'probe.zentaji';compiled=td/'probe.zex';src.write_bytes(SOURCE.replace('\n','\r\n').encode())
+        td=Path(tmp);src=td/'probe.zentaji';compiled=td/'probe.zex';source=SOURCE.replace('FsType()<>#FS_FAT','FsType()<>#FS_EXFAT') if a.filesystem=='exfat' else SOURCE
+        if a.filesystem=='exfat':
+            source=source.replace('If FsWalkRoot(@RangeVisit,0)<>1 Or FsWalkAllocations(@EntryVisit,@RangeVisit,0)<>1 Or visits<1 Or ranges<2 : ProcedureReturn 22 : EndIf',
+                'If FsWalkRoot(@RangeVisit,0)<>0 Or FsLastError()<>#FS_E_ALLOCATION_UNSUPPORTED : ProcedureReturn 22 : EndIf\n If FsWalkAllocations(@EntryVisit,@RangeVisit,0)<>0 Or FsLastError()<>#FS_E_ALLOCATION_UNSUPPORTED Or visits<>0 Or ranges<>0 : ProcedureReturn 22 : EndIf')
+        if a.boot_disk is not None:
+            source=source.replace('Or ZentajiStorageConfigure(0,1)<>1','Or ZentajiStorageFromBoot(context,1)<>1')
+        src.write_bytes(source.replace('\n','\r\n').encode())
         out=run([cc,'--compile',src,'-o',compiled]);assert 'is READ but never' not in out,out
         ref=A.Asm();origin,data=ref.assemble(Path(str(compiled)+'.asm').read_text(encoding='utf-8-sig'))
         assert compiled.read_bytes()==zexpack.header(origin,origin,data)+data
         wrapped,meta,_,_=B.pack(compiled.read_bytes(),zt/('zasm.exe' if os.name=='nt' else 'zasm'),source_map=json.loads(Path(str(compiled)+'.zmap').read_text(encoding='utf-8-sig')))
-        m=I.Machine(ram_size=4<<20,cores=2,disks={0:(bytearray(medium),False)},display_modes=[(1,1,60000)]);m.load_image(wrapped)
+        disk=0 if a.boot_disk is None else a.boot_disk
+        if a.boot_disk is not None:
+            boot=zexpack.disk_image(wrapped)
+            assert len(boot)<=4096*512,'boot payload overlaps the filesystem partition'
+            medium[:64]=boot[:64];medium[4096:len(boot)]=boot[4096:]
+        m=I.Machine(ram_size=4<<20,cores=2,disks={disk:(bytearray(medium),False)},display_modes=[(1,1,60000)])
+        if a.boot_disk is None:m.load_image(wrapped)
+        else:m.power_on(1,disk)
         assert not L.capture(m,str(td));cfg=td/'machine.txt';cfg.write_text(cfg.read_text().replace('disk-memory ','disk '),encoding='utf-8')
         out=run([L.EXE,cfg,'--max','12000000','--ram',td/'final.bin'])
         assert ' exit=2A ' in out,('native guest did not finish successfully',out[-2500:])
@@ -120,15 +146,14 @@ def main():
         assert c.state=='HALTED' and c.r[1]==42,(c.state,c.r[1],hex(c.pc),c.cr)
         assert (td/'final.bin').read_bytes()==m.ram
         line=next(s[6:] for s in out.splitlines() if s.startswith('STATE '));assert line.split(' ',1)[1]==L.state_line(m,0,-1).split(' ',1)[1]
-        assert (td/'disk0.img').read_bytes()==bytes(m.disks[0].image)
-        import zentaji_storage_oracle as O
+        assert (td/('disk%d.img'%disk)).read_bytes()==bytes(m.disks[disk].image)
         expected=bytes((n*7+n//512+31)&255 for n in range(2048))
         at=ref.sym['GLOBAL_READBUF'];assert m.ram[at:at+1000]==expected[:1000] and m.ram[at+1500:at+2001]==expected[100:601] and m.ram[at+2048:at+3848]==expected[:1800]
         at=ref.sym['GLOBAL_LISTED'];assert bytes(m.ram[at:at+19])==b'Long file name.bin\0'
         at=ref.sym['GLOBAL_CLOCKREPORT'];before,us,after=struct.unpack_from('<3Q',m.ram,at)
         assert before*1000000//100000000<=us<=after*1000000//100000000
-        proof=O.check(bytes(m.disks[0].image),medium,expected)
-        print('PASS full shared filesystem/hwfile over real persistent queues: native/twin state/RAM/host image; '+proof,flush=True)
+        proof=O.check(bytes(m.disks[disk].image),medium,expected)
+        print('PASS '+a.filesystem+(' ROM disk%d'%disk if a.boot_disk is not None else '')+' storage lifecycle/shared filesystem/hwfile over real persistent queues: native/twin state/RAM/host image; '+proof,flush=True)
 
 
 if __name__=='__main__':main()
