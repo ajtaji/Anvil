@@ -133,9 +133,9 @@ StackAddress $68000000
 ;  Full write-up: the vault's Environment/Build number note, and the
 ;  header of BuildNumber.pbi in the compiler tree.
 ; ----------------------------------------------------------------------
-#ANVIL_BUILD = 108        ; pmf:build
+#ANVIL_BUILD = 109        ; pmf:build
 #ANVIL_BUILD_DATE = 20261108   ; pmf:builddate
-#ANVIL_BUILD_TIME = 004327     ; pmf:buildtime
+#ANVIL_BUILD_TIME = 005847     ; pmf:buildtime
 
 ; ----------------------------------------------------------------------
 ;  1. THE Q'S HARDWARE BACKENDS.
@@ -730,6 +730,136 @@ Procedure.i BoardPromptPump(operation.i)
  ProcedureReturn 0
 EndProcedure
 
+XIncludeFile "Anvil/Core/command_loop.pbi"
+
+Procedure.i HwCommandLoopHook(phase.i)
+ Static attribute.i
+ Select phase
+  Case #ACMD_BEFORE_PROMPT
+   attribute=QEfiConAttribute() : QEfiSetConAttribute(#QTXT_LIGHTGREEN)
+  Case #ACMD_AFTER_PROMPT
+   UartDrain() : QEfiSetConAttribute(attribute)
+  Case #ACMD_BEFORE_INPUT
+   gQTyping=1
+  Case #ACMD_AFTER_INPUT
+   gQTyping=0
+   If gQExitWanted<>0 : ProcedureReturn 0 : EndIf
+  Case #ACMD_AFTER_COMMAND
+   QLogFlush()
+   If gQExitWanted<>0 : ProcedureReturn 0 : EndIf
+ EndSelect
+ ProcedureReturn 1
+EndProcedure
+
+Procedure.i HwCommandDispatch(c.i)
+    If c = 0
+      ; An empty line reprints the prompt and does nothing else.
+    ElseIf WordIs("memory") <> 0 Or WordIs("dump") <> 0 Or WordIs("md") <> 0 Or LetterIs(109) <> 0
+      CmdMem()
+    ElseIf WordIs("write") <> 0 Or WordIs("poke") <> 0 Or LetterIs(119) <> 0
+      CmdWrite()
+    ElseIf WordIs("compare") <> 0 Or WordIs("cmp") <> 0
+      CmdCompare()
+    ElseIf WordIs("copy") <> 0 Or WordIs("cp") <> 0
+      CmdCopy()
+    ElseIf WordIs("crc32") <> 0 Or WordIs("checksum") <> 0
+      CmdCrc32()
+    ElseIf WordIs("fill") <> 0 Or WordIs("mw") <> 0
+      CmdFill()
+    ElseIf WordIs("mm") <> 0
+      CmdMm()
+    ElseIf WordIs("nm") <> 0
+      CmdNm()
+    ElseIf WordIs("mtest") <> 0
+      CmdMtest()
+    ElseIf WordIs("base") <> 0
+      CmdBase()
+    ; force - arm one address this board refused, for the next command
+    ; line only. Whole word, no alias and no abbreviation: it is the
+    ; confirmation for an access that can stall this processor, and a
+    ; short way to type it would be the accident it exists to prevent.
+    ElseIf WordIs("force") <> 0
+      CmdForce()
+    ElseIf WordIs("run") <> 0 Or WordIs("go") <> 0 Or LetterIs(103) <> 0
+      CmdGo()
+    ElseIf WordIs("booti") <> 0
+      CmdBooti()
+    ElseIf WordIs("bootm") <> 0
+      CmdBootm()
+    ; boot - THE BOOTLOADER. `boot <name>` reads a payload container off
+    ; the ESP, takes the load address, entry point and SHA-256 out of it,
+    ; places the image, proves it and enters it, with no address typed.
+    ; `boot mem <addr>` does the same for one already in DRAM.
+    ElseIf WordIs("boot") <> 0
+      CmdBoot()
+    ; THE FILE COMMANDS. New on this board and unedited for it: load and
+    ; save ride the HwFile* seam over UEFI, and fatls refuses in a
+    ; sentence because this board cannot enumerate a directory.
+    ElseIf DispatchStorageCommand() <> 0
+      ; The portable storage family owns its names and aliases once.
+    ; THE SETTINGS STORE and U-Boot's names for it. SETTINGS.TXT lives at
+    ; \EFInvil on the ESP and survives a power cycle, which is what a
+    ; persisted boot target needs.
+    ElseIf WordIs("settings") <> 0
+      CmdSettings()
+    ElseIf WordIs("printenv") <> 0
+      CmdEnvPrint()
+    ElseIf WordIs("setenv") <> 0
+      CmdEnvSet()
+    ElseIf WordIs("saveenv") <> 0
+      CmdSettingsSave()
+    ElseIf WordIs("env") <> 0
+      CmdEnv()
+    ElseIf WordIs("time") <> 0
+      CmdTime()
+    ElseIf WordIs("uptime") <> 0 Or WordIs("up") <> 0
+      CmdUptime()
+    ElseIf WordIs("messages") <> 0
+      CmdMessages()
+    ElseIf WordIs("echo") <> 0
+      CmdEcho()
+    ElseIf WordIs("sleep") <> 0
+      CmdSleep()
+    ElseIf WordIs("version") <> 0 Or WordIs("ver") <> 0
+      CmdVersion()
+    ElseIf WordIs("setexpr") <> 0
+      CmdSetexpr()
+    ElseIf WordIs("gpio") <> 0
+      CmdGpio()
+    ElseIf WordIs("i2c") <> 0
+      CmdI2c()
+    ElseIf WordIs("fan") <> 0
+      CmdFan()
+    ; mod - the driver-module loader. Portable core; this board's own
+    ; hw_mod_q.unoq is what says whether an arena exists here yet.
+    ElseIf WordIs("mod") <> 0
+      CmdMod()
+
+    ElseIf WordIs("mmc") <> 0
+      CmdMmc()
+    ElseIf WordIs("usb") <> 0
+      CmdUsb()
+    ; map - the memory map as the running image measures it. Core, chip-free,
+    ; no capability: every board can say where it put itself. A whole word
+    ; only; m is the memory dump. See CmdMap in Anvil/Core/memcmd.pbi for
+    ; why it is a command of its own and not a section of `info`.
+    ElseIf WordIs("map") <> 0
+      CmdMap()
+
+    ElseIf WordIs("info") <> 0 Or WordIs("board") <> 0 Or LetterIs(105) <> 0
+      CmdQInfo()
+    ElseIf WordIs("reset") <> 0 Or WordIs("reboot") <> 0 Or LetterIs(114) <> 0
+      CmdQReset()
+    ElseIf WordIs("exit") <> 0 Or WordIs("quit") <> 0
+      CmdQExit()
+    ElseIf WordIs("help") <> 0 Or WordIs("commands") <> 0 Or LetterIs(104) <> 0 Or LetterIs(63) <> 0
+      Help()
+    Else
+      ProcedureReturn 0
+    EndIf
+ ProcedureReturn 1
+EndProcedure
+
 Procedure Main()
   Define c.i
   Define hz.i
@@ -926,215 +1056,13 @@ Procedure Main()
   ;  THE COMMAND LOOP.
   ;
   ;  This is the Pi 4's loop (RaspberryPi4/Board/board.pi4:1504) with the
-  ;  handlers this board actually includes, and nothing else. It is
-  ;  written out rather than called because there is no CommandLoop() in
-  ;  the core to call - on every Anvil board the loop lives inline in the
-  ;  board's Main(), and the Pi 4's is the reference.
+  ;  handlers this board actually includes, through the shared command loop
+  ;  and this board's dispatch/session hooks. Firmware owns its exit policy.
   ;
   ;  "pmf> " is load-bearing: five characters, trailing space, no newline.
   ;  Host tools match on it. Do not tidy it.
   ; ====================================================================
-  Repeat
-    ; The UEFI colour is sideband display state: raw transcript bytes stay
-    ; exactly "pmf> ". Flush while green because qcon batches a line until
-    ; UartDrain(), then restore the firmware's own attribute before ReadLine
-    ; echoes the user's input.
-    promptAttr=QEfiConAttribute()
-    QEfiSetConAttribute(#QTXT_LIGHTGREEN)
-    Print("pmf> ")
-    UartDrain()
-    QEfiSetConAttribute(promptAttr)
-
-    ; gQTyping brackets the line editor and NOTHING else. Outside these
-    ; two lines the staged script is invisible to UartReadReady(), which
-    ; is what stops Anvil/Core/rxbreak.pbi's break detector from reading
-    ; the next queued command as "the operator pressed a key" and
-    ; aborting every command that prints. See the long note on gQTyping
-    ; in ArduinoQ/Board/qcon_q.unoq - this cost a board run to find.
-    gQTyping = 1
-    ReadLine()
-    gQTyping = 0
-
-    ; The deadman in qcon_q.pi4, or the `exit` command, ends the session.
-    ; It is checked BEFORE the line is dispatched so a line the deadman
-    ; completed with a synthetic CR is not run as a command.
-    If gQExitWanted <> 0
-      Break
-    EndIf
-
-    OutBreakArm()
-    gPos = 0
-    SkipSpace()
-    gWordAt = gPos
-    c = gLine[gPos] & $FF
-    SkipWord()
-    gWordLen = gPos - gWordAt
-
-    ; `measure <command line>` - see MEASURE A COMMAND in Core/parse.pbi.
-    ; Two call sites, both of them core, because the command chain below
-    ; is inline here and there is nothing for a wrapper to re-enter. When
-    ; the word moves, the single-letter character moves with it; a refusal
-    ; sets that character to zero, which the chain's empty-line arm
-    ; already runs nothing for.
-    Define tmv.i
-    tmv = TimeArm()
-    If tmv = 1
-      c = gLine[gWordAt] & $FF
-    ElseIf tmv = 2
-      c = 0
-    EndIf
-
-    gMemWidth = 0
-    ; THE SAFETY OVERRIDE AGES HERE, beside the gMemWidth reset and for
-    ; the same stated reason: state must not leak from one command into
-    ; the next. `force <address>` arms one address for the NEXT command
-    ; line and this ends it - used or not. On THIS board that is not a
-    ; nicety: the thing being armed is an access that stalls the
-    ; processor. See Anvil/Core/addrsafe.pbi.
-    ForceAge()
-    If gWordLen >= 3 And gLine[gWordAt + gWordLen - 2] = 46      ; 46 = '.'
-      Define suf.i
-      suf = gLine[gWordAt + gWordLen - 1] & $FF
-      If suf = 98 Or suf = 66                                    ; b / B
-        gMemWidth = 1
-      ElseIf suf = 119 Or suf = 87                               ; w / W
-        gMemWidth = 2
-      ElseIf suf = 108 Or suf = 76                               ; l / L
-        gMemWidth = 4
-      EndIf
-      If gMemWidth <> 0
-        gWordLen = gWordLen - 2                                  ; hide ".x"
-      EndIf
-    EndIf
-
-    If c = 0
-      ; An empty line reprints the prompt and does nothing else.
-    ElseIf WordIs("memory") <> 0 Or WordIs("dump") <> 0 Or WordIs("md") <> 0 Or LetterIs(109) <> 0
-      CmdMem()
-    ElseIf WordIs("write") <> 0 Or WordIs("poke") <> 0 Or LetterIs(119) <> 0
-      CmdWrite()
-    ElseIf WordIs("compare") <> 0 Or WordIs("cmp") <> 0
-      CmdCompare()
-    ElseIf WordIs("copy") <> 0 Or WordIs("cp") <> 0
-      CmdCopy()
-    ElseIf WordIs("crc32") <> 0 Or WordIs("checksum") <> 0
-      CmdCrc32()
-    ElseIf WordIs("fill") <> 0 Or WordIs("mw") <> 0
-      CmdFill()
-    ElseIf WordIs("mm") <> 0
-      CmdMm()
-    ElseIf WordIs("nm") <> 0
-      CmdNm()
-    ElseIf WordIs("mtest") <> 0
-      CmdMtest()
-    ElseIf WordIs("base") <> 0
-      CmdBase()
-    ; force - arm one address this board refused, for the next command
-    ; line only. Whole word, no alias and no abbreviation: it is the
-    ; confirmation for an access that can stall this processor, and a
-    ; short way to type it would be the accident it exists to prevent.
-    ElseIf WordIs("force") <> 0
-      CmdForce()
-    ElseIf WordIs("run") <> 0 Or WordIs("go") <> 0 Or LetterIs(103) <> 0
-      CmdGo()
-    ElseIf WordIs("booti") <> 0
-      CmdBooti()
-    ElseIf WordIs("bootm") <> 0
-      CmdBootm()
-    ; boot - THE BOOTLOADER. `boot <name>` reads a payload container off
-    ; the ESP, takes the load address, entry point and SHA-256 out of it,
-    ; places the image, proves it and enters it, with no address typed.
-    ; `boot mem <addr>` does the same for one already in DRAM.
-    ElseIf WordIs("boot") <> 0
-      CmdBoot()
-    ; THE FILE COMMANDS. New on this board and unedited for it: load and
-    ; save ride the HwFile* seam over UEFI, and fatls refuses in a
-    ; sentence because this board cannot enumerate a directory.
-    ElseIf DispatchStorageCommand() <> 0
-      ; The portable storage family owns its names and aliases once.
-    ; THE SETTINGS STORE and U-Boot's names for it. SETTINGS.TXT lives at
-    ; \EFInvil on the ESP and survives a power cycle, which is what a
-    ; persisted boot target needs.
-    ElseIf WordIs("settings") <> 0
-      CmdSettings()
-    ElseIf WordIs("printenv") <> 0
-      CmdEnvPrint()
-    ElseIf WordIs("setenv") <> 0
-      CmdEnvSet()
-    ElseIf WordIs("saveenv") <> 0
-      CmdSettingsSave()
-    ElseIf WordIs("env") <> 0
-      CmdEnv()
-    ElseIf WordIs("time") <> 0
-      CmdTime()
-    ElseIf WordIs("uptime") <> 0 Or WordIs("up") <> 0
-      CmdUptime()
-    ElseIf WordIs("messages") <> 0
-      CmdMessages()
-    ElseIf WordIs("echo") <> 0
-      CmdEcho()
-    ElseIf WordIs("sleep") <> 0
-      CmdSleep()
-    ElseIf WordIs("version") <> 0 Or WordIs("ver") <> 0
-      CmdVersion()
-    ElseIf WordIs("setexpr") <> 0
-      CmdSetexpr()
-    ElseIf WordIs("gpio") <> 0
-      CmdGpio()
-    ElseIf WordIs("i2c") <> 0
-      CmdI2c()
-    ElseIf WordIs("fan") <> 0
-      CmdFan()
-    ; mod - the driver-module loader. Portable core; this board's own
-    ; hw_mod_q.unoq is what says whether an arena exists here yet.
-    ElseIf WordIs("mod") <> 0
-      CmdMod()
-
-    ElseIf WordIs("mmc") <> 0
-      CmdMmc()
-    ElseIf WordIs("usb") <> 0
-      CmdUsb()
-    ; map - the memory map as the running image measures it. Core, chip-free,
-    ; no capability: every board can say where it put itself. A whole word
-    ; only; m is the memory dump. See CmdMap in Anvil/Core/memcmd.pbi for
-    ; why it is a command of its own and not a section of `info`.
-    ElseIf WordIs("map") <> 0
-      CmdMap()
-
-    ElseIf WordIs("info") <> 0 Or WordIs("board") <> 0 Or LetterIs(105) <> 0
-      CmdQInfo()
-    ElseIf WordIs("reset") <> 0 Or WordIs("reboot") <> 0 Or LetterIs(114) <> 0
-      CmdQReset()
-    ElseIf WordIs("exit") <> 0 Or WordIs("quit") <> 0
-      CmdQExit()
-    ElseIf WordIs("help") <> 0 Or WordIs("commands") <> 0 Or LetterIs(104) <> 0 Or LetterIs(63) <> 0
-      Help()
-    Else
-      Define k.i
-      Print("? this monitor does not know the command ")
-      k = 0
-      While k < gWordLen And k < 24
-        UartWrite(gLine[gWordAt + k] & $FF)
-        k = k + 1
-      Wend
-      PrintN(", so nothing was done.")
-      PrintN("  Type help, or just a question mark, for the list of commands.")
-      PrintN("  Every command is a whole word; the old single letters still work.")
-    EndIf
-    ; What the command above cost, on this board's own counter, if the
-    ; line began with `measure`. Silent otherwise.
-    TimeReport()
-
-    ; The transcript is flushed after EVERY command, not once at the end.
-    ; This is the only channel anyone on this bench can read, and a
-    ; session that ends in a hang or a fault must still leave everything
-    ; up to the last completed command on disk.
-    QLogFlush()
-
-    If gQExitWanted <> 0
-      Break
-    EndIf
-  ForEver
+  AnvilCommandLoop()
 
   ; ---- shutdown ------------------------------------------------------
   PrintNl()

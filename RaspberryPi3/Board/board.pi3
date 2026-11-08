@@ -49,9 +49,9 @@ StackAddress $1F00000
 ;  other two Pi 3 board files, so three programs on one board keep three
 ;  numbers and none of them moves when another is built.
 ; ----------------------------------------------------------------------
-#ANVIL_BUILD = 110 ; pmf:build
+#ANVIL_BUILD = 112 ; pmf:build
 #ANVIL_BUILD_DATE = 20261108 ; pmf:builddate
-#ANVIL_BUILD_TIME = 004317 ; pmf:buildtime
+#ANVIL_BUILD_TIME = 010028 ; pmf:buildtime
 
 ; ======================================================================
 ;  1. THIS BOARD'S LOW-LEVEL LIBRARIES.
@@ -1297,6 +1297,137 @@ Procedure.i BoardPromptPump(operation.i)
  ProcedureReturn 0
 EndProcedure
 
+XIncludeFile "Anvil/Core/command_loop.pbi"
+
+Procedure.i HwCommandLoopHook(phase.i)
+ Select phase
+  Case #ACMD_AFTER_PROMPT
+   UartDrain() : NetConsoleFlush() : NetConsoleCommandDone()
+   pi3_wifi_prompt_ready=1
+  Case #ACMD_AFTER_INPUT
+   pi3_wifi_foreground_active=1 : NetConsoleCommandBegin()
+  Case #ACMD_AFTER_COMMAND
+   pi3_wifi_foreground_active=0
+ EndSelect
+ ProcedureReturn 1
+EndProcedure
+
+Procedure.i HwCommandDispatch(c.i)
+    If c = 0
+      ; An empty line reprints the prompt and does nothing else.
+    ElseIf WordIs("memory") <> 0 Or WordIs("dump") <> 0 Or WordIs("md") <> 0 Or LetterIs(109) <> 0
+      CmdMem()
+    ElseIf WordIs("write") <> 0 Or WordIs("poke") <> 0 Or LetterIs(119) <> 0
+      CmdWrite()
+    ElseIf WordIs("compare") <> 0 Or WordIs("cmp") <> 0
+      CmdCompare()
+    ElseIf WordIs("copy") <> 0 Or WordIs("cp") <> 0
+      CmdCopy()
+    ElseIf WordIs("crc32") <> 0 Or WordIs("checksum") <> 0
+      CmdCrc32()
+    ElseIf WordIs("fill") <> 0 Or WordIs("mw") <> 0
+      CmdFill()
+    ElseIf WordIs("mm") <> 0
+      CmdMm()
+    ElseIf WordIs("nm") <> 0
+      CmdNm()
+    ElseIf WordIs("mtest") <> 0
+      CmdMtest()
+    ElseIf WordIs("base") <> 0
+      CmdBase()
+    ; force - arm one address this board refused, for the next command
+    ; line only. A whole word, no alias and no abbreviation: it is the
+    ; confirmation for an access the board has said is not safe, and a
+    ; short way to type it would be the accident it exists to prevent.
+    ElseIf WordIs("force") <> 0
+      CmdForce()
+    ElseIf WordIs("run") <> 0 Or WordIs("go") <> 0 Or LetterIs(103) <> 0
+      CmdGo()
+    ElseIf WordIs("booti") <> 0
+      CmdBooti()
+    ElseIf WordIs("bootm") <> 0
+      CmdBootm()
+    ElseIf WordIs("boot") <> 0
+      CmdBoot()
+    ; The shared raw-block receiver is the fast, CRC-checked staging path.
+    ; Keep the old S-record loader available for serial tools that use it.
+    ElseIf WordIs("receive") <> 0 Or LetterIs(98) <> 0   ; b
+      CmdBlock()
+    ; Same shared guarded block receiver and CRC verdict, over the active
+    ; Wi-Fi UDP console. The command is present only with #CAP_NET enabled.
+    ElseIf WordIs("wb") <> 0
+      CmdWirelessBlock()
+    ElseIf WordIs("srecord") <> 0 Or WordIs("loads") <> 0 Or LetterIs(108) <> 0 ; l
+      SrecLoad()
+    ; THE FILE COMMANDS, over the shared filesystems and the shared file
+    ; seam. Unedited for this board: it supplies a block reader and a
+    ; block writer and nothing else.
+    ElseIf DispatchStorageCommand() <> 0
+      ; The portable storage family owns its names and aliases once.
+    ; THE SETTINGS STORE. SETTINGS.TXT on the boot partition, which is
+    ; where the other board keeps its too - a board that lost its
+    ; settings to a data-partition swap would be a board that lost its
+    ; network credentials to one.
+    ElseIf WordIs("settings") <> 0
+      CmdSettings()
+    ElseIf WordIs("printenv") <> 0
+      CmdEnvPrint()
+    ElseIf WordIs("setenv") <> 0
+      CmdEnvSet()
+    ElseIf WordIs("saveenv") <> 0
+      CmdSettingsSave()
+    ElseIf WordIs("env") <> 0
+      CmdEnv()
+    ElseIf WordIs("time") <> 0
+      CmdTime()
+    ElseIf WordIs("uptime") <> 0 Or WordIs("up") <> 0
+      CmdUptime()
+    ElseIf WordIs("messages") <> 0
+      CmdMessages()
+    ElseIf WordIs("echo") <> 0
+      CmdEcho()
+    ElseIf WordIs("sleep") <> 0
+      CmdSleep()
+    ElseIf WordIs("version") <> 0 Or WordIs("ver") <> 0
+      CmdVersion()
+    ElseIf WordIs("setexpr") <> 0
+      CmdSetexpr()
+    ElseIf WordIs("gpio") <> 0
+      CmdGpio()
+    ElseIf WordIs("i2c") <> 0
+      CmdI2c()
+    ElseIf WordIs("fan") <> 0
+      CmdFan()
+    ElseIf WordIs("font") <> 0
+      ; Only mutation subcommands take ownership; `font info` is observational.
+      If Pi3FontCommandMutates() <> 0 : pi3_screen_font_boot = 2 : EndIf
+      CmdFont()
+    ElseIf WordIs("mod") <> 0
+      CmdMod()
+    ElseIf WordIs("mmc") <> 0
+      CmdMmc()
+    ElseIf WordIs("usb") <> 0
+      CmdUsb()
+    ; map - where this image put itself, measured rather than declared.
+    ; A whole word only; m is the memory dump.
+    ElseIf WordIs("map") <> 0
+      CmdMap()
+    ElseIf WordIs("info") <> 0 Or WordIs("board") <> 0 Or LetterIs(105) <> 0
+      CmdPi3Info()
+    ElseIf WordIs("reset") <> 0 Or WordIs("reboot") <> 0 Or LetterIs(114) <> 0
+      CmdPi3Reset()
+    ElseIf WordIs("deadman") <> 0 Or LetterIs(100) <> 0 ; d
+      CmdPi3Deadman()
+    ElseIf WordIs("wifi") <> 0
+      CmdPi3Wifi()
+    ElseIf WordIs("help") <> 0 Or WordIs("commands") <> 0 Or LetterIs(104) <> 0 Or LetterIs(63) <> 0
+      Help()
+    Else
+      ProcedureReturn 0
+    EndIf
+ ProcedureReturn 1
+EndProcedure
+
 Procedure Main()
   Define clock.i
   Define c.i
@@ -1446,194 +1577,13 @@ Procedure Main()
   ; ==================================================================
   ;  THE PROMPT.
   ;
-  ;  Written out rather than called because there is no CommandLoop() in
-  ;  the core to call - on every Anvil board the loop lives inline in
-  ;  the board's Main(), and the other two are the reference. That is a
-  ;  duplication this monitor has three copies of and it is not this
-  ;  lane's to fix; it is recorded in the layering plan.
-  ;
+  ;  The shared command loop owns parsing and command lifecycle; this board
+  ;  supplies its dispatch and console/foreground hooks above.
   ;  "pmf> " IS LOAD-BEARING: five characters, a trailing space, no
   ;  newline. Host tools match on it. Do not tidy it.
   ; ==================================================================
   AnvilPromptServicesBind(@BoardPromptServices)
   AnvilPromptInputsBind(@BoardPromptInputs)
   AnvilPromptPumpBind(@BoardPromptPump)
-  Repeat
-    Print("pmf> ")
-    UartDrain()
-    ; Mirror the prompt and previous command's final bytes before releasing
-    ; the active UDP-console peer. ReadLine belongs to the next line; arm
-    ; that command owner only after input has been accepted.
-    NetConsoleFlush()
-    NetConsoleCommandDone()
-    pi3_wifi_prompt_ready = 1
-    ReadLine()
-    pi3_wifi_foreground_active = 1
-    NetConsoleCommandBegin()
-
-    OutBreakArm()
-    gPos = 0
-    SkipSpace()
-    gWordAt = gPos
-    c = gLine[gPos] & $FF
-    SkipWord()
-    gWordLen = gPos - gWordAt
-
-    ; `measure <command line>` - see MEASURE A COMMAND in Core/parse.pbi.
-    ; When the word moves, the single-letter character moves with it; a
-    ; refusal sets that character to zero, which the empty-line arm below
-    ; already runs nothing for.
-    tmv = TimeArm()
-    If tmv = 1
-      c = gLine[gWordAt] & $FF
-    ElseIf tmv = 2
-      c = 0
-    EndIf
-
-    gMemWidth = 0
-    ; THE SAFETY OVERRIDE AGES HERE, beside the width reset and for the
-    ; same reason: state must not leak from one command line into the
-    ; next. `force <address>` arms one address for the NEXT line and this
-    ; ends it, used or not.
-    ForceAge()
-    If gWordLen >= 3 And gLine[gWordAt + gWordLen - 2] = 46      ; 46 = .
-      suf = gLine[gWordAt + gWordLen - 1] & $FF
-      If suf = 98 Or suf = 66                                    ; b / B
-        gMemWidth = 1
-      ElseIf suf = 119 Or suf = 87                               ; w / W
-        gMemWidth = 2
-      ElseIf suf = 108 Or suf = 76                               ; l / L
-        gMemWidth = 4
-      EndIf
-      If gMemWidth <> 0
-        gWordLen = gWordLen - 2                                  ; hide .x
-      EndIf
-    EndIf
-
-    If c = 0
-      ; An empty line reprints the prompt and does nothing else.
-    ElseIf WordIs("memory") <> 0 Or WordIs("dump") <> 0 Or WordIs("md") <> 0 Or LetterIs(109) <> 0
-      CmdMem()
-    ElseIf WordIs("write") <> 0 Or WordIs("poke") <> 0 Or LetterIs(119) <> 0
-      CmdWrite()
-    ElseIf WordIs("compare") <> 0 Or WordIs("cmp") <> 0
-      CmdCompare()
-    ElseIf WordIs("copy") <> 0 Or WordIs("cp") <> 0
-      CmdCopy()
-    ElseIf WordIs("crc32") <> 0 Or WordIs("checksum") <> 0
-      CmdCrc32()
-    ElseIf WordIs("fill") <> 0 Or WordIs("mw") <> 0
-      CmdFill()
-    ElseIf WordIs("mm") <> 0
-      CmdMm()
-    ElseIf WordIs("nm") <> 0
-      CmdNm()
-    ElseIf WordIs("mtest") <> 0
-      CmdMtest()
-    ElseIf WordIs("base") <> 0
-      CmdBase()
-    ; force - arm one address this board refused, for the next command
-    ; line only. A whole word, no alias and no abbreviation: it is the
-    ; confirmation for an access the board has said is not safe, and a
-    ; short way to type it would be the accident it exists to prevent.
-    ElseIf WordIs("force") <> 0
-      CmdForce()
-    ElseIf WordIs("run") <> 0 Or WordIs("go") <> 0 Or LetterIs(103) <> 0
-      CmdGo()
-    ElseIf WordIs("booti") <> 0
-      CmdBooti()
-    ElseIf WordIs("bootm") <> 0
-      CmdBootm()
-    ElseIf WordIs("boot") <> 0
-      CmdBoot()
-    ; The shared raw-block receiver is the fast, CRC-checked staging path.
-    ; Keep the old S-record loader available for serial tools that use it.
-    ElseIf WordIs("receive") <> 0 Or LetterIs(98) <> 0   ; b
-      CmdBlock()
-    ; Same shared guarded block receiver and CRC verdict, over the active
-    ; Wi-Fi UDP console. The command is present only with #CAP_NET enabled.
-    ElseIf WordIs("wb") <> 0
-      CmdWirelessBlock()
-    ElseIf WordIs("srecord") <> 0 Or WordIs("loads") <> 0 Or LetterIs(108) <> 0 ; l
-      SrecLoad()
-    ; THE FILE COMMANDS, over the shared filesystems and the shared file
-    ; seam. Unedited for this board: it supplies a block reader and a
-    ; block writer and nothing else.
-    ElseIf DispatchStorageCommand() <> 0
-      ; The portable storage family owns its names and aliases once.
-    ; THE SETTINGS STORE. SETTINGS.TXT on the boot partition, which is
-    ; where the other board keeps its too - a board that lost its
-    ; settings to a data-partition swap would be a board that lost its
-    ; network credentials to one.
-    ElseIf WordIs("settings") <> 0
-      CmdSettings()
-    ElseIf WordIs("printenv") <> 0
-      CmdEnvPrint()
-    ElseIf WordIs("setenv") <> 0
-      CmdEnvSet()
-    ElseIf WordIs("saveenv") <> 0
-      CmdSettingsSave()
-    ElseIf WordIs("env") <> 0
-      CmdEnv()
-    ElseIf WordIs("time") <> 0
-      CmdTime()
-    ElseIf WordIs("uptime") <> 0 Or WordIs("up") <> 0
-      CmdUptime()
-    ElseIf WordIs("messages") <> 0
-      CmdMessages()
-    ElseIf WordIs("echo") <> 0
-      CmdEcho()
-    ElseIf WordIs("sleep") <> 0
-      CmdSleep()
-    ElseIf WordIs("version") <> 0 Or WordIs("ver") <> 0
-      CmdVersion()
-    ElseIf WordIs("setexpr") <> 0
-      CmdSetexpr()
-    ElseIf WordIs("gpio") <> 0
-      CmdGpio()
-    ElseIf WordIs("i2c") <> 0
-      CmdI2c()
-    ElseIf WordIs("fan") <> 0
-      CmdFan()
-    ElseIf WordIs("font") <> 0
-      ; Only mutation subcommands take ownership; `font info` is observational.
-      If Pi3FontCommandMutates() <> 0 : pi3_screen_font_boot = 2 : EndIf
-      CmdFont()
-    ElseIf WordIs("mod") <> 0
-      CmdMod()
-    ElseIf WordIs("mmc") <> 0
-      CmdMmc()
-    ElseIf WordIs("usb") <> 0
-      CmdUsb()
-    ; map - where this image put itself, measured rather than declared.
-    ; A whole word only; m is the memory dump.
-    ElseIf WordIs("map") <> 0
-      CmdMap()
-    ElseIf WordIs("info") <> 0 Or WordIs("board") <> 0 Or LetterIs(105) <> 0
-      CmdPi3Info()
-    ElseIf WordIs("reset") <> 0 Or WordIs("reboot") <> 0 Or LetterIs(114) <> 0
-      CmdPi3Reset()
-    ElseIf WordIs("deadman") <> 0 Or LetterIs(100) <> 0 ; d
-      CmdPi3Deadman()
-    ElseIf WordIs("wifi") <> 0
-      CmdPi3Wifi()
-    ElseIf WordIs("help") <> 0 Or WordIs("commands") <> 0 Or LetterIs(104) <> 0 Or LetterIs(63) <> 0
-      Help()
-    Else
-      Print("? this monitor does not know the command ")
-      k = 0
-      While k < gWordLen And k < 24
-        UartWrite(gLine[gWordAt + k] & $FF)
-        k = k + 1
-      Wend
-      PrintN(", so nothing was done.")
-      PrintN("  Type help, or just a question mark, for the list of commands.")
-      PrintN("  Every command is a whole word; the old single letters still work.")
-    EndIf
-
-    ; What the command above cost, on this board's own counter, if the
-    ; line began with `measure`. Silent otherwise.
-    TimeReport()
-    pi3_wifi_foreground_active = 0
-  ForEver
+  AnvilCommandLoop()
 EndProcedure

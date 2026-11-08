@@ -2986,3 +2986,14 @@ EndProcedure
 ; adapter and plain monitor commands. It retains that board's range/device,
 ; watchdog and recovery behavior; portable container code uses HwPayloadRun
 ; instead of staging a register argument for this one-argument legacy entry.
+
+
+; SHARED COMMAND LOOP BOARD CONTRACT
+; HwCommandDispatch(c.i)       handle the parsed command, 1 handled / 0 unknown.
+;                             c is its first byte after measure/suffix parsing;
+;                             gWordAt/gWordLen/gPos are the shared parser state.
+; HwCommandLoopHook(phase.i)   1 continue / 0 request session stop. Phases in
+;                             Anvil/Core/command_loop.pbi bracket prompt style,
+;                             output/owner flush, input and command completion.
+; These hooks implement board/session policy, not their own parser or loop.
+; A stop after input must not dispatch a synthetic/deadman-completed line.

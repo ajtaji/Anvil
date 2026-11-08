@@ -14,7 +14,7 @@ guest library, with its source revision and hash in `PROVENANCE.json`.
 The board's interrupt owner must reserve the calling core's timer and configure
 line 1 as a level source, enabled above that core's interrupt threshold. Anvil
 must already be running in its required supervisor context. Then call
-`ZentajiPromptIdlePrepare(maxMicroseconds)` with a 50ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦ÃƒÂ¢Ã¢â€šÂ¬Ã…â€œ2000 microsecond deadline.
+`ZentajiPromptIdlePrepare(maxMicroseconds)` with a 50ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¦ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦ÃƒÂ¢Ã¢â€šÂ¬Ã…â€œ2000 microsecond deadline.
 It refuses an active timer, a nonzero period or pending timer status, an
 inadmissible interrupt, a busy interrupt context, or a second reservation.
 It reads the machine frequency and rounds the interval down; an interval
@@ -490,3 +490,36 @@ two seconds, with exact recorded native/twin state/RAM replay and a real message
 log with no file hook. The qualified timer/WFI wake path is unchanged. This is a
 Windows headless execution proof; visible device input and Linux are still owed.
 The existing registered-adapter prompt and idle gates remain separate regressions.
+
+
+## Shared command loop
+
+`Anvil/Core/command_loop.pbi` now owns `AnvilCommandLoop()` and the
+single-iteration `AnvilCommandStep()`. Pi4, Pi3 and Arduino Q call that same loop;
+the Zentaji ROM command composition calls its step. Prompt bytes stay exactly
+`pmf> ` with the trailing space and no newline. Shared preparation arms output
+cancellation after input, parses the word, handles `measure`, resets memory
+width, ages the one-command force override and strips supported width suffixes.
+The shared loop supplies timing reports and the bounded unknown-command reply.
+
+A board implements the two declared HAL entries `HwCommandDispatch(c)` and
+`HwCommandLoopHook(phase)`. Dispatch tries its included command families and
+returns 0 for the shared unknown-word reply. The hook brackets prompt styling,
+output/console-owner flushing, input admission and command completion. It returns
+0 to stop the session. A stop after input suppresses dispatch and preparation,
+which preserves firmware/deadman exit behavior. Board hooks retain Pi3 foreground
+flags and Arduino Q typing, prompt-attribute and transcript-flush behavior;
+firmware argument capture and shutdown stay in each board's Main.
+
+```text
+python tools/zentaji_command_loop_check.py --compiler <Forge executable> --zen-tools <tools/zentaji directory>
+```
+
+Three real-UART native/twin cases check `.B/.W/.l` handling and reset, exact
+one-command force expiry, `measure` and its bare/nested refusals, empty input,
+unknown words and 24-byte display cap, all hook phases in order, and stopping
+before the prompt or after input without dispatch or state preparation. The
+ROM file-command gate also passes using the shared step and its existing
+independent RAM/disk oracle. These are bounded component proofs. A counted
+production Zentaji board entry and the remaining command/payload integration are
+still unfinished.

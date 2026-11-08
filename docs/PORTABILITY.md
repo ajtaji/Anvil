@@ -94,8 +94,8 @@ probe or automatic assertion that a virtual RTC holds correct civil time.
 Storage command names and aliases are dispatched by `DispatchStorageCommand()`
 in the shared `Anvil/Core/fs_cmd.pbi`, after the caller establishes the ordinary
 parsed word state. Pi4, Pi3, Arduino Q and the Zentaji command composition use
-that procedure; board loops continue to own their other command families and
-startup. A new architecture supplies memory/storage seams and reuses the shared
+that procedure; board dispatch backends own their other command families and
+startup, while the interactive lifecycle is shared in `command_loop.pbi`. A new architecture supplies memory/storage seams and reuses the shared
 handlers rather than copying the word chain or filesystem logic. Rock Pi's
 separate recovery-console composition has not been migrated by this change.
 
@@ -113,3 +113,14 @@ Pi4, Pi3 and Arduino Q wire their existing services after privileged entry captu
 Zentaji's serial command composition currently leaves the optional providers
 unregistered. Capabilities and payload-service availability remain separate
 contracts, and registration does not grant an architecture an ARM identity.
+
+
+## Command-loop board hooks
+
+`Anvil/Core/command_loop.pbi` owns prompt/read/prepare/dispatch/report ordering.
+The required `HwCommandDispatch` and `HwCommandLoopHook` entries are declared in
+`Anvil/Hal/hal.pbi`. A dispatch backend chooses compiled command families; the
+hook carries board/session operations at the five lifecycle boundaries without
+copying the parser or loop. Pi4, Pi3 and Arduino Q use this same core, preserving
+console ownership, prompt sideband style, firmware input gating and session-stop
+semantics. A new architecture supplies those hooks and its hardware/startup seams.

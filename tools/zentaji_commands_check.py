@@ -36,6 +36,14 @@ IncludeFile "Anvil/Core/addrsafe.pbi"
 IncludeFile "Anvil/Core/settings.pbi"
 IncludeFile "Anvil/Core/datapath.pbi"
 IncludeFile "Anvil/Core/fs_cmd.pbi"
+IncludeFile "Anvil/Core/command_loop.pbi"
+Procedure.i HwCommandLoopHook(phase.i)
+ If phase=#ACMD_AFTER_PROMPT : UartDrain() : EndIf
+ ProcedureReturn 1
+EndProcedure
+Procedure.i HwCommandDispatch(c.i)
+ ProcedureReturn DispatchStorageCommand()
+EndProcedure
 Global visits.i,ranges.i
 Global Dim report.q[4]
 Procedure.i RangeVisit(lba.i,blocks.i,context.i)
@@ -56,10 +64,7 @@ Procedure.i Main(table.i,source.i,context.i)
  stage=HwStageAddr()
  For n=0 To 1799 : PokeA(stage+n,(n*7+n/512+31)&255) : Next
  For command=0 To 5
-  Print("pmf> ") : ReadLine()
-  gPos=0 : SkipSpace() : gWordAt=gPos : SkipWord() : gWordLen=gPos-gWordAt
-  OutBreakArm()
-  If DispatchStorageCommand()<>1 : ProcedureReturn 3 : EndIf
+  If AnvilCommandStep()<>1 : ProcedureReturn 3 : EndIf
   If command=1
    For n=0 To 1799 : PokeA(stage+n,0) : Next
   ElseIf command=2

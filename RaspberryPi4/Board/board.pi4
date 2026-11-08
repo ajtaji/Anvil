@@ -1185,7 +1185,7 @@ StackAddress $8000000
 ;      #ANVIL_BUILD = 1        ; pmf:build off
 ;  The IDE's Compiler > Build Number... window writes that word for you.
 ; ======================================================================
-#ANVIL_BUILD = 500        ; pmf:build
+#ANVIL_BUILD = 501        ; pmf:build
 
 ;  The two optional siblings, written by the same successful build. They
 ;  are INTEGERS because `#NAME = <literal>` takes a number and nothing
@@ -1194,7 +1194,7 @@ StackAddress $8000000
 ;  for. YYYYMMDD and HHMMSS read correctly as decimal numbers anyway, and
 ;  CmdVersion() prints them with their separators put back.
 #ANVIL_BUILD_DATE = 20261108   ; pmf:builddate
-#ANVIL_BUILD_TIME = 004239     ; pmf:buildtime
+#ANVIL_BUILD_TIME = 005758     ; pmf:buildtime
 
 ; ======================================================================
 ;  THE LIBRARIES. A library never includes a library - the main file
@@ -2574,558 +2574,23 @@ Procedure.i BoardPromptPump(operation.i)
  ProcedureReturn 0
 EndProcedure
 
-Procedure Main()
-  Define c.i
-  Define hz.i
-  Define vulkanBootRc.i
-  Define fontBootReady.i
+XIncludeFile "Anvil/Core/command_loop.pbi"
 
-  ASM
-    ; CAPTURE THE FIRMWARE DEVICE-TREE POINTER, FIRST, BEFORE ANYTHING
-    ; TOUCHES x0.
-    ;
-    ; The selected Raspberry Pi armstub enters kernel8.img with x0 = the
-    ; firmware's flattened-device-tree pointer and x1=x2=x3=0. The stock stub
-    ; enters EL2h; Anvil's optional checked stub retains EL3. Both use the same
-    ; handoff (Datasheets/pi4/armstub8.S:163-171: primary_cpu loads w0 from
-    ; dtb_ptr32, then br x4). Anvil is kernel8.img, so x0 is that DTB at
-    ; _start. Nothing between _start and here has touched it:
-    ; EmitCore_A64.pbi's preamble uses x9,x10,x16,x17,x18 for the stack,
-    ; BSS-zero and the FP gate; Main()'s prologue uses x29,x30; and this is
-    ; Main()'s FIRST statement. So x0 still holds the DTB, and booti reads
-    ; it back through HwFirmwareDtb() (RaspberryPi4/Board/hw_boot.pi4).
-    ;
-    ; x1 is a safe scratch: the stub set it to 0 at entry and nothing reads
-    ; it here. The store lands in DRAM because the caches are still off (the
-    ; selected stub's active SCTLR bank has C=0 and Anvil has not enabled the MMU yet), which
-    ; is why HwFirmwareDtb() reads the right value however the D-cache is set
-    ; later. global_gbootdtb is gBootDtb (hw_boot.pi4), already zeroed by the
-    ; BSS-zero pass that ran before Main; this overwrites that zero.
-    adrp x1, global_gbootdtb
-    add  x1, x1, #:lo12:global_gbootdtb
-    str  x0, [x1]
+Procedure.i HwCommandLoopHook(phase.i)
+ Select phase
+  Case #ACMD_BEFORE_PROMPT
+   BootTimingPromptOnce()
+   UartScreenStyle(#UART_SCREEN_STYLE_PROMPT)
+  Case #ACMD_AFTER_PROMPT
+   UartScreenStyle(#UART_SCREEN_STYLE_NORMAL)
+   NetConsoleFlush() : NetConsoleCommandDone()
+  Case #ACMD_AFTER_INPUT
+   NetConsoleCommandBegin()
+ EndSelect
+ ProcedureReturn 1
+EndProcedure
 
-    ; MOVE THE MONITOR'S STACK OFF $08000000.
-    ;
-    ; The emitted prologue put sp at a hardcoded $08000000 and every
-    ; payload's prologue will put its own sp at the same address. One
-    ; of us has to move, and it has to be us, because we are the one
-    ; that has to still be here afterwards. #MON_STACK = $00100000,
-    ; growing down through free DRAM and stopping well above the
-    ; firmware's spin table at $0..$FFF.
-    ;
-    ; Main()'s own frame is stranded on the old stack by this, which is
-    ; harmless ONLY because Main() never returns.
-    ;
-    ; movz zeroes the whole 64-bit register and movk writes one field
-    ; without disturbing the rest, so this is a full 64-bit constant
-    ; even though only one field is non-zero.
-  EndASM
-  CompilerIf #PMF_CHIP = 2712
-    ; BCM2712: ONLY WHERE WE WERE LINKED. This build is linked at $80000,
-    ; where the Pi 5 firmware loads kernel=, and its whole map - the stack
-    ; at #MON_STACK, the phase record, the boot-count word, the raw-core
-    ; stacks, the autoboot record and the low payload window - is THE
-    ; BCM2712 MAP in memmap.pi4, computed from that address. 2026-09-27,
-    ; the first full Pi 5 boot ran the Pi 4 layout at $80000: the stack and
-    ; the boot records landed inside the code and the board died at a
-    ; procedure entry ($1FB660, EC 0). So the stack moves only when the
-    ; image is where the map assumes; otherwise it stays on the emitted
-    ; $08000000 stack and the board stops below with a sentence instead of
-    ; running on a map that is not its own.
-    If MonImageLo() = #MON_LO
-      gPi5StackTop = #MON_STACK
-      ASM
-        adrp x16, global_gpi5stacktop
-        add  x16, x16, #:lo12:global_gpi5stacktop
-        ldr  x16, [x16]
-        mov  sp, x16
-      EndASM
-    Else
-      gPi5LoadWrong = 1
-    EndIf
-  CompilerElse
-  ASM
-    movz x16, #0
-    movk x16, #0x0010, lsl #16
-    mov  sp, x16
-  EndASM
-  CompilerEndIf
-
-  ; ADOPT the port, do not initialise it. uart.pi4 offers both calls and
-  ; the wrong one here would disable the PL011, reprogram it and flush
-  ; whatever the loader had queued - see the header.
-  ; 115200 regardless of what the firmware or a loader left behind. The
-  ; baud command can raise it afterwards; coming up at anything else
-  ; would mean the first line out is unreadable to a host that has not
-  ; been told yet.
-  ; Capture synchronous failures from the earliest driver initialization.
-  ; This installs only the current EL's vectors; it never unmasks IRQs.
-  HwExceptionPrepare()
-  ; Registration only; hardware entropy is gathered lazily on first request.
-  RandomServiceBind(@RandomDrbgReady,@RandomDrbgGenerate)
-  HttpServerInit()
-  UartInit(115200)
-  CompilerIf #PMF_CHIP = 2712
-    If gPi5LoadWrong <> 0
-      Print("!! Anvil was loaded at ")
-      PutAddr(MonImageLo())
-      Print(" and is built to run at ")
-      PutAddr(#MON_LO)
-      PrintN(", where the Pi 5 firmware puts kernel=.")
-      PrintN("   Something moved it - config.txt must have no kernel_address line.")
-      PrintN("   This monitor's memory map is computed from its link address, so it")
-      PrintN("   stops now, before its stack or its boot records are touched.")
-      PrintN("   Nothing else was started.")
-      Repeat
-        ASM
-          wfe
-        EndASM
-      ForEver
-    EndIf
-    ; BCM2712: the JST debug connector (UART10, $107D001000) as a second
-    ; window on the console, teed from the header port (RaspberryPi4/Lib/
-    ; uart.pi4, Anvil 73c6886). Adopted if the firmware or the EL3 stub left
-    ; it running, else brought up at 115200. The tee is bounded and never
-    ; delays the header port, so a quiet header still leaves this one.
-    If Uart10Attach() = 1 Or Uart10Init(115200) = 1
-      Uart10Tee(1)
-    EndIf
-    Pi5DtbApply()
-  CompilerEndIf
-  If gExceptionReady = 0
-    Print("!! Processor exception installation failed with code ")
-    PrintDec(ExceptionError()) : PrintNl()
-    PrintN("   Processor exception vectors could not be installed. Check the")
-    PrintN("   primary-core EL2/EL3 boot configuration before using this image.")
-  EndIf
-  HwInterruptPrepare()
-  If gInterruptReady = 0
-    PrintN("!! The interrupt controller was not prepared; IRQs remain masked.")
-    PrintN("   Polling remains available. Check the GIC identity and vector setup.")
-  EndIf
-
-  ; THE ARM CLOCK, BEFORE ANYTHING THAT IS SLOW.
-  ;
-  ; The firmware hands a Pi 4 to its kernel at 600 MHz, not the 1500 MHz
-  ; the part is rated for. That is not a fault - it is the conservative
-  ; boot state, and every real kernel raises it. This monitor never did,
-  ; so for a long time every glyph drawn, every block copied and every
-  ; CRC computed here ran at 40 percent of the speed available, for
-  ; nothing.
-  ;
-  ; It was found the embarrassing way: the HDMI console was slow enough
-  ; to be reported as a fault from the bench, and `i` had been printing
-  ; "ARM configured 600000000" at the top of every session for weeks
-  ; while nobody read it. A 2.5x speedup was sitting in the output of a
-  ; command we ran constantly.
-  ;
-  ; ClockInit() asks the firmware for its OWN reported maximum rather
-  ; than naming a number here - see clocks.pi4:161. The firmware knows
-  ; what this board can do, raises the core voltage to match, and clamps
-  ; silently if it disagrees, which is why `c` prints APPLIED and then
-  ; MEASURED separately.
-  ;
-  ; IT IS NOT FATAL IF IT FAILS. A board running at 600 MHz is slow, not
-  ; broken, and refusing to boot the monitor over it would turn a
-  ; performance question into a dead board with no console.
-  If ClockInit() = 0
-    PrintN("!! the ARM clock could not be raised - running at the firmware's")
-    PrintN("   boot speed. Everything here still works, just slower. 'c' shows it.")
-  EndIf
-
-  ; TimerInit() does two things and only the second is worth calling
-  ; for: it caches CNTFRQ_EL0, which Micros()/millis() would do lazily
-  ; anyway, and it WATCHES THE COUNTER MOVE. Having a frequency and
-  ; having a running counter are different claims.
-  If TimerInit() = 0
-    PrintN("!! the architectural counter is not running - every timeout")
-    PrintN("   in this monitor is guesswork. Transfers may not time out.")
-  EndIf
-
-  ; SAMPLE THE BOOT TICK, and do it here rather than at the top of Main:
-  ; TimerInit() has just proved the counter is actually moving, and a
-  ; boot stamp taken from a frozen counter would make every later uptime
-  ; wrong in the one direction that matters - it would never appear to
-  ; reset. CNTPCT_EL0 is cleared by a reboot, so this is zero-based per
-  ; boot with nothing to subtract.
-  gBootTicks = Ticks()
-  WallClockInit()
-
-  ; Two seconds of silence ends a transfer. ubsend.py pauses 4 ms
-  ; between records in S-record mode and 600 ms after the command, and
-  ; in raw mode it waits on our own acks, so this is generous by two
-  ; orders of magnitude in both and still leaves a live prompt when the
-  ; host goes away.
-  hz = TickHz()
-  If hz <= 0 Or hz > 1000000000
-    hz = 54000000                ; the BCM2711's counter, as a fallback
-  EndIf
-  gToTicks = hz + hz
-
-  gBad = 0
-  gFail = 0
-  gHaveEntry = 0
-  gMbx = 0
-
-  ; THE TIMING RECORD, BEFORE THE FIRST THING WORTH TIMING. TimerInit()
-  ; above has just proved the counter is moving, which is the one
-  ; precondition a table of ticks has. See Board/boot_timing.pi4 - it is
-  ; at a fixed address in the display's own reserved window, it survives
-  ; the boot it describes, and `screen timing` reads it back.
-  BootTimingBegin(hz, ClockMeasuredHz(#MBX_CLK_ARM))
-
-  ScreenEarlyLogStart()
-  Banner()
-  fontBootReady = AnvilFontBootEmbeddedInit()
-
-  ; ------------------------------------------------------------------
-  ;  THE SCREEN FIRST. THEN THE CONFIGURATION. THEN THE NETWORK.
-  ;
-  ;  THIS ORDER IS A CHANGE AND IT HAS TO ANSWER THE ONE THAT WAS HERE.
-  ;  BootConfigUp() - PCIe, the xHCI host, the USB devices, the boot
-  ;  medium and SETTINGS.TXT - used to run FIRST, and the argument was
-  ;  sound: the screen is configured hardware, so a screen brought up
-  ;  before the store existed could only come up in a default and would
-  ;  have to be TORN DOWN AND REBUILT when the real answer arrived,
-  ;  erasing the boot log it was brought up early to carry.
-  ;
-  ;  THE CONCLUSION FOLLOWED FROM TWO THINGS THAT ARE NO LONGER TRUE.
-  ;  A geometry change is no longer a teardown: ScrDsiReadoptBegin
-  ;  re-points the HVS at its other fixed display list and re-installs
-  ;  the drawing surface with the panel still scanning - no power, no
-  ;  reset, no DSI host, no pixel valve, no allocation. And the boot log
-  ;  no longer lives only on the glass: Anvil/Core/boot_transcript.pbi
-  ;  retains the byte stream the console was built from, so a grid
-  ;  rebuilt at a new geometry is restored from WHAT WAS SAID rather
-  ;  than from pixels that are the wrong shape.
-  ;
-  ;  WHAT IT BUYS, AND IT IS THE WHOLE POINT: the slow half of the boot
-  ;  now PRINTS ON THE PANEL AS IT HAPPENS. USB enumeration and the boot
-  ;  medium are the longest things before the radio and they were the
-  ;  lines nobody could see. The stated cost of the old order - "the USB
-  ;  and boot-medium lines now reach the wire before the glass exists,
-  ;  so they are not on the panel" - is paid back here.
-  ;
-  ;  AND THE COMMON CASE COSTS NOTHING AT ALL. SETTINGS.TXT on this
-  ;  bench names no rotation, so the stored answer IS the default and
-  ;  ScreenApplyStoredGeometry finds nothing to change.
-  ;
-  ;  THE NETWORK IS STILL LAST, which is what the original ordering
-  ;  really existed for: it is the long, hang-prone half, and a board
-  ;  that stalls in the radio says so on the glass.
-  ;
-  ;  ScreenUp() is never fatal and it CHOOSES: the DSI panel if one
-  ;  answered on the display connector, else an HDMI display if the
-  ;  firmware found one, else none - and it says which. The prompt
-  ;  arrives on the wire either way.
-  ;
-  ;  NOTHING IN ScreenUp() READS THE SETTINGS STORE FOR ANYTHING BUT
-  ;  GEOMETRY. The panel is found over I2C, the firmware is asked over
-  ;  the mailbox, and the framebuffers are at fixed addresses this
-  ;  monitor chose - so there is nothing here that needs the boot medium
-  ;  to have mounted. The two things the store can say, rotation and
-  ;  magnification, are exactly the two ScreenApplyStoredGeometry
-  ;  corrects below.
-  ; ------------------------------------------------------------------
-  ; Opt in only for the existing panel/touch boot transactions. Capture is
-  ; bounded RAM history, not extra probes; disable retains it for touch trace.
-  If fontBootReady <> 0 : ScreenDsiEarlyCacheArm() : EndIf
-  I2cTraceEnable(1)
-  If fontBootReady <> 0
-    gScreenDeferFirstFrame = 1
-    ScreenUp()
-  Else
-    PrintN("!! no screen frame will be drawn without the embedded TrueType font")
-  EndIf
-  TouchBoot()
-  ; BCM2712: caches on, after ScreenUp so DisplayBase() is known when
-  ; CacheMapNc builds the Non-Cacheable map, and after Pi5DtbApply (top of
-  ; Main), whose MmuSetRamBytes sized RAM from the live /memory.
-  CompilerIf #PMF_CHIP = 2712
-    Pi5CachesOn()
-  CompilerEndIf
-  I2cTraceEnable(0)
-  BootTimingMark(#BTM_TOUCH_END, 0, 0)
-  ; Paint whatever the pre-screen lines left queued the instant the glass
-  ; exists, so the banner is followed by the log rather than by a pause.
-  ScreenServiceTick()
-
-  ; The embedded face and framebuffer are ready before storage. Present the
-  ; first Vulkan frame now so PCIe, USB and mount progress is visible live.
-  CompilerIf #ANVIL_VULKAN_CONSOLE = 1
-  If gScreen <> 0
-    If AnvilTrueTypeSlotSelected() < 0 Or gScreenFontMetricFault <> 0
-      PrintN("!! TrueType face or metrics unavailable; screen rendering remains deferred.")
-    Else
-      vulkanBootRc = VulkanConsoleStart()
-      If vulkanBootRc = #AVC_OK
-        VulkanConsolePump()
-        If avcFramePresented <> 0
-          gScreenDeferFirstFrame = 0
-          PrintN("display renderer: Vulkan on V3D (NeonArcade); the preferred tier is up.")
-        Else
-          If VulkanConsoleReady() <> 0 : VulkanConsoleStop() : EndIf
-          ConNoRenderer()
-          PrintN("!! Vulkan did not present a first frame before storage; screen rendering remains deferred.")
-        EndIf
-      Else
-        ConNoRenderer()
-        Print("!! Vulkan console unavailable before storage (code ")
-        PrintDec(vulkanBootRc)
-        PrintN("); screen rendering remains deferred.")
-      EndIf
-    EndIf
-  EndIf
-  BootTimingMark(#BTM_V3D_END, Bool(VulkanConsoleReady() <> 0 Or gV3dConOn <> 0), 0)
-  CompilerElseIf #ANVIL_V3D_CONSOLE = 1
-  V3dConAutoStart()
-  BootTimingMark(#BTM_V3D_END, gV3dConOn, 0)
-  CompilerElse
-  BootTimingMark(#BTM_V3D_END, 0, 0)
-  CompilerEndIf
-
-  ; The slow half, now with somewhere to print. Every line of it lands on
-  ; the panel as it is produced: StorageUp and UsbEnumerate call
-  ; ScreenServiceTick themselves (boot.pi4), so this is live progress and
-  ; not a buffer flushed at the end.
-  BootTimingMark(#BTM_CONFIG_BEGIN, 0, 0)
-  BootConfigUp()
-  BootTimingMark(#BTM_CONFIG_END, gFatUp, 0)
-
-  ; THE STORE EXISTS NOW. If it names a geometry the default bring-up did
-  ; not use, the console moves to it in place and the retained boot log is
-  ; replayed into the rebuilt grid. Returns without touching anything when
-  ; the stored answer and the default agree.
-  ScreenApplyStoredGeometry()
-  ScreenServiceTick()
-
-  TimeBoot()
-  CompilerIf #PMF_CHIP = 2712
-  ; BCM2712: seed the wall clock from the firmware RTC, AFTER TimeBoot has
-  ; set the clock's defaults (Anvil/Core/wallclock.pbi) so the seed wins.
-  HwClockSeed()
-  CompilerEndIf
-  NtpServiceBoot()
-  ScreenEarlyLogFinish()
-  GenetSetProgressHook(@ScreenServiceTick)
-  NetWaitSetProgressHook(@ScreenServiceTick)
-  WifiSetProgressHook(@ScreenServiceTick)
-  ; Draw whatever is already waiting the instant the glass is up, so the
-  ; screen shows it immediately rather than holding it - with the whole
-  ; network bring-up behind it - until the first prompt.
-  ScreenServiceTick()
-  BootTimingMark(#BTM_NET_BEGIN, 0, 0)
-  BootNetUp()
-  BootTimingMark(#BTM_NET_END, 0, 0)
-
-  ; ------------------------------------------------------------------
-  ;  THE DRIVER MODULES, HERE, AND THE POSITION IS THE WHOLE ARGUMENT.
-  ;
-  ;  AFTER THE CONSOLE so that a refusal is seen. A module that will not
-  ;  load is exactly the thing an operator has to be told about, and a
-  ;  walk that ran before the glass and the wire were up would print its
-  ;  sentences into a buffer nobody reads.
-  ;
-  ;  BEFORE BootWait() so that a driver is in place before autoboot can
-  ;  hand the whole board to a payload. A payload entered with the
-  ;  service table is entitled to find the seams a loaded module fills;
-  ;  loading them afterwards would mean the same card produced two
-  ;  different machines depending on how fast somebody pressed a key.
-  ;
-  ;  BEFORE FanBoot() for the same reason one step smaller: the fan
-  ;  policy reads a temperature, and whether that reading comes off the
-  ;  part or out of the firmware is decided by whether THERMAL.MOD
-  ;  loaded. Running the walk afterwards would start the fan on the slow
-  ;  source and silently keep it there.
-  ;
-  ;  IT IS NEVER FATAL. No manifest, no module, or a refused module all
-  ;  reach the prompt: every seam a module would fill has a core answer
-  ;  or an honest refusal behind it.
-  ; ------------------------------------------------------------------
-  ModBoot()
-  ScreenServiceTick()
-
-  ; THE DRAM AUTOBOOT RECORD FIRST, THE PERSISTED BOOT TARGET SECOND, and
-  ; the order is the precedence. BootWait() takes `autoboot <addr>`, which
-  ; somebody typed at this prompt during THIS power cycle and which lives
-  ; in DRAM across a reset; it returns at once when nothing is armed.
-  ; BootFileWait() then takes `boot.file` out of the settings store, which
-  ; survives a power cycle. The deliberate, just-typed thing wins over the
-  ; standing configuration, and on a cold start the DRAM record correctly
-  ; fails its magic so the persisted target is what acts.
-  BootWait()
-  BootFileWait()
-
-  ; THE FAN, LAST, AND AFTER THE SETTINGS ARE IN. FanBoot() resets the
-  ; curve to its documented defaults, lets SETTINGS.TXT override what it
-  ; names, and starts driving the stored pin if there is one. It is here
-  ; rather than in BootBringUp() because the settings load happens in
-  ; there and this has to be after it, and because a fan that starts
-  ; while PCIe is still enumerating would be a fan running on a
-  ; temperature nobody has read yet. It prints one line when a fan is
-  ; configured and nothing at all when one is not.
-  FanBoot()
-  ScreenServiceTick()
-
-  CompilerIf #PMF_CHIP = 2711
-  If AnvilSchedulerQualifyPi4Wfe() <> 0
-    PrintN("Core 0 idle wait: counter-event WFE enabled; CPU usage sampling active.")
-  Else
-    PrintN("Core 0 idle wait: unavailable; prompt remains on cooperative polling.")
-  EndIf
-  CompilerEndIf
-
-  ; THE BOOT LOG ENDS HERE, AND WITH IT THE LAST TIME A BACKGROUND SERVICE
-  ; MAY SPEAK ON THE CONSOLE. From the first prompt on, anything that is not
-  ; the answer to a typed command goes to the message log instead - see
-  ; Anvil/Core/messages.pbi. Everything above this line was the boot, and
-  ; stays on every console exactly as before.
-  ; Shared cooperative TLS driver; no IRQ, timer or secondary-core ownership.
-  ; Lower-EL compositions retain their existing synchronous driver until the
-  ; context backend has a qualified lower-EL execution contract.
-  If TlsCooperativeInstall(HwMonLo(),(HwMonBytes()+3) & -4)<>0
-    PrintN("TLS arithmetic: cooperative service slices enabled.")
-  Else
-    PrintN("TLS arithmetic: synchronous fallback (context backend unavailable).")
-  EndIf
-  BoardLinkTxInstall()
-  IPv6ServiceBind(@IPv6CywGeneration,@IPv6CywPrepare)
-  NetSetIPv6StatusHook(@IPv6ServiceSay)
-  NetSetIPv6CommandHook(@IPv6ServiceCommand)
-  AnvilPromptServicesBind(@BoardPromptServices)
-  AnvilPromptInputsBind(@BoardPromptInputs)
-  AnvilPromptPumpBind(@BoardPromptPump)
-  MessagesStart()
-  MsgLogStart()                                    ; and every kept line to MSGLOG.TXT on the stick
-
-  Repeat
-    ; "pmf> " IS A PROTOCOL STRING - the five characters, the space
-    ; included, and no newline after them. FOUR host tools wait for it:
-    ;
-    ;   tools/anvil.py     prompt() and setbaud() grep for "pmf>"
-    ;   tools/ubsend.py    PROMPTS = (b"U-Boot> ", b"=> ", b"pmf> ") and
-    ;                      it matches with tail.endswith(), so THE
-    ;                      TRAILING SPACE IS LOAD BEARING - without it
-    ;                      the sender never believes it has a prompt and
-    ;                      every transfer fails at the first step
-    ;   tools/monsession.py waits for b"pmf>" before it types anything
-    ;   tools/ubfs.py      uses b"pmf>" to notice Anvil is up and reset
-    ;                      into U-Boot
-    ;
-    ; It is not prose and it is not swept. Do not spell it out, do not
-    ; capitalise it, and do not put a newline after it.
-    ; ONE ROW, THE FIRST TIME ONLY. The record has a fixed number of rows
-    ; and a prompt printed every command would fill it with the least
-    ; interesting event in the boot; BootTimingPromptOnce keeps the first.
-    BootTimingPromptOnce()
-    ; Screen colour is sideband metadata on the primary mirror only. The
-    ; five protocol bytes below still reach PL011 and the network tap
-    ; unchanged, so every host tool continues to match exact b"pmf> ".
-    UartScreenStyle(#UART_SCREEN_STYLE_PROMPT)
-    Print("pmf> ")
-    UartScreenStyle(#UART_SCREEN_STYLE_NORMAL)
-    ; ================================================================
-    ;  AND IT HAS TO REACH THE NETWORK CONSOLE TOO.  2026-09-07.
-    ;
-    ;  MEASURED ON SILICON tonight, over the cable: every command's
-    ;  OUTPUT arrived at the laptop and the prompt NEVER DID - not once,
-    ;  in any capture. The reason is one line in
-    ;  RaspberryPi4/Lib/uart.pi4 (uart_AuxPut): the tap that feeds the
-    ;  network console flushes ON A LINE BOUNDARY - `c = 10` - or when
-    ;  its ring is nearly full. That rule is right for everything else,
-    ;  because flushing per character would put one datagram on the wire
-    ;  for every byte of a screenful.
-    ;
-    ;  "pmf> " HAS NO NEWLINE. That is deliberate and it is stated
-    ;  directly above: four host tools match on those five characters
-    ;  INCLUDING THE TRAILING SPACE and with nothing after them. So the
-    ;  one string the tools wait for is the one string the per-line rule
-    ;  can never release, and a console that never delivers it is a
-    ;  console those tools cannot drive - `tools/pi4_upload.py --console
-    ;  net` gave up with "no Anvil prompt" against a board that was
-    ;  answering `version` on that same address in the same second.
-    ;
-    ;  ONE EXPLICIT FLUSH, HERE, WHERE THE PROTOCOL STRING IS EMITTED.
-    ;  Not a change to the per-line rule, which would cost a datagram
-    ;  per byte on every long print; and not a special case inside the
-    ;  UART, which has no business knowing what a prompt is. It costs
-    ;  one call per command line, it is a no-op when no console is armed
-    ;  and another when there is no peer, and it is re-entry guarded.
-    ; ================================================================
-    NetConsoleFlush()
-    ; Release only after the command's output and following prompt have
-    ; reached its owner; nested ReadLine subprompts retain that owner.
-    NetConsoleCommandDone()
-    ReadLine()
-    ; The line is taken; a command runs under its owner from here, and the
-    ; console is not handed to another host until it finishes (forum 888).
-    NetConsoleCommandBegin()
-    ; Armed AFTER the line is read, so the Enter that submitted it - and
-    ; anything typed ahead of it - cannot count as an abort of the
-    ; command it is about to start. See STOPPING A LONG PRINT.
-    OutBreakArm()
-    gPos = 0
-    SkipSpace()
-    gWordAt = gPos
-    c = gLine[gPos] & $FF
-    SkipWord()
-    gWordLen = gPos - gWordAt
-
-    ; `measure <command line>` - see MEASURE A COMMAND in Core/parse.pbi.
-    ; Two call sites, both of them core, because the command chain below
-    ; is inline here and there is nothing for a wrapper to re-enter. When
-    ; the word moves, the single-letter character moves with it; a refusal
-    ; sets that character to zero, which the chain's first arm already
-    ; treats as an empty line and runs nothing for.
-    Define tmv.i
-    tmv = TimeArm()
-    If tmv = 1
-      c = gLine[gWordAt] & $FF
-    ElseIf tmv = 2
-      c = 0
-    EndIf
-
-    ; ================================================================
-    ;  THE WIDTH SUFFIX  -  U-Boot's .b / .w / .l on the command word.
-    ;
-    ;  U-Boot carries the object size ON THE COMMAND WORD - md.l, mw.w,
-    ;  cp.b - and reads it back off argv[0] (v2025.01_cmd_mem.c:143).
-    ;  This monitor matches whole words, so a word ending in .b/.w/.l
-    ;  would never match "md". Strip it ONCE here, record the width in
-    ;  gMemWidth for the handler that is about to run, and shorten
-    ;  gWordLen so WordIs sees the bare word. gMemWidth is RESET every
-    ;  command so a width cannot leak from one to the next.
-    ;
-    ;  Only the memory family reads gMemWidth; stripping a .b/.w/.l off
-    ;  any other word is harmless because no other command has that
-    ;  suffix and the width is simply ignored. A word that is only ".b"
-    ;  (gWordLen 2, nothing before the dot) is left alone - it is not a
-    ;  suffix on anything.
-    ; ================================================================
-    gMemWidth = 0
-    ; THE SAFETY OVERRIDE AGES HERE, FOR THE SAME REASON gMemWidth IS
-    ; RESET HERE: state that leaks from one command into the next is a
-    ; trap. `force <address>` arms one address for the NEXT command line
-    ; and this is what ends it - used or not, and whether or not the line
-    ; in between was even a command this monitor knows. See
-    ; Anvil/Core/addrsafe.pbi.
-    ForceAge()
-    If gWordLen >= 3 And gLine[gWordAt + gWordLen - 2] = 46   ; 46 = '.'
-      Define suf.i
-      suf = gLine[gWordAt + gWordLen - 1] & $FF
-      If suf = 98 Or suf = 66                                 ; b / B
-        gMemWidth = 1
-      ElseIf suf = 119 Or suf = 87                            ; w / W
-        gMemWidth = 2
-      ElseIf suf = 108 Or suf = 76                            ; l / L
-        gMemWidth = 4
-      EndIf
-      If gMemWidth <> 0
-        gWordLen = gWordLen - 2                               ; hide ".x"
-      EndIf
-    EndIf
-
+Procedure.i HwCommandDispatch(c.i)
     ; spi - ahead of the chain because a CompilerIf cannot wrap an ElseIf
     ; arm in this compiler today; only a #CAP_SPI = 1 board compiles it.
     CompilerIf #CAP_SPI = 1
@@ -3619,24 +3084,437 @@ Procedure Main()
       ; the word was the name of a program on the medium, and it was run
 
     Else
-      ; ECHO WHAT WAS ACTUALLY TYPED. "unknown command" with no subject is
-      ; the least useful thing a prompt can say, and it is the one that
-      ; hides a line editor that dropped or mangled a character.
-      Define k.i
-      Print("? this monitor does not know the command ")
-      k = 0
-      While k < gWordLen And k < 24
-        UartWrite(gLine[gWordAt + k] & $FF)
-        k = k + 1
-      Wend
-      PrintN(", so nothing was done.")
-      PrintN("  Type help, or just a question mark, for the list of commands.")
-      PrintN("  Every command is a whole word; the old single letters still work.")
+      ProcedureReturn 0
     EndIf
-    ; What the command above cost, on this board's own counter, if the
-    ; line began with `measure`. Silent otherwise.
-    TimeReport()
-  ForEver
+ ProcedureReturn 1
+EndProcedure
+
+Procedure Main()
+  Define c.i
+  Define hz.i
+  Define vulkanBootRc.i
+  Define fontBootReady.i
+
+  ASM
+    ; CAPTURE THE FIRMWARE DEVICE-TREE POINTER, FIRST, BEFORE ANYTHING
+    ; TOUCHES x0.
+    ;
+    ; The selected Raspberry Pi armstub enters kernel8.img with x0 = the
+    ; firmware's flattened-device-tree pointer and x1=x2=x3=0. The stock stub
+    ; enters EL2h; Anvil's optional checked stub retains EL3. Both use the same
+    ; handoff (Datasheets/pi4/armstub8.S:163-171: primary_cpu loads w0 from
+    ; dtb_ptr32, then br x4). Anvil is kernel8.img, so x0 is that DTB at
+    ; _start. Nothing between _start and here has touched it:
+    ; EmitCore_A64.pbi's preamble uses x9,x10,x16,x17,x18 for the stack,
+    ; BSS-zero and the FP gate; Main()'s prologue uses x29,x30; and this is
+    ; Main()'s FIRST statement. So x0 still holds the DTB, and booti reads
+    ; it back through HwFirmwareDtb() (RaspberryPi4/Board/hw_boot.pi4).
+    ;
+    ; x1 is a safe scratch: the stub set it to 0 at entry and nothing reads
+    ; it here. The store lands in DRAM because the caches are still off (the
+    ; selected stub's active SCTLR bank has C=0 and Anvil has not enabled the MMU yet), which
+    ; is why HwFirmwareDtb() reads the right value however the D-cache is set
+    ; later. global_gbootdtb is gBootDtb (hw_boot.pi4), already zeroed by the
+    ; BSS-zero pass that ran before Main; this overwrites that zero.
+    adrp x1, global_gbootdtb
+    add  x1, x1, #:lo12:global_gbootdtb
+    str  x0, [x1]
+
+    ; MOVE THE MONITOR'S STACK OFF $08000000.
+    ;
+    ; The emitted prologue put sp at a hardcoded $08000000 and every
+    ; payload's prologue will put its own sp at the same address. One
+    ; of us has to move, and it has to be us, because we are the one
+    ; that has to still be here afterwards. #MON_STACK = $00100000,
+    ; growing down through free DRAM and stopping well above the
+    ; firmware's spin table at $0..$FFF.
+    ;
+    ; Main()'s own frame is stranded on the old stack by this, which is
+    ; harmless ONLY because Main() never returns.
+    ;
+    ; movz zeroes the whole 64-bit register and movk writes one field
+    ; without disturbing the rest, so this is a full 64-bit constant
+    ; even though only one field is non-zero.
+  EndASM
+  CompilerIf #PMF_CHIP = 2712
+    ; BCM2712: ONLY WHERE WE WERE LINKED. This build is linked at $80000,
+    ; where the Pi 5 firmware loads kernel=, and its whole map - the stack
+    ; at #MON_STACK, the phase record, the boot-count word, the raw-core
+    ; stacks, the autoboot record and the low payload window - is THE
+    ; BCM2712 MAP in memmap.pi4, computed from that address. 2026-09-27,
+    ; the first full Pi 5 boot ran the Pi 4 layout at $80000: the stack and
+    ; the boot records landed inside the code and the board died at a
+    ; procedure entry ($1FB660, EC 0). So the stack moves only when the
+    ; image is where the map assumes; otherwise it stays on the emitted
+    ; $08000000 stack and the board stops below with a sentence instead of
+    ; running on a map that is not its own.
+    If MonImageLo() = #MON_LO
+      gPi5StackTop = #MON_STACK
+      ASM
+        adrp x16, global_gpi5stacktop
+        add  x16, x16, #:lo12:global_gpi5stacktop
+        ldr  x16, [x16]
+        mov  sp, x16
+      EndASM
+    Else
+      gPi5LoadWrong = 1
+    EndIf
+  CompilerElse
+  ASM
+    movz x16, #0
+    movk x16, #0x0010, lsl #16
+    mov  sp, x16
+  EndASM
+  CompilerEndIf
+
+  ; ADOPT the port, do not initialise it. uart.pi4 offers both calls and
+  ; the wrong one here would disable the PL011, reprogram it and flush
+  ; whatever the loader had queued - see the header.
+  ; 115200 regardless of what the firmware or a loader left behind. The
+  ; baud command can raise it afterwards; coming up at anything else
+  ; would mean the first line out is unreadable to a host that has not
+  ; been told yet.
+  ; Capture synchronous failures from the earliest driver initialization.
+  ; This installs only the current EL's vectors; it never unmasks IRQs.
+  HwExceptionPrepare()
+  ; Registration only; hardware entropy is gathered lazily on first request.
+  RandomServiceBind(@RandomDrbgReady,@RandomDrbgGenerate)
+  HttpServerInit()
+  UartInit(115200)
+  CompilerIf #PMF_CHIP = 2712
+    If gPi5LoadWrong <> 0
+      Print("!! Anvil was loaded at ")
+      PutAddr(MonImageLo())
+      Print(" and is built to run at ")
+      PutAddr(#MON_LO)
+      PrintN(", where the Pi 5 firmware puts kernel=.")
+      PrintN("   Something moved it - config.txt must have no kernel_address line.")
+      PrintN("   This monitor's memory map is computed from its link address, so it")
+      PrintN("   stops now, before its stack or its boot records are touched.")
+      PrintN("   Nothing else was started.")
+      Repeat
+        ASM
+          wfe
+        EndASM
+      ForEver
+    EndIf
+    ; BCM2712: the JST debug connector (UART10, $107D001000) as a second
+    ; window on the console, teed from the header port (RaspberryPi4/Lib/
+    ; uart.pi4, Anvil 73c6886). Adopted if the firmware or the EL3 stub left
+    ; it running, else brought up at 115200. The tee is bounded and never
+    ; delays the header port, so a quiet header still leaves this one.
+    If Uart10Attach() = 1 Or Uart10Init(115200) = 1
+      Uart10Tee(1)
+    EndIf
+    Pi5DtbApply()
+  CompilerEndIf
+  If gExceptionReady = 0
+    Print("!! Processor exception installation failed with code ")
+    PrintDec(ExceptionError()) : PrintNl()
+    PrintN("   Processor exception vectors could not be installed. Check the")
+    PrintN("   primary-core EL2/EL3 boot configuration before using this image.")
+  EndIf
+  HwInterruptPrepare()
+  If gInterruptReady = 0
+    PrintN("!! The interrupt controller was not prepared; IRQs remain masked.")
+    PrintN("   Polling remains available. Check the GIC identity and vector setup.")
+  EndIf
+
+  ; THE ARM CLOCK, BEFORE ANYTHING THAT IS SLOW.
+  ;
+  ; The firmware hands a Pi 4 to its kernel at 600 MHz, not the 1500 MHz
+  ; the part is rated for. That is not a fault - it is the conservative
+  ; boot state, and every real kernel raises it. This monitor never did,
+  ; so for a long time every glyph drawn, every block copied and every
+  ; CRC computed here ran at 40 percent of the speed available, for
+  ; nothing.
+  ;
+  ; It was found the embarrassing way: the HDMI console was slow enough
+  ; to be reported as a fault from the bench, and `i` had been printing
+  ; "ARM configured 600000000" at the top of every session for weeks
+  ; while nobody read it. A 2.5x speedup was sitting in the output of a
+  ; command we ran constantly.
+  ;
+  ; ClockInit() asks the firmware for its OWN reported maximum rather
+  ; than naming a number here - see clocks.pi4:161. The firmware knows
+  ; what this board can do, raises the core voltage to match, and clamps
+  ; silently if it disagrees, which is why `c` prints APPLIED and then
+  ; MEASURED separately.
+  ;
+  ; IT IS NOT FATAL IF IT FAILS. A board running at 600 MHz is slow, not
+  ; broken, and refusing to boot the monitor over it would turn a
+  ; performance question into a dead board with no console.
+  If ClockInit() = 0
+    PrintN("!! the ARM clock could not be raised - running at the firmware's")
+    PrintN("   boot speed. Everything here still works, just slower. 'c' shows it.")
+  EndIf
+
+  ; TimerInit() does two things and only the second is worth calling
+  ; for: it caches CNTFRQ_EL0, which Micros()/millis() would do lazily
+  ; anyway, and it WATCHES THE COUNTER MOVE. Having a frequency and
+  ; having a running counter are different claims.
+  If TimerInit() = 0
+    PrintN("!! the architectural counter is not running - every timeout")
+    PrintN("   in this monitor is guesswork. Transfers may not time out.")
+  EndIf
+
+  ; SAMPLE THE BOOT TICK, and do it here rather than at the top of Main:
+  ; TimerInit() has just proved the counter is actually moving, and a
+  ; boot stamp taken from a frozen counter would make every later uptime
+  ; wrong in the one direction that matters - it would never appear to
+  ; reset. CNTPCT_EL0 is cleared by a reboot, so this is zero-based per
+  ; boot with nothing to subtract.
+  gBootTicks = Ticks()
+  WallClockInit()
+
+  ; Two seconds of silence ends a transfer. ubsend.py pauses 4 ms
+  ; between records in S-record mode and 600 ms after the command, and
+  ; in raw mode it waits on our own acks, so this is generous by two
+  ; orders of magnitude in both and still leaves a live prompt when the
+  ; host goes away.
+  hz = TickHz()
+  If hz <= 0 Or hz > 1000000000
+    hz = 54000000                ; the BCM2711's counter, as a fallback
+  EndIf
+  gToTicks = hz + hz
+
+  gBad = 0
+  gFail = 0
+  gHaveEntry = 0
+  gMbx = 0
+
+  ; THE TIMING RECORD, BEFORE THE FIRST THING WORTH TIMING. TimerInit()
+  ; above has just proved the counter is moving, which is the one
+  ; precondition a table of ticks has. See Board/boot_timing.pi4 - it is
+  ; at a fixed address in the display's own reserved window, it survives
+  ; the boot it describes, and `screen timing` reads it back.
+  BootTimingBegin(hz, ClockMeasuredHz(#MBX_CLK_ARM))
+
+  ScreenEarlyLogStart()
+  Banner()
+  fontBootReady = AnvilFontBootEmbeddedInit()
+
+  ; ------------------------------------------------------------------
+  ;  THE SCREEN FIRST. THEN THE CONFIGURATION. THEN THE NETWORK.
+  ;
+  ;  THIS ORDER IS A CHANGE AND IT HAS TO ANSWER THE ONE THAT WAS HERE.
+  ;  BootConfigUp() - PCIe, the xHCI host, the USB devices, the boot
+  ;  medium and SETTINGS.TXT - used to run FIRST, and the argument was
+  ;  sound: the screen is configured hardware, so a screen brought up
+  ;  before the store existed could only come up in a default and would
+  ;  have to be TORN DOWN AND REBUILT when the real answer arrived,
+  ;  erasing the boot log it was brought up early to carry.
+  ;
+  ;  THE CONCLUSION FOLLOWED FROM TWO THINGS THAT ARE NO LONGER TRUE.
+  ;  A geometry change is no longer a teardown: ScrDsiReadoptBegin
+  ;  re-points the HVS at its other fixed display list and re-installs
+  ;  the drawing surface with the panel still scanning - no power, no
+  ;  reset, no DSI host, no pixel valve, no allocation. And the boot log
+  ;  no longer lives only on the glass: Anvil/Core/boot_transcript.pbi
+  ;  retains the byte stream the console was built from, so a grid
+  ;  rebuilt at a new geometry is restored from WHAT WAS SAID rather
+  ;  than from pixels that are the wrong shape.
+  ;
+  ;  WHAT IT BUYS, AND IT IS THE WHOLE POINT: the slow half of the boot
+  ;  now PRINTS ON THE PANEL AS IT HAPPENS. USB enumeration and the boot
+  ;  medium are the longest things before the radio and they were the
+  ;  lines nobody could see. The stated cost of the old order - "the USB
+  ;  and boot-medium lines now reach the wire before the glass exists,
+  ;  so they are not on the panel" - is paid back here.
+  ;
+  ;  AND THE COMMON CASE COSTS NOTHING AT ALL. SETTINGS.TXT on this
+  ;  bench names no rotation, so the stored answer IS the default and
+  ;  ScreenApplyStoredGeometry finds nothing to change.
+  ;
+  ;  THE NETWORK IS STILL LAST, which is what the original ordering
+  ;  really existed for: it is the long, hang-prone half, and a board
+  ;  that stalls in the radio says so on the glass.
+  ;
+  ;  ScreenUp() is never fatal and it CHOOSES: the DSI panel if one
+  ;  answered on the display connector, else an HDMI display if the
+  ;  firmware found one, else none - and it says which. The prompt
+  ;  arrives on the wire either way.
+  ;
+  ;  NOTHING IN ScreenUp() READS THE SETTINGS STORE FOR ANYTHING BUT
+  ;  GEOMETRY. The panel is found over I2C, the firmware is asked over
+  ;  the mailbox, and the framebuffers are at fixed addresses this
+  ;  monitor chose - so there is nothing here that needs the boot medium
+  ;  to have mounted. The two things the store can say, rotation and
+  ;  magnification, are exactly the two ScreenApplyStoredGeometry
+  ;  corrects below.
+  ; ------------------------------------------------------------------
+  ; Opt in only for the existing panel/touch boot transactions. Capture is
+  ; bounded RAM history, not extra probes; disable retains it for touch trace.
+  If fontBootReady <> 0 : ScreenDsiEarlyCacheArm() : EndIf
+  I2cTraceEnable(1)
+  If fontBootReady <> 0
+    gScreenDeferFirstFrame = 1
+    ScreenUp()
+  Else
+    PrintN("!! no screen frame will be drawn without the embedded TrueType font")
+  EndIf
+  TouchBoot()
+  ; BCM2712: caches on, after ScreenUp so DisplayBase() is known when
+  ; CacheMapNc builds the Non-Cacheable map, and after Pi5DtbApply (top of
+  ; Main), whose MmuSetRamBytes sized RAM from the live /memory.
+  CompilerIf #PMF_CHIP = 2712
+    Pi5CachesOn()
+  CompilerEndIf
+  I2cTraceEnable(0)
+  BootTimingMark(#BTM_TOUCH_END, 0, 0)
+  ; Paint whatever the pre-screen lines left queued the instant the glass
+  ; exists, so the banner is followed by the log rather than by a pause.
+  ScreenServiceTick()
+
+  ; The embedded face and framebuffer are ready before storage. Present the
+  ; first Vulkan frame now so PCIe, USB and mount progress is visible live.
+  CompilerIf #ANVIL_VULKAN_CONSOLE = 1
+  If gScreen <> 0
+    If AnvilTrueTypeSlotSelected() < 0 Or gScreenFontMetricFault <> 0
+      PrintN("!! TrueType face or metrics unavailable; screen rendering remains deferred.")
+    Else
+      vulkanBootRc = VulkanConsoleStart()
+      If vulkanBootRc = #AVC_OK
+        VulkanConsolePump()
+        If avcFramePresented <> 0
+          gScreenDeferFirstFrame = 0
+          PrintN("display renderer: Vulkan on V3D (NeonArcade); the preferred tier is up.")
+        Else
+          If VulkanConsoleReady() <> 0 : VulkanConsoleStop() : EndIf
+          ConNoRenderer()
+          PrintN("!! Vulkan did not present a first frame before storage; screen rendering remains deferred.")
+        EndIf
+      Else
+        ConNoRenderer()
+        Print("!! Vulkan console unavailable before storage (code ")
+        PrintDec(vulkanBootRc)
+        PrintN("); screen rendering remains deferred.")
+      EndIf
+    EndIf
+  EndIf
+  BootTimingMark(#BTM_V3D_END, Bool(VulkanConsoleReady() <> 0 Or gV3dConOn <> 0), 0)
+  CompilerElseIf #ANVIL_V3D_CONSOLE = 1
+  V3dConAutoStart()
+  BootTimingMark(#BTM_V3D_END, gV3dConOn, 0)
+  CompilerElse
+  BootTimingMark(#BTM_V3D_END, 0, 0)
+  CompilerEndIf
+
+  ; The slow half, now with somewhere to print. Every line of it lands on
+  ; the panel as it is produced: StorageUp and UsbEnumerate call
+  ; ScreenServiceTick themselves (boot.pi4), so this is live progress and
+  ; not a buffer flushed at the end.
+  BootTimingMark(#BTM_CONFIG_BEGIN, 0, 0)
+  BootConfigUp()
+  BootTimingMark(#BTM_CONFIG_END, gFatUp, 0)
+
+  ; THE STORE EXISTS NOW. If it names a geometry the default bring-up did
+  ; not use, the console moves to it in place and the retained boot log is
+  ; replayed into the rebuilt grid. Returns without touching anything when
+  ; the stored answer and the default agree.
+  ScreenApplyStoredGeometry()
+  ScreenServiceTick()
+
+  TimeBoot()
+  CompilerIf #PMF_CHIP = 2712
+  ; BCM2712: seed the wall clock from the firmware RTC, AFTER TimeBoot has
+  ; set the clock's defaults (Anvil/Core/wallclock.pbi) so the seed wins.
+  HwClockSeed()
+  CompilerEndIf
+  NtpServiceBoot()
+  ScreenEarlyLogFinish()
+  GenetSetProgressHook(@ScreenServiceTick)
+  NetWaitSetProgressHook(@ScreenServiceTick)
+  WifiSetProgressHook(@ScreenServiceTick)
+  ; Draw whatever is already waiting the instant the glass is up, so the
+  ; screen shows it immediately rather than holding it - with the whole
+  ; network bring-up behind it - until the first prompt.
+  ScreenServiceTick()
+  BootTimingMark(#BTM_NET_BEGIN, 0, 0)
+  BootNetUp()
+  BootTimingMark(#BTM_NET_END, 0, 0)
+
+  ; ------------------------------------------------------------------
+  ;  THE DRIVER MODULES, HERE, AND THE POSITION IS THE WHOLE ARGUMENT.
+  ;
+  ;  AFTER THE CONSOLE so that a refusal is seen. A module that will not
+  ;  load is exactly the thing an operator has to be told about, and a
+  ;  walk that ran before the glass and the wire were up would print its
+  ;  sentences into a buffer nobody reads.
+  ;
+  ;  BEFORE BootWait() so that a driver is in place before autoboot can
+  ;  hand the whole board to a payload. A payload entered with the
+  ;  service table is entitled to find the seams a loaded module fills;
+  ;  loading them afterwards would mean the same card produced two
+  ;  different machines depending on how fast somebody pressed a key.
+  ;
+  ;  BEFORE FanBoot() for the same reason one step smaller: the fan
+  ;  policy reads a temperature, and whether that reading comes off the
+  ;  part or out of the firmware is decided by whether THERMAL.MOD
+  ;  loaded. Running the walk afterwards would start the fan on the slow
+  ;  source and silently keep it there.
+  ;
+  ;  IT IS NEVER FATAL. No manifest, no module, or a refused module all
+  ;  reach the prompt: every seam a module would fill has a core answer
+  ;  or an honest refusal behind it.
+  ; ------------------------------------------------------------------
+  ModBoot()
+  ScreenServiceTick()
+
+  ; THE DRAM AUTOBOOT RECORD FIRST, THE PERSISTED BOOT TARGET SECOND, and
+  ; the order is the precedence. BootWait() takes `autoboot <addr>`, which
+  ; somebody typed at this prompt during THIS power cycle and which lives
+  ; in DRAM across a reset; it returns at once when nothing is armed.
+  ; BootFileWait() then takes `boot.file` out of the settings store, which
+  ; survives a power cycle. The deliberate, just-typed thing wins over the
+  ; standing configuration, and on a cold start the DRAM record correctly
+  ; fails its magic so the persisted target is what acts.
+  BootWait()
+  BootFileWait()
+
+  ; THE FAN, LAST, AND AFTER THE SETTINGS ARE IN. FanBoot() resets the
+  ; curve to its documented defaults, lets SETTINGS.TXT override what it
+  ; names, and starts driving the stored pin if there is one. It is here
+  ; rather than in BootBringUp() because the settings load happens in
+  ; there and this has to be after it, and because a fan that starts
+  ; while PCIe is still enumerating would be a fan running on a
+  ; temperature nobody has read yet. It prints one line when a fan is
+  ; configured and nothing at all when one is not.
+  FanBoot()
+  ScreenServiceTick()
+
+  CompilerIf #PMF_CHIP = 2711
+  If AnvilSchedulerQualifyPi4Wfe() <> 0
+    PrintN("Core 0 idle wait: counter-event WFE enabled; CPU usage sampling active.")
+  Else
+    PrintN("Core 0 idle wait: unavailable; prompt remains on cooperative polling.")
+  EndIf
+  CompilerEndIf
+
+  ; THE BOOT LOG ENDS HERE, AND WITH IT THE LAST TIME A BACKGROUND SERVICE
+  ; MAY SPEAK ON THE CONSOLE. From the first prompt on, anything that is not
+  ; the answer to a typed command goes to the message log instead - see
+  ; Anvil/Core/messages.pbi. Everything above this line was the boot, and
+  ; stays on every console exactly as before.
+  ; Shared cooperative TLS driver; no IRQ, timer or secondary-core ownership.
+  ; Lower-EL compositions retain their existing synchronous driver until the
+  ; context backend has a qualified lower-EL execution contract.
+  If TlsCooperativeInstall(HwMonLo(),(HwMonBytes()+3) & -4)<>0
+    PrintN("TLS arithmetic: cooperative service slices enabled.")
+  Else
+    PrintN("TLS arithmetic: synchronous fallback (context backend unavailable).")
+  EndIf
+  BoardLinkTxInstall()
+  IPv6ServiceBind(@IPv6CywGeneration,@IPv6CywPrepare)
+  NetSetIPv6StatusHook(@IPv6ServiceSay)
+  NetSetIPv6CommandHook(@IPv6ServiceCommand)
+  AnvilPromptServicesBind(@BoardPromptServices)
+  AnvilPromptInputsBind(@BoardPromptInputs)
+  AnvilPromptPumpBind(@BoardPromptPump)
+  MessagesStart()
+  MsgLogStart()                                    ; and every kept line to MSGLOG.TXT on the stick
+
+  AnvilCommandLoop()
 EndProcedure
 
 Main()
