@@ -108,15 +108,15 @@ EndProcedure
 def main():
     ap=argparse.ArgumentParser(description=__doc__);ap.add_argument('--compiler');ap.add_argument('--zen-tools',type=Path,required=True);ap.add_argument('--case');a=ap.parse_args()
     cc=resolve_compiler(a.compiler);zt=a.zen_tools.resolve();sys.path.insert(0,str(zt))
-    import zen_interp as I
-    import zen_lockstep_check as L
+    import zentaji_native as I
+    import zen_native_fixture as L
     import zasm_ref as A
     import zexpack
     def run(args):
         p=subprocess.run([str(x) for x in args],cwd=ROOT,env=dict(os.environ,PMF_ROOT=str(ROOT)),capture_output=True,text=True,encoding='utf-8',errors='replace',timeout=120)
         assert p.returncode==0,(p.returncode,p.stdout[-4000:],p.stderr)
         return p.stdout
-    with tempfile.TemporaryDirectory(prefix='anvil-input-') as tmp:
+    with I.NativeRunner() as runner, tempfile.TemporaryDirectory(prefix='anvil-input-') as tmp:
         td=Path(tmp);src=td/'input.zentaji';image=td/'input.zex';src.write_text(SOURCE,encoding='utf-8')
         run([cc,'--compile',src,'-o',image])
         ref=A.Asm();org,body=ref.assemble(Path(str(image)+'.asm').read_text(encoding='utf-8-sig'))
@@ -125,23 +125,16 @@ def main():
         checked=0
         for phase,name in enumerate(('events','held-fence','hardware-overflow','quarantine-recovery','geometry-change','explicit-flush','bounded-pump','command-cancel','numlock-release','queued-prompt')):
             if a.case and a.case!=name:continue
-            m=I.Machine(ram_size=8<<20,cores=2,display_modes=[(320,160,60000),(640,480,60000)]);m.load_image(wrapped)
+            m=I.Fixture(ram_size=8<<20,cores=2,display_modes=[(320,160,60000),(640,480,60000)]);m.load_image(wrapped)
             struct.pack_into('<Q',m.ram,0x700000,phase);m.ram[:32]=b'\xCC'*32
             assert not L.capture(m,str(td));script=[];seen=set()
-            read_input=m.input.rd
-            def observe_input(core,reg):
-                if 0x80<=reg<=0xA8:
-                    fencing=struct.unpack_from('<q',m.ram,ref.sym['GLOBAL_ZIFENCING'])[0]
-                    owned=struct.unpack_from('<q',m.ram,ref.sym['GLOBAL_ZIOWNED'])[0]
-                    generation=struct.unpack_from('<q',m.ram,ref.sym['GLOBAL_GINGEN'])[0]
-                    delivered=struct.unpack_from('<q',m.ram,ref.sym['GLOBAL_NUIGENERATION'])[0]
-                    assert not owned or fencing or generation==delivered,('mouse consumed before cancellation',name,reg,generation,delivered)
-                return read_input(core,reg)
-            m.input.rd=observe_input
-            def operator(core):
-                ready=struct.unpack_from('<Q',m.ram,ref.sym['GLOBAL_ZITESTREADY'])[0]
+            m.observe_ram=ref.sym['GLOBAL_ZITESTREADY']
+            m.read_witness=(I.DEV+0xA0080,I.DEV+0xA00A8,tuple(ref.sym['GLOBAL_'+name] for name in ('ZIFENCING','ZIOWNED','GINGEN','NUIGENERATION')))
+            def operator(observed):
+                core=observed.cores[0]
+                ready=struct.unpack_from('<Q',observed.ram,ref.sym['GLOBAL_ZITESTREADY'])[0]
                 if ready==0 or ready in seen:return
-                seen.add(ready);tick=max(m.time,core.cr[I.CR['CYCLE']])+100
+                seen.add(ready);tick=max(observed.time,core.cr[I.CR['CYCLE']])+100
                 def feed(kind,*fields):
                     m.input_feed(tick,kind,*fields);script.append((tick,kind,fields))
                 if phase==0:
@@ -163,12 +156,16 @@ def main():
                     for fields in [(89,1,0,0,0),(89,0,32,0,0),(90,1,0,0,0),(90,1,32,1,50),(90,0,32,0,0)]:feed('key',*fields)
                 elif phase==9 and ready==2:
                     feed('key',20,1,0,0,113);feed('key',20,0,0,0,0)
-            m.on_slice=operator;m.run(3000000);m.on_slice=None;c=m.cores[0]
+            m=runner.operate(m,operator,3000000,td);c=m.cores[0]
+            for row in m.read_witness:
+                fencing,owned,generation,delivered=row[5:]
+                assert not owned or fencing or generation==delivered,('mouse consumed before cancellation',name,row)
+            if phase in (0,1):assert m.read_witness,('missing native mouse read observations',name)
             assert c.state=='HALTED' and c.r[1]==42,(name,c.state,c.r[1])
             report=struct.unpack_from('<24q',m.ram,ref.sym['GLOBAL_REPORT'])
             assert report[:12]==(0,-22400,-22400,-22400,-22400,-22400,-22400,1,report[8],-22402,-22401,-22400),(name,report)
             assert struct.unpack_from('<4iQ',m.ram,0x200100)==(0x4E495331,1,0,32,3)
-            assert m.ram[:32]==b'\xCC'*32 and m.input.rumble[0]==0x12345678 and m.input.mctrl==0
+            assert m.ram[:32]==b'\xCC'*32 and m.fields['input'][5]==0x12345678 and m.fields['input'][1]==0
             if phase in (0,1,2,4,5,8):
                 assert report[18:]==(0,-22401,0,0,0,1),(name,report)
                 trace=[struct.unpack_from('<8iq2i',m.ram,0x220000+i*48) for i in range(report[17])]
@@ -184,7 +181,7 @@ def main():
                         if i<len(typed):expected.append(typed[i])
                         if i<len(device):expected.append(device[i])
                     assert events==expected,(name,events,expected)
-                    assert m.input.irq_status & 12==12 and m.input.pads[0][1]==2
+                    assert m.fields['input'][3] & 12==12 and m.fields['input'][4]==2
                 elif phase==1:
                     assert events==[text(98),key(5,1),key(5,0),(5,4,0,0,12,25,2,0),(6,4,0,0,12,25,2,3)],events
                 elif phase==2:
@@ -198,14 +195,12 @@ def main():
             elif phase==7:assert report[13:16]==(0,3,-1),report
             elif phase==9:assert report[13:18]==(0,256,2,113,-1),report
             cfg=td/'machine.txt'
-            with cfg.open('a',encoding='utf-8') as stream:
-                for tick,kind,fields in script:stream.write('%s $%X %s\n'%(kind,tick,' '.join(str(x) for x in fields)))
             out=run([L.EXE,cfg,'--max','3000000','--ram',td/'final.bin'])
             assert (td/'final.bin').read_bytes()==m.ram,name
-            state=next(line[6:] for line in out.splitlines() if line.startswith('STATE '));assert state.split(' ',1)[1]==L.state_line(m,0,-1).split(' ',1)[1],name
+            I.assert_same_state(out,m)
             assert m.cores[1].state=='PARKED'
             checked+=1
-            print('PASS input '+name+': actual hardware/shared NUI/focus/cancellation, independent event/bounds oracle, complete native/twin CPU/RAM/device digest',flush=True)
+            print('PASS input '+name+': actual hardware/shared NUI/focus/cancellation, independent event/bounds oracle, complete native CPU/RAM/device digest',flush=True)
         assert checked,'no input component case matched'
 
 

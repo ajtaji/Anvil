@@ -5,7 +5,6 @@ hardware. Only unrelated service lanes and queued-input providers are adapters.
 This is a backend proof, not a complete Anvil boot or visible-input proof.
 """
 import argparse
-from collections import deque
 import hashlib
 import json
 import os
@@ -142,8 +141,8 @@ def main():
     ap.add_argument('--compiler');ap.add_argument('--zen-tools',type=Path,required=True);ap.add_argument('--live-only',action='store_true')
     a=ap.parse_args();cc=resolve_compiler(a.compiler);zt=a.zen_tools.resolve()
     sys.path.insert(0,str(zt))
-    import zen_interp as I
-    import zen_lockstep_check as L
+    import zentaji_native as I
+    import zen_native_fixture as L
     import zasm_ref as A
     import zexpack
     import zen_sleep_check as S
@@ -155,14 +154,14 @@ def main():
         p=subprocess.run([str(x) for x in args],cwd=ROOT,env=env,capture_output=True,text=True,encoding='utf-8',errors='replace',timeout=60)
         assert p.returncode==0,(p.returncode,p.stdout[-4000:],p.stderr)
         return p.stdout
-    with tempfile.TemporaryDirectory(prefix='anvil-zen-idle-') as tmp:
+    with I.NativeRunner() as runner, tempfile.TemporaryDirectory(prefix='anvil-zen-idle-') as tmp:
         td=Path(tmp);src=td/'idle.zentaji';image=td/'idle.zex'
         src.write_text(SOURCE,encoding='utf-8');run([cc,'--compile',src,'-o',image])
         asm=Path(str(image)+'.asm').read_text(encoding='utf-8-sig')
         ref=A.Asm();org,data=ref.assemble(asm)
         assert image.read_bytes()==zexpack.header(org,org,data)+data
         def machine(scenario,owner=0):
-            m=I.Machine(ram_size=1<<20,cores=2,display_modes=[(1,1,60000)])
+            m=I.Fixture(ram_size=1<<20,cores=2,display_modes=[(1,1,60000)])
             m.load_image(image.read_bytes())
             pc=m.cores[0].pc;m.cores[0].state='PARKED'
             c=m.cores[owner];c.pc=pc;c.state='RUNNING';c.r[255]=0xF0000;c.r[1]=scenario
@@ -173,19 +172,18 @@ def main():
         def match(m,native,owner):
             assert m.cores[owner].r[1]==42,(owner,m.cores[owner].r[1])
             assert (td/'final.bin').read_bytes()==m.ram
-            expected=L.state_line(m,0,-1).split(' ',1)[1]
-            assert len(states(native))==1 and states(native)[0][6:].split(' ',1)[1]==expected
+            I.assert_same_state(native,m)
         for owner in ([] if a.live_only else (0,1)):
             for scenario in range(16):
                 m=machine(scenario,owner);c=m.cores[owner]
                 kept=list(c.r[128:253]);vectors=list(c.v[32:])
                 assert not L.capture(m,str(td))
                 native=run([L.EXE,td/'machine.txt','--max','1000000','--ram',td/'final.bin'])
-                m.run(1000000)
+                m=runner.execute(m,1000000,td);c=m.cores[owner]
                 try:match(m,native,owner)
                 except AssertionError as e:raise AssertionError((scenario,owner,native[-1500:])) from e
                 assert c.r[128:253]==kept and c.v[32:]==vectors and c.r[255]==0xF0000
-        if not a.live_only:print('PASS 32 actual backend/shared-scheduler native/twin state/RAM cases: cores0/1, reservation/admission, deadline and early wake, IE preservation, input/work, other timers and refusal without overwrites')
+        if not a.live_only:print('PASS 32 actual backend/shared-scheduler native state/RAM cases: cores0/1, reservation/admission, deadline and early wake, IE preservation, input/work, other timers and refusal without overwrites')
         results=[]
         for scenario in (20,21):
             m=machine(scenario);assert not L.capture(m,str(td));rec=td/('recorded%d.txt'%scenario)
@@ -193,13 +191,12 @@ def main():
             native=run([L.EXE,rec,'--max','2000000','--ram',td/'final.bin'])
             assert ' exit=2A ' in native,('live did not reach guest halt',native[-1800:])
             assert states(live)==states(native)
-            m.clock_samples=deque((int(s.split()[1][1:],16),int(s.split()[2]),int(s.split()[3]) if len(s.split())>3 else -1) for s in rec.read_text().splitlines() if s.startswith(('clock ','work ')))
-            m.clock_complete=True;m.run(2000000);match(m,native,0)
+            m=runner.execute_config(rec,2000000,td);match(m,native,0)
             results.append((wall,cpu))
         wall=results[1][0]-results[0][0];cpu=max(0,results[1][1]-results[0][1])
         assert wall>=1.8,(wall,cpu)
         assert cpu<0.4,(wall,cpu)
-        print(f'PASS actual Anvil idle backend live: startup-adjusted wall={wall:.6f}s cpu={cpu:.6f}s; bounded per-core timer/WFI, active service lanes, exact recorded native/twin replay')
+        print(f'PASS actual Anvil idle backend live: startup-adjusted wall={wall:.6f}s cpu={cpu:.6f}s; bounded per-core timer/WFI, active service lanes, exact recorded native replay')
 
 
 if __name__=='__main__':main()

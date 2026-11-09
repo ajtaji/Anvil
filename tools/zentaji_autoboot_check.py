@@ -39,8 +39,8 @@ def settings(medium):
 
 def main():
     ap=argparse.ArgumentParser(description=__doc__);ap.add_argument('--compiler');ap.add_argument('--zen-tools',type=Path,required=True);ap.add_argument('--keyboard-cancel',action='store_true');a=ap.parse_args();cc=resolve_compiler(a.compiler);sys.path.insert(0,str(a.zen_tools.resolve()))
-    import zen_interp as I
-    import zen_lockstep_check as L
+    import zentaji_native as I
+    import zen_native_fixture as L
     import zexpack
     image=(ROOT/'build/zentaji/anvil.zex').read_bytes();meta=json.loads((ROOT/'build/zentaji/anvil.zex.boot.json').read_text())
     assert hashlib.sha256(image).hexdigest()==meta['image_sha256']
@@ -48,7 +48,7 @@ def main():
         p=subprocess.run([str(x) for x in args],cwd=ROOT,env=dict(os.environ,PMF_ROOT=str(ROOT)),capture_output=True,text=True,encoding='utf-8',errors='replace',timeout=120)
         assert p.returncode==0,(p.returncode,p.stdout[-3000:],p.stderr)
         return p.stdout
-    with tempfile.TemporaryDirectory(prefix='anvil-auto-boot-') as tmp:
+    with I.NativeRunner() as runner, tempfile.TemporaryDirectory(prefix='anvil-auto-boot-') as tmp:
         td=Path(tmp);src=td/'app.zentaji';app=td/'app.zex'
         src.write_text('Procedure.q Main()\nPokeQ($600000,PeekQ($600000)+1)\nProcedureReturn 42\nEndProcedure\n')
         run([cc,'--compile',src,'--load-addr','0x280008','--stack-addr','0x2F0000','--entry-returns','-o',app])
@@ -57,15 +57,15 @@ def main():
         medium[:64]=boot[:64];medium[4096:len(boot)]=boot[4096:]
         phases=[('provision',['time set 1794009600','setenv boot.file APP.PMF','setenv boot.delay 1','setenv boot.maxfails 1','saveenv','halt'],0,False),('automatic-return',['boot status','halt'],1,False),('guard-and-acknowledge',['boot status','boot ok','halt'],0,False),('cancel-countdown',['boot status','halt'],0,True)]
         for name,commands,expected,cancel in phases:
-            m=I.Machine(ram_size=8<<20,cores=2,disks={15:(bytearray(medium),False)},display_modes=[(1,1,60000)]);m.power_on(1,15)
+            m=I.Fixture(ram_size=8<<20,cores=2,disks={15:(bytearray(medium),False)},display_modes=[(1,1,60000)]);m.power_on(1,15)
             assert not L.capture(m,str(td));cfg=td/'machine.txt';cfg.write_text(cfg.read_text().replace('disk-memory ','disk '))
-            schedule=[];key_schedule=[];sent=0;cancelled=False;waits=0
-            def operator(core):
-                nonlocal sent,cancelled,waits
-                output=bytes(m.serial[0].out)
+            schedule=[];key_schedule=[];sent=0;cancelled=False
+            def operator(observed):
+                core=observed.cores[0]
+                nonlocal sent,cancelled
+                output=bytes(observed.serial[0].out)
                 announcing=b'Press any key now to stop it' in output and b'pmf> ' not in output
-                if announcing and core.state=='WAITING':waits+=1
-                tick=max(m.time,core.cr[I.CR['CYCLE']])+100
+                tick=max(observed.time,core.cr[I.CR['CYCLE']])+100
                 if cancel and announcing and not cancelled:
                     if a.keyboard_cancel:
                         for fields in ((27,1,0,0,120),(27,0,0,0,0)):
@@ -75,23 +75,21 @@ def main():
                     cancelled=True
                 if sent<len(commands) and output.count(b'pmf> ')>sent:
                     line=[(tick,b) for b in (commands[sent]+'\r').encode()];schedule.extend(line);m.serial[0].incoming.extend(line);sent+=1
-            m.on_slice=operator;m.run(30000000);m.on_slice=None;c=m.cores[0];output=bytes(m.serial[0].out)
+            m=runner.operate(m,operator,30000000,td);c=m.cores[0]
+            cfg.write_text(cfg.read_text().replace('disk-memory ','disk '),encoding='utf-8');output=bytes(m.serial[0].out)
             assert c.state=='HALTED' and c.exit==0 and sent==len(commands),(name,c.state,c.exit,output[-3500:])
             assert struct.unpack_from('<Q',m.ram,0x600000)[0]==expected,name
-            if name=='automatic-return':assert waits>100 and b'attempt 1 of 1 recorded on the medium' in output and b'The payload returned, r1 = $000000000000002A' in output,(waits,output[-3500:])
+            if name=='automatic-return':assert c.perf['wait_cycles']>=90000000 and b'attempt 1 of 1 recorded on the medium' in output and b'The payload returned, r1 = $000000000000002A' in output,(c.perf['wait_cycles'],output[-3500:])
             if name=='guard-and-acknowledge':assert b'reboot-loop' in output and b'boot.fails is now 0' in output
             if cancel:assert cancelled and b'Stopped by a keypress.' in output and b'counter was NOT touched' in output
-            with cfg.open('a') as stream:
-                for tick,byte in schedule:stream.write('serial 0 $%X %02X\n'%(tick,byte))
-                for tick,fields in key_schedule:stream.write('key $%X %s\n'%(tick,' '.join(str(x) for x in fields)))
             out=run([L.EXE,cfg,'--max','30000000','--ram',td/'final.bin'])
             assert (td/'final.bin').read_bytes()==m.ram
-            state=next(s[6:] for s in out.splitlines() if s.startswith('STATE '));assert state.split(' ',1)[1]==L.state_line(m,0,-1).split(' ',1)[1]
+            I.assert_same_state(out,m)
             assert m.cores[1].state=='PARKED' and (td/'disk15.img').read_bytes()==bytes(m.disks[15].image)
             medium=bytearray(m.disks[15].image);pairs=settings(medium)
             assert pairs['boot.file']=='APP.PMF' and pairs['boot.delay']=='1' and pairs['boot.maxfails']=='1'
             assert pairs.get('boot.fails','0')==('1' if name=='automatic-return' else '0'),(name,pairs)
-            print('PASS %s: real persisted settings/power-on ROM/boot policy, app calls=%d, countdown WFI slices=%d; independent on-disk counter and exact native/twin state/RAM/host medium'%(name,expected,waits)+('; native keyboard cancellation' if cancel and a.keyboard_cancel else ''),flush=True)
+            print('PASS %s: real persisted settings/power-on ROM/boot policy, app calls=%d, actual WFI wait ticks=%d; independent on-disk counter and exact native state/RAM/host medium'%(name,expected,c.perf['wait_cycles'])+('; native keyboard cancellation' if cancel and a.keyboard_cancel else ''),flush=True)
 
 
 if __name__=='__main__':main()

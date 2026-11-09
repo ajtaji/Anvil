@@ -156,8 +156,8 @@ def main():
     ap.add_argument('--compiler');ap.add_argument('--zen-tools',type=Path,required=True)
     ap.add_argument('--case');a=ap.parse_args()
     cc=resolve_compiler(a.compiler);zt=a.zen_tools.resolve();sys.path.insert(0,str(zt))
-    import zen_interp as I
-    import zen_lockstep_check as L
+    import zentaji_native as I
+    import zen_native_fixture as L
     import zasm_ref as A
     import zexpack
     def run(args):
@@ -165,7 +165,7 @@ def main():
         assert p.returncode==0,(p.returncode,p.stdout[-4000:],p.stderr)
         return p.stdout
     checked=0
-    with tempfile.TemporaryDirectory(prefix='anvil-text-api-') as tmp:
+    with I.NativeRunner() as runner, tempfile.TemporaryDirectory(prefix='anvil-text-api-') as tmp:
         td=Path(tmp);src=td/'text.zentaji';out=td/'text.zex';src.write_text(SOURCE,encoding='utf-8')
         run([cc,'--compile',src,'-o',out])
         ref=A.Asm();org,body=ref.assemble(Path(str(out)+'.asm').read_text(encoding='utf-8-sig'))
@@ -174,15 +174,13 @@ def main():
         for phase,name in enumerate(('drawing','invalid-requests','lifetime','geometry','damaged-owner','no-grid','bounded-write','origin-ring','present-timeout','shrink-clear-growth','diagnostic-resume')):
             if a.case and a.case!=name:continue
             modes=[(1,1,60000)] if phase==5 else ([(320,160,1000)] if phase==8 else ([(1920,1080,60000)] if phase==6 else [(320,160,60000),(640,480,60000)]))
-            m=I.Machine(ram_size=8<<20,cores=2,display_modes=modes);m.load_image(image)
+            m=I.Fixture(ram_size=8<<20,cores=2,display_modes=modes);m.load_image(image)
             struct.pack_into('<Q',m.ram,0x700000,phase)
             capacity=(max((w//fw)*(h//fh)*4 for w,h,_ in modes for fw,fh in [(8,16),(12,24),(16,32)])+4095)&-4096
             base=(8<<20)-(1<<20)-65536-capacity
             struct.pack_into('<I',m.ram,base-4,0x12345678);struct.pack_into('<I',m.ram,base+capacity,0x76543210)
-            assert not L.capture(m,str(td));frames=[];advance=m.display.advance
-            def observe(t):
-                advance(t);frames.append('FRAME %d %08X'%(m.display.vsyncs,m.display.crc()))
-            m.display.advance=observe;m.run(4000000);c=m.cores[0]
+            assert not L.capture(m,str(td))
+            m=runner.execute(m,4000000,td);c=m.cores[0];frames=list(m.frames)
             assert c.state=='HALTED' and c.exit==42,(name,c.state,c.exit,struct.unpack_from('<2q',m.ram,0x600000))
             assert struct.unpack_from('<Q',m.ram,0x600000)[0]==0,(name,struct.unpack_from('<Q',m.ram,0x600000),struct.unpack_from('<2q',m.ram,0x600100))
             assert struct.unpack_from('<Q',m.ram,0x600008)[0]>=4,name
@@ -210,20 +208,19 @@ def main():
                 cleared=[0x70020]*(w*h)
                 if phase==10:
                     cleared[0]=0x70059
-                    assert bytes(m.serial[0].out)==b'Y' and m.text.cx==1 and m.text.cy==0,name
+                    assert bytes(m.serial[0].out)==b'Y' and m.fields['textcursor'][0]==1 and m.fields['textcursor'][1]==0,name
                 assert list(struct.unpack_from('<%dI'%(w*h),m.ram,base))==cleared,name
-                assert m.text.err==0 and m.text.origin==0 and m.text.style==0x101,name
-            if phase==4:assert m.text.cells==0 and m.text.layer==1,name
-            if phase==5:assert m.text.layer==0 and m.display.ctrl==0,name
+                assert m.fields['textmeta'][1]==0 and m.fields['text'][3]==0 and m.fields['textmeta'][2]==0x101,name
+            if phase==4:assert m.fields['text'][2]==0 and m.fields['textmeta'][0]==1,name
+            if phase==5:assert m.fields['textmeta'][0]==0 and m.fields['textmeta'][3]==0,name
             native=run([L.EXE,td/'machine.txt','--max','4000000','--ram',td/'final.bin'])
             assert (td/'final.bin').read_bytes()==m.ram,name
-            state=next(s[6:] for s in native.splitlines() if s.startswith('STATE '))
-            assert state.split(' ',1)[1]==L.state_line(m,0,-1).split(' ',1)[1],name
+            I.assert_same_state(native,m)
             assert m.cores[1].state=='PARKED'
             if phase in (0,3,7,10):
                 win=run([zt/('zenwin.exe' if os.name=='nt' else 'zenwin'),td/'machine.txt','--headless','--max','4000000'])
                 assert [s for s in win.splitlines() if s.startswith('FRAME ')]==frames,name
-            checked+=1;print('PASS native text API '+name+': actual provider/lifetime, independent cells/bounds, full native/twin state/RAM'+(' and exact headless frames' if phase in (0,3,7,10) else ''),flush=True)
+            checked+=1;print('PASS native text API '+name+': actual provider/lifetime, independent cells/bounds, full native state/RAM'+(' and exact headless frames' if phase in (0,3,7,10) else ''),flush=True)
     assert checked>0,'no matching case'
 
 

@@ -81,8 +81,8 @@ FAULTS={
 def main():
     ap=argparse.ArgumentParser(description=__doc__);ap.add_argument('--compiler');ap.add_argument('--zen-tools',type=Path,required=True)
     a=ap.parse_args();cc=resolve_compiler(a.compiler);zt=a.zen_tools.resolve();sys.path.insert(0,str(zt))
-    import zen_interp as I
-    import zen_lockstep_check as L
+    import zentaji_native as I
+    import zen_native_fixture as L
     import zasm_ref as A
     import zexpack
     env=dict(os.environ,PMF_ROOT=str(ROOT));passed=0
@@ -90,7 +90,7 @@ def main():
         p=subprocess.run([str(x) for x in args],cwd=ROOT,env=env,capture_output=True,text=True,encoding='utf-8',errors='replace',timeout=60)
         assert p.returncode==0,(p.returncode,p.stdout[-3000:],p.stderr)
         return p.stdout
-    with tempfile.TemporaryDirectory(prefix='anvil-zen-startup-proof-') as tmp:
+    with I.NativeRunner() as runner, tempfile.TemporaryDirectory(prefix='anvil-zen-startup-proof-') as tmp:
         td=Path(tmp);src=td/'probe.zentaji';compiled=td/'probe.zex'
         variants={}
         variants_raw={}
@@ -118,15 +118,15 @@ def main():
         image,meta,ref=variants['normal']
         assert meta['context_version']==2 and meta['payload_call']==ref.sym['ANVIL_ZEN_PAYLOAD_CALL']
         def direct(image,ram=2<<20,cores=2):
-            m=I.Machine(ram_size=ram,cores=cores,display_modes=[(16,16,60000)]);m.load_image(image)
+            m=I.Fixture(ram_size=ram,cores=cores,display_modes=[(16,16,60000)]);m.load_image(image)
             m.cores[0].r[255]=0xDEADBEF0
             return m
         def check(name,m,exit_code=42,serial=None,steps=1000000,active=0):
             nonlocal passed
             assert not L.capture(m,str(td)),name
-            native=run([L.EXE,td/'machine.txt','--max',str(steps),'--ram',td/'final.bin']);m.run(steps)
+            native=run([L.EXE,td/'machine.txt','--max',str(steps),'--ram',td/'final.bin']);m=runner.execute(m,steps,td)
             states=[s for s in native.splitlines() if s.startswith('STATE ')]
-            assert states[0][6:].split(' ',1)[1]==L.state_line(m,0,-1).split(' ',1)[1],name
+            I.assert_same_state(native,m)
             assert (td/'final.bin').read_bytes()==m.ram,name
             c=m.cores[active];assert c.state=='HALTED' and c.exit==exit_code,(name,c.state,c.exit,bytes(m.serial[0].out))
             serial_bytes=bytes(m.serial[0].out)
@@ -135,9 +135,9 @@ def main():
             if serial is not None:assert serial_bytes==serial,(name,serial_bytes,serial)
             assert all(c.state=='PARKED' for i,c in enumerate(m.cores) if i!=active),name
             passed+=1
-            return c
+            return c,m
         for ram in [2<<20,(2<<20)+7,8<<20]:
-            m=direct(image,ram);c=check('direct-ram-'+str(ram),m,serial=b'')
+            m=direct(image,ram);c,m=check('direct-ram-'+str(ram),m,serial=b'')
             ctx=meta['context'];q=lambda off:int.from_bytes(m.ram[ctx+off:ctx+off+8],'little')
             assert [q(x) for x in (0,8,16,24,32,40,48,56,64,72,80,88,96,104,112,120)]==[0x4E455A4C49564E41,2,128,I.DEV+0x10000,2,ram,0xDEADBEF0,((ram&-16)-1048576)-65536,(ram&-16)-1048576,meta['vectors'],meta['compiled_entry'],0,meta['load'],meta['image_end'],65536,ref.sym['ANVIL_ZEN_PAYLOAD_CALL']]
             assert c.cr[I.CR['EVEC']]==meta['vectors'] and c.r[255]==(ram&-16)-1048576
@@ -147,7 +147,7 @@ def main():
             ('wrong-source',5,lambda m:m.cores[0].r.__setitem__(2,3),2<<20),
             ('small-ram',6,lambda m:None,1<<20),
         ]:
-            m=direct(image,ram);mutate(m);c=check(name,m,reason,f'Anvil startup refused code={reason:016X}\r\n'.encode())
+            m=direct(image,ram);mutate(m);c,m=check(name,m,reason,f'Anvil startup refused code={reason:016X}\r\n'.encode())
             assert c.cr[I.CR['EVEC']]==I.DEV+0xF000 and c.r[255]==0xDEADBEF0,name
         m=direct(image);m.cores[0].state='PARKED';c=m.cores[1];c.state='RUNNING';c.pc=meta['entry'];c.r[1]=I.DEV+0x10000;c.r[2]=2;c.r[255]=0xDEADBEF0
         check('secondary-entry-refused',m,3,b'Anvil startup refused code=0000000000000003\r\n',active=1)
@@ -157,19 +157,19 @@ def main():
         check('protected-entry-refused',m,4,b'Anvil startup refused code=0000000000000004\r\n')
         bss_raw=bytearray(variants_raw['normal']);struct.pack_into('<Q',bss_raw,32,129)
         bss_image,bm,ba,bmap=B.pack(bytes(bss_raw),zt/('zasm.exe' if os.name=='nt' else 'zasm'),16384)
-        m=I.Machine(ram_size=2<<20,cores=2,display_modes=[(16,16,60000)]);m.ram[:]=bytes([0xA5])*len(m.ram);m.load_image(bss_image)
-        check('original-bss-and-min-stack',m,serial=b'')
+        m=I.Fixture(ram_size=2<<20,cores=2,display_modes=[(16,16,60000)]);m.ram[:]=bytes([0xA5])*len(m.ram);m.load_image(bss_image)
+        _,m=check('original-bss-and-min-stack',m,serial=b'')
         at=struct.unpack_from('<Q',bss_raw,16)[0]+len(bss_raw)-64
         assert not any(m.ram[at:at+129])
         returns_src=td/'returns.zentaji';returns_image=td/'returns.zex'
         returns_src.write_text(SOURCE.replace(' FAULT',''),encoding='utf-8')
         run([cc,'--compile',returns_src,'--entry-returns','-o',returns_image])
         returning,rm,ra,rmap=B.pack(returns_image.read_bytes(),zt/('zasm.exe' if os.name=='nt' else 'zasm'),source_map=json.loads(Path(str(returns_image)+'.zmap').read_text(encoding='utf-8-sig')))
-        rr=A.Asm();rr.assemble(ra);m=direct(returning);c=check('callable-entry-return',m,serial=b'')
+        rr=A.Asm();rr.assemble(ra);m=direct(returning);c,m=check('callable-entry-return',m,serial=b'')
         assert c.r[254]==rr.sym['ANVIL_ZEN_RETURNED'] and c.r[255]==(2<<20)-1048576
         img,md,r=variants['tx-busy-fault'];m=direct(img)
-        check('TX-block-busy-fault',m,267,b'')
-        assert m.serial[0].txdropped==0 and m.cores[0].r[255]==3
+        _,m=check('TX-block-busy-fault',m,267,b'')
+        assert m.fields['serialmeta0'][0]==0 and m.cores[0].r[255]==3
         raw=compiled.read_bytes()
         # Preserve original BSS addresses as zero bytes in the wrapped payload.
         # Malformed cases are rejected before assembly.
@@ -186,7 +186,7 @@ def main():
         m=direct(overlap);check('stack-image-overlap',m,7,b'Anvil startup refused code=0000000000000007\r\n')
         for name,cause in [('bad-sp-break',11),('nmi',13),('watchdog',14)]:
             img,md,r=variants[name];m=direct(img);m.cores[0].cr[I.CR['EPC']]=0xAA55;m.cores[0].cr[I.CR['EINFO']]=0xBB66
-            c=check(name,m,256+cause)
+            c,m=check(name,m,256+cause)
             pc=c.cr[I.CR['NEPC' if cause in (13,14,15) else 'EPC']];info=c.cr[I.CR['NEINFO' if cause in (13,14,15) else 'EINFO']]
             assert bytes(m.serial[0].out)==f'Anvil exception cause={cause:016X} pc={pc:016X} info={info:016X}\r\n'.encode(),name
             assert c.cr[I.CR['EVEC']]==md['vectors'],name
@@ -195,8 +195,8 @@ def main():
         for disk in [False,True]:
             files=[] if disk else [['anvil.zex',bytearray(image),False]]
             disks={0:(bytearray(zexpack.disk_image(image)),True)} if disk else None
-            m=I.Machine(ram_size=2<<20,cores=2,hostfiles=files,disks=disks,display_modes=[(16,16,60000)]);m.power_on(int(disk),0)
-            c=check('actual-ROM-'+('disk' if disk else 'hostfile'),m,serial=b'Zentaji boot ROM v1\r\nboot: starting the image\r\n')
+            m=I.Fixture(ram_size=2<<20,cores=2,hostfiles=files,disks=disks,display_modes=[(16,16,60000)]);m.power_on(int(disk),0)
+            c,m=check('actual-ROM-'+('disk' if disk else 'hostfile'),m,serial=b'Zentaji boot ROM v1\r\nboot: starting the image\r\n')
             assert c.cr[I.CR['EVEC']]==meta['vectors']
         from unittest.mock import patch
         output=td/'published.zex';raw=variants_raw['normal'];compiled=td/'normal.zex'
@@ -251,12 +251,12 @@ def main():
         for disk in [False,True]:
             files=[] if disk else [['anvil-prompt.zex',bytearray(prompt),False]]
             disks={0:(bytearray(zexpack.disk_image(prompt)),True)} if disk else None
-            m=I.Machine(ram_size=2<<20,cores=2,hostfiles=files,disks=disks,display_modes=[(16,16,60000)])
+            m=I.Fixture(ram_size=2<<20,cores=2,hostfiles=files,disks=disks,display_modes=[(16,16,60000)])
             m.power_on(int(disk),0);m.serial[0].incoming=[(400000000,b) for b in b'OK\r']
-            c=check('ROM-shared-ReadLine-'+('disk' if disk else 'hostfile'),m,serial=b'Zentaji boot ROM v1\r\nboot: starting the image\r\npmf> OK\r\n',steps=4000000)
+            c,m=check('ROM-shared-ReadLine-'+('disk' if disk else 'hostfile'),m,serial=b'Zentaji boot ROM v1\r\nboot: starting the image\r\npmf> OK\r\n',steps=4000000)
             assert c.cr[I.CR['EVEC']]==pm['vectors']
-        print('PASS actual ROM -> owned startup -> full shared ReadLine, both host-file and disk: timed serial input, service/message activity and exact native/twin state/RAM/output; unrelated hardware providers remain counted adapters')
-        print(f'PASS startup: {passed} real Forge/native/twin full-state/RAM cases; owned SP/EVEC/context, malformed handoff/overlap, damaged-SP BRK/NMI/watchdog reporting and actual ROM host-file/disk boot; independent assembly and header refusals')
+        print('PASS actual ROM -> owned startup -> full shared ReadLine, both host-file and disk: timed serial input, service/message activity and exact native state/RAM/output; unrelated hardware providers remain counted adapters')
+        print(f'PASS startup: {passed} real Forge/native full-state/RAM cases; owned SP/EVEC/context, malformed handoff/overlap, damaged-SP BRK/NMI/watchdog reporting and actual ROM host-file/disk boot; independent assembly and header refusals')
 
 
 if __name__=='__main__':main()

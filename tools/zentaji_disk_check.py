@@ -113,8 +113,8 @@ EndProcedure
 def main():
     ap=argparse.ArgumentParser(description=__doc__);ap.add_argument('--compiler');ap.add_argument('--zen-tools',type=Path,required=True);ap.add_argument('--fat-only',action='store_true')
     a=ap.parse_args();cc=resolve_compiler(a.compiler);zt=a.zen_tools.resolve();sys.path.insert(0,str(zt))
-    import zen_interp as I
-    import zen_lockstep_check as L
+    import zentaji_native as I
+    import zen_native_fixture as L
     import zasm_ref as A
     import zexpack
     env=dict(os.environ,PMF_ROOT=str(ROOT))
@@ -123,25 +123,26 @@ def main():
         assert p.returncode==0,(p.returncode,p.stdout[-4000:],p.stderr)
         return p.stdout
     disk=bytes((i*17+(i//512)*3+11)&255 for i in range(8*4096))
-    with tempfile.TemporaryDirectory(prefix='anvil-zen-disk-') as tmp:
+    with I.NativeRunner() as runner, tempfile.TemporaryDirectory(prefix='anvil-zen-disk-') as tmp:
         td=Path(tmp)
         if not a.fat_only:
             src=td/'disk.zentaji';image=td/'disk.zex';src.write_text(SOURCE,encoding='utf-8')
             out=run([cc,'--compile',src,'-o',image]);assert 'is READ but never' not in out,out
             ref=A.Asm();org,data=ref.assemble(Path(str(image)+'.asm').read_text(encoding='utf-8-sig'));assert image.read_bytes()==zexpack.header(org,org,data)+data
             for scenario,active in [(s,0) for s in range(19)]+[(0,1)]:
-                m=I.Machine(ram_size=2<<20,cores=2,disks={0:(bytearray(disk),scenario==8)},display_modes=[(1,1,60000)]);m.load_image(image.read_bytes());c=m.cores[active];c.r[1]=scenario
+                m=I.Fixture(ram_size=2<<20,cores=2,disks={0:(bytearray(disk),scenario==8)},display_modes=[(1,1,60000)]);m.load_image(image.read_bytes());c=m.cores[active];c.r[1]=scenario
                 if active:
                     m.cores[0].state='PARKED';c.pc=int.from_bytes(image.read_bytes()[8:16],'little');c.r[255]=2<<20;c.state='RUNNING'
                 for r in range(128,253):c.r[r]=0x10000+r*13
                 for r in range(32,64):c.v[r]=sum((r*100+j)<<(64*j) for j in range(8))
-                assert not L.capture(m,str(td))
+                fixture=m;m=runner.execute(fixture,4000000,td);c=m.cores[active]
+                assert not L.capture(fixture,str(td))
                 if scenario==6:
                     cfg=td/'machine.txt';cfg.write_text(cfg.read_text().replace('disk-memory ','disk '),encoding='utf-8')
-                native=run([L.EXE,td/'machine.txt','--max','4000000','--ram',td/'final.bin']);m.run(4000000)
+                native=run([L.EXE,td/'machine.txt','--max','4000000','--ram',td/'final.bin'])
                 assert c.state=='HALTED' and c.r[1]==42,(scenario,c.state,c.r[1],c.cr)
                 assert (td/'final.bin').read_bytes()==m.ram,scenario
-                line=next(s[6:] for s in native.splitlines() if s.startswith('STATE '));assert line.split(' ',1)[1]==L.state_line(m,0,-1).split(' ',1)[1],scenario
+                I.assert_same_state(native,m)
                 assert c.r[128:253]==[0x10000+r*13 for r in range(128,253)] and c.r[255]==2<<20,scenario
                 assert c.v[32:]==[sum((r*100+j)<<(64*j) for j in range(8)) for r in range(32,64)],scenario
                 want=bytearray(disk)
@@ -159,8 +160,8 @@ def main():
                     persisted=(td/'disk0.img').read_bytes()
                     assert persisted==want,'guest write/FLUSH did not persist exact host image bytes'
                     print('PASS exact host backing persisted after actual driver FUA writes and FLUSH',flush=True)
-                assert all(other.state=='PARKED' for other in m.cores if other is not c),scenario
-            print('PASS 20 actual Forge/reference/native/twin full-state/RAM/medium cases: aligned/unaligned and cross-4KB 512-sector I/O, partial/full writes, queue phase wrap, read-only/bounds/ownership/refusals, flush/device errors, timeout quarantine and late DMA retirement/reopen, corrupted tag/phase, owner mismatch and actual core1 execution')
+                assert all(other.state=='PARKED' for i,other in enumerate(m.cores) if i!=active),scenario
+            print('PASS 20 actual Forge/reference/native full-state/RAM/medium cases: aligned/unaligned and cross-4KB 512-sector I/O, partial/full writes, queue phase wrap, read-only/bounds/ownership/refusals, flush/device errors, timeout quarantine and late DMA retirement/reopen, corrupted tag/phase, owner mismatch and actual core1 execution')
         # Reuse the existing independent FAT fixture, not a second filesystem.
         sys.path.insert(0,str(ROOT/'tools/a64'))
         import a64_fat_check as F
@@ -215,14 +216,14 @@ EndProcedure
         out=run([cc,'--compile',src,'-o',compiled]);assert 'is READ but never' not in out,out
         aref=A.Asm();aref.assemble(Path(str(compiled)+'.asm').read_text(encoding='utf-8-sig'))
         wrapped,meta,assembly,mapping=B.pack(compiled.read_bytes(),zt/('zasm.exe' if os.name=='nt' else 'zasm'),source_map=json.loads(Path(str(compiled)+'.zmap').read_text(encoding='utf-8-sig')))
-        m=I.Machine(ram_size=2<<20,cores=2,disks={0:(bytearray(fatdisk),True)},display_modes=[(1,1,60000)]);m.load_image(wrapped)
-        assert not L.capture(m,str(td));native=run([L.EXE,td/'machine.txt','--max','8000000','--ram',td/'final.bin']);m.run(8000000)
+        m=I.Fixture(ram_size=2<<20,cores=2,disks={0:(bytearray(fatdisk),True)},display_modes=[(1,1,60000)]);m.load_image(wrapped)
+        assert not L.capture(m,str(td));native=run([L.EXE,td/'machine.txt','--max','8000000','--ram',td/'final.bin']);m=runner.execute(m,8000000,td)
         c=m.cores[0];assert c.state=='HALTED' and c.r[1]==42,('FAT',c.state,c.r[1],c.cr)
         assert (td/'final.bin').read_bytes()==m.ram
-        line=next(s[6:] for s in native.splitlines() if s.startswith('STATE '));assert line.split(' ',1)[1]==L.state_line(m,0,-1).split(' ',1)[1]
+        I.assert_same_state(native,m)
         at=aref.sym['GLOBAL_FILEBUF'];assert m.ram[at:at+2500]==F.content(2500) and m.ram[at+2500:at+4096]==b'\xCC'*(4096-2500)
         assert bytes(m.disks[0].image)==fatdisk and c.r[255]==meta['minimum_ram_bytes']-1048576 and m.cores[1].state=='PARKED'
-        print('PASS actual shared FAT32 over real Zentaji queues with owned startup stack/vectors: MBR/partition/FSInfo mount, root/allocation walk with corrupt-chain refusal, fragmented file reads/rewind/chunks/EOF/not-found; exact native/twin state/RAM and independent file/medium bytes')
+        print('PASS actual shared FAT32 over real Zentaji queues with owned startup stack/vectors: MBR/partition/FSInfo mount, root/allocation walk with corrupt-chain refusal, fragmented file reads/rewind/chunks/EOF/not-found; exact native state/RAM and independent file/medium bytes')
 
 
 

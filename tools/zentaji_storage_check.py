@@ -95,8 +95,8 @@ def main():
     a=ap.parse_args()
     if a.boot_disk is not None and a.filesystem!='exfat':ap.error('--boot-disk currently requires --filesystem exfat')
     cc=resolve_compiler(a.compiler);zt=a.zen_tools.resolve();sys.path.insert(0,str(zt));sys.path.insert(0,str(ROOT/'tools/a64'))
-    import zen_interp as I
-    import zen_lockstep_check as L
+    import zentaji_native as I
+    import zen_native_fixture as L
     import zasm_ref as A
     import zexpack
     import a64_fat_check as F
@@ -119,7 +119,7 @@ def main():
         sectors=(max(71104,max(sparse.s)+1)+7)&-8
         medium=bytearray(sectors*512)
         for lba,sector in sparse.s.items():medium[lba*512:(lba+1)*512]=sector
-    with tempfile.TemporaryDirectory(prefix='anvil-zen-storage-') as tmp:
+    with I.NativeRunner() as runner, tempfile.TemporaryDirectory(prefix='anvil-zen-storage-') as tmp:
         td=Path(tmp);src=td/'probe.zentaji';compiled=td/'probe.zex';source=SOURCE.replace('FsType()<>#FS_FAT','FsType()<>#FS_EXFAT') if a.filesystem=='exfat' else SOURCE
         if a.filesystem=='exfat':
             source=source.replace('If FsWalkRoot(@RangeVisit,0)<>1 Or FsWalkAllocations(@EntryVisit,@RangeVisit,0)<>1 Or visits<1 Or ranges<2 : ProcedureReturn 22 : EndIf',
@@ -136,16 +136,16 @@ def main():
             boot=zexpack.disk_image(wrapped)
             assert len(boot)<=4096*512,'boot payload overlaps the filesystem partition'
             medium[:64]=boot[:64];medium[4096:len(boot)]=boot[4096:]
-        m=I.Machine(ram_size=4<<20,cores=2,disks={disk:(bytearray(medium),False)},display_modes=[(1,1,60000)])
+        m=I.Fixture(ram_size=4<<20,cores=2,disks={disk:(bytearray(medium),False)},display_modes=[(1,1,60000)])
         if a.boot_disk is None:m.load_image(wrapped)
         else:m.power_on(1,disk)
-        assert not L.capture(m,str(td));cfg=td/'machine.txt';cfg.write_text(cfg.read_text().replace('disk-memory ','disk '),encoding='utf-8')
+        fixture=m;m=runner.execute(fixture,12000000,td);assert not L.capture(fixture,str(td));cfg=td/'machine.txt';cfg.write_text(cfg.read_text().replace('disk-memory ','disk '),encoding='utf-8')
         out=run([L.EXE,cfg,'--max','12000000','--ram',td/'final.bin'])
         assert ' exit=2A ' in out,('native guest did not finish successfully',out[-2500:])
-        m.run(12000000);c=m.cores[0]
+        c=m.cores[0]
         assert c.state=='HALTED' and c.r[1]==42,(c.state,c.r[1],hex(c.pc),c.cr)
         assert (td/'final.bin').read_bytes()==m.ram
-        line=next(s[6:] for s in out.splitlines() if s.startswith('STATE '));assert line.split(' ',1)[1]==L.state_line(m,0,-1).split(' ',1)[1]
+        I.assert_same_state(out,m)
         assert (td/('disk%d.img'%disk)).read_bytes()==bytes(m.disks[disk].image)
         expected=bytes((n*7+n//512+31)&255 for n in range(2048))
         at=ref.sym['GLOBAL_READBUF'];assert m.ram[at:at+1000]==expected[:1000] and m.ram[at+1500:at+2001]==expected[100:601] and m.ram[at+2048:at+3848]==expected[:1800]
@@ -153,7 +153,7 @@ def main():
         at=ref.sym['GLOBAL_CLOCKREPORT'];before,us,after=struct.unpack_from('<3Q',m.ram,at)
         assert before*1000000//100000000<=us<=after*1000000//100000000
         proof=O.check(bytes(m.disks[disk].image),medium,expected)
-        print('PASS '+a.filesystem+(' ROM disk%d'%disk if a.boot_disk is not None else '')+' storage lifecycle/shared filesystem/hwfile over real persistent queues: native/twin state/RAM/host image; '+proof,flush=True)
+        print('PASS '+a.filesystem+(' ROM disk%d'%disk if a.boot_disk is not None else '')+' storage lifecycle/shared filesystem/hwfile over real persistent queues: native state/RAM/host image; '+proof,flush=True)
 
 
 if __name__=='__main__':main()

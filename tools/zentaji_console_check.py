@@ -1,6 +1,5 @@
 """Actual serial-0 transport and shared input/editor on Zentaji hardware."""
 import argparse
-from collections import deque
 import os
 from pathlib import Path
 import subprocess
@@ -180,8 +179,8 @@ def main():
     ap.add_argument('--compiler');ap.add_argument('--zen-tools',type=Path,required=True)
     a=ap.parse_args();cc=resolve_compiler(a.compiler);zt=a.zen_tools.resolve()
     sys.path.insert(0,str(zt))
-    import zen_interp as I
-    import zen_lockstep_check as L
+    import zentaji_native as I
+    import zen_native_fixture as L
     import zasm_ref as A
     import zexpack
     import zen_sleep_check as S
@@ -192,14 +191,14 @@ def main():
         return p.stdout
     expected={0:'Zentaji café'.encode()+b'\r\n\0\xff',2:b'ab\x08 \x08C',10:b'A',12:b'Hi',13:b'AB',14:b'A',15:b'C',17:b'F',18:b'B'}
     incoming={1:b'\0\x7f\xff',2:b'ab\x08C\r\n',4:b'Q',6:b'Q',8:b'AB',9:b'AB',12:b'Hi\x03',13:b'A\r\nB\r',20:b'Q',21:b'Q'}
-    with tempfile.TemporaryDirectory(prefix='anvil-zen-console-') as tmp:
+    with I.NativeRunner() as runner, tempfile.TemporaryDirectory(prefix='anvil-zen-console-') as tmp:
         td=Path(tmp);src=td/'console.zentaji';image=td/'console.zex'
         src.write_text(SOURCE,encoding='utf-8');out=run([cc,'--compile',src,'-o',image])
         assert "'gLastCR' is READ" not in out,out
         asm=Path(str(image)+'.asm').read_text(encoding='utf-8-sig');ref=A.Asm();org,data=ref.assemble(asm)
         assert image.read_bytes()==zexpack.header(org,org,data)+data
         def machine(scenario):
-            m=I.Machine(ram_size=1<<20,display_modes=[(1,1,60000)]);m.load_image(image.read_bytes());c=m.cores[0]
+            m=I.Fixture(ram_size=1<<20,display_modes=[(1,1,60000)]);m.load_image(image.read_bytes());c=m.cores[0]
             c.r[1]=scenario;c.r[255]=0xF0000
             for reg in range(128,253):c.r[reg]=0x10000+reg*13
             for reg in range(32,64):c.v[reg]=sum((reg*100+j)<<(64*j) for j in range(8))
@@ -210,7 +209,7 @@ def main():
         def match(m,native,scenario):
             assert m.cores[0].r[1]==42,(scenario,m.cores[0].state,hex(m.cores[0].pc),hex(m.cores[0].r[1]),{k:hex(v) for k,v in m.cores[0].cr.items()},bytes(m.serial[0].out),native[-1200:])
             assert (td/'final.bin').read_bytes()==m.ram,scenario
-            assert states(native)[0][6:].split(' ',1)[1]==L.state_line(m,0,-1).split(' ',1)[1],scenario
+            I.assert_same_state(native,m)
             want=expected.get(scenario,b'')
             assert bytes(m.serial[0].out)==want,(scenario,bytes(m.serial[0].out),want)
             serial=[s.split(' ',1)[1] for s in native.splitlines() if s.startswith('SERIAL0 ')]
@@ -218,21 +217,20 @@ def main():
         for scenario in range(20):
             m=machine(scenario);c=m.cores[0];kept=list(c.r[128:253]);vectors=list(c.v[32:])
             assert not L.capture(m,str(td))
-            native=run([L.EXE,td/'machine.txt','--max','4000000','--ram',td/'final.bin']);m.run(4000000)
+            native=run([L.EXE,td/'machine.txt','--max','4000000','--ram',td/'final.bin']);m=runner.execute(m,4000000,td);c=m.cores[0]
             match(m,native,scenario)
             assert c.r[128:253]==kept and c.v[32:]==vectors and c.r[255]==0xF0000
-        print('PASS 20 actual console/input/editor/message-routing native/twin state/RAM/output cases: byte/UTF8, nondestructive ready, CRLF/edit/cancel, bounded pressure/drain, baud/adoption/detach, DMA ownership and timer-backed input; unbound/nested/newline/partial diversion, drop-newest overflow, wrap, fatal abandon and unbind/rebind')
+        print('PASS 20 actual console/input/editor/message-routing native state/RAM/output cases: byte/UTF8, nondestructive ready, CRLF/edit/cancel, bounded pressure/drain, baud/adoption/detach, DMA ownership and timer-backed input; unbound/nested/newline/partial diversion, drop-newest overflow, wrap, fatal abandon and unbind/rebind')
         results=[]
         for scenario in (20,21):
-            m=machine(scenario);assert not L.capture(m,str(td));rec=td/'recorded.txt'
+            m=machine(scenario);assert not L.capture(m,str(td));rec=td/('recorded%d.txt'%scenario)
             live,wall,cpu=S.run([str(zt/('zenwin.exe' if os.name=='nt' else 'zenwin')),str(td/'machine.txt'),'--headless','--live','--mute','--record',str(rec),'--max','4000000'],timeout=30)
             native=run([L.EXE,rec,'--max','4000000','--ram',td/'final.bin'])
             assert states(live)==states(native)
-            m.clock_samples=deque((int(s.split()[1][1:],16),int(s.split()[2]),int(s.split()[3]) if len(s.split())>3 else -1) for s in rec.read_text().splitlines() if s.startswith('clock '))
-            m.clock_complete=True;m.run(4000000);match(m,native,scenario);results.append((wall,cpu))
+            observed=runner.execute_config(rec,4000000,td);match(observed,native,scenario);results.append((wall,cpu))
         wall=results[1][0]-results[0][0];cpu=max(0,results[1][1]-results[0][1])
         assert wall>=1.8 and cpu<0.4,(wall,cpu)
-        print(f'PASS real console blocking RX live: startup-adjusted wall={wall:.6f}s cpu={cpu:.6f}s; timed input wakes the real backend, exact recorded native/twin replay')
+        print(f'PASS real console blocking RX live: startup-adjusted wall={wall:.6f}s cpu={cpu:.6f}s; timed input wakes the real backend, exact recorded native replay')
 
 
 if __name__=='__main__':main()

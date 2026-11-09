@@ -76,8 +76,8 @@ def main():
     ap=argparse.ArgumentParser(description=__doc__);ap.add_argument('--compiler');ap.add_argument('--zen-tools',type=Path,required=True)
     ap.add_argument('--case',type=int,choices=(1,2,3,4),action='append')
     a=ap.parse_args();cc=resolve_compiler(a.compiler);zt=a.zen_tools.resolve();sys.path.insert(0,str(zt))
-    import zen_interp as I
-    import zen_lockstep_check as L
+    import zentaji_native as I
+    import zen_native_fixture as L
     import zasm_ref as A
     import zexpack
     env=dict(os.environ,PMF_ROOT=str(ROOT))
@@ -85,7 +85,7 @@ def main():
         p=subprocess.run([str(x) for x in args],cwd=ROOT,env=env,capture_output=True,text=True,encoding='utf-8',errors='replace',timeout=120)
         assert p.returncode==0,(p.returncode,p.stdout[-4000:],p.stderr)
         return p.stdout
-    with tempfile.TemporaryDirectory(prefix='anvil-zen-storage-lifecycle-') as tmp:
+    with I.NativeRunner() as runner, tempfile.TemporaryDirectory(prefix='anvil-zen-storage-lifecycle-') as tmp:
         td=Path(tmp)
         for case in (a.case or (1,2,3,4)):
             src=td/'probe.zentaji';compiled=td/'probe.zex';src.write_bytes(SOURCE.replace('CASE_VALUE',str(case)).replace('\n','\r\n').encode())
@@ -94,19 +94,19 @@ def main():
             assert compiled.read_bytes()==zexpack.header(origin,origin,data)+data
             wrapped,_,_,_=B.pack(compiled.read_bytes(),zt/('zasm.exe' if os.name=='nt' else 'zasm'),source_map=json.loads(Path(str(compiled)+'.zmap').read_text(encoding='utf-8-sig')))
             medium=bytearray(2104*512) if case==3 else E.build()
-            m=I.Machine(ram_size=4<<20,cores=2,disks={0:(bytearray(medium),case==4)},display_modes=[(1,1,60000)]);m.load_image(wrapped)
-            assert not L.capture(m,str(td));cfg=td/'machine.txt';cfg.write_text(cfg.read_text().replace('disk-memory ','disk '),encoding='utf-8')
+            m=I.Fixture(ram_size=4<<20,cores=2,disks={0:(bytearray(medium),case==4)},display_modes=[(1,1,60000)]);m.load_image(wrapped)
+            fixture=m;m=runner.execute(fixture,3000000,td);assert not L.capture(fixture,str(td));cfg=td/'machine.txt';cfg.write_text(cfg.read_text().replace('disk-memory ','disk '),encoding='utf-8')
             out=run([L.EXE,cfg,'--max','3000000','--ram',td/'final.bin'])
             assert ' exit=2A ' in out,(case,'native failure',out[-2500:])
-            m.run(3000000);c=m.cores[0];assert c.state=='HALTED' and c.r[1]==42,(case,c.state,c.r[1])
+            c=m.cores[0];assert c.state=='HALTED' and c.r[1]==42,(case,c.state,c.r[1])
             assert (td/'final.bin').read_bytes()==m.ram
-            line=next(s[6:] for s in out.splitlines() if s.startswith('STATE '));assert line.split(' ',1)[1]==L.state_line(m,0,-1).split(' ',1)[1]
+            I.assert_same_state(out,m)
             assert (td/'disk0.img').read_bytes()==bytes(m.disks[0].image)==medium
             expected=(b'Zentaji disk 0 holds 2056 blocks of 512 bytes.\r\nMounted partition 1 uses exFAT; the medium is read-only.\r\n'
                       b'Zentaji disk 0 holds 2056 blocks of 512 bytes.\r\nA filesystem mount is in progress.\r\n'
                       b'Zentaji disk 0 holds 2056 blocks of 512 bytes.\r\nNo filesystem partition is currently mounted.\r\n') if case==4 else b''
             assert bytes(m.serial[0].out)==expected,(case,bytes(m.serial[0].out))
-            print('PASS storage lifecycle case%d: native/twin state/RAM, unchanged host disk, exact output'%case,flush=True)
+            print('PASS storage lifecycle case%d: native state/RAM, unchanged host disk, exact output'%case,flush=True)
 
 
 if __name__=='__main__':main()

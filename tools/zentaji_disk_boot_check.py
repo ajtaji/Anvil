@@ -40,8 +40,8 @@ def main():
     ap=argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--compiler');ap.add_argument('--zen-tools',type=Path,required=True)
     a=ap.parse_args();cc=resolve_compiler(a.compiler);zt=a.zen_tools.resolve();sys.path.insert(0,str(zt))
-    import zen_interp as I
-    import zen_lockstep_check as L
+    import zentaji_native as I
+    import zen_native_fixture as L
     import zasm_ref as A
     import zexpack
     env=dict(os.environ,PMF_ROOT=str(ROOT))
@@ -49,7 +49,7 @@ def main():
         p=subprocess.run([str(x) for x in args],cwd=ROOT,env=env,capture_output=True,text=True,encoding='utf-8',errors='replace',timeout=60)
         assert p.returncode==0,(p.returncode,p.stdout[-4000:],p.stderr)
         return p.stdout
-    with tempfile.TemporaryDirectory(prefix='anvil-zen-boot-disk-') as tmp:
+    with I.NativeRunner() as runner, tempfile.TemporaryDirectory(prefix='anvil-zen-boot-disk-') as tmp:
         td=Path(tmp);src=td/'probe.zentaji';compiled=td/'probe.zex'
         src.write_bytes(SOURCE.replace('\n','\r\n').encode('utf-8'))
         run([cc,'--compile',src,'-o',compiled])
@@ -58,16 +58,15 @@ def main():
         wrapped,meta,_,_=B.pack(compiled.read_bytes(),zt/('zasm.exe' if os.name=='nt' else 'zasm'),source_map=json.loads(Path(str(compiled)+'.zmap').read_text(encoding='utf-8-sig')))
         medium=zexpack.disk_image(wrapped)
         for disk in (0,15):
-            m=I.Machine(ram_size=2<<20,cores=2,disks={disk:(bytearray(medium),True)},display_modes=[(16,16,60000)])
+            m=I.Fixture(ram_size=2<<20,cores=2,disks={disk:(bytearray(medium),True)},display_modes=[(16,16,60000)])
             m.power_on(1,disk)
             assert not L.capture(m,str(td))
             native=run([L.EXE,td/'machine.txt','--max','1000000','--ram',td/'final.bin'])
-            m.run(1000000);c=m.cores[0]
+            m=runner.execute(m,1000000,td);c=m.cores[0]
             assert c.state=='HALTED' and c.r[1]==42,(disk,c.state,c.r[1],hex(c.pc),bytes(m.serial[0].out).decode('ascii',errors='replace'),c.cr)
             assert not c.perf['exceptions'] and m.cores[1].state=='PARKED'
             assert (td/'final.bin').read_bytes()==m.ram
-            line=next(s[6:] for s in native.splitlines() if s.startswith('STATE '))
-            assert line.split(' ',1)[1]==L.state_line(m,0,-1).split(' ',1)[1],disk
+            I.assert_same_state(native,m)
             at=ref.sym['GLOBAL_BLOCK'];assert m.ram[at:at+4096]==medium[:4096]
             at=ref.sym['GLOBAL_SECTOR'];assert m.ram[at:at+512]==wrapped[64:576]
             d=m.disks[disk]
@@ -75,7 +74,7 @@ def main():
             assert not any((d.sq_base,d.sq_n,d.sq_head,d.sq_tail,d.cq_base,d.cq_n,d.cq_head,d.cq_tail)) and d.phase==1
             assert bytes(d.image)==medium and c.r[255]==meta['minimum_ram_bytes']-1048576
             assert (td/('disk%d.img'%disk)).read_bytes()==medium
-            print('PASS actual ROM disk%d -> owned Anvil supervisor startup -> same-disk acquire/read/refuse readonly write/close/reopen/read: full native/twin state/RAM, independent header/payload bytes, clean queues and unchanged host image'%disk,flush=True)
+            print('PASS actual ROM disk%d -> owned Anvil supervisor startup -> same-disk acquire/read/refuse readonly write/close/reopen/read: full native state/RAM, independent header/payload bytes, clean queues and unchanged host image'%disk,flush=True)
 
 
 if __name__=='__main__':main()

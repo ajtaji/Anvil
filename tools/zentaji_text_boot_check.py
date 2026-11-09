@@ -51,8 +51,8 @@ def main():
     ap.add_argument('--compiler');ap.add_argument('--zen-tools',type=Path,required=True)
     ap.add_argument('--case',choices=('repeat-return','damaged-text-owner'));a=ap.parse_args()
     cc=resolve_compiler(a.compiler);zt=a.zen_tools.resolve();sys.path.insert(0,str(zt))
-    import zen_interp as I
-    import zen_lockstep_check as L
+    import zentaji_native as I
+    import zen_native_fixture as L
     import zasm_ref as A
     import zexpack
     artifact=ROOT/'build/zentaji/anvil.zex';image=artifact.read_bytes()
@@ -71,7 +71,7 @@ def main():
     expected[82:85]=[0x4030041,0x40300e9,0x4032500]
     old=expected[:]
     for y in range(1,5):expected[y*40:(y+1)*40]=old[(y+1)*40:(y+2)*40] if y<4 else [0x605002e]*40
-    with tempfile.TemporaryDirectory(prefix='anvil-text-boot-') as tmp:
+    with I.NativeRunner() as runner, tempfile.TemporaryDirectory(prefix='anvil-text-boot-') as tmp:
         td=Path(tmp)
         for name,damage,calls,code in [('repeat-return','',2,0),('damaged-text-owner','PokeQ($FFFF0000001A0048,0)',1,0x5B05)]:
             if a.case and name!=a.case:continue
@@ -83,49 +83,44 @@ def main():
             print('Checking published text '+name+': independently assembled %d-byte app body'%len(body),flush=True)
             medium=E.build(4096);E.seed_file(medium,pmf,'APP.PMF');boot=zexpack.disk_image(image)
             medium[:64]=boot[:64];medium[4096:len(boot)]=boot[4096:]
-            m=I.Machine(ram_size=8<<20,cores=2,disks={15:(bytearray(medium),False)},display_modes=[(320,160,60000),(640,480,60000)]);m.power_on(1,15)
+            m=I.Fixture(ram_size=8<<20,cores=2,disks={15:(bytearray(medium),False)},display_modes=[(320,160,60000),(640,480,60000)]);m.power_on(1,15)
             assert not L.capture(m,str(td));cfg=td/'machine.txt';cfg.write_text(cfg.read_text(encoding='utf-8').replace('disk-memory ','disk '),encoding='utf-8')
+            m.observe_ram=0x600010;m.observe_serial='pmf> '
             commands=['boot APP.PMF']*calls+(['halt'] if code==0 else []);scheduled=[];seen=set();verifications=0
-            frames=[];advance=m.display.advance
-            def observe(t):
-                advance(t);frames.append('FRAME %d %08X'%(m.display.vsyncs,m.display.crc()))
-            m.display.advance=observe
-            def operator(core):
+            def operator(observed):
+                core=observed.cores[0]
                 nonlocal verifications
-                output=bytes(m.serial[0].out);count=output.count(b'Verifying ')
+                output=bytes(observed.serial[0].out);count=output.count(b'Verifying ')
                 if count>verifications:verifications=count;print('Text proof: real PMF verification %d started'%count,flush=True)
-                ready=struct.unpack_from('<Q',m.ram,0x600010)[0]
+                ready=struct.unpack_from('<Q',observed.ram,0x600010)[0]
                 if ready and ready not in seen:
-                    got=list(struct.unpack_from('<400I',m.ram,m.text.cells))
+                    got=list(struct.unpack_from('<400I',observed.ram,observed.fields['text'][2]))
                     assert got==expected,(name,ready,[(n,x,y) for n,(x,y) in enumerate(zip(got,expected)) if x!=y][:5])
-                    assert (m.text.cx,m.text.cy,m.text.style)==(4,2,2)
+                    assert (observed.fields['textcursor'][0],observed.fields['textcursor'][1],observed.fields['textmeta'][2])==(4,2,2)
                     seen.add(ready);print('Text proof: actual cell grid/session %d observed'%ready,flush=True)
                 if len(scheduled)<len(commands) and output.count(b'pmf> ')>len(scheduled):
-                    assert m.input.mctrl==0 and m.input.irq_enable==0
-                    assert m.text.style==0x101 and m.text.cells!=0
-                    tick=max(m.time,core.cr[I.CR['CYCLE']])+100
+                    assert observed.fields['input'][1]==0 and observed.fields['input'][2]==0
+                    assert observed.fields['textmeta'][2]==0x101 and observed.fields['text'][2]!=0
+                    tick=max(observed.time,core.cr[I.CR['CYCLE']])+100
                     line=[(tick,b) for b in (commands[len(scheduled)]+'\r').encode()]
                     scheduled.append(line);m.serial[0].incoming.extend(line)
-            m.on_slice=operator;m.run(100000000);m.on_slice=None;c=m.cores[0];output=bytes(m.serial[0].out)
+            m=runner.operate(m,operator,100000000,td);c=m.cores[0];frames=list(m.frames)
+            cfg.write_text(cfg.read_text().replace('disk-memory ','disk '),encoding='utf-8');output=bytes(m.serial[0].out)
             assert c.state=='HALTED' and c.exit==code,(name,c.state,c.exit,output[-3000:])
             assert seen==set(range(1,calls+1)) and struct.unpack_from('<Q',m.ram,0x600000)[0]==calls,name
             if code==0:assert output.count(b'The payload returned, r1 = $1122334455667788')==2 and len(scheduled)==3 and b'Anvil stopped.' in output
             else:assert output.count(b'pmf> ')==1 and b'Payload return failed (0x5B05)' in output and b'The payload returned' not in output
             assert bytes(m.disks[15].image)==bytes(medium) and E.root_files(bytes(m.disks[15].image))=={'APP.PMF':pmf}
-            with cfg.open('a',encoding='utf-8') as stream:
-                for line in scheduled:
-                    for tick,b in line:stream.write('serial 0 $%X %02X\n'%(tick,b))
             native=run([L.EXE,cfg,'--max','100000000','--ram',td/'final.bin'])
             assert (td/'final.bin').read_bytes()==m.ram
-            state=next(s[6:] for s in native.splitlines() if s.startswith('STATE '))
-            assert state.split(' ',1)[1]==L.state_line(m,0,-1).split(' ',1)[1]
+            I.assert_same_state(native,m)
             assert (td/'disk15.img').read_bytes()==bytes(medium) and m.cores[1].state=='PARKED'
             win=run([zt/('zenwin.exe' if os.name=='nt' else 'zenwin'),cfg,'--headless','--max','100000000'])
             assert [s for s in win.splitlines() if s.startswith('FRAME ')]==frames
             for row in mapping['code']:
                 pc=int(row['pc'],16);n=row['size'];assert m.ram[pc:pc+n]==image[64+pc-meta['load']:64+pc-meta['load']+n]
             outcome='both input/text scopes retired' if code==0 else 'foreign text owner failed-stop5B05 before reuse'
-            print('PASS published text '+name+': real ROM/PMF/SHA/table208/discovered dispatch, cells/cursor/present, '+outcome+'; exact native/twin RAM/state/frames and independent immutable disk/monitor oracle',flush=True)
+            print('PASS published text '+name+': real ROM/PMF/SHA/table208/discovered dispatch, cells/cursor/present, '+outcome+'; exact native RAM/state/frames and independent immutable disk/monitor oracle',flush=True)
 
 
 if __name__=='__main__':main()

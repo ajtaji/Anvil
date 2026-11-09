@@ -76,8 +76,8 @@ EndProcedure
 def main():
     ap=argparse.ArgumentParser(description=__doc__);ap.add_argument('--compiler');ap.add_argument('--zen-tools',type=Path,required=True)
     a=ap.parse_args();cc=resolve_compiler(a.compiler);zt=a.zen_tools.resolve();sys.path.insert(0,str(zt))
-    import zen_interp as I
-    import zen_lockstep_check as L
+    import zentaji_native as I
+    import zen_native_fixture as L
     import zasm_ref as A
     import zexpack
     env=dict(os.environ,PMF_ROOT=str(ROOT))
@@ -85,7 +85,7 @@ def main():
         p=subprocess.run([str(x) for x in args],cwd=ROOT,env=env,capture_output=True,text=True,encoding='utf-8',errors='replace',timeout=120)
         assert p.returncode==0,(p.returncode,p.stdout[-4000:],p.stderr)
         return p.stdout
-    with tempfile.TemporaryDirectory(prefix='anvil-zen-payload-') as tmp:
+    with I.NativeRunner() as runner, tempfile.TemporaryDirectory(prefix='anvil-zen-payload-') as tmp:
         td=Path(tmp);src=td/'probe.zentaji';image=td/'probe.zex';src.write_bytes(SOURCE.replace('\n','\r\n').encode())
         run([cc,'--compile',src,'--entry-returns','-o',image])
         ref=A.Asm();org,data=ref.assemble(Path(str(image)+'.asm').read_text(encoding='utf-8-sig'))
@@ -123,7 +123,7 @@ def main():
             payload=A.Asm();address,code=payload.assemble('\n'.join(lines)+'\n')
             if scenario==22:address,code=load,pmf[128:]
             files=[['anvil.zex',bytearray(wrapped),True]] if rom else []
-            m=I.Machine(ram_size=8<<20,cores=2,hostfiles=files,display_modes=[(1,1,60000)])
+            m=I.Fixture(ram_size=8<<20,cores=2,hostfiles=files,display_modes=[(1,1,60000)])
             if rom:m.power_on(0,0)
             else:m.load_image(wrapped)
             # Avoid the ROM memory-count probe at each 64KB boundary.
@@ -135,31 +135,40 @@ def main():
             for n in range(32,64):c.v[n]=int.from_bytes(bytes((n+j)&255 for j in range(64)),'little')
             for n in range(1,8):c.k[n]=n*0x11223344556677
             assert not L.capture(m,str(td))
-            snapshots=[];arguments=[];pending=None;original=m.step
-            def observe(core):
-                nonlocal pending
-                if core.pc==address:
-                    arguments.append(core.r[1])
-                    assert core.r[2:16]==[0]*14 and core.r[255]==0x2F0000
-                    assert core.cr[I.CR['STATUS']]==0 and core.cr[I.CR['PROT']]==0
-                    assert core.cr[I.CR['FPCR']]==0 and core.cr[I.CR['FPSR']]==0
-                if core.pc==owned.sym['ANVIL_ZEN_PAYLOAD_CALL']:
-                    assert pending is None
-                    pending=(core.r[254],list(core.r[128:256]),list(core.v[32:]),list(core.k),core.cr[I.CR['FPCR']],core.cr[I.CR['FPSR']])
-                if pending and core.pc==pending[0]:
-                    assert list(core.r[128:256])==pending[1],('kept scalar/SP/link',scenario)
-                    assert list(core.v[32:])==pending[2] and list(core.k)==pending[3],('vector/mask',scenario)
-                    assert core.cr[I.CR['FPCR']]==pending[4] and core.cr[I.CR['FPSR']]==pending[5]
-                    assert core.cr[I.CR['STATUS']]==0 and core.cr[I.CR['EVEC']]==meta['vectors']
-                    assert core.r[1]==0x8877665544332211
-                    snapshots.append(pending);pending=None
-                original(core)
-            m.step=observe
-            out=run([L.EXE,td/'machine.txt','--max','1000000','--ram',td/'final.bin']);m.run(1000000)
+            fixture=m
+            out=run([L.EXE,td/'machine.txt','--max','1000000','--ram',td/'final.bin'])
+            m=runner.execute(fixture,1000000,td);c=m.cores[0]
+            snapshots=[];arguments=[];pending=None
+            commands=['break 0 $%X'%owned.sym['ANVIL_ZEN_PAYLOAD_CALL'],'continue 1000000']
+            boundary=runner.debug_snapshot(fixture,commands,td).core()
+            for launch in range(2):
+                if boundary.state=='HALTED':break
+                assert boundary.pc==owned.sym['ANVIL_ZEN_PAYLOAD_CALL']
+                pending=(boundary.r[254],list(boundary.r[128:256]),list(boundary.v[32:]),list(boundary.k),boundary.cr[I.CR['FPCR']],boundary.cr[I.CR['FPSR']])
+                commands+=['clear','break 0 $%X'%address,'continue 1000000']
+                entry=runner.debug_snapshot(fixture,commands,td).core()
+                assert entry.pc==address and entry.state=='RUNNING'
+                arguments.append(entry.r[1])
+                assert entry.r[2:16]==[0]*14 and entry.r[255]==0x2F0000
+                assert entry.cr[I.CR['STATUS']]==0 and entry.cr[I.CR['PROT']]==0
+                assert entry.cr[I.CR['FPCR']]==0 and entry.cr[I.CR['FPSR']]==0
+                commands+=['clear','break 0 $%X'%pending[0],'continue 1000000']
+                returned=runner.debug_snapshot(fixture,commands,td).core()
+                if returned.state=='HALTED':break
+                assert returned.pc==pending[0]
+                assert returned.r[128:256]==pending[1],('kept scalar/SP/link',scenario)
+                assert returned.v[32:]==pending[2] and returned.k==pending[3],('vector/mask',scenario)
+                assert returned.cr[I.CR['FPCR']]==pending[4] and returned.cr[I.CR['FPSR']]==pending[5]
+                assert returned.cr[I.CR['STATUS']]==0 and returned.cr[I.CR['EVEC']]==meta['vectors']
+                assert returned.r[1]==0x8877665544332211
+                snapshots.append(pending);pending=None
+                if launch==0:
+                    commands+=['clear','break 0 $%X'%owned.sym['ANVIL_ZEN_PAYLOAD_CALL'],'continue 1000000']
+                    boundary=runner.debug_snapshot(fixture,commands,td).core()
             want=0x5A02 if scenario==20 else 0x5A01 if scenario==21 else 42
             assert c.state=='HALTED' and c.exit==want,(scenario,rom,c.state,c.exit,bytes(m.serial[0].out))
             assert (td/'final.bin').read_bytes()==m.ram
-            state=next(s[6:] for s in out.splitlines() if s.startswith('STATE '));assert state.split(' ',1)[1]==L.state_line(m,0,-1).split(' ',1)[1]
+            I.assert_same_state(out,m)
             assert m.cores[1].state=='PARKED'
             calls=struct.unpack_from('<Q',m.ram,0x281008)[0]
             if scenario in (0,13,22):assert len(snapshots)==2 and pending is None and calls==2 and arguments==[0x1122334455667788,0]
@@ -168,7 +177,7 @@ def main():
             count+=1
             if scenario==22:
                 assert bytes(m.ram[load:load+len(body)])==body
-            print('PASS payload boundary scenario=%d ROM=%s: native/twin full state/RAM, calls=%d'%(scenario,rom,calls),flush=True)
+            print('PASS payload boundary scenario=%d ROM=%s: native full state/RAM, calls=%d'%(scenario,rom,calls),flush=True)
         print('PASS real placed compiler PMF body through owned CPU boundary twice, direct and ROM: args/results/caller stack restored; harness placement, not shared-loader integration')
         print('PASS %d actual CPU-boundary cases: entry arguments/stack/FP state, complete kept-register restoration despite foreign SP/vectors, repeat/nested entry, refusal before jump and unsafe-return fail-stop'%count)
 

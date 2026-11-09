@@ -52,12 +52,11 @@ EndProcedure
 def main():
     ap=argparse.ArgumentParser(description=__doc__);ap.add_argument('--compiler');ap.add_argument('--case');ap.add_argument('--zen-tools',type=Path,required=True);a=ap.parse_args()
     cc=resolve_compiler(a.compiler);sys.path.insert(0,str(a.zen_tools.resolve()))
-    import zen_interp as I
-    import zen_devices as D
-    import zen_lockstep_check as L
+    import zentaji_native as I
+    import zen_native_fixture as L
     import zasm_ref as A
     import zexpack
-    assert D.EPOCH==1767225600 and D.TIME_HZ==100000000
+    epoch_base=1767225600;time_hz=100000000
     abi=(ROOT/'Anvil/Hal/abi.pbi').read_text(encoding='utf-8')
     names=('SvcClockProv','SvcTicks','SvcUtc','SvcClockProvenance','SvcClockUncertaintyMs','SvcUtcLastSyncTicks')
     slots=[]
@@ -71,7 +70,7 @@ def main():
         assert p.returncode==0,(p.returncode,p.stdout[-3000:],p.stderr)
         return p.stdout
     checked=0
-    with tempfile.TemporaryDirectory(prefix='anvil-rtc-') as tmp:
+    with I.NativeRunner() as runner, tempfile.TemporaryDirectory(prefix='anvil-rtc-') as tmp:
         td=Path(tmp);src=td/'clock.zentaji';image=td/'clock.zex'
         for capability in (1,0):
             src.write_text(SOURCE.replace('CAPABILITY',str(capability)).replace('CLOCK_SLOTS',slots),encoding='utf-8')
@@ -84,16 +83,12 @@ def main():
             if not capability:samples=[('no-provider',0,0,0,0)]
             for name,deadline,epoch,nanos,formatter in samples:
                 if a.case and a.case not in name:continue
-                m=I.Machine(ram_size=1<<20,cores=2,display_modes=[(1,1,60000)]);m.load_image(image.read_bytes())
+                m=I.Fixture(ram_size=1<<20,cores=2,display_modes=[(1,1,60000)]);m.load_image(image.read_bytes())
                 for index,value in enumerate((deadline,epoch,nanos,formatter),1):m.cores[0].r[index]=value&((1<<64)-1)
                 m.ram[:32]=bytes([204])*32
                 assert not L.capture(m,str(td))
-                reads=[];nano_reads=[];original=m.rtc.rd
-                def observe(core,reg):
-                    if reg==0x40:reads.append(m.time_now())
-                    if reg==0x48:nano_reads.append(m.time_now())
-                    return original(core,reg)
-                m.rtc.rd=observe;m.run(2000000);c=m.cores[0]
+                m=runner.execute(m,2000000,td);c=m.cores[0]
+                reads=m.rtc_reads;nano_reads=m.rtc_nano_reads
                 assert c.state=='HALTED' and c.exit==42,(name,c.state,c.exit)
                 assert m.ram[:32]==bytes([204])*32,'null output wrote address zero'
                 if name=='second-edge':
@@ -113,19 +108,19 @@ def main():
                 else:
                     available=bool(capability);assert got[8]==-1
                     if available:
-                        tick=reads[-1];epoch=D.EPOCH+tick//D.TIME_HZ;milliseconds=(tick%D.TIME_HZ)*1000//D.TIME_HZ
+                        tick=reads[-1];epoch=epoch_base+tick//time_hz;milliseconds=(tick%time_hz)*1000//time_hz
                 if available:
                     dt=datetime.datetime.fromtimestamp(epoch,datetime.timezone.utc)
                     expected=(dt.year,dt.month,dt.day,dt.hour,dt.minute,dt.second,milliseconds)
                     assert struct.unpack('<7i',raw[4:32])==expected,(name,struct.unpack('<7i',raw[4:32]),expected)
                 else:assert raw[4:32]==bytes(28),(name,raw)
-                assert m.rtc.alarm==m.rtc.alarm_ctrl==m.rtc.alarm_status==0 and m.rtc.nvram==bytes(256)
+                assert m.fields['rtc']==[0,0,0] and m.fields['nvram']==[0]*32
                 out=run([L.EXE,td/'machine.txt','--max','2000000','--ram',td/'final.bin'])
                 assert (td/'final.bin').read_bytes()==m.ram
-                state=next(line[6:] for line in out.splitlines() if line.startswith('STATE '));assert state.split(' ',1)[1]==L.state_line(m,0,-1).split(' ',1)[1]
+                I.assert_same_state(out,m)
                 assert m.cores[1].state=='PARKED'
                 checked+=1
-                print('PASS RTC '+name+': '+('production snapshot formatter' if formatter else 'actual hardware/shared clock slots')+', independent UTC/subseconds, bounds/guards/manual separation and full native/twin state/RAM',flush=True)
+                print('PASS RTC '+name+': '+('production snapshot formatter' if formatter else 'actual hardware/shared clock slots')+', independent UTC/subseconds, bounds/guards/manual separation and full native state/RAM',flush=True)
 
     assert checked,'no RTC case matched'
 

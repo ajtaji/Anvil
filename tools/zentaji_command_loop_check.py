@@ -66,8 +66,8 @@ EndProcedure
 def main():
     ap=argparse.ArgumentParser(description=__doc__);ap.add_argument('--compiler');ap.add_argument('--zen-tools',type=Path,required=True)
     a=ap.parse_args();cc=resolve_compiler(a.compiler);zt=a.zen_tools.resolve();sys.path.insert(0,str(zt))
-    import zen_interp as I
-    import zen_lockstep_check as L
+    import zentaji_native as I
+    import zen_native_fixture as L
     import zasm_ref as A
     import zexpack
     env=dict(os.environ,PMF_ROOT=str(ROOT))
@@ -76,18 +76,18 @@ def main():
         assert p.returncode==0,(p.returncode,p.stdout[-3500:],p.stderr)
         return p.stdout
     commands=['force 1234','probe.B','probe','measure probe.W','measure','measure measure probe','nonesuch','','probe.l','probe.bx','abcdefghijklmnopqrstuvwxyz123456']
-    with tempfile.TemporaryDirectory(prefix='anvil-command-loop-') as tmp:
+    with I.NativeRunner() as runner, tempfile.TemporaryDirectory(prefix='anvil-command-loop-') as tmp:
         td=Path(tmp);src=td/'probe.zentaji';image=td/'probe.zex';src.write_bytes(SOURCE.replace('\n','\r\n').encode());run([cc,'--compile',src,'-o',image])
         ref=A.Asm();origin,data=ref.assemble(Path(str(image)+'.asm').read_text(encoding='utf-8-sig'))
         assert image.read_bytes()==zexpack.header(origin,origin,data)+data
         for scenario in (0,1,2):
-            m=I.Machine(ram_size=1<<20,display_modes=[(1,1,60000)]);m.load_image(image.read_bytes());m.cores[0].r[1]=scenario;m.cores[0].r[255]=0xf0000
+            m=I.Fixture(ram_size=1<<20,display_modes=[(1,1,60000)]);m.load_image(image.read_bytes());m.cores[0].r[1]=scenario;m.cores[0].r[255]=0xf0000
             incoming='\r'.join(commands)+'\r' if scenario==0 else ('X' if scenario==1 else 'probe.B\r')
             m.serial[0].incoming=[(0,b) for b in incoming.encode()]
             assert not L.capture(m,str(td));out=run([L.EXE,td/'machine.txt','--max','4000000','--ram',td/'final.bin']);assert ' exit=2A ' in out,(scenario,out[-1800:])
-            m.run(4000000);c=m.cores[0];assert c.state=='HALTED' and c.r[1]==42,(scenario,c.state,c.r[1])
+            m=runner.execute(m,4000000,td);c=m.cores[0];assert c.state=='HALTED' and c.r[1]==42,(scenario,c.state,c.r[1])
             assert (td/'final.bin').read_bytes()==m.ram
-            state=next(s[6:] for s in out.splitlines() if s.startswith('STATE '));assert state.split(' ',1)[1]==L.state_line(m,0,-1).split(' ',1)[1]
+            I.assert_same_state(out,m)
             output=bytes(m.serial[0].out)
             if scenario==0:
                 expected=[1,1,5,0,0,5,2,0,5,4,0,5]
@@ -98,7 +98,7 @@ def main():
                     assert phrase in output,(phrase,output[-2000:])
             elif scenario==1:assert output==b''
             else:assert output==b'pmf> probe.B\r\n'
-            print('PASS shared command loop case%d: suffix/reset/force aging, measure/refusal/unknown and hook order/stop boundaries; native/twin state/RAM/exact expected fields/output'%scenario,flush=True)
+            print('PASS shared command loop case%d: suffix/reset/force aging, measure/refusal/unknown and hook order/stop boundaries; native state/RAM/exact expected fields/output'%scenario,flush=True)
 
 
 if __name__=='__main__':main()

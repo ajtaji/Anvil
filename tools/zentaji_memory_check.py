@@ -46,8 +46,8 @@ EndProcedure
 def main():
     ap=argparse.ArgumentParser(description=__doc__);ap.add_argument('--compiler');ap.add_argument('--zen-tools',type=Path,required=True)
     a=ap.parse_args();cc=resolve_compiler(a.compiler);zt=a.zen_tools.resolve();sys.path.insert(0,str(zt))
-    import zen_interp as I
-    import zen_lockstep_check as L
+    import zentaji_native as I
+    import zen_native_fixture as L
     import zasm_ref as A
     import zexpack
     env=dict(os.environ,PMF_ROOT=str(ROOT))
@@ -55,7 +55,7 @@ def main():
         p=subprocess.run([str(x) for x in args],cwd=ROOT,env=env,capture_output=True,text=True,encoding='utf-8',errors='replace',timeout=120)
         assert p.returncode==0,(p.returncode,p.stdout[-4000:],p.stderr)
         return p.stdout
-    with tempfile.TemporaryDirectory(prefix='anvil-zen-memory-') as tmp:
+    with I.NativeRunner() as runner, tempfile.TemporaryDirectory(prefix='anvil-zen-memory-') as tmp:
         td=Path(tmp);src=td/'probe.zentaji';image=td/'probe.zex';src.write_bytes(SOURCE.replace('\n','\r\n').encode())
         run([cc,'--compile',src,'-o',image])
         ref=A.Asm();org,data=ref.assemble(Path(str(image)+'.asm').read_text(encoding='utf-8-sig'))
@@ -63,14 +63,14 @@ def main():
         wrapped,meta,_,_=B.pack(image.read_bytes(),zt/('zasm.exe' if os.name=='nt' else 'zasm'),source_map=json.loads(Path(str(image)+'.zmap').read_text(encoding='utf-8-sig')))
         for ram,boot in ((2<<20,False),(4<<20,False),((8<<20)+123,False),(4<<20,True)):
             disks={15:(bytearray(zexpack.disk_image(wrapped)),True)} if boot else {}
-            m=I.Machine(ram_size=ram,cores=2,disks=disks,display_modes=[(1,1,60000)])
+            m=I.Fixture(ram_size=ram,cores=2,disks=disks,display_modes=[(1,1,60000)])
             if boot:m.power_on(1,15)
             else:m.load_image(wrapped)
             assert not L.capture(m,str(td));out=run([L.EXE,td/'machine.txt','--max','1000000','--ram',td/'final.bin'])
             assert ' exit=2A ' in out,(ram,boot,out[-2000:])
-            m.run(1000000);c=m.cores[0];assert c.state=='HALTED' and c.r[1]==42,(ram,boot,c.state,c.r[1])
+            m=runner.execute(m,1000000,td);c=m.cores[0];assert c.state=='HALTED' and c.r[1]==42,(ram,boot,c.state,c.r[1])
             assert (td/'final.bin').read_bytes()==m.ram
-            state=next(s[6:] for s in out.splitlines() if s.startswith('STATE '));assert state.split(' ',1)[1]==L.state_line(m,0,-1).split(' ',1)[1]
+            I.assert_same_state(out,m)
             last=meta['image_end'];stage=(last+4095)&-4096;stack=(ram&-16)-(1<<20);bottom=stack-meta['stack_bytes']
             expected=[meta['load'],last-1,last-meta['load'],stack,1,stage,bottom-1,bottom-1,0,stage-1,bottom,stack-1,stack,ram-1]+[(1<<64)-1]*4
             assert list(struct.unpack_from('<18Q',m.ram,ref.sym['GLOBAL_REPORT']))==expected
@@ -79,7 +79,7 @@ def main():
             for value in (meta['load'],last-1,stage,stack,bottom,ram-1):assert ('%08X'%value).encode() in output,(value,output)
             assert b'ARM' not in output and b'ROM workspace and loader stack' in output
             if boot:assert bytes(m.disks[15].image)==bytes(disks[15][0])==(td/'disk15.img').read_bytes()
-            print('PASS memory layout RAM=%d ROM=%s: actual startup, independent extents, shared range boundaries, native/twin state/RAM and map output'%(ram,boot),flush=True)
+            print('PASS memory layout RAM=%d ROM=%s: actual startup, independent extents, shared range boundaries, native state/RAM and map output'%(ram,boot),flush=True)
 
 
 if __name__=='__main__':main()

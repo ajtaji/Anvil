@@ -94,8 +94,8 @@ EndProcedure
 def main():
     ap=argparse.ArgumentParser(description=__doc__);ap.add_argument('--compiler');ap.add_argument('--zen-tools',type=Path,required=True);a=ap.parse_args()
     cc=resolve_compiler(a.compiler);zt=a.zen_tools.resolve();sys.path.insert(0,str(zt))
-    import zen_interp as I
-    import zen_lockstep_check as L
+    import zentaji_native as I
+    import zen_native_fixture as L
     import zasm_ref as A
     import zexpack
     env=dict(os.environ,PMF_ROOT=str(ROOT))
@@ -103,22 +103,19 @@ def main():
         p=subprocess.run([str(x) for x in args],cwd=ROOT,env=env,capture_output=True,text=True,encoding='utf-8',errors='replace',timeout=120)
         assert p.returncode==0,(p.returncode,p.stdout[-3000:],p.stderr)
         return p.stdout
-    with tempfile.TemporaryDirectory(prefix='anvil-text-') as tmp:
+    with I.NativeRunner() as runner, tempfile.TemporaryDirectory(prefix='anvil-text-') as tmp:
         td=Path(tmp);src=td/'text.zentaji';image=td/'text.zex';src.write_text(SOURCE,encoding='utf-8')
         run([cc,'--compile',src,'-o',image])
         ref=A.Asm();org,body=ref.assemble(Path(str(image)+'.asm').read_text(encoding='utf-8-sig'))
         assert image.read_bytes()==zexpack.header(org,org,body)+body
         for name,phase,modes in [('native',0,[(320,160,60000),(640,480,60000)]),('small-ram',1,[(320,160,60000),(640,480,60000)]),('mode-font-growth',2,[(320,160,60000),(640,480,60000)]),('stolen-cells',3,[(320,160,60000)]),('live-foreign-display',4,[(320,160,60000)]),('hardware-scroll',5,[(320,160,60000)]),('retained-growth',6,[(320,160,60000),(640,480,60000)]),('zero-grid',0,[(1,1,60000)])]:
-            m=I.Machine(ram_size=4<<20,cores=2,display_modes=modes);m.load_image(image.read_bytes());m.cores[0].r[1]=phase
+            m=I.Fixture(ram_size=4<<20,cores=2,display_modes=modes);m.load_image(image.read_bytes());m.cores[0].r[1]=phase
             required=max((w//fw)*(h//fh)*4 for w,h,_ in modes for fw,fh in [(8,16),(12,24),(16,32)])
             capacity=(required+4095)&-4096;base=(4<<20)-(1<<20)-65536-capacity
             struct.pack_into('<I',m.ram,base-4,0x12345678)
             struct.pack_into('<I',m.ram,(4<<20)-(1<<20)-65536,0x76543210)
             assert not L.capture(m,str(td))
-            frames=[];advance=m.display.advance
-            def observe(t):
-                advance(t);frames.append('FRAME %d %08X'%(m.display.vsyncs,m.display.crc()))
-            m.display.advance=observe;m.run(2000000);c=m.cores[0]
+            m=runner.execute(m,2000000,td);c=m.cores[0];frames=list(m.frames)
             assert c.state=='HALTED' and c.exit==42,(name,c.state,c.exit,ref.sym['GLOBAL_CONTEXT'],struct.unpack_from('<16q',m.ram,ref.sym['GLOBAL_CONTEXT']))
             got=struct.unpack_from('<14q',m.ram,ref.sym['GLOBAL_REPORT'])
             assert got[0]==required,(name,got,required)
@@ -131,8 +128,8 @@ def main():
                 assert struct.unpack_from('<I',m.ram,base-4)[0]==0x12345678
                 assert struct.unpack_from('<I',m.ram,(4<<20)-(1<<20)-65536)[0]==0x76543210
                 if phase in (0,2,5,6):
-                    assert m.text.err==0 and frames,(name,m.text.err,frames)
-                    cols,rows=m.text.cols,m.text.rows
+                    assert m.fields['textmeta'][1]==0 and frames,(name,m.fields['textmeta'][1],frames)
+                    cols,rows=m.fields['text'][0],m.fields['text'][1]
                     cells=list(struct.unpack_from('<%dI'%(cols*rows),m.ram,base))
                     expected=[0x70020]*(cols*rows)
                     if phase==5:
@@ -144,15 +141,15 @@ def main():
                         assert got[11:]==(1,0x12345678,0x76543210)
                     assert cells==expected,(name,[(i,x,y) for i,(x,y) in enumerate(zip(cells,expected)) if x!=y][:10])
             else:
-                assert got[2:4]==(0,0) and got[5]==3 and m.text.layer==0 and m.display.ctrl==0,(name,got)
+                assert got[2:4]==(0,0) and got[5]==3 and m.fields['textmeta'][0]==0 and m.fields['textmeta'][3]==0,(name,got)
             out=run([L.EXE,td/'machine.txt','--max','2000000','--ram',td/'final.bin'])
             assert (td/'final.bin').read_bytes()==m.ram,name
-            state=next(line[6:] for line in out.splitlines() if line.startswith('STATE '));assert state.split(' ',1)[1]==L.state_line(m,0,-1).split(' ',1)[1],name
+            I.assert_same_state(out,m)
             assert m.cores[1].state=='PARKED'
             if phase in (0,2,6) and active:
                 out=run([zt/'zenwin.exe',td/'machine.txt','--headless','--max','2000000'])
                 assert [line for line in out.splitlines() if line.startswith('FRAME ')]==frames,name
-            print('PASS text '+name+': actual compiled console/memory HAL, independent cell/protection oracle, full native/twin state/RAM'+(' and headless frame hashes' if phase in (0,2,6) and active else ''),flush=True)
+            print('PASS text '+name+': actual compiled console/memory HAL, independent cell/protection oracle, full native state/RAM'+(' and headless frame hashes' if phase in (0,2,6) and active else ''),flush=True)
 
 
 if __name__=='__main__':main()
