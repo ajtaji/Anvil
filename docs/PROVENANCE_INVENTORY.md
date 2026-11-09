@@ -826,7 +826,6 @@ all are `original` and are not listed; `--list-original` enumerates them.
 | `Anvil/Core/wallclock.pbi` | protocol-facts | ietf-rfc | IETF specification | cite the document; no notice obligation |
 | `Anvil/Core/xfer.pbi` | interface-facts | uboot-v2025.01 | GPL-2.0-or-later | cite the document; no notice obligation |
 | `Anvil/Graphics/Vulkan/vk_core_1_0.pbi` | consulted | khronos-vulkan | MIT (of Apache-2.0 OR MIT) | cite the source; no notice obligation; `licenses/Khronos-Vulkan-Registry-MIT.txt` retained as an acknowledgment |
-| `Anvil/Hal/abi.pbi` | hardware-facts | rpi-armstub8 | BSD-3-Clause | cite the document; no notice obligation |
 | `Anvil/Hal/abi.pbi` | hardware-facts | vendor-spec | vendor/standards document | cite the document; no notice obligation |
 | `Anvil/Hal/hal.pbi` | protocol-facts | ietf-rfc | IETF specification | cite the document; no notice obligation |
 | `Anvil/Hal/hal.pbi` | hardware-facts | linux-dt-bcm2711 | GPL-2.0 | cite the document; no notice obligation |
