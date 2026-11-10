@@ -5,10 +5,20 @@ EnableFloatingPoint
 XIncludeFile "Anvil/Math/float32.pbi"
 XIncludeFile "Anvil/Hal/neon_service_api.pbi"
 XIncludeFile "Anvil/Graphics/neon_service_client.pbi"
+XIncludeFile "Anvil/Graphics/neon_service_particles.pbi"
+Global Dim foreignParticle.NeonParticleRecord[1]
 Procedure.i Main(services.i)
- If NeonServiceBind(services,#NEON_SERVICE_VULKAN)<>0 : ProcedureReturn $BAD01 : EndIf
+ If NeonServiceBind(services,#NEON_SERVICE_VULKAN | (#ZEN_SERVICE_FOREIGN_PARTICLES * #NEON_SERVICE_PARTICLES))<>0 : ProcedureReturn $BAD01 : EndIf
  If NeonServiceOpen()<>0 : ProcedureReturn $BAD02 : EndIf
+ CompilerIf #ZEN_SERVICE_FOREIGN_PARTICLES=1
+ foreignParticle[0]\x=20.0 : foreignParticle[0]\y=20.0 : foreignParticle[0]\size=8.0
+ foreignParticle[0]\r=1.0 : foreignParticle[0]\a=1.0
+ If NeonServiceParticlesPrepare(@foreignParticle[0],32,1)<>0 : ProcedureReturn $BAD05 : EndIf
+ CompilerEndIf
  If NeonServiceBegin(0.2,0.3,0.4,1.0)<>0 : ProcedureReturn $BAD03 : EndIf
+ CompilerIf #ZEN_SERVICE_FOREIGN_PARTICLES=1
+ If NeonServiceParticlesDrawPrepared()<>0 : ProcedureReturn $BAD06 : EndIf
+ CompilerEndIf
  If NeonServiceEnd()<>0 : ProcedureReturn $BAD04 : EndIf
  ; Preserve page alignment for address registers; change ownership metadata
  ; without kicking a queue or relying on an invalid-address hardware fault.

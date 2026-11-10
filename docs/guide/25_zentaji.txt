@@ -225,10 +225,11 @@ This also handles an application that returns without explicitly closing its
 service context. Failed or foreign ownership pins the context and resources
 and stops the monitor before a restored prompt can be displayed.
 
-The native backend does not advertise particle compute. Its requests return
-an explicit provider refusal. Other unsupported native shader operations retain
-their backend refusals; the presence of a service contract is not a claim that
-every optional GPU feature is implemented.
+The particle service uses shared float32 input records, CPU-prepared Q8 corners
+and a sampled palette drawn on the native GPU. It is available without Vulkan
+compute; optional compute dispatch remains unavailable. Other unsupported
+native shader operations retain their backend refusals. The particle service
+is available in counted build25 and later.
 
 @FRAG
 python tools/zentaji_graphical_boot_check.py --zen-tools ZEN --keep PROOF --resident
@@ -246,6 +247,20 @@ applications that change DMA, GPU queue or display configuration. It requires
 fail-stop 0x5B07, no second prompt, retained live context/target/Chrome resources
 and no Vulkan faults. This is ownership-quarantine evidence, not isolation from
 a malicious supervisor application.
+Add `--particles` to retain a live particle palette and staging allocation in
+each of those foreign-owner cases.
+
+@FRAG
+python tools/zentaji_neon_particles_check.py --zen-tools ZEN --keep PROOF
+@ENDFRAG
+
+This uses the public service through ROM boot, filesystem loading and PMF hash
+verification. It checks all 307200 pixels in each of four native display frames:
+rotation/alpha/scissor, 10000 coloured particles, half zoom with caller records
+changed after preparation, and an empty list that must clear the old image.
+Independent float32 wire records, all 33 application assertions and the vertex
+tail beyond 60000 vertices must match. The returning monitor must retire the
+particle allocations and restore its graphical prompt without Vulkan faults.
 
 @SECTION Evidence and remaining work
 

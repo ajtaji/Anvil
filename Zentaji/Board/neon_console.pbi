@@ -178,10 +178,10 @@ Procedure.i ZentajiNeonConsoleBind()
 EndProcedure
 
 ; Hardware hooks for the existing shared resident Neon application service.
-; The native backend has no qualified particle compute path yet; report its
-; absence while preserving the same protocol and explicit request refusal.
+; The shared particle path prepares Q8 corners on the CPU and draws a sampled
+; palette through Vulkan. It does not require the optional compute provider.
 Procedure.i AvsSurfaceFlags()
- ProcedureReturn #NEON_SERVICE_VULKAN | #NEON_SERVICE_FONT_REFS | #NEON_SERVICE_SPRITES | #NEON_SERVICE_FONT_BYTES | #NEON_SERVICE_MAPPING | #NEON_SERVICE_FONT_SPACING | #NEON_SERVICE_FONT_SNAP | #NEON_SERVICE_FONT_CONTROLS | #NEON_SERVICE_FONT_DERIVE | #NEON_SERVICE_TARGETS | #NEON_SERVICE_TARGET_CONTINUATION | #NEON_SERVICE_TARGET_LOAD | #NEON_SERVICE_TARGET_RETRO | #NEON_SERVICE_FONT_CARETS | #NEON_SERVICE_ROLE_CARETS
+ ProcedureReturn #NEON_SERVICE_VULKAN | #NEON_SERVICE_FONT_REFS | #NEON_SERVICE_SPRITES | #NEON_SERVICE_FONT_BYTES | #NEON_SERVICE_PARTICLES | #NEON_SERVICE_MAPPING | #NEON_SERVICE_FONT_SPACING | #NEON_SERVICE_FONT_SNAP | #NEON_SERVICE_FONT_CONTROLS | #NEON_SERVICE_FONT_DERIVE | #NEON_SERVICE_TARGETS | #NEON_SERVICE_TARGET_CONTINUATION | #NEON_SERVICE_TARGET_LOAD | #NEON_SERVICE_TARGET_RETRO | #NEON_SERVICE_FONT_CARETS | #NEON_SERVICE_ROLE_CARETS
 EndProcedure
 Procedure.i AvsSurfacePresentError() : ProcedureReturn #NEON_SERVICE_ERR_PROVIDER : EndProcedure
 Procedure.i AvsSurfaceRetireReady()

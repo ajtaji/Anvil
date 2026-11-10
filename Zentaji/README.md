@@ -15,9 +15,12 @@ Zentaji supplies native surface/presentation and return-cleanup hooks.
 `tools/zentaji_graphical_boot_check.py --resident` runs the existing shared
 retained-UI application twice and checks its real frames and restored prompt.
 `tools/zentaji_neon_service_return_check.py` checks that foreign DMA/GPU/display
-ownership pins resources and stops before a false prompt. Particle compute is
-not advertised by the native provider; full desktop and platform acceptance
-remain unfinished.
+ownership pins resources and stops before a false prompt; add `--particles`
+to cover live palette/staging allocations. The public particle service uses
+the existing CPU-prepared geometry and native GPU palette path, independently
+of optional Vulkan compute. `tools/zentaji_neon_particles_check.py` checks four
+complete native frames, the 10000-record limit, copied input, wire layout and
+cleanup. Full desktop and platform acceptance remain unfinished.
 
 The counted Zentaji board now boots Anvil through the machine ROM and owned
 supervisor startup. It uses the shared command loop, serial console, clock,

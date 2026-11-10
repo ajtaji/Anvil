@@ -1,0 +1,81 @@
+; Public resident particle service: rotated/alpha/scissored quads, the full
+; 10,000-record limit, camera zoom and immutable copied input, then an empty
+; prepared list. The host compares every actual display pixel independently.
+EnableFloatingPoint
+XIncludeFile "Anvil/Math/float32.pbi"
+XIncludeFile "Anvil/Hal/neon_service_api.pbi"
+XIncludeFile "Anvil/Graphics/neon_service_client.pbi"
+XIncludeFile "Anvil/Graphics/neon_service_particles.pbi"
+XIncludeFile "Anvil/Graphics/neon_service_mapping.pbi"
+XIncludeFile "Anvil/Graphics/neon_service_sprite.pbi"
+Global Dim zppItems.NeonParticleRecord[10000]
+Global zppCase.i,zppChecks.i,zppFailure.i
+Procedure.i ZppCheck(actual.i,expected.i)
+ zppChecks=zppChecks+1
+ If actual<>expected And zppFailure=0 : zppFailure=zppChecks : EndIf
+ PokeQ(#ZPP_REPORT+16,zppChecks) : PokeQ(#ZPP_REPORT+24,zppFailure)
+ ProcedureReturn Bool(actual=expected)
+EndProcedure
+Procedure ZppCapture()
+ PokeQ(#ZPP_REPORT+32,zppCase) ; native debugger frame checkpoint
+EndProcedure
+Procedure.i ZppDraw()
+ If ZppCheck(NeonServiceBegin(0.0,0.0,0.0,1.0),0)=0 : ProcedureReturn 0 : EndIf
+ If zppCase=0
+  If ZppCheck(NeonServiceScissorSet(0.0,0.0,40.0,48.0),0)=0 : ProcedureReturn 0 : EndIf
+  If ZppCheck(NeonServiceParticlesPrepare(@zppItems[0],128,4),#NEON_SERVICE_ERR_STATE)=0 : ProcedureReturn 0 : EndIf
+  If ZppCheck(NeonServiceCamera(9.0,4.0,1.0),0)=0 : ProcedureReturn 0 : EndIf
+  If ZppCheck(NeonServiceParticlesDrawPrepared(),#NEON_SERVICE_ERR_STATE)=0 : ProcedureReturn 0 : EndIf
+  If ZppCheck(NeonServiceCamera(8.0,4.0,1.0),0)=0 : ProcedureReturn 0 : EndIf
+ Else
+  If ZppCheck(NeonServiceScissorClear(),0)=0 : ProcedureReturn 0 : EndIf
+ EndIf
+ If ZppCheck(NeonServiceParticlesDrawPrepared(),0)=0 : ProcedureReturn 0 : EndIf
+ If ZppCheck(NeonServiceEnd(),0)=0 : ProcedureReturn 0 : EndIf
+ PokeQ(#ZPP_REPORT+40,zppCase+1)
+ ZppCapture()
+ ProcedureReturn 1
+EndProcedure
+Procedure.i Main(services.i)
+ Protected limits.NeonServiceParticleLimits,i.i
+ PokeQ(#ZPP_REPORT,$3150505A) : PokeQ(#ZPP_REPORT+8,1)
+ If ZppCheck(NeonServiceBind(services,#NEON_SERVICE_VULKAN | #NEON_SERVICE_PARTICLES | #NEON_SERVICE_MAPPING | #NEON_SERVICE_SPRITES),0)=0 : ProcedureReturn 101 : EndIf
+ If ZppCheck(NeonServiceOpen(),0)=0 : ProcedureReturn 102 : EndIf
+ If ZppCheck(NeonServiceParticleLimitsGet(@limits),0)=0 : ProcedureReturn 103 : EndIf
+ PokeQ(#ZPP_REPORT+48,limits\maxCount) : PokeQ(#ZPP_REPORT+56,limits\recordBytes) : PokeQ(#ZPP_REPORT+64,limits\coordinateFractionBits)
+ If ZppCheck(NeonServiceParticlesPrepare(@zppItems[0],320032,10001),#NEON_SERVICE_ERR_ARGS)=0 : ProcedureReturn 104 : EndIf
+ If ZppCheck(NeonServiceParticlesPrepare(@zppItems[0],127,4),#NEON_SERVICE_ERR_ARGS)=0 : ProcedureReturn 105 : EndIf
+ If ZppCheck(NeonServiceParticlesDrawPrepared(),#NEON_SERVICE_ERR_STATE)=0 : ProcedureReturn 106 : EndIf
+ zppItems[0]\x=16.0 : zppItems[0]\y=16.0 : zppItems[0]\size=8.0 : zppItems[0]\r=1.0 : zppItems[0]\a=1.0
+ zppItems[1]\x=20.0 : zppItems[1]\y=16.0 : zppItems[1]\size=8.0 : zppItems[1]\g=1.0 : zppItems[1]\a=0.5
+ zppItems[2]\x=40.0 : zppItems[2]\y=20.0 : zppItems[2]\size=8.0 : zppItems[2]\angle=0.7853981633974483 : zppItems[2]\b=1.0 : zppItems[2]\a=1.0
+ zppItems[3]\x=60.0 : zppItems[3]\y=40.0 : zppItems[3]\size=6.0 : zppItems[3]\r=1.0 : zppItems[3]\g=1.0 : zppItems[3]\b=1.0 : zppItems[3]\a=1.0
+ If ZppCheck(NeonServiceCamera(8.0,4.0,1.0),0)=0 : ProcedureReturn 107 : EndIf
+ If ZppCheck(NeonServiceParticlesPrepare(@zppItems[0],128,4),0)=0 : ProcedureReturn 108 : EndIf
+ If ZppDraw()<>1 : ProcedureReturn 109 : EndIf
+ For i=0 To 9999
+  zppItems[i]\x=MathFFromInt((i % 100)*4)+2.25 : zppItems[i]\y=MathFFromInt((i/100)*4)+2.25
+  zppItems[i]\size=2.0 : zppItems[i]\angle=0.0
+  zppItems[i]\r=0.0 : zppItems[i]\g=0.0 : zppItems[i]\b=0.0 : zppItems[i]\a=1.0
+  If i % 4=0 Or i % 4=3 : zppItems[i]\r=1.0 : EndIf
+  If i % 4=1 Or i % 4=3 : zppItems[i]\g=1.0 : EndIf
+  If i % 4=2 Or i % 4=3 : zppItems[i]\b=1.0 : EndIf
+ Next
+ zppCase=1
+ If ZppCheck(NeonServiceCamera(0.0,0.0,1.0),0)=0 : ProcedureReturn 110 : EndIf
+ If ZppCheck(NeonServiceParticlesPrepare(@zppItems[0],320000,10000),0)=0 : ProcedureReturn 111 : EndIf
+ If ZppDraw()<>1 : ProcedureReturn 112 : EndIf
+ zppCase=2
+ If ZppCheck(NeonServiceCamera(8.0,4.0,0.5),0)=0 : ProcedureReturn 113 : EndIf
+ If ZppCheck(NeonServiceParticlesPrepare(@zppItems[0],320000,10000),0)=0 : ProcedureReturn 114 : EndIf
+ ; Successful Prepare owns its corners and palette; caller data may change.
+ For i=0 To 9999
+  zppItems[i]\x=-1000.0 : zppItems[i]\y=-1000.0 : zppItems[i]\r=0.0 : zppItems[i]\g=0.0 : zppItems[i]\b=0.0 : zppItems[i]\a=0.0
+ Next
+ If ZppDraw()<>1 : ProcedureReturn 115 : EndIf
+ zppCase=3
+ If ZppCheck(NeonServiceParticlesPrepare(0,0,0),0)=0 : ProcedureReturn 116 : EndIf
+ If ZppDraw()<>1 : ProcedureReturn 117 : EndIf
+ ; Leave the service context open for checked monitor-owned cleanup.
+ ProcedureReturn zppFailure
+EndProcedure
