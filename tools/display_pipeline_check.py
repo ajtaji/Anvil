@@ -18,9 +18,9 @@ CONSOLE = (ROOT / "RaspberryPi4/Board/v3d_console.pi4").read_text(encoding="utf-
 SCREEN = (ROOT / "RaspberryPi4/Board/screen_cmd.pi4").read_text(encoding="utf-8")
 DISPLAY = (ROOT / "RaspberryPi4/Board/display.pi4").read_text(encoding="utf-8")
 CURSOR = (ROOT / "RaspberryPi4/Board/cursor_input.pi4").read_text(encoding="utf-8")
-UART = (ROOT / "RaspberryPi4/Lib/uart.pi4").read_text(encoding="utf-8")
+UART = (ROOT / "RaspberryPi4/Lib/uart.pi4").read_text(encoding="utf-8") + "\n" + (ROOT / "Anvil/Core/console_mirror.pbi").read_text(encoding="utf-8")
 CORE_PARSE = (ROOT / "Anvil/Core/parse.pbi").read_text(encoding="utf-8")
-CORE_CONSOLE = (ROOT / "RaspberryPi4/Board/console.pi4").read_text(encoding="utf-8")
+CORE_CONSOLE = (ROOT / "Anvil/Core/console_grid.pbi").read_text(encoding="utf-8")
 
 
 def body(text: str, name: str) -> str:
@@ -105,7 +105,7 @@ def main() -> None:
     assert SCREEN.count("ScrCaptureSnapshot(@fb") == 2
     # The current screen command has four capture probes plus the two legacy
     # protocol paths; each path samples its row anchor and pixel body.
-    assert SCREEN.count("ScrCapturePixel(fb, pitch, rot") == 8
+    assert SCREEN.count("ScrCapturePixel(fb, pitch, rot") == 12
 
     # Producer-side draining updates only the model AT THE PROMPT. The
     # renderer remains a ScreenPump concern, which is what turns a 45 KB help
@@ -139,7 +139,9 @@ def main() -> None:
     assert "DrawBanner()" not in tick
     assert "ConRepaint()" not in tick
     assert "delay(" not in tick
-    assert "ScreenServiceTick()" in CORE_PARSE
+    assert "AnvilPromptService(#APS_SCREEN)" in CORE_PARSE
+    board = (ROOT / "RaspberryPi4/Board/board.pi4").read_text(encoding="utf-8")
+    assert "Case #APS_SCREEN : ScreenServiceTick()" in board
 
     # Font scale is one source of truth for both renderer tiers.
     for face in ("UI", "SMALL", "MONO", "BOLD"):

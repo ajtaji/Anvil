@@ -216,17 +216,25 @@ def check(cpu) -> None:
 
 
 def check_source_contract() -> None:
-    uart = (ROOT / "RaspberryPi4/Lib/uart.pi4").read_text(encoding="utf-8")
+    uart = (ROOT / "RaspberryPi4/Lib/uart.pi4").read_text(encoding="utf-8") + "\n" + (ROOT / "Anvil/Core/console_mirror.pbi").read_text(encoding="utf-8")
     board = (ROOT / "RaspberryPi4/Board/board.pi4").read_text(encoding="utf-8")
     dma = (ROOT / "RaspberryPi4/Board/screen_cmd.pi4").read_text(encoding="utf-8")
     v3d = (ROOT / "RaspberryPi4/Board/v3d_console.pi4").read_text(encoding="utf-8")
 
     prompt = 'Print("pmf> ")'
-    at = board.index(prompt)
-    before = board.rfind("UartScreenStyle(#UART_SCREEN_STYLE_PROMPT)", 0, at)
-    after = board.find("UartScreenStyle(#UART_SCREEN_STYLE_NORMAL)", at)
-    if before < 0 or after < 0 or at - before > 300 or after - at > 300:
-        raise SystemExit("prompt is not tightly bracketed by screen-only style changes")
+    loop = (ROOT / "Anvil/Core/command_loop.pbi").read_text(encoding="utf-8")
+    at = loop.index(prompt)
+    before = loop.rfind("HwCommandLoopHook(#ACMD_BEFORE_PROMPT)", 0, at)
+    after = loop.find("HwCommandLoopHook(#ACMD_AFTER_PROMPT)", at)
+    hook_at = board.index("Procedure.i HwCommandLoopHook(")
+    hook = board[hook_at:board.index("EndProcedure", hook_at)]
+    prompt_case = hook.index("Case #ACMD_BEFORE_PROMPT")
+    normal_case = hook.index("Case #ACMD_AFTER_PROMPT")
+    end_case = hook.index("Case #ACMD_AFTER_INPUT")
+    if (before < 0 or after < 0 or at - before > 300 or after - at > 300
+            or "UartScreenStyle(#UART_SCREEN_STYLE_PROMPT)" not in hook[prompt_case:normal_case]
+            or "UartScreenStyle(#UART_SCREEN_STYLE_NORMAL)" not in hook[normal_case:end_case]):
+        raise SystemExit("shared prompt hooks do not bracket screen-only style changes")
     if "uart_AuxPut(c)" not in uart or "uart_mirrorStyle[uart_mirrorHead]" not in uart:
         raise SystemExit("UART screen and network fan-out no longer have separate paths")
     if "uart_auxStyle" in uart or "UartWrite(27)" in board or "\\x1b" in board:

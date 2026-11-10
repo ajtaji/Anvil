@@ -379,6 +379,7 @@ SOURCES = (
     "Anvil/Core/boot_transcript.pbi",
     "Anvil/Core/console_style.pbi",
     "RaspberryPi4/Board/console.pi4",
+    "Anvil/Core/console_grid.pbi",
 )
 
 

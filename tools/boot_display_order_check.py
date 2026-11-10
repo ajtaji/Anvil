@@ -37,11 +37,25 @@ import re
 ROOT = Path(__file__).resolve().parents[1]
 BOARD = ROOT / "RaspberryPi4/Board/board.pi4"
 BANNER = ROOT / "RaspberryPi4/Board/banner_clock.pi4"
-CONSOLE = ROOT / "RaspberryPi4/Board/console.pi4"
+CONSOLE = ROOT / "Anvil/Core/console_grid.pbi"
 BOOT = ROOT / "RaspberryPi4/Board/boot.pi4"
 SCREEN = ROOT / "RaspberryPi4/Board/screen_cmd.pi4"
 
 NL = chr(10)
+FONT_SCREEN = ('  If fontBootReady <> 0\n'
+               '    gScreenDeferFirstFrame = 1\n'
+               '    ScreenUp()\n'
+               '  Else\n'
+               '    PrintN("!! no screen frame will be drawn without the embedded TrueType font")\n'
+               '  EndIf\n')
+
+
+def statement(token: str) -> str:
+    if token == "ScreenUp()":
+        return FONT_SCREEN
+    if token == "ScreenDsiEarlyCacheArm()":
+        return "  If fontBootReady <> 0 : ScreenDsiEarlyCacheArm() : EndIf\n"
+    return "  " + token + NL
 
 # Exactly one of each, in this order, at Main()'s own indentation.
 ORDER = (
@@ -69,11 +83,14 @@ def body(text: str, name: str) -> str:
 def validate(board: str, banner: str, console: str, boot: str, screen: str) -> None:
     main = body(board, "Main")
     for token in ORDER:
-        if len(re.findall(rf"(?m)^  {re.escape(token)}$", main)) != 1:
+        if main.count(statement(token)) != 1:
             raise AssertionError(f"expected exactly one {token} in Main")
-    at = [re.search(rf"(?m)^  {re.escape(token)}$", main).start() for token in ORDER]
+    at = [main.index(statement(token)) for token in ORDER]
     if at != sorted(at):
         raise AssertionError("the display-first boot order changed")
+    font_init = "  fontBootReady = AnvilFontBootEmbeddedInit()\n"
+    if main.count(font_init) != 1 or main.index(font_init) > main.index(statement("ScreenDsiEarlyCacheArm()")):
+        raise AssertionError("screen admission precedes the real embedded font initialization")
 
     # THE SLOW PERIPHERALS ARE INSIDE BootConfigUp AND NOWHERE ELSE. If one of
     # them ever migrates back into Main above ScreenUp the order above would
@@ -131,7 +148,7 @@ def once(text: str, old: str, new: str) -> str:
 
 def move_main(board: str, token: str, anchor: str, before: bool) -> str:
     main = body(board, "Main")
-    line = "  " + token + NL
+    line = statement(token)
     moved = once(main, line, "")
     ins = line + anchor if before else anchor + line
     return board.replace(main, once(moved, anchor, ins), 1)
@@ -152,9 +169,14 @@ MUTATIONS = (
      lambda b, bn, c, bt, sc: (move_main(b, "BootTimingBegin(hz, ClockMeasuredHz(#MBX_CLK_ARM))",
                                          "  TouchBoot()" + NL, False), bn, c, bt, sc)),
     ("USB enumeration hoisted into Main above the screen",
-     lambda b, bn, c, bt, sc: (once(b, "  ScreenDsiEarlyCacheArm()" + NL,
-                                    "  UsbEnumerate()" + NL + "  ScreenDsiEarlyCacheArm()" + NL),
+     lambda b, bn, c, bt, sc: (once(b, statement("ScreenDsiEarlyCacheArm()"),
+                                    "  UsbEnumerate()" + NL + statement("ScreenDsiEarlyCacheArm()")),
                                bn, c, bt, sc)),
+    ("screen initialization ignores embedded-font failure",
+     lambda b, bn, c, bt, sc: (once(b, FONT_SCREEN, "  ScreenUp()" + NL), bn, c, bt, sc)),
+    ("the embedded font is never initialized",
+     lambda b, bn, c, bt, sc: (once(b, "  fontBootReady = AnvilFontBootEmbeddedInit()" + NL,
+                                    "  fontBootReady = 1" + NL), bn, c, bt, sc)),
     ("the transcript never armed",
      lambda b, bn, c, bt, sc: (b, once(bn, "  BootTranscriptStart()" + NL, ""), c, bt, sc)),
     ("the transcript never stopped",

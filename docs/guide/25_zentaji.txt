@@ -128,6 +128,27 @@ Native cases check two GPU colors in private planes, scanout CRCs, unchanged
 shown pixels and row/page guards. DMA ownership loss quarantines the writer and
 GPU lease. Resident Neon/fonts remain unfinished; the monitor still boots to text.
 
+@SECTION One console model across CPU architectures
+
+The fixed-grid terminal model lives in Anvil/Core/console_grid.pbi. It owns
+characters, screen-only styles, cursor, wrap, scroll, viewport and dirty state.
+Renderers paint that one model; they do not consume another output stream.
+A board supplies proportional-advance measurement when it enables that policy.
+The model acquires no display, UART or GPU.
+
+Anvil/Core/console_mirror.pbi holds the bounded screen/style and auxiliary
+output taps. Styles remain metadata beside screen bytes, never serial or network
+escape sequences. A producer callback drains into the model without painting.
+The Pi4 include path remains a compatibility entry for the same shared core.
+Optional paint, overlay and drain callbacks retain zero/uninstalled behavior;
+concrete signatures let the Zentaji backend compile their indirect calls.
+
+The production Forge/native Zentaji console-grid check verifies exact characters,
+styles and cursor, callback order, unregister/reset, wrap/scroll and 10001 bytes
+without loss. The A64 emitted check also passes four capture rotations, RLE CRCs,
+45150 lossless bytes and styled terminal operations. These are model/component
+proofs. The Zentaji monitor's resident graphical prompt is still unfinished.
+
 @SECTION Evidence and remaining work
 
 Acceptance runs the shipped native ASM-built Zentaji tools against explicit

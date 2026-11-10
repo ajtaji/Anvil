@@ -261,6 +261,7 @@ def stage(work: pathlib.Path, compose: str, keep: str) -> pathlib.Path:
                 "Anvil/Core/console_style.pbi",
                 "Anvil/Graphics/touch_keyboard_view.pbi",
                 "RaspberryPi4/Board/console.pi4",
+                "Anvil/Core/console_grid.pbi",
                 "RaspberryPi4/Board/screen_geom.pi4",
                 "RaspberryPi4/Monitor/anvil_fonts.pi4"):
         shutil.copy2(ROOT / rel, work / rel)

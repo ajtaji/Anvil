@@ -13,6 +13,22 @@ effects, bytes/pixels, ABI boundaries and application behavior. Python helpers
 write fixture data or calculate mathematical/byte expectations. Observation
 helpers read native state and take debugger snapshots of native execution.
 
+## Shared console model
+
+The terminal model and bounded output taps now live in
+`Anvil/Core/console_grid.pbi` and `console_mirror.pbi`. Pi4 keeps a compatibility
+include; Zentaji uses the same implementation in its native acceptance, with
+concrete callback signatures and unchanged zero/uninstalled behavior.
+The core owns grid/style/cursor/wrap/scroll/viewport state, not hardware.
+Boards supply the proportional-advance measurement when enabling that policy.
+
+`tools/zentaji_console_grid_check.py` uses the tracked production Forge, strict
+language maps, independent assembler bytes and the native CPU. It checks exact
+model state, callback ordering/uninstall/reset and 10001 bytes without loss.
+The existing A64 capture/console gate also passes four rotations, exact RLE CRCs,
+45150 lossless bytes and styled terminal operations. Resident Zentaji console
+rendering is still being connected; the counted monitor remains text-only.
+
 ## Native graphics bring-up
 
 The graphics components now reserve an immutable, page-aligned arena below the
