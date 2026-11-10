@@ -1,0 +1,91 @@
+EnableFloatingPoint
+XIncludeFile "Zentaji/Board/console.pbi"
+XIncludeFile "Anvil/Hal/hal.pbi"
+XIncludeFile "Anvil/Core/format.pbi"
+XIncludeFile "Zentaji/Board/memory.pbi"
+XIncludeFile "Anvil/Core/memrange.pbi"
+XIncludeFile "Zentaji/Board/prompt_idle.pbi"
+XIncludeFile "Zentaji/Board/graphics_queue.pbi"
+XIncludeFile "Anvil/Graphics/neon_frontend.pbi"
+XIncludeFile "Anvil/Graphics/neon_lifecycle_absent.pbi"
+XIncludeFile "Anvil/Graphics/neon_colour.pbi"
+XIncludeFile "Anvil/Graphics/neon_atlas_raster.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_api.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_spirv_fixtures.pbi"
+XIncludeFile "Zentaji/Lib/Vulkan/vk_zentaji_backend.pbi"
+#ANVIL_VULKAN_BACKEND=3
+XIncludeFile "Anvil/Graphics/Vulkan/vk_backend_select.pbi"
+XIncludeFile "Zentaji/Lib/Vulkan/vk_zentaji_present.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/neon_vk_chrome.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/neon_vk_lifecycle.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/neon_vk_port.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/neon_vk_font_port.pbi"
+; Existing immutable data asset only; no Pi 4 hardware module is included.
+XIncludeFile "RaspberryPi4/Monitor/anvil_boot_ttf.pi4"
+
+XIncludeFile "Zentaji/Board/neon_surface.pbi"
+Global Dim report.q[32]
+Global Dim atlas.a[#NEON_ATLAS_MAXBYTES]
+Global Dim uvbytes.a[4096]
+Global Dim bitmap.a[95*16]
+Global surfaceFont.NeonVkPortFontRef
+Global Dim hiddenText.a[513]
+Procedure.i DrawWi(r.f,g.f,b.f)
+ If NeonVkPortFrameBegin(0.0,0.0,0.0,1.0)<>0 : ProcedureReturn 0 : EndIf
+ If ZentajiNeonSurfacePresent()<>0 Or znsState<>2 : ProcedureReturn 0 : EndIf
+ If NeonVkPortFontText(@surfaceFont,4.0,1.0,"Wi",r,g,b,1.0,1,1)<>0 : ProcedureReturn 0 : EndIf
+ If NeonVkPortFontText(@surfaceFont,512.0,512.0,@hiddenText[0],r,g,b,1.0,1,1)<>0 : ProcedureReturn 0 : EndIf
+ If NeonVkChromeDrawCount()<>2 Or NeonVkChromeVertexCount()<>3084 : ProcedureReturn 0 : EndIf
+ If NeonVkPortFrameEnd()<>0 : ProcedureReturn 0 : EndIf
+ If ZentajiNeonSurfaceStop()<>0 Or znsState<>2 : ProcedureReturn 0 : EndIf
+ If ZentajiNeonSurfacePresent()<>1 : ProcedureReturn 0 : EndIf
+ If ZentajiNeonSurfacePresent()<>0 Or znsState<>2 : ProcedureReturn 0 : EndIf
+ ProcedureReturn 1
+EndProcedure
+Procedure.i Main(table.i,source.i,context.i)
+ Protected i.i,tail.i,req.VkMemoryRequirements
+ report[0]=1
+ If ZentajiNeonSurfaceStart(0)<>0 Or znsState<>0 : ProcedureReturn 101 : EndIf
+ If ZentajiNeonSurfaceStartCapacities(256,-1)<>0 Or znsState<>0 : ProcedureReturn 116 : EndIf
+ If ZentajiNeonSurfacePresent()<>0 Or ZentajiNeonSurfaceStop()<>0 : ProcedureReturn 102 : EndIf
+ If ZentajiMemoryBind(context)<>1 Or ZentajiMemoryGraphicsInit($1000000)<>1 : ProcedureReturn 103 : EndIf
+ PokeQ(#ZEN_IDLE_INTC+$120,3) : PokeQ(#ZEN_IDLE_INTC+$F008,2)
+ If ZentajiPromptIdlePrepare(1000)<>1 : ProcedureReturn 104 : EndIf
+ neon_texSrc=@atlas[0] : neon_glyphUV=@uvbytes[0]
+ If NeonBitmapFontBind(@bitmap[0],8,16,32,126)<>1 : ProcedureReturn 105 : EndIf
+ NeonFontDefaults()
+ If AnvilTrueTypeSlotLoad(#ANVIL_TTS_BOOT_SLOT,?anvilBootTtf,#ANVIL_BOOT_TTF_BYTES)<>1 : ProcedureReturn 106 : EndIf
+ If AnvilTrueTypeSlotSelect(#ANVIL_TTS_BOOT_SLOT)<>1 : ProcedureReturn 107 : EndIf
+ If NeonVkPortFontBind(@surfaceFont,#ANVIL_TTS_BOOT_SLOT,#NEON_FONT_UI,16)<>0 : ProcedureReturn 108 : EndIf
+ report[0]=2
+ If ZentajiNeonSurfaceStartCapacities(256,12000)<>1 : ProcedureReturn 109 : EndIf
+ If nvcMaxQuads<>256 Or nvcMaxVertexQuads<>12000 : ProcedureReturn 117 : EndIf
+ report[15]=nvcMaxQuads : report[16]=nvcMaxVertexQuads
+ If ZentajiNeonSurfaceStart(256)<>0 Or znsState<>2 : ProcedureReturn 110 : EndIf
+ If NeonVkPortFontWarm(@surfaceFont,"Wi")<>0 : ProcedureReturn 111 : EndIf
+ For i=0 To 511 : hiddenText[i]=105 : Next
+ If NeonVkPortFontWarm(@surfaceFont,@hiddenText[0])<>0 : ProcedureReturn 118 : EndIf
+ vkGetBufferMemoryRequirements(znsDev,nvcVertexBuffer,@req)
+ report[17]=req\size
+ If req\size<1728000 Or req\size>=1732096 : ProcedureReturn 119 : EndIf
+ If vkMapMemory(znsDev,nvcVertexMemory,1727936,64,0,@tail)<>0 Or tail=0 : ProcedureReturn 120 : EndIf
+ For i=0 To 63 : PokeA(tail+i,(i*7+19)&255) : Next
+ vkUnmapMemory(znsDev,nvcVertexMemory)
+ report[0]=3
+ If DrawWi(1.0,1.0,1.0)<>1 : ProcedureReturn 112 : EndIf
+ report[1]=zgdBase : report[2]=zgdSpan : report[3]=zgdShown : report[4]=zgdSequence
+ If DrawWi(1.0,0.0,0.0)<>1 : ProcedureReturn 113 : EndIf
+ report[5]=zgdShown : report[6]=zgdSequence : report[7]=znsImageBase : report[8]=znsImagePitch
+ report[20]=NeonVkChromeDrawCount() : report[21]=NeonVkChromeVertexCount()
+ If vkMapMemory(znsDev,nvcVertexMemory,1727936,64,0,@tail)<>0 Or tail=0 : ProcedureReturn 121 : EndIf
+ For i=0 To 63 : If (PeekA(tail+i)&255)<>((i*7+19)&255) : ProcedureReturn 122 : EndIf : Next
+ vkUnmapMemory(znsDev,nvcVertexMemory) : report[19]=1
+ report[0]=4
+ If ZentajiNeonSurfaceStop()<>1 : ProcedureReturn 114 : EndIf
+ report[9]=znsState : report[10]=Neon_Ready() : report[11]=NeonVkLifecycleConfigured()
+ report[12]=PeekQ(#ZEN_GFX_DISPLAY+$10) : report[13]=AnvilVkFaultCount()
+ If ZentajiNeonSurfaceStart(256)<>0 Or ZentajiNeonSurfacePresent()<>0 Or ZentajiNeonSurfaceStop()<>0 : ProcedureReturn 115 : EndIf
+ report[14]=znsError
+ report[0]=5
+ ProcedureReturn 42
+EndProcedure
