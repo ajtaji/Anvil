@@ -238,11 +238,17 @@ EndProcedure
 ; Rendering into the backend's private optimal image layout. This is separate
 ; from sampling that layout: a texture-only tiling must not become a target.
 #ANVIL_VK_CAP_OPTIMAL_COLOR_ATTACHMENT = $800000
+; RGB uses SRC_ALPHA/ONE_MINUS_SRC_ALPHA, alpha uses ONE/ONE_MINUS_SRC_ALPHA.
+; Separate from the older SRC_ALPHA-for-alpha subset: the equations differ.
+#ANVIL_VK_CAP_BLEND_ALPHA_ONE = $1000000
 
 ; Target-neutral closed-draw blend semantics. A backend maps these values to
 ; its own packet vocabulary; V3D blend-factor numbers never cross this seam.
 #ANVIL_VK_BLEND_DISABLED = 0
 #ANVIL_VK_BLEND_SRC_OVER = 1
+; Mode1 retains its existing SRC_ALPHA factor for alpha. Mode2 is straight
+; source-over with alpha sA+dA*(1-sA); neither mode may substitute for the other.
+#ANVIL_VK_BLEND_ALPHA_ONE = 2
 
 ; ----------------------------------------------------------------------
 ;  ONE CLOSED DRAW, handed to the backend.
@@ -866,11 +872,11 @@ Procedure.i AnvilVkBackendCanDraw()
   ProcedureReturn 0
 EndProcedure
 
-; Blend is useful only together with a graphics draw path. Requiring both
-; bits here prevents a malformed backend capability word from advertising a
-; format feature no queue can execute.
+; Blend is useful only together with a graphics draw path. Require DRAW
+; and at least one exact alpha equation, so a malformed capability word cannot
+; advertise a format feature no queue can execute.
 Procedure.i AnvilVkBackendCanBlendSourceOver()
-  If (avkBackendCaps() & (#ANVIL_VK_CAP_DRAW | #ANVIL_VK_CAP_BLEND_SRC_OVER)) = (#ANVIL_VK_CAP_DRAW | #ANVIL_VK_CAP_BLEND_SRC_OVER)
+  If (avkBackendCaps() & #ANVIL_VK_CAP_DRAW) <> 0 And (avkBackendCaps() & (#ANVIL_VK_CAP_BLEND_SRC_OVER | #ANVIL_VK_CAP_BLEND_ALPHA_ONE)) <> 0
     ProcedureReturn 1
   EndIf
   ProcedureReturn 0

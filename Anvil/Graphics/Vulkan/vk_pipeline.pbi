@@ -1789,8 +1789,12 @@ Procedure.i avkPipeCheckMultisample(*ms.VkPipelineMultisampleStateCreateInfo, *o
   ProcedureReturn #VK_SUCCESS
 EndProcedure
 
+; Khronos Vulkan framebuffer blending specifies independent RGB/alpha factors:
+; https://docs.vulkan.org/spec/latest/chapters/framebuffer.html#framebuffer-blending
+; Equations implemented independently; no third-party implementation code used.
 Procedure.i avkPipeCheckColorBlend(*cb.VkPipelineColorBlendStateCreateInfo, *outMode)
   Define *a.VkPipelineColorBlendAttachmentState
+  Define mode.i,cap.i
   If *outMode = 0 : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf
   PokeI(*outMode, #ANVIL_VK_BLEND_DISABLED)
   If *cb = 0
@@ -1815,13 +1819,19 @@ Procedure.i avkPipeCheckColorBlend(*cb.VkPipelineColorBlendStateCreateInfo, *out
   If (*a\blendEnable & $FFFFFFFF) <> #VK_TRUE
     ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkCreateGraphicsPipelines was given blendEnable other than VK_FALSE or VK_TRUE (Anvil code -20001, invalid boolean); no pipeline was created.")
   EndIf
-  If (*a\srcColorBlendFactor & $FFFFFFFF) <> #VK_BLEND_FACTOR_SRC_ALPHA Or (*a\dstColorBlendFactor & $FFFFFFFF) <> #VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA Or (*a\colorBlendOp & $FFFFFFFF) <> #VK_BLEND_OP_ADD Or (*a\srcAlphaBlendFactor & $FFFFFFFF) <> #VK_BLEND_FACTOR_SRC_ALPHA Or (*a\dstAlphaBlendFactor & $FFFFFFFF) <> #VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA Or (*a\alphaBlendOp & $FFFFFFFF) <> #VK_BLEND_OP_ADD
-    ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreateGraphicsPipelines was asked for a blend equation other than straight source-over (Anvil code -20005, unsupported blend equation); the supported equation is SRC_ALPHA plus ONE_MINUS_SRC_ALPHA with ADD for both colour and alpha.")
+  If (*a\srcColorBlendFactor & $FFFFFFFF) <> #VK_BLEND_FACTOR_SRC_ALPHA Or (*a\dstColorBlendFactor & $FFFFFFFF) <> #VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA Or (*a\colorBlendOp & $FFFFFFFF) <> #VK_BLEND_OP_ADD Or (*a\dstAlphaBlendFactor & $FFFFFFFF) <> #VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA Or (*a\alphaBlendOp & $FFFFFFFF) <> #VK_BLEND_OP_ADD
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreateGraphicsPipelines requires SRC_ALPHA/ONE_MINUS_SRC_ALPHA with ADD for RGB, and alpha source ONE or SRC_ALPHA, destination ONE_MINUS_SRC_ALPHA and ADD; the selected backend must advertise that exact alpha equation.")
   EndIf
-  If AnvilVkBackendCanBlendSourceOver() = 0
-    ProcedureReturn avkFault(#VK_ERROR_FEATURE_NOT_PRESENT, "vkCreateGraphicsPipelines requested straight source-over blending on a backend that does not advertise that operation (VkResult -8, VK_ERROR_FEATURE_NOT_PRESENT); vkGetPhysicalDeviceFormatProperties therefore omits COLOR_ATTACHMENT_BLEND for this device.")
+  mode=#ANVIL_VK_BLEND_SRC_OVER : cap=#ANVIL_VK_CAP_BLEND_SRC_OVER
+  If (*a\srcAlphaBlendFactor & $FFFFFFFF) = #VK_BLEND_FACTOR_ONE
+    mode=#ANVIL_VK_BLEND_ALPHA_ONE : cap=#ANVIL_VK_CAP_BLEND_ALPHA_ONE
+  ElseIf (*a\srcAlphaBlendFactor & $FFFFFFFF) <> #VK_BLEND_FACTOR_SRC_ALPHA
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreateGraphicsPipelines requires ONE or SRC_ALPHA for the source alpha blend factor; no pipeline was created.")
   EndIf
-  PokeI(*outMode, #ANVIL_VK_BLEND_SRC_OVER)
+  If AnvilVkBackendCanBlendSourceOver() = 0 Or (avkBackendCaps() & cap) = 0
+    ProcedureReturn avkFault(#VK_ERROR_FEATURE_NOT_PRESENT, "vkCreateGraphicsPipelines requested an alpha blend equation the backend does not advertise (VkResult -8, VK_ERROR_FEATURE_NOT_PRESENT); no different equation was substituted.")
+  EndIf
+  PokeI(*outMode, mode)
   ProcedureReturn #VK_SUCCESS
 EndProcedure
 

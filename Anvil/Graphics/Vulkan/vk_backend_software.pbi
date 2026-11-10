@@ -49,7 +49,7 @@ EndProcedure
 
 Procedure.i avkBackendCaps()
   If avkSwEnsureHeap() = 0 : ProcedureReturn 0 : EndIf
-  ProcedureReturn #ANVIL_VK_CAP_DEVICE | #ANVIL_VK_CAP_CLEAR_COLOR | #ANVIL_VK_CAP_ATTACHMENT_LOAD | #ANVIL_VK_CAP_DRAW | #ANVIL_VK_CAP_BLEND_SRC_OVER | #ANVIL_VK_CAP_DRAW_LIST | #ANVIL_VK_CAP_BUFFER_TRANSFER | #ANVIL_VK_CAP_LINEAR_TRANSFER | #ANVIL_VK_CAP_CLEAR_ATTACHMENT_RECT | #ANVIL_VK_CAP_TILED_RECT_COPY | #ANVIL_VK_CAP_TILED_EDGE_TAIL_COPY | #ANVIL_VK_CAP_TILED_MICRO_COPY | #ANVIL_VK_CAP_TILED_MICRO_READBACK | #ANVIL_VK_CAP_TILED_TO_LINEAR_MICRO_COPY | #ANVIL_VK_CAP_LINEAR_TO_TILED_RECT_COPY | #ANVIL_VK_CAP_LINEAR_TO_TILED_MICRO_COPY | #ANVIL_VK_CAP_BUFFER_TO_TILED_RECT_COPY | #ANVIL_VK_CAP_BUFFER_TO_TILED_TAIL_COPY | #ANVIL_VK_CAP_BUFFER_TO_TILED_MICRO_COPY | #ANVIL_VK_CAP_BUFFER_TO_TILED_GRID_COPY | #ANVIL_VK_CAP_BUFFER_TO_TILED_GRID_4X4_COPY
+  ProcedureReturn #ANVIL_VK_CAP_DEVICE | #ANVIL_VK_CAP_CLEAR_COLOR | #ANVIL_VK_CAP_ATTACHMENT_LOAD | #ANVIL_VK_CAP_DRAW | #ANVIL_VK_CAP_BLEND_SRC_OVER | #ANVIL_VK_CAP_BLEND_ALPHA_ONE | #ANVIL_VK_CAP_DRAW_LIST | #ANVIL_VK_CAP_BUFFER_TRANSFER | #ANVIL_VK_CAP_LINEAR_TRANSFER | #ANVIL_VK_CAP_CLEAR_ATTACHMENT_RECT | #ANVIL_VK_CAP_TILED_RECT_COPY | #ANVIL_VK_CAP_TILED_EDGE_TAIL_COPY | #ANVIL_VK_CAP_TILED_MICRO_COPY | #ANVIL_VK_CAP_TILED_MICRO_READBACK | #ANVIL_VK_CAP_TILED_TO_LINEAR_MICRO_COPY | #ANVIL_VK_CAP_LINEAR_TO_TILED_RECT_COPY | #ANVIL_VK_CAP_LINEAR_TO_TILED_MICRO_COPY | #ANVIL_VK_CAP_BUFFER_TO_TILED_RECT_COPY | #ANVIL_VK_CAP_BUFFER_TO_TILED_TAIL_COPY | #ANVIL_VK_CAP_BUFFER_TO_TILED_MICRO_COPY | #ANVIL_VK_CAP_BUFFER_TO_TILED_GRID_COPY | #ANVIL_VK_CAP_BUFFER_TO_TILED_GRID_4X4_COPY
 EndProcedure
 
 Procedure.i avkBackendName()
@@ -503,6 +503,28 @@ Procedure.i avkSwPack(r.i, g.i, b.i, a.i)
   ProcedureReturn bi | (gi << 8) | (ri << 16) | (ai << 24)
 EndProcedure
 
+; Blend Q16 source channels with exact UNORM8 destination values. Keep the
+; numerator wide until the final UNORM8 write: multiplying a destination byte
+; by257 approximates division by255 and biases half-way alpha results downward.
+; For RGB, numerator is srcQ16*alphaQ16*255 + dstByte*(65536-alphaQ16)*65536.
+; For alpha use alpha*1 or alpha*alpha, as explicitly selected by the API.
+; Every product is bounded by255*2^32 (well inside signed64). Adding2^31 then
+; shifting32 rounds once, half upward; zero/full alpha and saturation are exact.
+; Khronos Vulkan framebuffer blending specifies independent RGB/alpha factors:
+; https://docs.vulkan.org/spec/latest/chapters/framebuffer.html#framebuffer-blending
+; Equations implemented independently; no third-party implementation code used.
+Procedure.i avkSwBlend(r.i, g.i, b.i, a.i, dest.i, alphaOne.i)
+  Define keep.i, sourceAlpha.i, ri.i, gi.i, bi.i, ai.i
+  r=avkSwClamp(r) : g=avkSwClamp(g) : b=avkSwClamp(b) : a=avkSwClamp(a)
+  keep=(65536-a)*65536
+  ri=(r*a*255+((dest>>16)&255)*keep+$80000000)>>32
+  gi=(g*a*255+((dest>>8)&255)*keep+$80000000)>>32
+  bi=(b*a*255+(dest&255)*keep+$80000000)>>32
+  sourceAlpha=a*a : If alphaOne<>0 : sourceAlpha=a*65536 : EndIf
+  ai=(sourceAlpha*255+((dest>>24)&255)*keep+$80000000)>>32
+  ProcedureReturn bi|(gi<<8)|(ri<<16)|(ai<<24)
+EndProcedure
+
 Procedure.i avkSwEdge(ax.i, ay.i, bx.i, by.i, px.i, py.i)
   ProcedureReturn (bx - ax) * (py - ay) - (by - ay) * (px - ax)
 EndProcedure
@@ -644,15 +666,11 @@ Procedure avkSwTriangle(*d.AnvilVkBackendDraw, *a.AvkSwVertex, *b.AvkSwVertex, *
           EndIf
       EndSelect
       dest = *d\targetBase + y * *d\pitch + x * 4
-      If *d\blendMode = #ANVIL_VK_BLEND_SRC_OVER
-        word = PeekL(dest)
-        alpha = avkSwClamp(alpha)
-        r = (r * alpha + ((word >> 16) & $FF) * 257 * (65536 - alpha)) / 65536
-        g = (g * alpha + ((word >> 8) & $FF) * 257 * (65536 - alpha)) / 65536
-        blue = (blue * alpha + (word & $FF) * 257 * (65536 - alpha)) / 65536
-        alpha = alpha + ((word >> 24) & $FF) * 257 * (65536 - alpha) / 65536
+      If *d\blendMode = #ANVIL_VK_BLEND_SRC_OVER Or *d\blendMode = #ANVIL_VK_BLEND_ALPHA_ONE
+        PokeL(dest,avkSwBlend(r,g,blue,alpha,PeekL(dest),Bool(*d\blendMode=#ANVIL_VK_BLEND_ALPHA_ONE)))
+      Else
+        PokeL(dest,avkSwPack(r,g,blue,alpha))
       EndIf
-      PokeL(dest, avkSwPack(r, g, blue, alpha))
     Next
   Next
 EndProcedure

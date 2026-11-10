@@ -130,7 +130,7 @@ Procedure.i avkZenDrawPreflight(*d.AnvilVkBackendDraw)
  If pipe<1 Or pipe>#ANVIL_VK_MAX_PIPELINES : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf
  If avkZenPipelines[pipe]\base=0 Or avkZenHeapRange(avkZenPipelines[pipe]\base,avkZenPipelines[pipe]\bytes)=0 : ProcedureReturn #ANVIL_VK_ERR_STATE : EndIf
  If *d\kind<>#ANVIL_VK_RENDER_OP_DRAW Or (*d\loadColor<>0 And *d\loadColor<>1) Or (*d\sampleMask<>0 And *d\sampleMask<>1) : ProcedureReturn #VK_ERROR_FEATURE_NOT_PRESENT : EndIf
- If *d\blendMode<>#ANVIL_VK_BLEND_DISABLED : ProcedureReturn #VK_ERROR_FEATURE_NOT_PRESENT : EndIf
+ If *d\blendMode<>#ANVIL_VK_BLEND_DISABLED And *d\blendMode<>#ANVIL_VK_BLEND_ALPHA_ONE : ProcedureReturn #VK_ERROR_FEATURE_NOT_PRESENT : EndIf
  If avkBackendDrawSupported(*d\targetBase,*d\targetBytes,*d\width,*d\height,*d\pitch)<>#VK_SUCCESS : ProcedureReturn #VK_ERROR_FEATURE_NOT_PRESENT : EndIf
  If avkZenOverlaps(*d\targetBase,*d\targetBytes,avkZenPipelines[pipe]\base,avkZenPipelines[pipe]\bytes)<>0 : ProcedureReturn #VK_ERROR_FEATURE_NOT_PRESENT : EndIf
  If avkZenPipelines[pipe]\sampledBinding>=0
@@ -239,6 +239,10 @@ Procedure.i avkBackendSubmitDraw(*d.AnvilVkBackendDraw)
  avkZenBlankCommand() : avkZenCommand[0]=6
  avkZenCommand[1]=avkZenPipelines[pipe]\base : avkZenCommand[2]=avkZenCommand[1]+#AVK_ZEN_SHADER_CODE_BYTES
  PokeA(@avkZenCommand[0]+26,avkZenPipelines[pipe]\varyings)
+ ; Native blend1 uses source alpha for RGB and ONE for alpha. The portable
+ ; mode is deliberately distinct from SRC_ALPHA-for-alpha, which this device
+ ; cannot execute. A disabled draw always clears the hardware blend byte.
+ If *d\blendMode=#ANVIL_VK_BLEND_ALPHA_ONE : PokeA(@avkZenCommand[0]+29,1) : EndIf
  avkZenCommand[5]=avkZenQueue\list+2560 : avkZenCommand[6]=256
  If avkZenAppendCommand()=0 : ProcedureReturn avkBackendRefuseBeforeLaunch(#VK_ERROR_DEVICE_LOST) : EndIf
  avkZenBlankCommand() : avkZenCommand[0]=7 : avkZenCommand[1]=meta

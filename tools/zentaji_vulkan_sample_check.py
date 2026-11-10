@@ -220,7 +220,7 @@ def main():
             assert ' exit=2A ' in end, (phase, end, report)
             assert report[2:8] == (0,)*6 and report[15] == 0, (phase, report)
             assert report[8:15] == (0, -8, -8, -8, -8, -8, 1), (phase, 'pre-launch refusals', report)
-            assert report[16:23] == (0x81, 0, 16384, 1, -8, -8, -8), (phase, 'format queries, flight retention and descriptor bounds', report)
+            assert report[16:23] == (0x181, 0, 16384, 1, -8, -8, -8), (phase, 'format queries, flight retention and descriptor bounds', report)
             producer = b''.join(struct.pack('<I', 0xFFFF0000 if x+y < 15 else 0)
                                 for y in range(16) for x in range(16))
             assert final[report[0]:report[0]+1024] == producer, (phase, 'producer/source immutability')

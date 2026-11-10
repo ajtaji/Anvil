@@ -90,8 +90,18 @@ with a barrier, and sample it into a second image. Independent expectations chec
 all RGBA pixels, fractional alpha at filtered edges, unchanged source contents,
 in-flight sampler/view/image retention and exact scanout CRCs. Malformed or
 aliased sampled descriptors are refused before launch.
-Blend, transfer and ordered draw-list capabilities are not enabled.
-The resident Neon Arcade adapter and graphics boot composition remain unfinished.
+Native blending supports SRC_ALPHA/ONE_MINUS_SRC_ALPHA for RGB and
+ONE/ONE_MINUS_SRC_ALPHA for alpha, both ADD. The older SRC_ALPHA-for-alpha
+equation has its own portable mode and capability and is refused on this native
+backend. Pipeline creation checks the exact equation; it does not substitute one
+because the device supports a different form of blending. Native cases check
+full RGBA and display CRCs at alpha zero, quarter, half and one, including a
+second scissored attachment-LOAD pass. The shared software executor separately
+checks both equations against expected pixels.
+
+Transfer and ordered draw-list capabilities are not enabled. Resident Neon
+callers still need a portable alpha-equation migration and safe display
+backbuffer ownership. The graphics boot composition remains unfinished.
 The counted monitor still boots to text.
 
 @SECTION Evidence and remaining work
@@ -105,7 +115,8 @@ The established multi-target host Forge build retains its C backend. The
 Zentaji emulator, assembler and focused native tools use the ASM backend only.
 The planned built-in self-hosted Forge targets only Zentaji and remains unfinished.
 
-Windows headless checks and the observed native text boot do not establish
-Linux execution or physical input and rumble acceptance. Those remain separate
-proofs, as does reference instruction-cost timing on an otherwise idle host.
+Windows component cases and a separate Linux ASM headless blend/LOAD case
+establish their stated native execution paths. Visible Linux input, physical
+input/rumble and full Linux acceptance remain separate proofs, as does reference
+instruction-cost timing on an otherwise idle host.
 `Zentaji/README.md` lists the component checks and their current boundaries.

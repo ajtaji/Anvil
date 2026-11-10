@@ -1616,3 +1616,6 @@ text is unchanged; no new board execution or boot claim follows.
 | `Anvil/Network/quic_crypto_send.pbi` | protocol-facts | ietf-rfc | IETF specification | RFC 9000 sections 13.3/19.6 and RFC 9001 section 4.1.3; independent outgoing CRYPTO retention and frame writer. No implementation copied. |
 
 | `Anvil/Network/quic_peer_ids.pbi` | protocol-facts | ietf-rfc | IETF specification | RFC9000 sections5.1/19.15; independent peer CID ownership, duplicates, retirement floor and ACK-based record reclamation. No implementation copied. |
+
+| `Anvil/Graphics/Vulkan/vk_pipeline.pbi` | consulted | khronos-vulkan | MIT (of Apache-2.0 OR MIT) | Normative framebuffer RGB/alpha factor semantics; independently written exact-equation validation, no implementation code copied. |
+| `Anvil/Graphics/Vulkan/vk_backend_software.pbi` | consulted | khronos-vulkan | MIT (of Apache-2.0 OR MIT) | Normative framebuffer RGB/alpha blend equations; independently written bounded integer arithmetic and single-round UNORM8 output, no implementation code copied. |

@@ -100,11 +100,36 @@ ledger must retain the sampler, image and view until retirement. Closed-record
 probes check bounds, filter/layout/pitch refusals, null/truncated descriptors
 and source/target aliasing without changing the queue.
 
-Blend, transfer and ordered draw-list capabilities remain absent.
-In particular, native blend mode 1 and the shared API validator currently use
-different alpha equations; do not advertise blend until the contract is resolved
-and exact alpha/colour pixels are qualified. The resident Neon Arcade adapter
-still needs these remaining capabilities and production composition wiring.
+Native blending now supports RGB SRC_ALPHA/ONE_MINUS_SRC_ALPHA and alpha
+ONE/ONE_MINUS_SRC_ALPHA, both ADD. This is explicitly closed mode ALPHA_ONE,
+which maps to hardware blend1. The older SRC_ALPHA-for-alpha equation remains
+a separate portable mode and capability; the native backend refuses it instead
+of silently substituting an equation. Format queries advertise blend availability,
+while pipeline creation checks the exact requested factor against backend support.
+The software executor supports both equations and now squares source alpha only
+when SRC_ALPHA was requested for alpha. It keeps a wide numerator and rounds
+once at the final UNORM8 write, avoiding the previous approximate destination
+conversion's downward bias at half-alpha boundaries. Its Q16 source precision
+and the native GPU's documented UNORM8 pre-blend quantization have separate
+rational pixel expectations. V3D's existing equation remains unchanged.
+
+tools/zentaji_vulkan_blend_check.py checks full RGBA with alpha zero, quarter,
+half and one, plus a scissored second pass using attachment LOAD. Native GPU
+cases also require independent scanout CRCs. Separate software-backend cases
+execute the actual shared renderer on the native Zentaji CPU, against explicit
+expected pixels for both equations; they are not a native graphics fallback.
+The existing software backend reserves 64MiB internally, so that focused proof
+uses a 128MiB machine. Native GPU proofs use the separate 32MiB component profile.
+Neither profile changes the counted monitor's text boot memory requirements. A separate
+Linux ASM headless run of the qualified native second-pass fixture also checks
+all 256 RGBA words, the public queue/fence/cleanup result and an exact scanout
+CRC. This bounded Linux case does not establish visible input or full platform
+acceptance.
+
+Transfer and ordered draw-list capabilities remain absent. Resident Neon
+callers still select the older alpha equation; their portable migration and
+V3D ALPHA_ONE support remain separate work before native resident composition.
+The resident adapter also needs safe ownership of configured display backbuffers.
 
 These components are not yet connected to the counted monitor composition or
 the resident shared Vulkan/Neon Arcade presentation adapter. The shipped monitor remains
@@ -116,6 +141,8 @@ python tools/zentaji_vulkan_present_check.py --compiler <Forge executable> --zen
 python tools/zentaji_shader_check.py --compiler <Forge executable> --zen-tools <tools/zentaji directory>
 python tools/zentaji_vulkan_draw_check.py --compiler <Forge executable> --zen-tools <tools/zentaji directory>
 python tools/zentaji_vulkan_sample_check.py --compiler <Forge executable> --zen-tools <tools/zentaji directory>
+python tools/zentaji_vulkan_blend_check.py --backend native --compiler <Forge executable> --zen-tools <tools/zentaji directory>
+python tools/zentaji_vulkan_blend_check.py --backend software --compiler <Forge executable> --zen-tools <tools/zentaji directory>
 ```
 
 ## Native text output
