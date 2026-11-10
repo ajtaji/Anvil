@@ -11,7 +11,8 @@ def png(path,bgra,w,h):
    at=(y*w+x)*4;rows.extend((bgra[at+2],bgra[at+1],bgra[at]))
  path.write_bytes(b'\x89PNG\r\n\x1a\n'+chunk(b'IHDR',struct.pack('>IIBBBBB',w,h,8,2,0,0,0))+chunk(b'IDAT',zlib.compress(rows))+chunk(b'IEND',b''))
 def main():
- ap=argparse.ArgumentParser(description=__doc__);ap.add_argument('--zen-tools',type=Path,required=True);ap.add_argument('--keep',type=Path,required=True);ap.add_argument('--exercise',action='store_true');a=ap.parse_args()
+ ap=argparse.ArgumentParser(description=__doc__);ap.add_argument('--zen-tools',type=Path,required=True);ap.add_argument('--keep',type=Path,required=True);ap.add_argument('--exercise',action='store_true');ap.add_argument('--keyboard',action='store_true',help='Exercise native keyboard events and Backspace editing instead of UART commands (requires --exercise)');a=ap.parse_args()
+ if a.keyboard and not a.exercise:ap.error('--keyboard requires --exercise')
  zt=a.zen_tools.resolve();td=a.keep.resolve();td.mkdir(parents=True,exist_ok=True);sys.path.insert(0,str(zt))
  import zen_native_fixture as F,zasm_ref as A
  image=ROOT/'build/zentaji/anvil.zex';raw=image.read_bytes();meta=json.loads(Path(str(image)+'.boot.json').read_text());mapping=json.loads(Path(str(image)+'.zmap').read_text())
@@ -20,7 +21,10 @@ def main():
   path=Path(source['path']);path=path if path.is_absolute() else ROOT/path
   assert hashlib.sha256(path.read_bytes().replace(b'\r',b'')).hexdigest()==source['sha256'],path
  source=ROOT/'Anvil/Core/command_loop.pbi';line=next(i for i,text in enumerate(source.read_text().splitlines(),1) if text.strip()=='ReadLine()')
- pc=next(int(row['pc'],16) for row in mapping['code'] if Path(row['source']).resolve()==source.resolve() and row['line']==line)
+ # Resolve each distinct source once: the full monitor map contains hundreds
+ # of thousands of code records referring to the same small set of paths.
+ source_paths={row['path']:Path(row['path']).resolve() for row in mapping['sources']}
+ pc=next(int(row['pc'],16) for row in mapping['code'] if row['line']==line and source_paths[row['source']]==source.resolve())
  ref=A.Asm();ref.assemble(Path(str(image)+'.compiled.asm').read_text(encoding='utf-8-sig'))
  m=F.Fixture(ram_size=128<<20,cores=2,hostfiles=[['anvil.zex',bytearray(raw),False]],display_modes=[(640,480,60000)])
  if a.exercise:
@@ -33,8 +37,23 @@ def main():
   assert compiled.returncode==0,(compiled.stdout,compiled.stderr)
   medium=E.build(4096);E.seed_file(medium,Path(str(app)+'.pmf').read_bytes(),'APP.PMF')
   m=F.Fixture(ram_size=128<<20,cores=2,hostfiles=[['anvil.zex',bytearray(raw),False]],disks={0:(bytearray(medium),False)},display_modes=[(640,480,60000)])
-  # Feed real serial bytes through the hardware FIFO; the debugger only stops execution.
-  m.serial[0].incoming=[(600000000,b) for b in b'echo GRAPHICS READY\rboot APP.PMF\r']
+  if a.keyboard:
+   # Real HID usages/text go through the native device, board normalizer and
+   # shared editor. Backspace must repair READX to READY before dispatch.
+   # Separate the commands so the prompt's held-key fence cannot consume
+   # the next command while returning ownership from the previous one.
+   for tick,command in [(600000000,'echo GRAPHICS READX\bY\r'),(2000000000,'boot APP.PMF\r')]:
+    for ch in command:
+     if ch=='\r':usage,mods,text=40,0,0
+     elif ch=='\b':usage,mods,text=42,0,0
+     elif ch==' ':usage,mods,text=44,0,32
+     elif ch=='.':usage,mods,text=55,0,46
+     else:usage,mods,text=4+ord(ch.lower())-ord('a'),int(ch.isupper()),ord(ch)
+     m.input_feed(tick,'key',usage,1,mods,0,text)
+     m.input_feed(tick,'key',usage,0,mods,0,0)
+  else:
+   # Feed real serial bytes through the hardware FIFO; the debugger only stops execution.
+   m.serial[0].incoming=[(600000000,b) for b in b'echo GRAPHICS READY\rboot APP.PMF\r']
  m.power_on(0,0);m.write(td)
  p=subprocess.Popen([str(zt/'zenemu.exe'),str(td/'machine.txt'),'--debug-stdio','--ram',str(td/'final.bin')],cwd=ROOT,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,encoding='utf-8',errors='replace',bufsize=1,creationflags=0x08000000 if os.name=='nt' else 0)
  replies=queue.Queue();lines=[]
@@ -80,11 +99,15 @@ def main():
  if a.exercise:assert struct.unpack_from('<q',ram,marker)[0]==1 and q('gGoRc')==42,(struct.unpack_from('<q',ram,marker)[0],q('gGoRc'))
  cols,rows=q('gConCols'),q('gConRows');at=ref.sym['GLOBAL_GCONGRID'];text=ram[at:at+cols*rows].decode('ascii',errors='replace');assert 'pmf> ' in text and 'Anvil' in text,text
  if a.exercise:assert 'GRAPHICS READY' in text and 'The payload returned' in text,text
+ if a.keyboard:
+  assert 'GRAPHICS READX' not in text,text
+  assert q('ziUp')==1 and q('ziOwned')==0 and q('ziFencing')==0
  base,span,shown,pitch,w,h=[q(n) for n in ['zgdBase','zgdSpan','zgdShown','zgdPitch','zgdWidth','zgdHeight']]
  assert (w,h,pitch)==(640,480,2560) and 0<=shown<3
  at=base+shown*span;frame=b''.join(ram[at+y*pitch:at+y*pitch+w*4] for y in range(h))
  colours={frame[i:i+4] for i in range(0,len(frame),4)};assert len(colours)>17,len(colours)
  png(td/'anvil-graphical-prompt.png',frame,w,h);(td/'console.txt').write_text(text)
- (td/'result.json').write_text(json.dumps(dict(image_sha256=meta['image_sha256'],entry=meta['entry'],breakpoint=pc,width=w,height=h,shown=shown,frames=q('zgdSequence'),font='Anvil shared TrueType boot font',colours=len(colours),frame_sha256=hashlib.sha256(frame).hexdigest()),indent=2))
+ (td/'result.json').write_text(json.dumps(dict(image_sha256=meta['image_sha256'],entry=meta['entry'],breakpoint=pc,width=w,height=h,shown=shown,frames=q('zgdSequence'),font='Anvil shared TrueType boot font',colours=len(colours),frame_sha256=hashlib.sha256(frame).hexdigest(),exercise=a.exercise,input_transport='keyboard' if a.keyboard else 'uart',payload_marker=struct.unpack_from('<q',ram,marker)[0] if a.exercise else None,payload_return=q('gGoRc') if a.exercise else None),indent=2))
  print('PASS actual ROM-loaded counted Anvil image: shared TrueType/Neon graphical prompt, native display enabled, cell-text disabled, no Vulkan faults; screenshot '+str(td/'anvil-graphical-prompt.png'))
+ if a.exercise:print('PASS '+('native keyboard with Backspace editing' if a.keyboard else 'UART')+': GRAPHICS READY command, filesystem PMF application, RAM marker=1, return=42, graphical prompt restored')
 if __name__=='__main__':main()
