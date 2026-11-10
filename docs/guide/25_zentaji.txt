@@ -1,0 +1,101 @@
+@CHAPTER Anvil on Zentaji
+
+@INTRO Zentaji is a custom emulated computer with its own 64-bit instruction set. Its boot ROM loads Anvil as the selected bootloader and resident monitor. The current production composition reaches a text prompt; the native GPU components are qualified separately and do not yet provide the Neon Arcade desktop.
+
+@SECTION Build and boot
+
+From the Anvil repository root, select the existing multi-target Forge
+executable explicitly. The following build command has been run on Windows;
+replace the placeholder with your installed executable's path.
+
+@FRAG
+python tools/build.py zentaji --compiler <Forge executable>
+@ENDFRAG
+
+A successful build publishes `build/zentaji/anvil.zex`, its `.boot.json`
+metadata and `.zmap` source map. The metadata records the counted build,
+image digest, entry and memory requirements. The source map records the source
+hashes. Each successful monitor build advances the build number automatically.
+Do not substitute an ARM image: Zentaji executes native Zentaji instructions.
+
+Configure the machine ROM to load this image from its selected host file or
+boot disk. The monitor acceptance tool exercises both routes using the
+published image. This invocation has been run with the native tools directory
+from the compiler repository:
+
+@FRAG
+python tools/zentaji_monitor_check.py --zen-tools <tools/zentaji directory>
+@ENDFRAG
+
+It reports PASS only after checking the actual ROM boot, monitor version,
+commands and memory boundaries against native execution. A host-file profile
+without a disk can reach the prompt, but correctly refuses storage operations.
+The machine's own ROM console and Anvil's `pmf>` prompt are different stages.
+
+The shared monitor supplies command policy, settings, FAT32/exFAT and the
+application service table. The Zentaji hardware layer supplies serial, native
+text, keyboard/mouse input, persistent queues, clock and timer ownership.
+Idle command and countdown waits use the CPU's WFI instruction and timer wakes.
+There is no operating system beneath the guest monitor.
+
+@SECTION Load a native application
+
+The monitor accepts version 2 PMFBOOT containers tagged ISA 2, target 1.
+Use `boot APP.PMF` to load from the selected filesystem, or `boot mem`
+with an address for a container already in memory. The shared loader checks
+metadata, complete source ranges, placement, stack and entry alignment, then
+hashes the placed bytes before entering the application. Untagged legacy
+containers and containers for another architecture are refused.
+
+Service-backed applications retain Anvil's resident device owners and use
+the shared service table. Ordinary supervisor applications receive quiesced
+owners and must return their devices quiescent. A return that changes owned
+timer, disk or text hardware is refused rather than overwriting a foreign owner.
+This boundary is not isolation from malicious supervisor code.
+
+Saved `boot.file` and `boot.delay` use the existing shared countdown and
+reboot-loop guard. Persist settings with `saveenv`. Automatic entry records
+the attempt before calling the application. A returned application is
+acknowledged with `boot ok`; return alone does not erase the guard.
+
+The application checks use an 8 MiB machine profile. The exact monitor floor
+in the build metadata includes a staging page, but each application still needs
+space for its image and stack. That text-profile size is not a promise that a
+future graphics composition fits in the same memory.
+
+@SECTION What graphics currently does
+
+The graphics memory owner reserves a permanent page-aligned arena below the
+text reservation and supervisor stack. Payload placement excludes it. The
+display owner uses two or three pinned buffers, presents only retired native
+GPU work, and waits for the real display latch through timer/WFI. A timeout
+does not release memory or claim that presentation finished.
+
+The native Vulkan backend supports color clears, opaque triangle drawing and
+attachment LOAD. Pipeline creation lowers verified typed shader IR to native
+GPU instructions and retains resource requirements independently of source
+shader-module lifetime. Native cases check exact pixels, indexed draws,
+scissor/clear behavior, instances, sample-mask zero and independent scanout CRCs.
+
+The shader component also lowers nearest and bilinear combined-image sampling
+through the machine's actual TEX2D boot-ROM service. Those component cases pass,
+but public Vulkan sampled-image submission is still refused pending descriptor
+integration. Blend, transfer and ordered draw-list capabilities are not enabled.
+The resident Neon Arcade adapter and graphics boot composition remain unfinished.
+The counted monitor still boots to text.
+
+@SECTION Evidence and remaining work
+
+Acceptance runs the shipped native ASM-built Zentaji tools against explicit
+instruction effects, ABI boundaries, bytes, pixels and application behavior.
+Python helpers write fixtures, inspect native state or calculate independent
+expected data; they do not execute a second CPU/device machine.
+
+The established multi-target host Forge build retains its C backend. The
+Zentaji emulator, assembler and focused native tools use the ASM backend only.
+The planned built-in self-hosted Forge targets only Zentaji and remains unfinished.
+
+Windows headless checks and the observed native text boot do not establish
+Linux execution or physical input and rumble acceptance. Those remain separate
+proofs, as does reference instruction-cost timing on an otherwise idle host.
+`Zentaji/README.md` lists the component checks and their current boundaries.

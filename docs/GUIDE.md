@@ -40,6 +40,7 @@ path in.** Chapter 11 is the map back out to them, by topic.
 | 22 | [Raspberry Pi 5: source bring-up](guide/22_the_raspberry_pi_5.txt) | EL3 `pmf>` boot captured on Pi 5; PCIe/RP1, storage, network and GPU acceptance remain open. |
 | 23 | [Vulkan on a Raspberry Pi 4](guide/23_vulkan_on_pi4.txt) | GPU drawing, hardware transfer paths, the bounded linear readback, and the desk versus board proof boundary. |
 | 24 | [Every command](guide/24_every_command.txt) | The monitor's own `help`, as each board prints it - generated from the help text, so it cannot say less than the board does. |
+| 25 | [Anvil on Zentaji](guide/25_zentaji.txt) | Native ROM boot, counted image, shared loader and services, sleeping idle waits, qualified graphics components and the remaining desktop integration. |
 
 [`guide/00_OUTLINE.txt`](guide/00_OUTLINE.txt) documents the book itself: the
 markup, the rules the chapters are written to, and the chapter plan. Files whose
