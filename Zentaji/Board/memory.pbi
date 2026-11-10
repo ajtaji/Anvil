@@ -1,7 +1,7 @@
 ; Live Anvil memory layout from its validated Zentaji startup context.
 ; Include boot_context, console, HAL and format before the shared range policy.
 ; RAM between the page-rounded image end and owned stack is the payload window,
-; less an optional boot-time reservation for native text cells at its high end.
+; less boot-time reservations for native text cells and pinned graphics RAM.
 ; The low prefix, complete image/BSS/vectors, stack and ROM's top 1MB stay owned.
 XIncludeFile "Anvil/Kernel/Zentaji/boot_context.pbi"
 Global zenMemoryContext.i
@@ -15,6 +15,7 @@ Global zenMemoryAddrLo.i
 Global zenMemoryAddrHi.i
 Global zenMemoryAddrWhy.i
 Global zenMemoryTextBase.i,zenMemoryTextBytes.i,zenMemoryTextTried.i
+Global zenMemoryGraphicsBase.i,zenMemoryGraphicsBytes.i,zenMemoryGraphicsTried.i
 
 Procedure.i ZentajiMemoryBind(context.i)
  Protected last.i,nextPage.i,bottom.i
@@ -38,15 +39,18 @@ Procedure.i HwMonBytes() : ProcedureReturn zenMemoryLast-zenMemoryFirst : EndPro
 Procedure.i HwMonStack() : ProcedureReturn zenMemoryStackTop : EndProcedure
 Procedure.i HwMonRegions()
  If zenMemoryContext=0 : ProcedureReturn 0 : EndIf
- If zenMemoryTextBase<>0 : ProcedureReturn 4 : EndIf
- ProcedureReturn 3
+ ProcedureReturn 3+Bool(zenMemoryTextBase<>0)+Bool(zenMemoryGraphicsBase<>0)
 EndProcedure
 Procedure.i HwMonRegionLo(index.i)
  Select index
   Case 0 : ProcedureReturn 0
   Case 1 : ProcedureReturn zenMemoryStackBottom
   Case 2 : ProcedureReturn zenMemoryStackTop
-  Case 3 : If zenMemoryTextBase<>0 : ProcedureReturn zenMemoryTextBase : EndIf
+  Case 3
+   If zenMemoryTextBase<>0 : ProcedureReturn zenMemoryTextBase : EndIf
+   If zenMemoryGraphicsBase<>0 : ProcedureReturn zenMemoryGraphicsBase : EndIf
+  Case 4
+   If zenMemoryTextBase<>0 And zenMemoryGraphicsBase<>0 : ProcedureReturn zenMemoryGraphicsBase : EndIf
  EndSelect
  ProcedureReturn -1
 EndProcedure
@@ -55,7 +59,10 @@ Procedure.i HwMonRegionHi(index.i)
   Case 0 : ProcedureReturn zenMemoryPayload-1
   Case 1 : ProcedureReturn zenMemoryStackTop-1
   Case 2 : ProcedureReturn zenMemoryRam-1
-  Case 3 : If zenMemoryTextBase<>0 : ProcedureReturn zenMemoryStackBottom-1 : EndIf
+  Case 3
+   If zenMemoryTextBase<>0 Or zenMemoryGraphicsBase<>0 : ProcedureReturn zenMemoryStackBottom-1 : EndIf
+  Case 4
+   If zenMemoryTextBase<>0 And zenMemoryGraphicsBase<>0 : ProcedureReturn zenMemoryTextBase-1 : EndIf
  EndSelect
  ProcedureReturn -1
 EndProcedure
@@ -64,7 +71,13 @@ Procedure HwMonRegionSay(index.i)
   Case 0 : Print("monitor image, data, vectors and low reserved RAM")
   Case 1 : Print("Anvil supervisor stack")
   Case 2 : Print("ROM workspace and loader stack")
-  Case 3 : Print("native text cells (all configured modes and fonts)")
+  Case 3
+   If zenMemoryTextBase<>0
+    Print("native text cells (all configured modes and fonts)")
+   Else
+    Print("pinned native graphics commands, fences and resources")
+   EndIf
+  Case 4 : Print("pinned native graphics commands, fences and resources")
  EndSelect
 EndProcedure
 Procedure.i HwPayWindows()
@@ -77,6 +90,7 @@ Procedure.i HwPayLo(index.i)
 EndProcedure
 Procedure.i HwPayHi(index.i)
  If zenMemoryContext=0 Or index<>0 : ProcedureReturn -1 : EndIf
+ If zenMemoryGraphicsBase<>0 : ProcedureReturn zenMemoryGraphicsBase-1 : EndIf
  If zenMemoryTextBase<>0 : ProcedureReturn zenMemoryTextBase-1 : EndIf
  ProcedureReturn zenMemoryStackBottom-1
 EndProcedure
@@ -101,6 +115,29 @@ Procedure.i ZentajiMemoryTextInit(table.i)
   zenMemoryTextBase=0 : zenMemoryTextBytes=0
   ProcedureReturn 0
  EndIf
+ ProcedureReturn 1
+EndProcedure
+
+; Reserve before settings/staging/payload admission and before binding a GPU
+; queue. Text admission must happen first; sealing both decisions prevents a
+; later text allocation from overlapping GPU resources. The reservation never
+; moves or returns to payload use, including after device loss or a timeout.
+; The caller sizes the arena for commands/fences, images and resource heap.
+; Keep one complete page for payload staging. Refusal changes no range.
+Procedure.i ZentajiMemoryGraphicsInit(bytes.i)
+ Protected top.i,base.i
+ If zenMemoryContext=0 Or zenMemoryGraphicsTried<>0 : ProcedureReturn 0 : EndIf
+ zenMemoryGraphicsTried=1 : zenMemoryTextTried=1
+ If bytes<8192 Or bytes>$7FFFFFFFFFFFFFFF-4095 : ProcedureReturn 0 : EndIf
+ bytes=(bytes+4095)&-4096
+ top=zenMemoryStackBottom
+ If zenMemoryTextBase<>0 : top=zenMemoryTextBase : EndIf
+ ; Round down the upper boundary as fitted RAM need not be page-aligned.
+ ; Own any alignment tail too; it must not become a hidden payload gap.
+ base=top&-4096
+ If bytes>base-zenMemoryPayload-4096 : ProcedureReturn 0 : EndIf
+ base=base-bytes
+ zenMemoryGraphicsBase=base : zenMemoryGraphicsBytes=bytes
  ProcedureReturn 1
 EndProcedure
 

@@ -8,6 +8,37 @@ serial on admitted display profiles. Native keyboard/mouse input uses the shared
 event pipeline and resident service; self-hosted Forge remains unfinished. The
 shared monitor owns scheduler and command policy.
 
+## Native graphics bring-up
+
+The graphics components now reserve an immutable, page-aligned arena below the
+text reservation and supervisor stack. The memory HAL removes it, including
+alignment padding, from payload/staging admission while retaining a 4KB staging
+minimum. Graphics admission seals text admission; call text admission first.
+A refused request changes no ranges. A GPU timeout, release or device loss does
+not return this memory to applications.
+
+`Board/graphics_display.pbi` owns the native pixel display and its advertised
+two or three pinned image buffers. Present requires a retired native GPU queue;
+completion means the hardware has latched the requested buffer. Wait sleeps
+through the existing timer/WFI owner. Pending presentation cannot be released,
+and foreign mode/stride/buffer/text ownership quarantines the owner. Images
+are rendered by the native GPU, with no processor pixel fallback.
+
+`tools/zentaji_graphics_memory_check.py` compiles these components with the real
+owned startup. Eleven cases check independent memory boundaries, exact staging
+capacity, refusal, text coexistence, native GPU pixels/fence/guards, display
+latching, pending timeout, foreign-owner quarantine and release. A headless frame
+must match the independently calculated CRC of the expected displayed pixels.
+The original memory and text gates remain green.
+
+These components are not yet connected to the counted monitor composition or
+the shared Vulkan/Neon Arcade presentation adapter. The shipped monitor remains
+text; shader/draw/transfer/sampling integration and graphical boot remain owed.
+
+```text
+python tools/zentaji_graphics_memory_check.py --compiler <Forge executable> --zen-tools <tools/zentaji directory>
+```
+
 ## Native text output
 
 `Board/text.pbi` uses the machine's text PUTC, CLEAR and hardware scrolling.
