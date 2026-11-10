@@ -224,8 +224,11 @@ in GENERAL or TRANSFER_SRC layout. Both linear and this backend's private
 optimal images are supported. Abort releases an unsubmitted writer; Commit
 copies with native DMA and waits for the display latch before dropping pins.
 Uncertain retirement retains the resources and quarantines the GPU lease until
-reset. The composition still has to carve display planes outside the Vulkan
-heap and start the managed display before acquiring a token. Native coverage:
+reset. `AnvilVkZentajiDisplayWindow()` reads the native display geometry and
+descriptor buffer count, carves page-rounded private planes from the end of the
+protected graphics arena, starts the managed display and gives Vulkan only the
+remaining window. Call it before any Vulkan heap discovery or allocation.
+An undersized arena is refused before hardware setup. Native coverage:
 `tools/zentaji_present_pin_check.py`.
 
 These components are not yet connected to the counted monitor composition or

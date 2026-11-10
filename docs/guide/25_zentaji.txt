@@ -112,18 +112,17 @@ Owned DMA supplies buffer copy/fill/update, linear transfers and whole optimal
 uploads/copies. The CPU writes descriptors; DMA writes pixels. Timer/WFI waits
 retire work; failures quarantine resources.
 
-Managed display planes live outside the Vulkan heap, inside the permanent
-graphics reservation. Acquire a writer token before a copy. The owner refuses
-the shown plane, any pending presentation, a second writer and stale tokens,
-including tokens from before a display restart. Native DMA copies every row;
-the plane becomes ready only after DMA and its producer GPU fence retire.
-Presentation consumes the writer token. A pending plane stays unavailable until
-the actual display latch. A submitted or quarantined writer cannot be aborted
-or released. The Vulkan image presentation bridge pins the source image and its
-allocation and holds the external GPU lease. Begin requires a matching BGRA image
-with transfer-source usage and GENERAL or TRANSFER_SRC layout. Abort releases an
-unsubmitted writer. Commit performs native DMA and waits for the real latch
-before releasing the pins; uncertain retirement keeps them until reset.
+Before Vulkan allocation, DisplayWindow reads native geometry and the descriptor
+buffer count, then carves private planes from the graphics reservation. It
+refuses a small arena before hardware setup. Writer tokens reject stale reuse
+across rotations/restarts; shown or pending planes and a second writer are
+unavailable. DMA and the producer GPU fence must retire before presentation.
+A pending plane stays unavailable until the real display latch. Submitted or
+quarantined writers cannot be aborted or released. The Vulkan bridge pins the
+source image/allocation and holds the external GPU lease. Begin requires matching
+BGRA geometry, transfer-source usage and GENERAL or TRANSFER_SRC layout. Abort
+releases an unsubmitted writer; Commit uses native DMA and waits for the latch
+before releasing pins. Uncertain retirement keeps the resources until reset.
 
 Native cases check two GPU colors in private planes, scanout CRCs, unchanged
 shown pixels and row/page guards. DMA ownership loss quarantines the writer and

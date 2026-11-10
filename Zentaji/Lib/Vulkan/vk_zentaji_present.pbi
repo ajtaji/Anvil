@@ -10,6 +10,30 @@ XIncludeFile "Zentaji/Board/graphics_display.pbi"
 Global avkZenPresentState.i,avkZenPresentImage.i,avkZenPresentMemory.i
 Global avkZenPresentSource.i,avkZenPresentPitch.i,avkZenPresentToken.q
 
+; Split the existing permanently protected arena before Vulkan heap discovery.
+; Commands/fences retain its first page. Exactly the descriptor's two or three
+; page-rounded display planes occupy its end; only the middle becomes the heap.
+; A small arena is refused before writing any GPU, DMA or display register.
+Procedure.i AnvilVkZentajiDisplayWindow()
+ Protected w.i,h.i,span.i,buffers.i,displayBytes.i,windowBytes.i,base.i,rc.i
+ If avkZenUp<>0 Or avkHeapReady<>0 Or avkZenPresentState<>0 Or zgdUp<>0 Or zgdLost<>0 : ProcedureReturn #ANVIL_VK_ERR_STATE : EndIf
+ If ZenCpuStatus()<>0 Or ZenCpuCoreId()<>0 Or zenMemoryGraphicsBase=0 Or zenMemoryGraphicsBytes<8192 : ProcedureReturn #ANVIL_VK_ERR_STATE : EndIf
+ buffers=ZentajiGraphicsDisplayBufferCount()
+ If buffers=0 : ProcedureReturn #VK_ERROR_INITIALIZATION_FAILED : EndIf
+ w=PeekQ(#ZEN_GFX_DISPLAY+$50) : h=PeekQ(#ZEN_GFX_DISPLAY+$58)
+ If w<1 Or w>16384 Or h<1 Or h>16384 : ProcedureReturn #VK_ERROR_INITIALIZATION_FAILED : EndIf
+ span=(w*h*4+4095)&-4096 : displayBytes=span*buffers
+ If displayBytes>zenMemoryGraphicsBytes-8192 : ProcedureReturn #VK_ERROR_OUT_OF_DEVICE_MEMORY : EndIf
+ windowBytes=zenMemoryGraphicsBytes-displayBytes : base=zenMemoryGraphicsBase+windowBytes
+ If ZentajiGraphicsDisplayManagedStart(base)<>1 : ProcedureReturn #VK_ERROR_INITIALIZATION_FAILED : EndIf
+ rc=AnvilVkZentajiWindow(zenMemoryGraphicsBase,windowBytes)
+ If rc<>#VK_SUCCESS
+  ; No copy was submitted; release only our admitted, still disabled display.
+  ZentajiGraphicsDisplayRelease() : ProcedureReturn rc
+ EndIf
+ ProcedureReturn #VK_SUCCESS
+EndProcedure
+
 Procedure avkZenPresentUnpin()
  avkImgInFlight[avkZenPresentImage]=avkImgInFlight[avkZenPresentImage]-1
  avkMemInFlight[avkZenPresentMemory]=avkMemInFlight[avkZenPresentMemory]-1

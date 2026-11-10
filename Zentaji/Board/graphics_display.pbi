@@ -28,22 +28,32 @@ Procedure.i ZentajiGraphicsDisplayOwned()
  ProcedureReturn 1
 EndProcedure
 
-Procedure.i ZentajiGraphicsDisplayStart(base.i)
- Protected w.i,h.i,pitch.i,span.i,n.i,last.i,table.i=$FFFF000000010000,total.i,entries.i,p.i,buffers.i
- If zgdUp<>0 Or zgdLost<>0 Or zenMemoryGraphicsBase=0 Or ZenCpuStatus()<>0 Or ZenCpuCoreId()<>0 : ProcedureReturn 0 : EndIf
- If PeekQ(#ZEN_GFX_DISPLAY)<>$1000D Or PeekQ(#ZEN_GFX_DISPLAY+$10)<>0 Or PeekQ(#ZEN_GFX_DISPLAY+$20)<>0 Or PeekQ($FFFF0000001A0040)<>0 Or (PeekQ(#ZEN_GFX_DISPLAY+8)&$FF01)<>0 : ProcedureReturn 0 : EndIf
- ; Buffer count comes from the validated device descriptor, not a guessed
- ; triple-buffer profile. No display register is changed before admission.
+; Read-only geometry discovery shared with the Vulkan arena composition.
+; Count comes from the native descriptor; duplicate or unsupported entries fail.
+Procedure.i ZentajiGraphicsDisplayBufferCount()
+ Protected table.i=$FFFF000000010000,total.i,entries.i,n.i,p.i,buffers.i
+ If ZenCpuStatus()<>0 Or ZenCpuCoreId()<>0 : ProcedureReturn 0 : EndIf
  If PeekQ(table)<>$00494A41544E455A Or PeekU(table+8)<>1 Or PeekU(table+10)<>64 Or PeekL(table+20)<>64 : ProcedureReturn 0 : EndIf
  total=PeekL(table+12)&$FFFFFFFF : entries=PeekL(table+16)&$FFFFFFFF
  If total<64 Or total>65536 Or entries<1 Or entries>(total-64)/64 : ProcedureReturn 0 : EndIf
  For n=0 To entries-1
   p=table+64+n*64
   If PeekU(p)=13 And PeekA(p+2)=0 And PeekA(p+3)=1 And (PeekA(p+5)&1)<>0 And PeekQ(p+8)=#ZEN_GFX_DISPLAY And PeekQ(p+16)=65536
+   If buffers<>0 : ProcedureReturn 0 : EndIf
    buffers=PeekQ(p+56)
+   If buffers<2 Or buffers>3 : ProcedureReturn 0 : EndIf
   EndIf
  Next
  If buffers<2 Or buffers>3 : ProcedureReturn 0 : EndIf
+ ProcedureReturn buffers
+EndProcedure
+
+Procedure.i ZentajiGraphicsDisplayStart(base.i)
+ Protected w.i,h.i,pitch.i,span.i,n.i,last.i,buffers.i
+ If zgdUp<>0 Or zgdLost<>0 Or zenMemoryGraphicsBase=0 Or ZenCpuStatus()<>0 Or ZenCpuCoreId()<>0 : ProcedureReturn 0 : EndIf
+ If PeekQ(#ZEN_GFX_DISPLAY)<>$1000D Or PeekQ(#ZEN_GFX_DISPLAY+$10)<>0 Or PeekQ(#ZEN_GFX_DISPLAY+$20)<>0 Or PeekQ($FFFF0000001A0040)<>0 Or (PeekQ(#ZEN_GFX_DISPLAY+8)&$FF01)<>0 : ProcedureReturn 0 : EndIf
+ buffers=ZentajiGraphicsDisplayBufferCount()
+ If buffers=0 : ProcedureReturn 0 : EndIf
  w=PeekQ(#ZEN_GFX_DISPLAY+$50) : h=PeekQ(#ZEN_GFX_DISPLAY+$58)
  If w<1 Or w>16384 Or h<1 Or h>16384 : ProcedureReturn 0 : EndIf
  pitch=w*4 : span=(pitch*h+4095)&-4096

@@ -21,7 +21,7 @@ XIncludeFile "Anvil/Core/memrange.pbi"
 Global presentPhase.i
 '''
 BODY=r''' Protected token.q,stale.q,s.i=avkImgSlot(image),m.i=avkImgMemSlot[s],faults.i
- If ZentajiGraphicsDisplayManagedStart(arena+$3FD000)<>1 : ProcedureReturn 40 : EndIf
+ If zgdManaged<>1 Or zgdBase<>arena+$3FD000 Or zgdBuffers<>3 : ProcedureReturn 40 : EndIf
  token=AnvilVkZentajiPresentBegin(image)
  If token<1 Or avkImgInFlight[s]<>1 Or avkMemInFlight[m]<>1 : ProcedureReturn 41 : EndIf
  If AnvilVkZentajiPresentBegin(image)<>0 Or AnvilVkZentajiPresentCommit(token,0)<>0 : ProcedureReturn 42 : EndIf
@@ -52,7 +52,12 @@ BODY=r''' Protected token.q,stale.q,s.i=avkImgSlot(image),m.i=avkImgMemSlot[s],f
  vkDeviceWaitIdle(device)'''
 SOURCE=PREFIX+LIFECYCLE.replace('Procedure.i Main(',r'''XIncludeFile "Zentaji/Lib/Vulkan/vk_zentaji_present.pbi"
 Procedure.i VulkanMain(''').replace(
-    'AnvilVkZentajiWindow(arena,$400000)','AnvilVkZentajiWindow(arena,$3FD000)').replace(
+    ' If AnvilVkZentajiWindow(arena,$400000)',r''' Protected savedBytes.i=zenMemoryGraphicsBytes,oldPitch.i=PeekQ(#ZEN_GFX_DISPLAY+$70)
+ zenMemoryGraphicsBytes=8192
+ If AnvilVkZentajiDisplayWindow()<>#VK_ERROR_OUT_OF_DEVICE_MEMORY : ProcedureReturn 82 : EndIf
+ If zgdUp<>0 Or avkZenUp<>0 Or avkZenQueue\state<>0 Or PeekQ(#ZEN_GFX_DISPLAY+$70)<>oldPitch : ProcedureReturn 83 : EndIf
+ zenMemoryGraphicsBytes=savedBytes
+ If AnvilVkZentajiDisplayWindow()''').replace(
     r'imageInfo\usage=#VK_IMAGE_USAGE_TRANSFER_DST_BIT',
     r'imageInfo\usage=#VK_IMAGE_USAGE_TRANSFER_DST_BIT|#VK_IMAGE_USAGE_TRANSFER_SRC_BIT').replace(
     ' If vkEndCommandBuffer(cmd)',r''' barrier\oldLayout=#VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL : barrier\newLayout=#VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
@@ -96,6 +101,7 @@ def main():
             assert ' exit=2A ' in end,(phase,end,report)
             arena=(((32<<20)-(1<<20)-meta['stack_bytes'])&-4096)-0x400000
             plane=arena+0x3fd000
+            assert report[3]==arena+4096 and report[4]==0x3fc000 and report[8]<plane,report
             if phase==2:
                 assert report[21:27]==(2,1,1,-2,1,2),report
                 assert ram[plane:plane+0x3000]==bytes(0x3000)
