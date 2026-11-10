@@ -1,5 +1,5 @@
 """Boot the counted Anvil image through the ROM and capture its graphical prompt."""
-import argparse,hashlib,json,os,struct,subprocess,sys,tempfile,zlib,queue,threading,time
+import argparse,hashlib,json,os,struct,subprocess,sys,tempfile,zlib,queue,threading,time,re
 from pathlib import Path
 ROOT=Path(__file__).resolve().parents[1]
 def png(path,bgra,w,h):
@@ -28,6 +28,7 @@ def main():
  source_paths={row['path']:Path(row['path']).resolve() for row in mapping['sources']}
  pc=next(int(row['pc'],16) for row in mapping['code'] if row['line']==line and source_paths[row['source']]==source.resolve())
  ref=A.Asm();ref.assemble(Path(str(image)+'.compiled.asm').read_text(encoding='utf-8-sig'))
+ (td/'symbols.json').write_text(json.dumps(ref.sym))
  m=F.Fixture(ram_size=128<<20,cores=2,hostfiles=[['anvil.zex',bytearray(raw),False]],display_modes=[(640,480,60000)])
  if a.exercise:
   from pmf_compiler import TRACKED_COMPILER
@@ -173,7 +174,25 @@ def main():
  at=base+shown*span;frame=b''.join(ram[at+y*pitch:at+y*pitch+w*4] for y in range(h))
  colours={frame[i:i+4] for i in range(0,len(frame),4)};assert len(colours)>17,len(colours)
  png(td/'anvil-graphical-prompt.png',frame,w,h);(td/'console.txt').write_text(text)
- (td/'result.json').write_text(json.dumps(dict(image_sha256=meta['image_sha256'],entry=meta['entry'],breakpoint=pc,width=w,height=h,shown=shown,frames=q('zgdSequence'),font='Anvil shared TrueType boot font',colours=len(colours),frame_sha256=hashlib.sha256(frame).hexdigest(),exercise=a.exercise,input_transport='keyboard' if a.keyboard else 'uart',payload_marker=struct.unpack_from('<q',ram,marker)[0] if a.exercise and not a.resident else None,payload_return=q('gGoRc') if a.exercise else None,resident_sessions=len(resident_frames),resident_frame_sha256=hashlib.sha256(resident_frames[0]).hexdigest() if resident_frames else None),indent=2))
+ # Verify the actual boot header, independently of the generic text grid.
+ # Read immutable RGB asset literals; no second CPU or renderer is executed.
+ logo=bytearray()
+ for kind,row in re.findall(r'^\s*Data\.(a|b|w|l|q)\s+([^;\r\n]+)',(ROOT/'Anvil/Graphics/anvil_logo.pbi').read_text(encoding='utf-8'),re.M|re.I):
+  size={'a':1,'b':1,'w':2,'l':4,'q':8}[kind.lower()]
+  for token in row.split(','):
+   token=token.strip();value=int(token[1:],16) if token.startswith('$') else int(token)
+   logo.extend((value&((1<<(8*size))-1)).to_bytes(size,'little'))
+ assert len(logo)==76*74*3,len(logo)
+ for y in range(74):
+  for x in range(76):
+   rgb=logo[(y*76+x)*3:(y*76+x+1)*3]
+   actual=frame[((y+12)*w+(w-76-12+x))*4:((y+12)*w+(w-76-12+x))*4+4]
+   assert actual==bytes((rgb[2],rgb[1],rgb[0],255)),('Missing/corrupt Anvil logo',x,y,actual,bytes(rgb))
+ assert frame[0:4]==bytes((40,0,0,255)),'Missing banner background'
+ assert all(frame[(114*w+x)*4:(114*w+x)*4+4]==bytes((48,148,255,255)) for x in range(24,w-24)),'Missing orange header rule'
+ assert q('gConRows')==(h-128-8)//q('zngLineHeight'),'Console overlaps the header band'
+ print('PASS real Anvil boot header:5624 exact logo pixels, banner background/rule, reserved console band.',flush=True)
+ (td/'result.json').write_text(json.dumps(dict(image_sha256=meta['image_sha256'],entry=meta['entry'],breakpoint=pc,width=w,height=h,shown=shown,frames=q('zgdSequence'),font='Anvil shared TrueType boot font',header_logo_pixels=5624,header_console_top=128,colours=len(colours),frame_sha256=hashlib.sha256(frame).hexdigest(),exercise=a.exercise,input_transport='keyboard' if a.keyboard else 'uart',payload_marker=struct.unpack_from('<q',ram,marker)[0] if a.exercise and not a.resident else None,payload_return=q('gGoRc') if a.exercise else None,resident_sessions=len(resident_frames),resident_frame_sha256=hashlib.sha256(resident_frames[0]).hexdigest() if resident_frames else None),indent=2))
  print('PASS actual ROM-loaded counted Anvil image: shared TrueType/Neon graphical prompt, native display enabled, cell-text disabled, no Vulkan faults; screenshot '+str(td/'anvil-graphical-prompt.png'))
  if a.resident:print('PASS existing shared retained-UI service application twice: 22 assertions per session, real matching native frames, return=0, retired scopes, graphical prompt restored')
  elif a.exercise:print('PASS '+('native keyboard with Backspace editing' if a.keyboard else 'UART')+': GRAPHICS READY command, filesystem PMF application, RAM marker=1, return=42, graphical prompt restored')

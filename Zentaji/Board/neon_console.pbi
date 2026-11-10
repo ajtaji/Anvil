@@ -25,11 +25,16 @@ XIncludeFile "Anvil/Graphics/Vulkan/neon_vk_sprite_port.pbi"
 XIncludeFile "RaspberryPi4/Monitor/anvil_boot_ttf.pi4"
 
 XIncludeFile "Zentaji/Board/neon_surface.pbi"
+XIncludeFile "Anvil/Graphics/anvil_logo.pbi"
+XIncludeFile "Anvil/Core/build_identity.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/neon_vk_banner.pbi"
 XIncludeFile "Anvil/Core/font_cmd.pbi"
 XIncludeFile "Anvil/Graphics/Vulkan/neon_vk_resident_state.pbi"
 
 Global zngUp.i,zngFault.i,zngLineHeight.i,zngSuspended.i
 Global zngFont.NeonVkPortFontRef
+#ZNG_CONSOLE_TOP=128
+Global zngBanner.NeonVkBannerArgs
 Global Dim zngAtlas.a[#NEON_ATLAS_MAXBYTES]
 Global Dim zngUV.a[4096]
 Global Dim zngBitmap.a[95*16]
@@ -62,6 +67,23 @@ Procedure.i zngRunX(row.i,col.i)
  first=NeonVkChromeMeasureWidthControls(zngFont\face,@zngPair[0],0,1)
  ProcedureReturn whole-first
 EndProcedure
+; Use Anvil's existing banner composition and immutable logo, not an app UI.
+; Warm all title/caption glyphs while idle; drawing inside a frame never rasterizes.
+Procedure.i zngBannerPrepare()
+ zngBanner\width=znsWidth : zngBanner\height=znsHeight
+ zngBanner\logoWidth=#ANVIL_PIC_W : zngBanner\logoHeight=#ANVIL_PIC_H
+ zngBanner\platformText="bare-metal monitor   -   Zentaji   -   Zentaji64"
+ zngBanner\buildText=AnvilBuildLabel(#ANVIL_BUILD,#ANVIL_BUILD_DATE,#ANVIL_BUILD_TIME)
+ zngBanner\clockText=WallClockCaption() : zngBanner\glintActive=0
+ If NeonVkChromeFontHeightSet(#NEON_FONT_BOLD,48)<>0 : ProcedureReturn 0 : EndIf
+ If NeonVkChromeFontHeightSet(#NEON_FONT_SMALL,16)<>0 : ProcedureReturn 0 : EndIf
+ If NeonVkChromeWarmTrueTypeText(48,"PureMetal Forge")<0 : ProcedureReturn 0 : EndIf
+ If NeonVkChromeWarmTrueTypeText(16,zngBanner\platformText)<0 : ProcedureReturn 0 : EndIf
+ If NeonVkChromeWarmTrueTypeText(16,zngBanner\buildText)<0 : ProcedureReturn 0 : EndIf
+ If NeonVkChromeWarmTrueTypeText(16,zngBanner\clockText)<0 : ProcedureReturn 0 : EndIf
+ If NeonVkChromeWarmTrueTypeText(16,"A N V I L")<0 : ProcedureReturn 0 : EndIf
+ ProcedureReturn 1
+EndProcedure
 Procedure zngPaint()
  Protected row.i,col.i,count.i,style.i,x.f,y.f,r.f,g.f,b.f,cursor.i
  If zngUp=0 Or zngSuspended<>0 Or zngFault<>0 : ProcedureReturn : EndIf
@@ -70,7 +92,9 @@ Procedure zngPaint()
   ConGridRowText(row,@zngRow[0])
   If NeonVkPortFontWarm(@zngFont,@zngRow[0])<>0 : zngFault=1 : ProcedureReturn : EndIf
  Next
+ If zngBannerPrepare()<>1 : zngFault=8 : ProcedureReturn : EndIf
  If NeonVkPortFrameBegin(0.025,0.035,0.055,1.0)<>0 : zngFault=2 : ProcedureReturn : EndIf
+ If NeonVkBannerRender(@zngBanner)<>0 : zngFault=9 : ProcedureReturn : EndIf
  For row=0 To ConGridRows()-1
   col=0
   While col<ConGridCols()
@@ -79,7 +103,7 @@ Procedure zngPaint()
    If count<1 : zngFault=3 : ProcedureReturn : EndIf
    If zngRun[0]<>0
     x=8.0+MathFFromInt(zngRunX(row,col))/65536.0
-    y=MathFFromInt(8+row*zngLineHeight)
+    y=MathFFromInt(#ZNG_CONSOLE_TOP+row*zngLineHeight)
     r=0.85 : g=0.87 : b=0.91
     If style=#UART_SCREEN_STYLE_PROMPT : r=0.35 : g=0.85 : b=0.95 : EndIf
     If NeonVkPortFontText(@zngFont,x,y,@zngRun[0],r,g,b,1.0,1,1)<>0 : zngFault=4 : ProcedureReturn : EndIf
@@ -90,7 +114,7 @@ Procedure zngPaint()
  cursor=ConGridCurR()-ConViewTop()
  If cursor>=0 And cursor<ConGridRows()
   x=8.0+MathFFromInt(gConCurPen)/65536.0
-  y=MathFFromInt(8+(cursor+1)*zngLineHeight-2)
+  y=MathFFromInt(#ZNG_CONSOLE_TOP+(cursor+1)*zngLineHeight-2)
   If NeonVkPortBox(x,y,2.0,1.0,0.35,0.85,0.95,1.0,1,1)<>0 : zngFault=5 : ProcedureReturn : EndIf
  EndIf
  If NeonVkPortFrameEnd()<>0 : zngFault=6 : ProcedureReturn : EndIf
@@ -106,10 +130,11 @@ Procedure.i ZentajiNeonConsoleStart()
  If AnvilTrueTypeSlotLoad(#ANVIL_TTS_BOOT_SLOT,?anvilBootTtf,#ANVIL_BOOT_TTF_BYTES)<>1 : ProcedureReturn 0 : EndIf
  If AnvilTrueTypeSlotSelect(#ANVIL_TTS_BOOT_SLOT)<>1 : ProcedureReturn 0 : EndIf
  If NeonVkPortFontBind(@zngFont,#ANVIL_TTS_BOOT_SLOT,#NEON_FONT_UI,16)<>0 : ProcedureReturn 0 : EndIf
+ If NeonVkChromeLogoSource(?anvilPix,#ANVIL_PIC_W,#ANVIL_PIC_H)<>0 : ProcedureReturn 0 : EndIf
  If ZentajiNeonSurfaceStartCapacities(#NEON_VK_CHROME_MAX_QUADS,#CON_CELLS+1)<>1 : ProcedureReturn 0 : EndIf
  zngLineHeight=NeonVkPortFontLineHeight(@zngFont)
  If zngLineHeight<1 : ProcedureReturn 0 : EndIf
- cols=(znsWidth-16)/4 : rows=(znsHeight-16)/zngLineHeight
+ cols=(znsWidth-16)/4 : rows=(znsHeight-#ZNG_CONSOLE_TOP-8)/zngLineHeight
  If cols<1 Or rows<1 : ProcedureReturn 0 : EndIf
  If cols>#CON_MAXCOLS : cols=#CON_MAXCOLS : EndIf
  If rows>#CON_MAXROWS : rows=#CON_MAXROWS : EndIf

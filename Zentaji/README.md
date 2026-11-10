@@ -9,6 +9,16 @@
 
 # Zentaji backend bring-up
 
+The resident monitor uses the existing Anvil banner composition in
+`Anvil/Graphics/Vulkan/neon_vk_banner.pbi`: PureMetal Forge title, ANVIL logo,
+platform/build identity and clock caption. The Pi4 path is a compatibility
+include of that same source. Zentaji supplies its own identity and native
+presentation, with console rows below the reserved 128-pixel top band.
+The boot-only graphical check verifies all 5624 logo pixels, the orange rule
+and console band on Anvil itself, without compiling or loading an application.
+The current adapter still redraws the complete console on a model change;
+preserving the completed image and repainting dirty rows/bands remains owed.
+
 Resident graphical applications use Anvil's existing slot38 Neon service and
 retained-UI client. Protocol ownership and dispatch are shared with Pi4;
 Zentaji supplies native surface/presentation and return-cleanup hooks.

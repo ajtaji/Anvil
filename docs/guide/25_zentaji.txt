@@ -165,6 +165,14 @@ Anvil TrueType library on Zentaji. The immutable boot-font data is reused;
 no bitmap substitute or separate terminal model is introduced. Serial output
 remains the diagnostic transport. Screen-only prompt styles remain metadata.
 
+The monitor itself includes Anvil's existing PureMetal Forge title, ANVIL
+logo, platform/build identity and wall-clock caption. The banner composition
+is shared with the Pi4 composition; Zentaji supplies its own identity and
+native presentation. Console rows begin below the reserved 128-pixel top band.
+The boot-only graphical check compares every one of the 5624 logo pixels
+against the immutable RGB asset, checks the orange rule and reserved band,
+and captures the actual monitor prompt without loading a test application.
+
 The board admits one graphics arena before settings or application staging.
 Its size covers four full-size images plus 16MB of queue/resource storage.
 The arena stays protected for the monitor's lifetime. A 128MB machine with a
@@ -174,7 +182,9 @@ text reservation but cannot admit the graphics arena. Consult the boot JSON
 for the image's minimum RAM; the complete renderer has a larger image than
 the earlier serial-only composition.
 
-The console paints only dirty model state. Atlas preparation occurs before
+A dirty model triggers painting. The current adapter redraws the complete
+console and banner; Pi4-style dirty-row/band optimization remains owed.
+Atlas preparation occurs before
 FrameBegin; the frame is presented through native GPU/DMA ownership and the
 real display latch. The prompt scheduler supplies screen updates while input
 is waiting and retains the existing timer/WFI idle path.
