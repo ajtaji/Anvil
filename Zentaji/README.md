@@ -36,6 +36,23 @@ startup, protected memory admission, public Vulkan image/allocation/barrier/
 clear/fence calls, native display latch and an independent expected frame CRC.
 It releases scanout before destroying the live Vulkan image/allocation.
 
+Lib/Vulkan/vk_zentaji_shader.pbi now lowers verified typed IR into native
+GPU shader code. It resolves declared input locations and block offsets,
+supports scalar/vector constants, loads, composite extract/construct, stores
+and float32 add/subtract/multiply, and records required push/uniform extents.
+Vertex bindings include per-instance inputs. A target flag adapts Vulkan's
+positive viewport Y to the native rasterizer without changing the SSA value.
+Code is published only after successful validation and bounded emission;
+unsupported operations and exhausted code/register storage leave it unchanged.
+
+The native-only tools/zentaji_shader_check.py executes real SPIR-V parsing,
+typed-IR adaptation and generated shaders on the GPU. Six cases check exact
+triangle pixels, interpolated RGB, push/UBO reads, scalar/vector arithmetic,
+viewport orientation, padding/guards and atomic refusal. It separately compares
+one generated shader against independent assembly. Shader sampling and the
+remaining IR operations are still refused, and this module does not enable a
+Vulkan draw capability until backend pipeline/submission integration is proven.
+
 These components are not yet connected to the counted monitor composition or
 the resident shared Vulkan/Neon Arcade presentation adapter. The shipped monitor remains
 text; shader/draw/transfer/sampling integration and graphical boot remain owed.
@@ -43,6 +60,7 @@ text; shader/draw/transfer/sampling integration and graphical boot remain owed.
 ```text
 python tools/zentaji_graphics_memory_check.py --compiler <Forge executable> --zen-tools <tools/zentaji directory>
 python tools/zentaji_vulkan_present_check.py --compiler <Forge executable> --zen-tools <tools/zentaji directory>
+python tools/zentaji_shader_check.py --compiler <Forge executable> --zen-tools <tools/zentaji directory>
 ```
 
 ## Native text output
