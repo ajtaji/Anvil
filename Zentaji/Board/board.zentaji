@@ -1,8 +1,9 @@
+EnableFloatingPoint
 ; Zentaji serial/storage monitor composition. The ROM loads the owned startup
 ; envelope; Main receives its validated table/source/context, never ARM registers.
-#ANVIL_BUILD = 21 ; pmf:build
+#ANVIL_BUILD = 22 ; pmf:build
 #ANVIL_BUILD_DATE = 20261110 ; pmf:builddate
-#ANVIL_BUILD_TIME = 055158 ; pmf:buildtime
+#ANVIL_BUILD_TIME = 082606 ; pmf:buildtime
 #CAP_TOUCH=0
 #CAP_PWM=0
 #CAP_NET=0
@@ -63,6 +64,7 @@ XIncludeFile "Zentaji/Board/payload.pbi"
 XIncludeFile "Anvil/Core/pmfboot.pbi"
 XIncludeFile "Anvil/Core/bootfile_cmd.pbi"
 XIncludeFile "Anvil/Core/command_loop.pbi"
+XIncludeFile "Zentaji/Board/neon_console.pbi"
 
 Procedure ZentajiShellHelp()
  PrintN("Anvil Zentaji commands:")
@@ -80,6 +82,7 @@ Procedure.i HwCommandLoopHook(phase.i)
   UartScreenStyle(#UART_SCREEN_STYLE_PROMPT)
  EndIf
  If phase=#ACMD_AFTER_PROMPT
+  If ZentajiNeonConsolePump()<>1 : ZentajiPayloadRecoveryFailed($5C01,"Console graphics failed (0x5C01): the prompt could not be presented.") : EndIf
   UartScreenStyle(#UART_SCREEN_STYLE_NORMAL)
   UartDrain()
  EndIf
@@ -133,18 +136,31 @@ Procedure.i HwCommandDispatch(c.i)
  ProcedureReturn 1
 EndProcedure
 Procedure.i Main(table.i,source.i,context.i)
+ Protected graphicsWidth.i,graphicsHeight.i,graphicsBytes.i
  If ZentajiMemoryBind(context)<>1
   ZentajiPayloadRecoveryFailed($5B04,"Startup memory layout failed (0x5B04): check the owned context and increase RAM to leave at least 4KB for payload staging.")
   ProcedureReturn 1
  EndIf
  If table<>PeekQ(context+#ZEN_BOOT_TABLE) Or source<>PeekQ(context+#ZEN_BOOT_SOURCE) : ProcedureReturn 1 : EndIf
- ; Text admission is optional on small profiles; serial remains available.
- ZentajiMemoryTextInit(table)
- ZentajiTextServiceStart()
+ ; Admit one display owner before settings or payload staging. Use the
+ ; existing cell-text provider only when the fitted RAM cannot hold graphics.
+ graphicsWidth=PeekQ(#ZEN_DISPLAY+$50) : graphicsHeight=PeekQ(#ZEN_DISPLAY+$58)
+ If graphicsWidth>=64 And graphicsWidth<=8192 And graphicsHeight>=64 And graphicsHeight<=8192
+  graphicsBytes=graphicsWidth*graphicsHeight*16+$1000000
+  If graphicsBytes<=zenMemoryStackBottom-zenMemoryPayload-4096
+   If ZentajiMemoryGraphicsInit(graphicsBytes)<>1 : ProcedureReturn 5 : EndIf
+  EndIf
+ EndIf
+ If zenMemoryGraphicsBase=0
+  ZentajiMemoryTextInit(table) : ZentajiTextServiceStart()
+ EndIf
  ; This board owns core0's timer/IRQ routing. No other core is started here.
  PokeQ(#ZEN_IDLE_INTC+$120,3) : PokeQ(#ZEN_IDLE_INTC+$220,3)
  PokeQ(#ZEN_IDLE_INTC+$228,1) : PokeQ(#ZEN_IDLE_INTC+$F008,514)
  If ZentajiPromptIdlePrepare(2000)<>1 Or UartAttach()<>1 : ProcedureReturn 2 : EndIf
+ If zenMemoryGraphicsBase<>0
+  If ZentajiNeonConsoleStart()<>1 Or ZentajiNeonConsoleBind()<>1 : ZentajiPayloadRecoveryFailed($5C01,"Console graphics failed (0x5C01): TrueType/Vulkan startup could not acquire the display.") : EndIf
+ EndIf
  gBootTicks=Ticks()
  MessagesStart()
  If WallClockInit()<>1 : ProcedureReturn 3 : EndIf
@@ -170,6 +186,7 @@ Procedure.i Main(table.i,source.i,context.i)
  AnvilCommandLoop()
  PrintN("Anvil stopped.") : UartDrain()
  If ZentajiInputPayload(1,0)=0 : ZentajiPayloadRecoveryFailed($5B06,"Monitor exit failed (0x5B06): native input ownership changed.") : EndIf
+ If ZentajiNeonConsoleStop()<>1 : ZentajiPayloadRecoveryFailed($5C01,"Monitor exit failed (0x5C01): graphics work could not retire.") : EndIf
  If ZentajiTextRelease()=0 : ZentajiPayloadRecoveryFailed($5B05,"Monitor exit failed (0x5B05): native text or display ownership changed.") : EndIf
  If ZentajiPromptIdleRelease()=0 : ProcedureReturn 4 : EndIf
  UartOff()

@@ -1,6 +1,6 @@
 @CHAPTER Anvil on Zentaji
 
-@INTRO Zentaji is a custom emulated computer with its own 64-bit instruction set. Its boot ROM loads Anvil as the selected bootloader and resident monitor. The current production composition reaches a text prompt; the native GPU components are qualified separately and do not yet provide the Neon Arcade desktop.
+@INTRO Zentaji is a custom emulated computer with its own 64-bit instruction set. Its boot ROM loads Anvil as the selected bootloader and resident monitor. The production composition now presents its shared terminal through the Neon/Vulkan renderer and the existing TrueType library when the fitted RAM admits graphics. The full Neon Arcade desktop and self-hosted Forge remain unfinished.
 
 @SECTION Build and boot
 
@@ -126,7 +126,7 @@ before releasing pins. Uncertain retirement keeps the resources until reset.
 
 Native cases check two GPU colors in private planes, scanout CRCs, unchanged
 shown pixels and row/page guards. DMA ownership loss quarantines the writer and
-GPU lease. Resident Neon/fonts remain unfinished; the monitor still boots to text.
+GPU lease. The resident monitor now uses this ownership path for its shared Neon/TrueType console. Full desktop integration remains unfinished.
 
 @SECTION One console model across CPU architectures
 
@@ -146,8 +146,7 @@ concrete signatures let the Zentaji backend compile their indirect calls.
 The production Forge/native Zentaji console-grid check verifies exact characters,
 styles and cursor, callback order, unregister/reset, wrap/scroll and 10001 bytes
 without loss. The A64 emitted check also passes four capture rotations, RLE CRCs,
-45150 lossless bytes and styled terminal operations. These are model/component
-proofs. The Zentaji monitor's resident graphical prompt is still unfinished.
+45150 lossless bytes and styled terminal operations. The resident monitor now paints this same model through its native Neon/Vulkan endpoint.
 
 The Zentaji serial transport feeds these shared screen and auxiliary taps only
 after an accepted write. Diverted background messages and refused writes never
@@ -157,7 +156,53 @@ disabled until a consumer activates them. Native transport/model checks cover
 25 cases, including independent byte/style streams, bounded overflow and 10001
 UART bytes drained into the shared model without loss. ROM boot, storage, native
 text, keyboard editing and sleeping input remain qualified in the counted monitor.
-These taps prepare the renderer connection; they do not enable a graphical prompt.
+The resident graphics endpoint now consumes the screen tap and paints the same model.
+
+@SECTION Resident graphical console
+
+The counted monitor now boots the existing shared Neon/Vulkan renderer and
+Anvil TrueType library on Zentaji. The immutable boot-font data is reused;
+no bitmap substitute or separate terminal model is introduced. Serial output
+remains the diagnostic transport. Screen-only prompt styles remain metadata.
+
+The board admits one graphics arena before settings or application staging.
+Its size covers four full-size images plus 16MB of queue/resource storage.
+The arena stays protected for the monitor's lifetime. A 128MB machine with a
+640x480 display is the qualified graphical profile. Smaller profiles can use
+the existing native cell-text endpoint if they fit the published image and
+text reservation but cannot admit the graphics arena. Consult the boot JSON
+for the image's minimum RAM; the complete renderer has a larger image than
+the earlier serial-only composition.
+
+The console paints only dirty model state. Atlas preparation occurs before
+FrameBegin; the frame is presented through native GPU/DMA ownership and the
+real display latch. The prompt scheduler supplies screen updates while input
+is waiting and retains the existing timer/WFI idle path.
+
+Before entering a returning PMF application, the monitor retires graphics
+work and releases the queue, display and DMA channel. CPU-side renderer objects
+remain in protected monitor RAM. On return, ownership is validated before
+rebinding and repainting the retained model. A foreign or uncertain owner
+stops the monitor rather than displaying a false restored prompt.
+
+These checks run the published image through the actual machine ROM. Replace
+ZEN with the installed native-tools directory and PROOF with a capture folder.
+
+@FRAG
+python tools/zentaji_graphical_boot_check.py --zen-tools ZEN --keep PROOF
+@ENDFRAG
+
+Add --exercise to send real serial commands, load a compiler-produced PMF
+from the real filesystem, verify its hash, execute it and check its returned
+value and RAM effect. The graphical prompt must survive the application.
+The captured PNG comes from the native displayed plane. The check refuses
+cell-text output, missing presentation, stale source hashes or Vulkan faults.
+
+The separate zentaji_neon_surface_check.py also checks two exact font frames
+against independent geometry, 514 glyph quads in two draws, a 12000-quad vertex
+buffer, its untouched tail, preserved display planes and clean shutdown.
+These are native execution proofs; visible host-window and physical-input
+acceptance retain their separate scopes.
 
 @SECTION Evidence and remaining work
 

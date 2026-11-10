@@ -4,6 +4,18 @@
 ; owners and call them through the actual shared ABI. Both paths verify return
 ; ownership before a prompt; failed recovery halts, never a false prompt.
 XIncludeFile "Anvil/Kernel/Zentaji/payload_call.pbi"
+; Optional graphics-owner handoff installed by the board composition.
+; The shared payload path keeps its serial/text behavior without a renderer.
+Procedure.i ZentajiPayloadGraphicsAbsent() : ProcedureReturn 1 : EndProcedure
+Global *zenPayloadGraphicsDown=@ZentajiPayloadGraphicsAbsent
+Global *zenPayloadGraphicsUp=@ZentajiPayloadGraphicsAbsent
+Procedure.i ZentajiPayloadGraphicsBind(down.i,up.i)
+ If (down=0 And up<>0) Or (down<>0 And up=0) : ProcedureReturn 0 : EndIf
+ *zenPayloadGraphicsDown=@ZentajiPayloadGraphicsAbsent
+ *zenPayloadGraphicsUp=@ZentajiPayloadGraphicsAbsent
+ If down<>0 : *zenPayloadGraphicsDown=down : *zenPayloadGraphicsUp=up : EndIf
+ ProcedureReturn 1
+EndProcedure
 Global zenPayTimer.q,zenPayConfig.q,zenPayRoute.q,zenPayRouteMask.q,zenPayEnable.q,zenPayThreshold.q
 Procedure.i HwPmfTargetId() : ProcedureReturn 1 : EndProcedure
 Procedure.i HwPmfStackAllowed(lo.i,hi.i) : ProcedureReturn InPayload(lo,hi) : EndProcedure
@@ -89,6 +101,7 @@ Procedure.i HwPayloadRun(entry.i,argument.i,stack.i,stackBytes.i)
  zenPayConfig=PeekQ(#ZEN_IDLE_INTC+$120) : zenPayRoute=PeekQ(#ZEN_IDLE_INTC+$220)
  zenPayRouteMask=PeekQ(#ZEN_IDLE_INTC+$228) : zenPayEnable=PeekQ(#ZEN_IDLE_INTC+$F008)
  zenPayThreshold=PeekQ(#ZEN_IDLE_INTC+$F010)
+ If zenPayloadGraphicsDown()<>1 : ZentajiPayloadRecoveryFailed($5B07,"Payload admission failed (0x5B07): graphics ownership could not retire.") : EndIf
  If ZentajiInputPayload(1,services)=0 : ZentajiPayloadRecoveryFailed($5B06,"Payload admission failed (0x5B06): native input ownership changed.") : EndIf
  If services=0
  If ZentajiTextRelease()=0 : ZentajiPayloadRecoveryFailed($5B05,"Payload admission failed (0x5B05): native text or display ownership changed.") : EndIf
@@ -129,6 +142,7 @@ Procedure.i HwPayloadRun(entry.i,argument.i,stack.i,stackBytes.i)
   If UartAttach()=0 Or HwPromptIdleReady()=0 : ZentajiPayloadRecoveryFailed($5B02,"Payload return failed (0x5B02): timer, interrupt or serial ownership changed. Restore device state before returning.") : EndIf
   If hadStorage<>0 And ZentajiDiskOwned()=0 : ZentajiPayloadRecoveryFailed($5B03,"Payload return failed (0x5B03): storage ownership could not be reacquired. Check disk queues and configuration.") : EndIf
  EndIf
+ If zenPayloadGraphicsUp()<>1 : ZentajiPayloadRecoveryFailed($5B07,"Payload return failed (0x5B07): graphics ownership could not be restored.") : EndIf
  If entered=0
   Print("!! the Zentaji CPU entry refused the payload, code ") : PrintDec(code) : PrintN(".")
  Else

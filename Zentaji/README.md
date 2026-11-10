@@ -1,3 +1,12 @@
+> Current graphical-console status (2026-11-10): the counted monitor now
+> boots through the ROM to the shared Neon/Vulkan TrueType prompt. Native
+> 128MB/640x480 acceptance covers real UART commands, a filesystem-loaded
+> returning PMF application, its RAM effect and graphical restoration.
+> `tools/zentaji_graphical_boot_check.py` captures the actual displayed plane;
+> `--exercise` checks the command/application path. Earlier text-only status
+> below records the preceding bring-up. Full desktop, visible/physical input,
+> cross-host graphics and self-hosted Forge remain unfinished.
+
 # Zentaji backend bring-up
 
 The counted Zentaji board now boots Anvil through the machine ROM and owned
