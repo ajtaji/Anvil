@@ -11,14 +11,15 @@ def checksum(data, bits=32, skip=()):
 
 
 def build(part=1,cluster_shift=0):
-    assert 0<=cluster_shift<=3
+    assert 0<=cluster_shift<=6
     cluster_bytes=512<<cluster_shift
-    image=bytearray(((part+2048+7)&-8)*512)
+    sectors=max(2048,(26+128*(1<<cluster_shift)+7)&-8)
+    image=bytearray(((part+sectors+7)&-8)*512)
     def put(at,fmt,*values):struct.pack_into('<'+fmt,image,at,*values)
-    image[450]=7;put(454,'II',part,2048);put(510,'H',0xaa55)
+    image[450]=7;put(454,'II',part,sectors);put(510,'H',0xaa55)
     boot=part*512
     image[boot:boot+11]=b'\xeb\x76\x90EXFAT   '
-    put(boot+64,'QQIIIIIIHH',part,2048,24,2,26,128,4,0x12345678,0x100,0)
+    put(boot+64,'QQIIIIIIHH',part,sectors,24,2,26,128,4,0x12345678,0x100,0)
     image[boot+108:boot+113]=bytes([9,cluster_shift,1,0x80,2])
     for sector in range(11):put(boot+sector*512+510,'H',0xaa55)
     for cl in (2,3,4):put((part+24)*512+cl*4,'I',0xffffffff)

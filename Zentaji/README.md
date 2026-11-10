@@ -22,6 +22,14 @@ of optional Vulkan compute. `tools/zentaji_neon_particles_check.py` checks four
 complete native frames, the 10000-record limit, copied input, wire layout and
 cleanup. Full desktop and platform acceptance remain unfinished.
 
+`tools/zentaji_neon_composed_check.py` builds and runs the existing composed
+application with native input and boot TrueType slot4, captures its real first
+frame, and requires all90 frames and clean return. Its initial native run renders
+9 frames, then fails the existing8-second application budget (-30); this is a
+known timing failure, not completed desktop acceptance. The original budget
+and frame count remain in place. Fixture volumes support larger cluster sizes
+so the composed application fits without changing the guest filesystem.
+
 The counted Zentaji board now boots Anvil through the machine ROM and owned
 supervisor startup. It uses the shared command loop, serial console, clock,
 settings and FAT32/exFAT storage code. Ordinary and service-backed PMFBOOT
