@@ -195,11 +195,15 @@ descriptor batches and proves the retired GPU fence stays intact. Two owner-loss
 cases additionally check repeated public device loss, unsignalled fences and
 retained buffers/memory/images with destruction refused. These are Windows component proofs.
 
-The qualified Linux ASM runtime matches uploaded/copied bytes and preserves the
-GPU fence in the optimal/bilinear case, but 13 red-channel results are one level
-below the independent expectation. An isolated native ASM probe confirms that
-the emulator's current ZG3Rne helper rounds values just above a half downward on
-Linux. Native-core rounding repair and Linux pixel parity remain owed.
+The native-core rounding repair on compiler main `fda44fac5` passes the same Linux optimal/bilinear guest
+that exposed 13 low red-channel results: exact staging/transfer/texture bytes,
+all RGBA pixels, scanout CRC and the retired GPU fence across 100 DMA rows now
+match. A Linux public owner-loss case also retains resources and refuses
+destruction. The native helper passes 29,301 inputs under 12 host floating-point
+configurations on both Windows and Linux. These are headless Linux component
+proofs; full platform, visible-input and physical-device acceptance remain owed.
+Separate native Linux FMATH conformance failures remain under repair; this
+result covers the textured-upload composition.
 Resident font integration and safe ownership of configured display backbuffers
 still precede graphics boot.
 
