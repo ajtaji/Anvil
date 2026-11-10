@@ -216,6 +216,18 @@ The composition pins its source and holds the external GPU lease. The native
 guards, actual scanout CRCs, stale tokens, premature presentation/release and
 real DMA ownership loss. This primitive is not yet the resident Neon adapter.
 
+`Lib/Vulkan/vk_zentaji_present.pbi` connects a public image to this owner.
+`AnvilVkZentajiPresentBegin(image)` returns a writer token while pinning the
+image and its allocation and acquiring the external GPU lease. The image must
+match the display geometry, have BGRA8 format and transfer-source usage, and be
+in GENERAL or TRANSFER_SRC layout. Both linear and this backend's private
+optimal images are supported. Abort releases an unsubmitted writer; Commit
+copies with native DMA and waits for the display latch before dropping pins.
+Uncertain retirement retains the resources and quarantines the GPU lease until
+reset. The composition still has to carve display planes outside the Vulkan
+heap and start the managed display before acquiring a token. Native coverage:
+`tools/zentaji_present_pin_check.py`.
+
 These components are not yet connected to the counted monitor composition or
 the resident shared Vulkan/Neon Arcade presentation adapter. The shipped monitor remains
 text; resident adapter/font integration and graphical boot remain owed.

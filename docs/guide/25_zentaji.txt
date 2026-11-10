@@ -119,13 +119,15 @@ including tokens from before a display restart. Native DMA copies every row;
 the plane becomes ready only after DMA and its producer GPU fence retire.
 Presentation consumes the writer token. A pending plane stays unavailable until
 the actual display latch. A submitted or quarantined writer cannot be aborted
-or released. The composition must pin its source and hold the external GPU lease.
+or released. The Vulkan image presentation bridge pins the source image and its
+allocation and holds the external GPU lease. Begin requires a matching BGRA image
+with transfer-source usage and GENERAL or TRANSFER_SRC layout. Abort releases an
+unsubmitted writer. Commit performs native DMA and waits for the real latch
+before releasing the pins; uncertain retirement keeps them until reset.
 
-Native cases check two distinct GPU colors in separate private planes, their
-scanout CRCs, unchanged shown pixels and row/page guards. A real DMA ownership
-loss leaves the writer and GPU lease quarantined. This is a component boundary;
-resident font integration and the Neon presentation adapter remain unfinished.
-The monitor still boots to text.
+Native cases check two GPU colors in private planes, scanout CRCs, unchanged
+shown pixels and row/page guards. DMA ownership loss quarantines the writer and
+GPU lease. Resident Neon/fonts remain unfinished; the monitor still boots to text.
 
 @SECTION Evidence and remaining work
 
