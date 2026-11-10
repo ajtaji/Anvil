@@ -235,6 +235,9 @@ EndProcedure
 #ANVIL_VK_CAP_TRIANGLE_FAN = $200000
 ; Whole-attachment preservation at render-pass entry, including empty passes.
 #ANVIL_VK_CAP_ATTACHMENT_LOAD = $400000
+; Rendering into the backend's private optimal image layout. This is separate
+; from sampling that layout: a texture-only tiling must not become a target.
+#ANVIL_VK_CAP_OPTIMAL_COLOR_ATTACHMENT = $800000
 
 ; Target-neutral closed-draw blend semantics. A backend maps these values to
 ; its own packet vocabulary; V3D blend-factor numbers never cross this seam.

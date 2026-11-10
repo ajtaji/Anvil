@@ -59,10 +59,9 @@ triangle pixels, interpolated RGB, push/UBO reads, scalar/vector arithmetic,
 viewport orientation, padding/guards and atomic refusal. It separately compares
 one generated shader against independent assembly. Two additional cases execute
 nearest/bilinear sampling through the real ROM and compare complete triangle
-pixels with independent integer-filter expectations. The public backend still
-refuses sampled-image draws until descriptor/pipeline integration is qualified;
-remaining unsupported IR operations are explicit refusals. The native backend
-now connects this lowerer to public Vulkan pipeline creation and draw submission.
+pixels with independent integer-filter expectations. The public backend connects
+this lowerer to Vulkan pipeline creation and sampled-image draw submission;
+remaining unsupported IR operations are explicit refusals.
 
 The native Vulkan backend now advertises opaque drawing and attachment loads.
 Pipeline creation publishes two immutable native shader entries, retaining
@@ -79,7 +78,29 @@ scissored pass with LOAD preserving earlier pixels. Three cases also match an
 independent headless frame CRC. Per-instance attribute addressing is implemented
 but is not claimed as qualified by the instance-count case.
 
-Blend, sampled-image, transfer and ordered draw-list capabilities remain absent.
+Public combined-image descriptors now resolve to a frozen ROM texture table in
+its own region of the protected command page. Pipeline publication checks the
+fragment binding against the portable descriptor contract. Sampling supports
+BGRA8, normalized clamp-to-edge coordinates and equal nearest or linear min/mag
+filters. Different min/mag filters are refused before launch. Linear images use
+their validated row pitch; native optimal images have private tightly packed
+storage with no public row pitch. The portable image-format query and creation
+both require the explicit OPTIMAL_COLOR_ATTACHMENT backend capability before
+accepting optimal render targets; texture-only backends retain their refusals.
+The native backend advertises that capability and resets its texture-table state
+on every draw, including a subsequent untextured pipeline.
+
+tools/zentaji_vulkan_sample_check.py renders the source texture on the real GPU,
+transitions it with a public barrier, then samples it through a second public
+pipeline. Four cases cover linear/optimal source images and nearest/bilinear
+filters. Independent integer-filter expectations check every RGBA pixel,
+including fractional alpha on the filtered edge, unchanged source pixels and
+exact native scanout CRC. Shader modules are destroyed before use; the flight
+ledger must retain the sampler, image and view until retirement. Closed-record
+probes check bounds, filter/layout/pitch refusals, null/truncated descriptors
+and source/target aliasing without changing the queue.
+
+Blend, transfer and ordered draw-list capabilities remain absent.
 In particular, native blend mode 1 and the shared API validator currently use
 different alpha equations; do not advertise blend until the contract is resolved
 and exact alpha/colour pixels are qualified. The resident Neon Arcade adapter
@@ -87,13 +108,14 @@ still needs these remaining capabilities and production composition wiring.
 
 These components are not yet connected to the counted monitor composition or
 the resident shared Vulkan/Neon Arcade presentation adapter. The shipped monitor remains
-text; shader/draw/transfer/sampling integration and graphical boot remain owed.
+text; resident adapter integration, transfer and graphical boot remain owed.
 
 ```text
 python tools/zentaji_graphics_memory_check.py --compiler <Forge executable> --zen-tools <tools/zentaji directory>
 python tools/zentaji_vulkan_present_check.py --compiler <Forge executable> --zen-tools <tools/zentaji directory>
 python tools/zentaji_shader_check.py --compiler <Forge executable> --zen-tools <tools/zentaji directory>
 python tools/zentaji_vulkan_draw_check.py --compiler <Forge executable> --zen-tools <tools/zentaji directory>
+python tools/zentaji_vulkan_sample_check.py --compiler <Forge executable> --zen-tools <tools/zentaji directory>
 ```
 
 ## Native text output

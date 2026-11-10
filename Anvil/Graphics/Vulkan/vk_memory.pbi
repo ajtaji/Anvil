@@ -329,8 +329,10 @@ Procedure.i AnvilVkImageFormatSupport(format.i, imageType.i, tiling.i, usage.i, 
       ProcedureReturn #VK_ERROR_FORMAT_NOT_SUPPORTED
     EndIf
   ElseIf tiling = #VK_IMAGE_TILING_OPTIMAL
-    If (usage & (~(#VK_IMAGE_USAGE_TRANSFER_SRC_BIT | #VK_IMAGE_USAGE_TRANSFER_DST_BIT | #VK_IMAGE_USAGE_SAMPLED_BIT))) <> 0
-      ProcedureReturn #VK_ERROR_FORMAT_NOT_SUPPORTED
+    If (usage & #VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) <> 0
+      If AnvilVkBackendCanDraw() = 0 Or (avkBackendCaps() & #ANVIL_VK_CAP_OPTIMAL_COLOR_ATTACHMENT) = 0
+        ProcedureReturn #VK_ERROR_FORMAT_NOT_SUPPORTED
+      EndIf
     EndIf
   Else
     ProcedureReturn #VK_ERROR_FORMAT_NOT_SUPPORTED

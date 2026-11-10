@@ -206,6 +206,12 @@ Procedure vkGetPhysicalDeviceFormatProperties(physicalDevice.i, format.i, *pForm
     EndIf
     If AnvilVkBackendCanDraw() <> 0
       *pFormatProperties\linearTilingFeatures = *pFormatProperties\linearTilingFeatures | #VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT
+      If (avkBackendCaps() & #ANVIL_VK_CAP_OPTIMAL_COLOR_ATTACHMENT) <> 0
+        *pFormatProperties\optimalTilingFeatures = *pFormatProperties\optimalTilingFeatures | #VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT
+        If AnvilVkBackendCanBlendSourceOver() <> 0
+          *pFormatProperties\optimalTilingFeatures = *pFormatProperties\optimalTilingFeatures | #VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT
+        EndIf
+      EndIf
     EndIf
     If AnvilVkBackendCanBlendSourceOver() <> 0
       *pFormatProperties\linearTilingFeatures = *pFormatProperties\linearTilingFeatures | #VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT

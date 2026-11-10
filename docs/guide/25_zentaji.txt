@@ -77,10 +77,20 @@ GPU instructions and retains resource requirements independently of source
 shader-module lifetime. Native cases check exact pixels, indexed draws,
 scissor/clear behavior, instances, sample-mask zero and independent scanout CRCs.
 
-The shader component also lowers nearest and bilinear combined-image sampling
-through the machine's actual TEX2D boot-ROM service. Those component cases pass,
-but public Vulkan sampled-image submission is still refused pending descriptor
-integration. Blend, transfer and ordered draw-list capabilities are not enabled.
+Public combined-image descriptors use the machine's actual TEX2D boot-ROM
+service for nearest and bilinear sampling. BGRA8 images use normalized
+clamp-to-edge coordinates and matching minification/magnification filters;
+mixed filters are refused. Source images can use linear or the native backend's
+private optimal layout. An explicit backend capability controls optimal color
+attachments in both the format query and image creation, so a backend that only
+samples optimal images does not acquire render-target support implicitly.
+
+Native public-API cases render a source image on the GPU, transition its layout
+with a barrier, and sample it into a second image. Independent expectations check
+all RGBA pixels, fractional alpha at filtered edges, unchanged source contents,
+in-flight sampler/view/image retention and exact scanout CRCs. Malformed or
+aliased sampled descriptors are refused before launch.
+Blend, transfer and ordered draw-list capabilities are not enabled.
 The resident Neon Arcade adapter and graphics boot composition remain unfinished.
 The counted monitor still boots to text.
 

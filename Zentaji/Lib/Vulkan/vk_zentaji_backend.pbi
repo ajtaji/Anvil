@@ -3,8 +3,8 @@
 ; The boot owner supplies an already protected, permanently pinned RAM window.
 ; Its first page belongs to commands/fences; only later pages are Vulkan memory.
 ; Hardware completion orders coherent RAM writes before fences/status. No CPU
-; pixel fallback is used. Draw uses typed-IR native shader lowering; transfer
-; and sampled-image capabilities remain absent. This backend does not own display.
+; pixel fallback is used. Draw uses typed-IR native shader lowering and the
+; real ROM TEX2D sampler. Transfer remains absent. This backend does not own display.
 #ANVIL_VULKAN_BACKEND_PRESENT=3
 #AVK_ZEN_IMAGE_LAYOUT=3
 #AVK_ZEN_DISPLAY=$FFFF0000000C0000
@@ -38,7 +38,7 @@ EndProcedure
 
 Procedure.i avkBackendCaps()
  If avkZenUp=0 Or avkZenQueue\lost<>0 : ProcedureReturn 0 : EndIf
- ProcedureReturn #ANVIL_VK_CAP_DEVICE | #ANVIL_VK_CAP_CLEAR_COLOR | #ANVIL_VK_CAP_GPU | #ANVIL_VK_CAP_DRAW | #ANVIL_VK_CAP_ATTACHMENT_LOAD
+ ProcedureReturn #ANVIL_VK_CAP_DEVICE | #ANVIL_VK_CAP_CLEAR_COLOR | #ANVIL_VK_CAP_GPU | #ANVIL_VK_CAP_DRAW | #ANVIL_VK_CAP_ATTACHMENT_LOAD | #ANVIL_VK_CAP_OPTIMAL_COLOR_ATTACHMENT
 EndProcedure
 
 Procedure.i avkBackendName()
@@ -145,6 +145,7 @@ Procedure avkBackendRenderAreaGranularity(*out.VkExtent2D)
 EndProcedure
 
 Procedure.i avkBackendSampledMaxDimension2D(tiling.i)
+  If tiling=#VK_IMAGE_TILING_LINEAR Or tiling=#VK_IMAGE_TILING_OPTIMAL : ProcedureReturn 16384 : EndIf
   ProcedureReturn 0
 EndProcedure
 
@@ -154,7 +155,7 @@ Procedure.i avkBackendImagePlan(width.i, height.i, format.i, tiling.i, usage.i, 
  *plan\backendLayout=0 : *plan\paddedWidth=0 : *plan\paddedHeight=0
  If width<1 Or height<1 Or width>16384 Or height>16384 Or format<>#VK_FORMAT_B8G8R8A8_UNORM : ProcedureReturn #VK_ERROR_FORMAT_NOT_SUPPORTED : EndIf
  If tiling<>#VK_IMAGE_TILING_LINEAR And tiling<>#VK_IMAGE_TILING_OPTIMAL : ProcedureReturn #VK_ERROR_FORMAT_NOT_SUPPORTED : EndIf
- If (usage&~(#VK_IMAGE_USAGE_TRANSFER_DST_BIT|#VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT))<>0 : ProcedureReturn #VK_ERROR_FORMAT_NOT_SUPPORTED : EndIf
+ If (usage&~(#VK_IMAGE_USAGE_TRANSFER_DST_BIT|#VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT|#VK_IMAGE_USAGE_SAMPLED_BIT))<>0 : ProcedureReturn #VK_ERROR_FORMAT_NOT_SUPPORTED : EndIf
  *plan\bytes=width*height*4 : *plan\alignment=4096
  *plan\paddedWidth=width : *plan\paddedHeight=height
  If tiling=#VK_IMAGE_TILING_LINEAR
