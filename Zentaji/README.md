@@ -8,6 +8,11 @@ serial on admitted display profiles. Native keyboard/mouse input uses the shared
 event pipeline and resident service; self-hosted Forge remains unfinished. The
 shared monitor owns scheduler and command policy.
 
+Acceptance executes the shipped ASM tools against explicit instruction/register
+effects, bytes/pixels, ABI boundaries and application behavior. Python helpers
+write fixture data or calculate mathematical/byte expectations. Observation
+helpers read native state and take debugger snapshots of native execution.
+
 ## Native graphics bring-up
 
 The graphics components now reserve an immutable, page-aligned arena below the
@@ -115,7 +120,7 @@ python tools/zentaji_boot_check.py --compiler <Forge executable> --zen-tools <to
 ```
 
 The component proof executes the actual compiled console and memory HAL, with
-independent expected cells, protection and guard checks, native/twin CPU/RAM
+independent expected cells, protection and guard checks, native CPU/RAM
 comparison and headless frame hashes. It covers UTF-8/controls/scroll, retained
 mode/font growth, release/reacquisition, ownership refusals and serial fallback.
 The monitor and boot checks use the counted ROM-loaded product. No visible host
@@ -149,7 +154,7 @@ python tools/zentaji_text_live_check.py --compiler <Forge executable> --zen-tool
 
 The component proof executes actual provider/lifetime code with independent
 cell, status and memory-bound expectations, ring-origin/stride/resize cases,
-presentation/timeout, full native/twin CPU/RAM and exact headless frames. The
+presentation/timeout, full native CPU/RAM and exact headless frames. The
 product proof uses ROM disk boot and real separately compiled PMFs to discover
 the table/dispatch, render cells, present and return with both text/input open;
 a damaged text owner must fail-stop before any false prompt. These remain
@@ -196,7 +201,7 @@ The input component compiles the production backend, NUI/focus owners and
 cancellation code. Recorded device events prove exact typed/physical/pointer
 results, held fences, hardware overflow, quarantine recovery, geometry changes,
 explicit flush, bounded pumping and command cancellation, with complete
-native/twin CPU/RAM/device digests. The product checks boot separately compiled
+native CPU/RAM/device digests. The product checks boot separately compiled
 applications from disk through the ROM, real PMF/SHA loader and actual slot39;
 they also cover return with an input session open and unsafe hardware returns.
 The monitor check includes keyboard-only commands, caret editing, sleep
@@ -259,13 +264,13 @@ python tools/zentaji_idle_check.py --compiler <Forge executable> --zen-tools <to
 ```
 
 The check compiles the production backend and shared scheduler, compares complete
-image bytes with independent assembly, and executes 32 native/twin CPU-state and
+image bytes with independent assembly, and executes 32 native CPU-state and
 RAM cases on cores 0 and 1. It exercises reservation and admission failures,
 timer preservation, input admission, early interrupt wake and STATUS preservation.
 Only unrelated service lanes and queued-input providers are adapters. Timer,
 CPU, clock and interrupt behavior use actual emulated hardware. A two-second
 headless live run keeps service lanes active and verifies startup-adjusted CPU
-use below 20%, with exact recorded native/twin replay. This is currently a
+use below 20%, with exact recorded native replay. This is currently a
 Windows execution proof; Linux execution and visible input remain unverified.
 
 `Board/console.pbi` adopts serial port 0 without resetting it, draining RX,
@@ -294,12 +299,12 @@ it dispatches their events without duplicating their implementation.
 python tools/zentaji_console_check.py --compiler <Forge executable> --zen-tools <tools/zentaji directory>
 ```
 
-Twenty native/twin full-state, RAM and exact-output cases cover byte/UTF8
+Twenty native full-state, RAM and exact-output cases cover byte/UTF8
 output, nonconsuming readiness, editing/cancel and cross-line CRLF, pressure,
 drain, adoption/detach, baud validation, DMA ownership and timer-backed input.
 They also check nested/partial/newline message diversion, unbound output,
 drop-newest overflow, FIFO wrap, fatal abandon and unregister/register behavior.
-A two-second headless live input wait also has exact recorded native/twin replay
+A two-second headless live input wait also has exact recorded native replay
 and checks startup-adjusted host CPU below 20%. This is a Windows component
 proof. `Anvil/Core/console_messages.pbi` now owns background-message byte
 routing once for all four transports. A registered drain receives bracketed
@@ -323,13 +328,13 @@ python tools/zentaji_prompt_check.py --compiler <Forge executable> --zen-tools <
 
 This compiles the complete production `parse.pbi`/ReadLine, input queue, editor,
 message log and scheduler with the real Zentaji console/timer backend. Five
-native/twin full-state/RAM/exact-output cases cover editing, cross-line CRLF,
+native full-state/RAM/exact-output cases cover editing, cross-line CRLF,
 case-insensitive words, full-width hex parsing, Ctrl-C, normalized keyboard Tab
 refusal in the log, line truncation and fair background service. Serial Tab is
 intentionally ignored by the existing byte translator; the refusal case feeds
 a normalized key event through the real event API. A two-second live ReadLine
 wait keeps service lanes and message routing active, checks CPU below 20%, and
-has exact recorded native/twin replay. Providers for unavailable display, mouse,
+has exact recorded native replay. Providers for unavailable display, mouse,
 network, radio maintenance and log-file notification are counted test adapters.
 They are not implemented Zentaji devices. This is still a component composition,
 not a complete monitor image, command dispatcher, ROM boot or physical input proof.
@@ -387,7 +392,7 @@ invalid input identity, rows or merged limits refuse before publication.
 python tools/zentaji_startup_check.py --compiler <Forge executable> --zen-tools <tools/zentaji directory>
 ```
 
-Twenty real native/twin full-state/RAM cases check direct entry, RAM rounding,
+Twenty real native full-state/RAM cases check direct entry, RAM rounding,
 owned SP/EVEC/context, rejected table/status/core/source/protection/size/overlap,
 original BSS, minimum stack, callable entry return, damaged-SP BRK and raw TX-block exclusion, NMI and
 watchdog reporting. All64 vector slots are independently checked. Both actual
@@ -455,7 +460,7 @@ therefore acquire that same boot disk without treating disable as cancellation.
 python tools/zentaji_disk_check.py --compiler <Forge executable> --zen-tools <tools/zentaji directory>
 ```
 
-Twenty actual Forge/reference-assembly/native/twin cases compare complete state,
+Twenty actual Forge/reference-assembly/native cases compare complete state,
 RAM and independently expected medium bytes. They cover unaligned and cross-4KB
 I/O, full and partial writes, phase wrap, read-only/bounds/context/ownership
 refusals, flush, device errors, timeout quarantine, late DMA, caller-buffer reuse,
@@ -467,7 +472,7 @@ A further case compiles the unchanged full `Anvil/Storage/fat32.pbi`, binds thes
 real disk callbacks, and runs under Anvil's owned supervisor startup, stack and
 vectors. It mounts an MBR partition, walks root/allocation metadata with expected
 corrupt-chain refusals, reads a fragmented file, rewinds, reads chunks and checks
-EOF/not-found behavior. Native/twin state and RAM match, independent expected file
+EOF/not-found behavior. Native state and RAM match, independent expected file
 bytes match, and the read-only medium stays unchanged. This is a component proof
 with direct owned startup, not the full storage facade, exFAT,
 a writable filesystem transaction proof or the complete monitor command loop.
@@ -480,7 +485,7 @@ python tools/zentaji_disk_boot_check.py --compiler <Forge executable> --zen-tool
 This boots the compiled driver through the actual ROM on disk0 and disk15, enters
 Anvil's owned supervisor startup, and reacquires the same disk. It reads the boot
 header and payload using 512-byte range callbacks, refuses a read-only write,
-closes, reopens and reads again. Full native/twin state and RAM match; independent
+closes, reopens and reads again. Full native state and RAM match; independent
 header/payload bytes match; final queues are empty and disabled; host images stay
 unchanged. The fixture uses the production Forge startup (including its global
 initialization) and a bounded one-million-instruction allowance. The native tools
@@ -507,7 +512,7 @@ empty folder and deletes another file. It verifies writer disarming, read-only
 admission without disk submission, not-found, cross-volume rename refusal and
 refused partition switching while a file is open. Directory enumeration and
 allocation/root walks use their real APIs and callbacks. Each write uses an
-ordinary persistent host disk binding. Full native/twin state and RAM and the
+ordinary persistent host disk binding. Full native state and RAM and the
 host image match. An independent byte-level oracle checks MBR/BPB, both FATs,
 LFN ordering/checksum, dot links, exact file bytes, six reachable allocations
 without leaks, FSInfo free count, clean status and the UTC write timestamp.
@@ -545,7 +550,7 @@ The boot fixture places the selected Anvil executable in the disk boot area and
 an MBR exFAT partition at sector 4096. The ROM loads Anvil and hands over disk 15;
 the production lifecycle adopts that instance, mounts the partition, executes
 the same writable file operations, cleanly releases storage and reopens the
-persisted file. Native/twin full state, RAM and host image match. An independent
+persisted file. Native full state, RAM and host image match. An independent
 oracle checks boot-region checksums and clean flags, unchanged backup and boot
 payload, file entry-set/name hashes, upcase-table checksum, exact file bytes,
 eight reachable bitmap allocations without leaks/crosslinks and UTC timestamps.
@@ -593,7 +598,7 @@ load and execute an application through Anvil's payload ABI.
 python tools/zentaji_storage_lifecycle_check.py --compiler <Forge executable> --zen-tools <tools/zentaji directory>
 ```
 
-Four focused native/twin cases check invalid/non-disk boot contexts, a missing
+Four focused native cases check invalid/non-disk boot contexts, a missing
 selected disk, refusal to adopt or close another queue owner, an invalid volume
 with an acquired disk retained for clean release, and a hardware read-only
 volume. Read-only writes fail before any command submission; pending mount jobs
@@ -626,7 +631,7 @@ python tools/zentaji_commands_check.py --compiler <Forge executable> --zen-tools
 ```
 
 The memory gate executes real owned startup with 2 MB, 4 MB and uneven RAM sizes,
-and through the actual ROM on disk 15. Native/twin full state and RAM agree.
+and through the actual ROM on disk 15. Native full state and RAM agree.
 Independent extents from the packed image and actual RAM check every reported
 region/window edge; shared policy refuses negative, reversed, crossing and
 monitor/stack/ROM-workspace intervals. The gate writes and checks both admitted
@@ -639,7 +644,7 @@ commands create a folder, save 1800 staged bytes to a quoted long path, clear th
 stage and load the file back, list its folder, report a missing file, and refuse
 a load over the running monitor. The independent oracle verifies the complete
 persisted exFAT result, allocation accounting, hashes and timestamps; the staged
-RAM bytes and monitor instruction bytes are independently checked. Native/twin
+RAM bytes and monitor instruction bytes are independently checked. Native
 full state, RAM and host disk match, with expected command echoes/results.
 
 `DispatchStorageCommand()` in `Anvil/Core/fs_cmd.pbi` now owns the storage word
@@ -697,7 +702,7 @@ work/pumping, active rebinding refusal, independent unregister and invalid IDs.
 It also executes the real UART cancellation code: any-byte and Ctrl-C behavior,
 sticky abort without consuming extra bytes, rearm and exact output. A real
 unbound ReadLine wait checks startup-adjusted host CPU below 20% of one core over
-two seconds, with exact recorded native/twin state/RAM replay and a real message
+two seconds, with exact recorded native state/RAM replay and a real message
 log with no file hook. The qualified timer/WFI wake path is unchanged. This is a
 Windows headless execution proof; visible device input and Linux are still owed.
 The existing registered-adapter prompt and idle gates remain separate regressions.
@@ -726,7 +731,7 @@ firmware argument capture and shutdown stay in each board's Main.
 python tools/zentaji_command_loop_check.py --compiler <Forge executable> --zen-tools <tools/zentaji directory>
 ```
 
-Three real-UART native/twin cases check `.B/.W/.l` handling and reset, exact
+Three real-UART native cases check `.B/.W/.l` handling and reset, exact
 one-command force expiry, `measure` and its bare/nested refusals, empty input,
 unknown words and 24-byte display cap, all hook phases in order, and stopping
 before the prompt or after input without dispatch or state preparation. The
@@ -785,7 +790,7 @@ python tools/zentaji_build_rollback_check.py --compiler <Forge executable>
 
 These gates consume the counted published image. They verify source-map identity
 and independent assembly, ROM disk15 and host-file boot, actual version/layout,
-time/sleep and file commands, clean halt, full native/twin state and RAM, and an
+time/sleep and file commands, clean halt, full native state and RAM, and an
 independent exFAT allocation/content/timestamp oracle. The host-file case has no
 disk and verifies honest storage refusal. The publication test performs a real
 second compile and injects a failure at the third artifact rename, requiring all
@@ -795,7 +800,7 @@ The Windows headless live proof compares six-second sessions using `sleep 0`
 and `sleep 2`, including ROM startup, real timer wakes and halt. Both consumed
 0.15625 seconds of host CPU in this run; the incremental cost was below the host
 accounting resolution. Recorded clock/work samples replay exactly through the
-native emulator and independent twin. This is not a Linux or physical-input
+native CLI and native observation instrument. This is not a Linux or physical-input
 proof, nor instruction-cost calibration.
 
 The shared FAT32 walker also has typed refusal targets for absent callbacks;
@@ -832,10 +837,10 @@ protection at return halts with explicit exit code $5A01 or $5A02 respectively.
 python tools/zentaji_payload_check.py --compiler <Forge executable> --zen-tools <tools/zentaji directory>
 ```
 
-The 25 native/twin full-state/RAM cases use the actual compiled admission code
+The 25 native full-state/RAM cases use the actual compiled admission code
 and packed startup trampoline. Independent raw guest assembly deliberately
-clobbers kept registers, vectors, masks, FP state, EVEC and SP. Read-only twin
-observers check entry and restored CPU state; native replay must agree exactly.
+clobbers kept registers, vectors, masks, FP state, EVEC and SP. Read-only native debugger
+snapshots check entry and restored CPU state against explicit ABI expectations.
 Repeated launches receive distinct arguments, including zero. Nested calls,
 alignment/range/ownership/context refusals, v1 unavailability, malformed contexts
 and unsafe-return fail-stop are covered, with actual ROM host-file boot cases.
@@ -883,7 +888,7 @@ checks its PMF body/hash/ISA/target/flags/stack against independent assembly, an
 calls those exact bytes twice through the actual admission/startup boundary.
 Direct and ROM host-file cases check argument changes, full-width results,
 restored caller CPU state and unchanged compiled image bytes, with exact full
-native/twin state/RAM agreement. The harness places that PMF body; it does not
+native state/RAM agreement. The harness places that PMF body; it does not
 substitute a product PMF reader or claim public boot-command integration.
 
 The production monitor now admits ordinary and service-backed PMFBOOT
@@ -940,7 +945,7 @@ python tools/zentaji_board_ram_check.py --zen-tools <tools/zentaji directory>
 The boot gate consumes the counted image and a real compiler PMF. It exercises
 actual ROM disk15 -> command -> shared file/memory/hash/entry paths, repeated
 return, metadata/stack/alignment/length/digest refusals, real service-table calls, truncated memory
-source bounds and unsafe hardware return. It compares complete native/twin CPU
+source bounds and unsafe hardware return. It compares complete native CPU
 state, RAM, exact persisted medium and immutable monitor instructions. The
 power-cycle gate provisions settings through real commands, then checks automatic
 entry, the persisted failure guard, acknowledgement and cancelled countdown with
@@ -980,7 +985,7 @@ The component proof calls the actual RTC and shared slots, including a read whos
 SECONDS/NANOS accesses straddle a second boundary. It checks a disabled capability,
 null output, bounds and guards, and compares the production snapshot formatter
 with independent calendar results at leap days and date/nanosecond limits.
-Native and twin CPU state/RAM agree. The counted monitor proof reads UTC through
+Native CLI and observation runs agree on CPU state and RAM. The counted monitor proof reads UTC through
 an actual compiled PMF twice, after manual time/timezone changes, with independent
 RTC-time brackets and persisted file checks. These are deterministic headless
 proofs; live host civil time and Linux/visible-window execution remain separate.
