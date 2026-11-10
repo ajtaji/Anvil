@@ -37,6 +37,7 @@ Global fakeClear0.i
 Global fakeClear1.i
 Global fakeClear2.i
 Global fakeClear3.i
+Global fakeCapacityCreates.i,fakeDrawBudget.i,fakeVertexBudget.i
 
 Procedure.i FakeBox(x.i, y.i, w.i, h.i, colour.i) : ProcedureReturn #NEON_OK : EndProcedure
 Procedure.i FakeText(font.i, x.i, y.i, *s, colour.i) : ProcedureReturn #NEON_OK : EndProcedure
@@ -58,6 +59,12 @@ Procedure.i NeonVkChromeCreate(physicalDevice.i, device.i, queue.i, commandPool.
     ProcedureReturn 99
   EndIf
   ProcedureReturn 0
+EndProcedure
+
+Procedure.i NeonVkChromeCreateWithCapacities(physicalDevice.i, device.i, queue.i, commandPool.i, renderPass.i, framebuffer.i, width.i, height.i, maxDraws.i, maxVertexQuads.i)
+  fakeCapacityCreates=fakeCapacityCreates+1
+  fakeDrawBudget=maxDraws : fakeVertexBudget=maxVertexQuads
+  ProcedureReturn NeonVkChromeCreate(physicalDevice,device,queue,commandPool,renderPass,framebuffer,width,height,maxDraws)
 EndProcedure
 
 Procedure.i NeonVkChromeBegin(*clearValue)
@@ -113,6 +120,14 @@ Procedure.i NeonVkLifecycleBinderGate()
   If NeonShutdown() <> #NEON_ERR_BACKEND Or Neon_Ready() = 0 Or NeonDrawBackendActive() = 0 Or NeonVkLifecycleConfigured() <> 1 : ProcedureReturn 71 : EndIf
   fakeDestroyRc = 0
   If NeonShutdown() <> #NEON_OK Or Neon_Ready() <> 0 Or NeonDrawBackendActive() <> 0 Or NeonVkLifecycleConfigured() <> 0 : ProcedureReturn 7 : EndIf
+  If NeonVkLifecycleConfigureCapacities(@cfg,-1) <> #NEON_ERR_ARGS Or NeonVkLifecycleConfigured() <> 0 : ProcedureReturn 26 : EndIf
+  cfg\maxQuads=256
+  If NeonVkLifecycleConfigureCapacities(@cfg,12000) <> #NEON_OK : ProcedureReturn 27 : EndIf
+  If NeonInit() <> #NEON_OK Or fakeCapacityCreates <> 1 Or fakeDrawBudget <> 256 Or fakeVertexBudget <> 12000 : ProcedureReturn 28 : EndIf
+  If NeonShutdown() <> #NEON_OK Or nvlMaxVertexQuads <> 0 : ProcedureReturn 29 : EndIf
+  If NeonVkLifecycleConfigure(@cfg) <> #NEON_OK Or NeonInit() <> #NEON_OK : ProcedureReturn 30 : EndIf
+  If fakeCapacityCreates <> 1 Or nvlMaxVertexQuads <> 0 Or fakeCreateCount <> 4 : ProcedureReturn 31 : EndIf
+  If NeonShutdown() <> #NEON_OK Or fakeDestroyCount <> 4 : ProcedureReturn 32 : EndIf
   If NeonLifecycleUseNative() <> #NEON_OK : ProcedureReturn 8 : EndIf
   If binderNativeCalls <> 0 : ProcedureReturn 9 : EndIf
   ProcedureReturn 0

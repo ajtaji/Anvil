@@ -17,7 +17,10 @@ Global anvil_ttr_error.i
 Global anvil_ttr_count.i
 Global anvil_ttr_edges.i
 Global anvil_ttr_revision.i
-Global *anvil_ttr_alpha_handler = 0
+; A concrete scalar default supplies the callable signature on every target.
+; Optional optimized converters use this same buffer/count/capacity contract.
+Declare.i anvil_ttr_CoverageCountsToAlphaScalar(buffer.i,pixelCount.i,capacity.i)
+Global *anvil_ttr_alpha_handler = @anvil_ttr_CoverageCountsToAlphaScalar
 Global Dim anvil_ttr_points.a[#ANVIL_TTR_MAX_POINTS*12]
 Global Dim anvil_ttr_contours.i[#ANVIL_TTR_MAX_CONTOURS]
 Global Dim anvil_ttr_x1.i[#ANVIL_TTR_MAX_EDGES]
@@ -153,17 +156,18 @@ EndProcedure
 
 ; Install an optional trusted converter; zero always selects scalar.
 Procedure.i AnvilTrueTypeRasterAlphaHandlerSet(*handler)
-  *anvil_ttr_alpha_handler=*handler
+  If *handler=0
+    *anvil_ttr_alpha_handler=@anvil_ttr_CoverageCountsToAlphaScalar
+  Else
+    *anvil_ttr_alpha_handler=*handler
+  EndIf
   ProcedureReturn 1
 EndProcedure
 
-Procedure.i AnvilTrueTypeCoverageCountsToAlpha(buffer.i,pixelCount.i,capacity.i)
+Procedure.i anvil_ttr_CoverageCountsToAlphaScalar(buffer.i,pixelCount.i,capacity.i)
   Protected n.i, value.i
   If pixelCount<0 Or capacity<pixelCount Or (pixelCount>0 And buffer=0)
     ProcedureReturn 0
-  EndIf
-  If *anvil_ttr_alpha_handler<>0
-    ProcedureReturn anvil_ttr_alpha_handler(buffer,pixelCount,capacity)
   EndIf
   For n=0 To pixelCount-1
     value=PeekA(buffer+n)&$FF
@@ -174,6 +178,16 @@ Procedure.i AnvilTrueTypeCoverageCountsToAlpha(buffer.i,pixelCount.i,capacity.i)
     PokeA(buffer+n,(value*255+8)/16)
   Next
   ProcedureReturn 1
+EndProcedure
+
+Procedure.i AnvilTrueTypeCoverageCountsToAlpha(buffer.i,pixelCount.i,capacity.i)
+  If pixelCount<0 Or capacity<pixelCount Or (pixelCount>0 And buffer=0)
+    ProcedureReturn 0
+  EndIf
+  If *anvil_ttr_alpha_handler<>0
+    ProcedureReturn anvil_ttr_alpha_handler(buffer,pixelCount,capacity)
+  EndIf
+  ProcedureReturn anvil_ttr_CoverageCountsToAlphaScalar(buffer,pixelCount,capacity)
 EndProcedure
 
 Procedure.i AnvilTrueTypeRasterizeGlyph(glyph.i,pixelHeight.i,coverage.i,capacity.i,widthOut.i,heightOut.i,strideOut.i,bearingXOut.i,bearingYOut.i,advanceOut.i)

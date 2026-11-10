@@ -16,6 +16,7 @@ Structure NeonVkLifecycleConfig
 EndStructure
 
 Declare.i NeonVkChromeCreate(physicalDevice.i, device.i, queue.i, commandPool.i, renderPass.i, framebuffer.i, width.i, height.i, maxQuads.i)
+Declare.i NeonVkChromeCreateWithCapacities(physicalDevice.i, device.i, queue.i, commandPool.i, renderPass.i, framebuffer.i, width.i, height.i, maxDraws.i, maxVertexQuads.i)
 Declare.i NeonVkChromeBegin(*clearValue)
 Declare.i NeonVkChromeEnd()
 Declare NeonVkChromeDestroy()
@@ -31,12 +32,17 @@ Global nvlFramebuffer.i
 Global nvlWidth.i
 Global nvlHeight.i
 Global nvlMaxQuads.i
+Global nvlMaxVertexQuads.i
 Global Dim nvlClear.l[4]
 
 Procedure.i nvlInit()
   Protected r.i
   If nvlConfigured = 0 : ProcedureReturn #NEON_ERR_BACKEND : EndIf
-  r = NeonVkChromeCreate(nvlPhysical, nvlDevice, nvlQueue, nvlCommandPool, nvlRenderPass, nvlFramebuffer, nvlWidth, nvlHeight, nvlMaxQuads)
+  If nvlMaxVertexQuads = 0
+    r = NeonVkChromeCreate(nvlPhysical, nvlDevice, nvlQueue, nvlCommandPool, nvlRenderPass, nvlFramebuffer, nvlWidth, nvlHeight, nvlMaxQuads)
+  Else
+    r = NeonVkChromeCreateWithCapacities(nvlPhysical, nvlDevice, nvlQueue, nvlCommandPool, nvlRenderPass, nvlFramebuffer, nvlWidth, nvlHeight, nvlMaxQuads, nvlMaxVertexQuads)
+  EndIf
   If r <> 0
     ; Shared lifecycle retains the failed init's cleanup obligation. The
     ; caller must use NeonShutdown(), which reaches checked destruction even
@@ -67,12 +73,16 @@ Procedure.i nvlShutdown()
     ProcedureReturn #NEON_ERR_BACKEND
   EndIf
   nvlConfigured = 0
+  nvlMaxVertexQuads = 0
   ProcedureReturn #NEON_OK
 EndProcedure
 
 ; Configuration is complete before lifecycle selection. No partial config is
 ; published if validation or callback installation refuses.
-Procedure.i NeonVkLifecycleConfigure(*cfg.NeonVkLifecycleConfig)
+; Zero vertexQuads retains the established coupled-budget entry point.
+; A positive budget separates glyph vertices from draw records, without
+; changing the config structure or allocating either resource here.
+Procedure.i NeonVkLifecycleConfigureCapacities(*cfg.NeonVkLifecycleConfig, vertexQuads.i)
   Protected r.i
   If *cfg = 0 Or nvlConfigured <> 0 Or Neon_Ready() <> 0
     ProcedureReturn #NEON_ERR_BACKEND
@@ -80,20 +90,26 @@ Procedure.i NeonVkLifecycleConfigure(*cfg.NeonVkLifecycleConfig)
   If *cfg\physicalDevice = 0 Or *cfg\device = 0 Or *cfg\queue = 0 Or *cfg\commandPool = 0 Or *cfg\renderPass = 0 Or *cfg\framebuffer = 0
     ProcedureReturn #NEON_ERR_ARGS
   EndIf
-  If *cfg\width < 1 Or *cfg\height < 1 Or *cfg\maxQuads < 1
+  If *cfg\width < 1 Or *cfg\height < 1 Or *cfg\maxQuads < 1 Or vertexQuads < 0
     ProcedureReturn #NEON_ERR_ARGS
   EndIf
   nvlPhysical = *cfg\physicalDevice : nvlDevice = *cfg\device : nvlQueue = *cfg\queue
   nvlCommandPool = *cfg\commandPool : nvlRenderPass = *cfg\renderPass : nvlFramebuffer = *cfg\framebuffer
   nvlWidth = *cfg\width : nvlHeight = *cfg\height : nvlMaxQuads = *cfg\maxQuads
+  nvlMaxVertexQuads = vertexQuads
   r = NeonLifecycleInstall(@nvlInit, @nvlBegin, @nvlEnd, @nvlShutdown)
   If r <> #NEON_OK
     nvlPhysical = 0 : nvlDevice = 0 : nvlQueue = 0 : nvlCommandPool = 0
     nvlRenderPass = 0 : nvlFramebuffer = 0 : nvlWidth = 0 : nvlHeight = 0 : nvlMaxQuads = 0
+    nvlMaxVertexQuads = 0
     ProcedureReturn r
   EndIf
   nvlConfigured = 1
   ProcedureReturn #NEON_OK
+EndProcedure
+
+Procedure.i NeonVkLifecycleConfigure(*cfg.NeonVkLifecycleConfig)
+  ProcedureReturn NeonVkLifecycleConfigureCapacities(*cfg, 0)
 EndProcedure
 
 Procedure.i NeonVkLifecycleConfigured()
