@@ -84,6 +84,8 @@ REQUIRED_BLEND_CONTRACT = (
     "V3dClCfgBits(V3dCfgBitsWord(#AVK_V3D_CFG_FWD, #AVK_V3D_CFG_REV, #AVK_V3D_CFG_CW, #AVK_V3D_CFG_DEPTH_ALWAYS) | (1 << 19))",
     "V3dClBlendEnables(1)",
     "V3dClBlendCfg(1, #V3D_BF_INV_SRC_ALPHA, #V3D_BF_SRC_ALPHA, #V3D_BM_ADD, #V3D_BF_INV_SRC_ALPHA, #V3D_BF_SRC_ALPHA, #V3D_BM_ADD)",
+    "ElseIf *d\\blendMode = #ANVIL_VK_BLEND_ALPHA_ONE",
+    "V3dClBlendCfg(1, #V3D_BF_INV_SRC_ALPHA, #V3D_BF_SRC_ALPHA, #V3D_BM_ADD, #V3D_BF_INV_SRC_ALPHA, #V3D_BF_ONE, #V3D_BM_ADD)",
     "V3dClBlendEnables(0)",
 )
 REQUIRED_HOST_COHERENT_BACKEND = (
@@ -455,6 +457,31 @@ def source_contract(text: str) -> list[str]:
                 if token in transfer:
                     failures.append("the Pi 4 buffer transfer contains a CPU copy: " + name)
             render_text = render_text[:start] + render_text[end + len("EndProcedure"):]
+    # These owners write command metadata, never a render target. Exempt only
+    # their exact bounded writes; an added or retargeted write stays forbidden.
+    metadata = (
+        ("avkV3dCompactDraws",
+         ("*out = @avkV3dBatchDraw[count]", "While offset < SizeOf(AnvilVkBackendDraw)", "offset = offset + 8"),
+         ("        PokeI(*out + offset, PeekI(*in + offset))\n",)),
+        ("AnvilVkV3dComputeLower",
+         ("uniformCapacity < #AVK_V3D_COMPUTE_UNIFORM_BYTES", "avkV3dCsdInside(uniformAddr, uniformCapacity) = 0",
+          "uniformAddr > $100000000 - #AVK_V3D_COMPUTE_UNIFORM_BYTES"),
+         tuple("  PokeL(uniformAddr + %d, %s)\n" % (offset, value) for offset, value in
+               ((0, "inputBase"), (4, "outputBase"), (8, "constantBits"), (12, "$0000FFFF"),
+                (16, "16"), (20, "#AVK_V3D_COMPUTE_LOAD_VEC4"), (24, "#AVK_V3D_COMPUTE_LOAD_VEC4"),
+                (28, "#AVK_V3D_COMPUTE_LOAD_VEC4")))),
+    )
+    for name, guards, writes in metadata:
+        start = render_text.find("Procedure.i " + name + "(")
+        end = render_text.find("EndProcedure", start)
+        owner = render_text[start:end] if start >= 0 and end > start else ""
+        if not owner or any(guard not in owner for guard in guards) or any(owner.count(write) != 1 for write in writes):
+            failures.append("the bounded metadata-write contract changed: " + name)
+            continue
+        reviewed = owner
+        for write in writes:
+            reviewed = reviewed.replace(write, "", 1)
+        render_text = render_text[:start] + reviewed + render_text[end:]
     for token in FORBIDDEN_TOKENS:
         if token in render_text:
             failures.append("the backend holds a processor-side fallback token " + token)

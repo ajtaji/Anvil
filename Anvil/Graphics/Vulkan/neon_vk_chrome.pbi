@@ -1454,7 +1454,7 @@ Procedure.i nvcCreateDrawPipelineBlend(fsBytes.i, topology.i, *pipeline, blendEn
   cba\srcColorBlendFactor = #VK_BLEND_FACTOR_SRC_ALPHA
   cba\dstColorBlendFactor = #VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA
   cba\colorBlendOp = #VK_BLEND_OP_ADD
-  cba\srcAlphaBlendFactor = #VK_BLEND_FACTOR_SRC_ALPHA
+  cba\srcAlphaBlendFactor = #VK_BLEND_FACTOR_ONE
   cba\dstAlphaBlendFactor = #VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA
   cba\alphaBlendOp = #VK_BLEND_OP_ADD
   cba\colorWriteMask = #VK_COLOR_COMPONENT_R_BIT | #VK_COLOR_COMPONENT_G_BIT | #VK_COLOR_COMPONENT_B_BIT | #VK_COLOR_COMPONENT_A_BIT

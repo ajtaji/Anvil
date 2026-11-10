@@ -111,7 +111,8 @@ when SRC_ALPHA was requested for alpha. It keeps a wide numerator and rounds
 once at the final UNORM8 write, avoiding the previous approximate destination
 conversion's downward bias at half-alpha boundaries. Its Q16 source precision
 and the native GPU's documented UNORM8 pre-blend quantization have separate
-rational pixel expectations. V3D's existing equation remains unchanged.
+rational pixel expectations. V3D retains that existing equation and also supports the explicit ALPHA_ONE
+equation in both legacy and ordered-list submission paths.
 
 tools/zentaji_vulkan_blend_check.py checks full RGBA with alpha zero, quarter,
 half and one, plus a scissored second pass using attachment LOAD. Native GPU
@@ -126,10 +127,33 @@ all 256 RGBA words, the public queue/fence/cleanup result and an exact scanout
 CRC. This bounded Linux case does not establish visible input or full platform
 acceptance.
 
-Transfer and ordered draw-list capabilities remain absent. Resident Neon
-callers still select the older alpha equation; their portable migration and
-V3D ALPHA_ONE support remain separate work before native resident composition.
-The resident adapter also needs safe ownership of configured display backbuffers.
+The shared Neon textured, line and outline pipeline builders now request ONE
+for source alpha. V3D advertises that exact mode, emits the corresponding alpha
+factor in both submission paths and budgets the extra blend packet on every
+required transition. Its older SRC_ALPHA alpha equation remains available.
+
+tools/zentaji_neon_pipeline_check.py compiles the actual production textured
+pipeline builder and atlas fragment-shader generator into the native test.
+Four GPU cases cover linear/optimal sources and nearest/bilinear filtering,
+including binding1 sampling, push tint, zero UBO, dynamic viewport/scissor and
+ALPHA_ONE blending. Every RGBA pixel and native display CRC is independently
+checked. This qualifies these production components, not ChromeCreate, font
+upload, complete line/outline shader execution or the resident lifecycle.
+
+tools/zentaji_v3d_blend_packets_check.py executes both actual V3D emission
+branches and packet encoders on the Zentaji CPU. Fourteen cases check exact
+command bytes, guards and cached transition sizing for disabled and both alpha
+equations. It also proves the source guard refuses retargeted metadata writes
+and added CPU writes while accepting bounded command-metadata writes.
+tools/zentaji_v3d_list_check.py runs the repaired existing closed-list fixture
+on the native CPU at focused 35/40-list sizes, retaining its independent
+property grader and adding ALPHA_ONE/hostile-mode checks. These V3D checks do
+not execute a Pi4 GPU; that physical pixel proof remains owed. The repaired
+fixture also compiles for Pi4.
+
+Native transfer and ordered draw-list capabilities remain absent. Resident
+resource/upload integration and safe ownership of configured display backbuffers
+still precede the graphics boot composition.
 
 These components are not yet connected to the counted monitor composition or
 the resident shared Vulkan/Neon Arcade presentation adapter. The shipped monitor remains
@@ -143,6 +167,9 @@ python tools/zentaji_vulkan_draw_check.py --compiler <Forge executable> --zen-to
 python tools/zentaji_vulkan_sample_check.py --compiler <Forge executable> --zen-tools <tools/zentaji directory>
 python tools/zentaji_vulkan_blend_check.py --backend native --compiler <Forge executable> --zen-tools <tools/zentaji directory>
 python tools/zentaji_vulkan_blend_check.py --backend software --compiler <Forge executable> --zen-tools <tools/zentaji directory>
+python tools/zentaji_neon_pipeline_check.py --compiler <Forge executable> --zen-tools <tools/zentaji directory>
+python tools/zentaji_v3d_blend_packets_check.py --compiler <Forge executable> --zen-tools <tools/zentaji directory>
+python tools/zentaji_v3d_list_check.py --compiler <Forge executable> --zen-tools <tools/zentaji directory>
 ```
 
 ## Native text output

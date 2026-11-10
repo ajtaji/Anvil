@@ -175,7 +175,7 @@ Procedure.i avkBackendCaps()
   Define caps.i
   If avkV3dWindowBase <= 0 Or avkV3dWindowBytes <= 0 : ProcedureReturn 0 : EndIf
   If NeonHardwareReady() = 0 : ProcedureReturn 0 : EndIf
-  caps = #ANVIL_VK_CAP_DEVICE | #ANVIL_VK_CAP_CLEAR_COLOR | #ANVIL_VK_CAP_GPU | #ANVIL_VK_CAP_DRAW | #ANVIL_VK_CAP_BLEND_SRC_OVER | #ANVIL_VK_CAP_DRAW_LIST | #ANVIL_VK_CAP_CLEAR_ATTACHMENT_RECT | #ANVIL_VK_CAP_TRIANGLE_FAN | #ANVIL_VK_CAP_ATTACHMENT_LOAD
+  caps = #ANVIL_VK_CAP_DEVICE | #ANVIL_VK_CAP_CLEAR_COLOR | #ANVIL_VK_CAP_GPU | #ANVIL_VK_CAP_DRAW | #ANVIL_VK_CAP_BLEND_SRC_OVER | #ANVIL_VK_CAP_BLEND_ALPHA_ONE | #ANVIL_VK_CAP_DRAW_LIST | #ANVIL_VK_CAP_CLEAR_ATTACHMENT_RECT | #ANVIL_VK_CAP_TRIANGLE_FAN | #ANVIL_VK_CAP_ATTACHMENT_LOAD
   CompilerIf #DSP_DMA_LINKED = 1
     ; A linked DMA driver is not an initialized DMA channel. Atlas prewarm
     ; selects the full-image TFU upload until DmaInit has actually succeeded.
@@ -1340,7 +1340,7 @@ Procedure.i avkV3dValidateClosedDraw(*d.AnvilVkBackendDraw, *first.AnvilVkBacken
     ProcedureReturn #ANVIL_VK_ERR_ARGS
   EndIf
   If AnvilVkV3dVaryingComponents(pipe) < 0 Or AnvilVkV3dVaryingComponents(pipe) > 24 : ProcedureReturn #ANVIL_VK_ERR_STATE : EndIf
-  If *d\blendMode <> #ANVIL_VK_BLEND_DISABLED And *d\blendMode <> #ANVIL_VK_BLEND_SRC_OVER
+  If *d\blendMode <> #ANVIL_VK_BLEND_DISABLED And *d\blendMode <> #ANVIL_VK_BLEND_SRC_OVER And *d\blendMode <> #ANVIL_VK_BLEND_ALPHA_ONE
     ProcedureReturn #ANVIL_VK_ERR_ARGS
   EndIf
   If *d\bindingCount < 1 Or *d\bindingCount > #ANVIL_VK_MAX_BINDINGS Or *d\bindings = 0
@@ -1537,7 +1537,7 @@ Procedure.i avkV3dListPacketBytes(*list.AnvilVkBackendDrawList)
       EndIf
       If blend <> *d\blendMode
         bytes = bytes + 6
-        If *d\blendMode = #ANVIL_VK_BLEND_SRC_OVER : bytes = bytes + 5 : EndIf
+        If *d\blendMode = #ANVIL_VK_BLEND_SRC_OVER Or *d\blendMode = #ANVIL_VK_BLEND_ALPHA_ONE : bytes = bytes + 5 : EndIf
         blend = *d\blendMode
       EndIf
       If vary <> AnvilVkV3dVaryingComponents(pipe) : bytes = bytes + 5 : vary = AnvilVkV3dVaryingComponents(pipe) : EndIf
@@ -1641,8 +1641,8 @@ Procedure.i avkV3dSubmitLegacyDraw(*d.AnvilVkBackendDraw)
     avkV3dNative = #VK_ERROR_FEATURE_NOT_PRESENT
     ProcedureReturn -1
   EndIf
-  If *d\blendMode <> #ANVIL_VK_BLEND_DISABLED And *d\blendMode <> #ANVIL_VK_BLEND_SRC_OVER
-    avkFault(#ANVIL_VK_ERR_ARGS, "the Pi 4 Vulkan backend was handed a draw with an unknown normalized blend mode (Anvil code -20001, invalid closed draw); nothing was submitted. The portable pipeline layer must supply either disabled or straight source-over.")
+  If *d\blendMode <> #ANVIL_VK_BLEND_DISABLED And *d\blendMode <> #ANVIL_VK_BLEND_SRC_OVER And *d\blendMode <> #ANVIL_VK_BLEND_ALPHA_ONE
+    avkFault(#ANVIL_VK_ERR_ARGS, "the Pi 4 Vulkan backend was handed a draw with an unknown normalized blend mode (Anvil code -20001, invalid closed draw); nothing was submitted. The portable pipeline layer must supply disabled or one of the two explicitly supported alpha equations.")
     ProcedureReturn -1
   EndIf
 
@@ -1781,6 +1781,11 @@ Procedure.i avkV3dSubmitLegacyDraw(*d.AnvilVkBackendDraw)
       V3dClCfgBits(V3dCfgBitsWord(#AVK_V3D_CFG_FWD, #AVK_V3D_CFG_REV, #AVK_V3D_CFG_CW, #AVK_V3D_CFG_DEPTH_ALWAYS) | (1 << 19))
       V3dClBlendEnables(1)
       V3dClBlendCfg(1, #V3D_BF_INV_SRC_ALPHA, #V3D_BF_SRC_ALPHA, #V3D_BM_ADD, #V3D_BF_INV_SRC_ALPHA, #V3D_BF_SRC_ALPHA, #V3D_BM_ADD)
+    ElseIf *d\blendMode = #ANVIL_VK_BLEND_ALPHA_ONE
+      ; Source-over keeps the source alpha once; RGB retains SRC_ALPHA.
+      V3dClCfgBits(V3dCfgBitsWord(#AVK_V3D_CFG_FWD, #AVK_V3D_CFG_REV, #AVK_V3D_CFG_CW, #AVK_V3D_CFG_DEPTH_ALWAYS) | (1 << 19))
+      V3dClBlendEnables(1)
+      V3dClBlendCfg(1, #V3D_BF_INV_SRC_ALPHA, #V3D_BF_SRC_ALPHA, #V3D_BM_ADD, #V3D_BF_INV_SRC_ALPHA, #V3D_BF_ONE, #V3D_BM_ADD)
     Else
       V3dClCfgBits(V3dCfgBitsWord(#AVK_V3D_CFG_FWD, #AVK_V3D_CFG_REV, #AVK_V3D_CFG_CW, #AVK_V3D_CFG_DEPTH_ALWAYS))
       V3dClBlendEnables(0)
@@ -2155,6 +2160,11 @@ Procedure.i avkBackendSubmitDraw(*payload)
             V3dClCfgBits(V3dCfgBitsWord(#AVK_V3D_CFG_FWD, #AVK_V3D_CFG_REV, #AVK_V3D_CFG_CW, #AVK_V3D_CFG_DEPTH_ALWAYS) | (1 << 19))
             V3dClBlendEnables(1)
             V3dClBlendCfg(1, #V3D_BF_INV_SRC_ALPHA, #V3D_BF_SRC_ALPHA, #V3D_BM_ADD, #V3D_BF_INV_SRC_ALPHA, #V3D_BF_SRC_ALPHA, #V3D_BM_ADD)
+          ElseIf *d\blendMode = #ANVIL_VK_BLEND_ALPHA_ONE
+            ; Source-over keeps the source alpha once; RGB retains SRC_ALPHA.
+            V3dClCfgBits(V3dCfgBitsWord(#AVK_V3D_CFG_FWD, #AVK_V3D_CFG_REV, #AVK_V3D_CFG_CW, #AVK_V3D_CFG_DEPTH_ALWAYS) | (1 << 19))
+            V3dClBlendEnables(1)
+            V3dClBlendCfg(1, #V3D_BF_INV_SRC_ALPHA, #V3D_BF_SRC_ALPHA, #V3D_BM_ADD, #V3D_BF_INV_SRC_ALPHA, #V3D_BF_ONE, #V3D_BM_ADD)
           Else
             V3dClCfgBits(V3dCfgBitsWord(#AVK_V3D_CFG_FWD, #AVK_V3D_CFG_REV, #AVK_V3D_CFG_CW, #AVK_V3D_CFG_DEPTH_ALWAYS))
             V3dClBlendEnables(0)

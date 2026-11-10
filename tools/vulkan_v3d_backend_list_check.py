@@ -93,6 +93,12 @@ def execute(interp: pathlib.Path, image: pathlib.Path, ceiling=200_000_000):
 def u64(cpu, addr): return sum(cpu.memory.get(addr+i, 0) << (8*i) for i in range(8))
 
 def grade(cpu, rc, stress_n=3505, admission_n=4096):
+    # Current no-launch refusals are JOB_REFUSED (-2); a launched renderer
+    # failure remains -1. Input-range diagnostics count the collector after
+    # insertion coalescing: contiguous stress vertices contribute one interval
+    # plus two private spans per draw. The alias fixture contributes one vertex
+    # union, six private spans and three repeated 20-byte resource unions (10),
+    # which the final physical union still reduces to the original eight cleans.
     s = [u64(cpu, OUT+i*8) for i in range(162)]; bad=[]
     def need(name, i, want):
         if s[i] != want: bad.append(f"{name}: got {s[i]:#x}, expected {want:#x}")
@@ -105,45 +111,45 @@ def grade(cpu, rc, stress_n=3505, admission_n=4096):
       ("exact slot cache ranges",17,4),("merged vertex range count",18,1),("merged vertex start",19,0x2200010),("merged vertex bytes",20,64),
       ("live stress rc",23,0),("live stress arena",24,stress_n*896),("live stress primitives",25,stress_n),("live stress begin",26,1),("live stress free",27,1),
       ("admission rc",28,0),("admission arena",29,admission_n*896),("admission masked primitives",30,0),("admission begin",31,1),("admission free",32,1),
-      ("stale k refused",33,(-1)&0xffffffffffffffff),("stale pre-begin",34,0),("stale pre-allocation",35,0),
-      ("overflow refused",36,(-1)&0xffffffffffffffff),("overflow pre-begin",37,0),("overflow pre-allocation",38,0),
-      ("capacity refused",39,(-1)&0xffffffffffffffff),("capacity pre-begin",40,0),("capacity pre-allocation",41,0),
+      ("stale k refused",33,(-2)&0xffffffffffffffff),("stale pre-begin",34,0),("stale pre-allocation",35,0),
+      ("overflow refused",36,(-2)&0xffffffffffffffff),("overflow pre-begin",37,0),("overflow pre-allocation",38,0),
+      ("capacity refused",39,(-2)&0xffffffffffffffff),("capacity pre-begin",40,0),("capacity pre-allocation",41,0),
       ("rollback rc",42,(-1)&0xffffffffffffffff),("rollback begin",43,1),("rollback end",44,1),("rollback restore",45,2),("rollback free",46,1),("successful jobs only",47,6),
       ("pipeline build",50,0),("immutable pipeline clean count",51,1),("immutable pipeline clean base",52,0x02400000),("immutable pipeline clean bytes",53,8192),
-      ("negative firstVertex refused",54,(-1)&0xffffffffffffffff),("negative pre-begin",55,0),("negative pre-allocation",56,0),
+      ("negative firstVertex refused",54,(-2)&0xffffffffffffffff),("negative pre-begin",55,0),("negative pre-allocation",56,0),
       ("stable record bytes",58,64),("stable record first",59,0xA5),("stable record last",60,0x5A),
-      ("alias rc",61,0),("alias input ranges",62,15),("alias merged ranges",63,8),("alias cache calls",64,8),
+      ("alias rc",61,0),("alias input ranges",62,10),("alias merged ranges",63,8),("alias cache calls",64,8),
       ("alias vertex line",65,0x02200000),("alias vertex bytes",66,0x70),("alias resource line",67,0x02201000),("alias resource bytes",68,0x14),
       ("alias slot calls",69,6),("alias resource inputs",70,6),
       ("stress prepares",71,stress_n),("stress builds",72,stress_n),("stress shader packets",73,stress_n),
-      ("stress merged barriers",74,2*stress_n+1),("stress input ranges",75,3*stress_n),("stress merged getter",76,2*stress_n+1),
+      ("stress merged barriers",74,2*stress_n+1),("stress input ranges",75,2*stress_n+1),("stress merged getter",76,2*stress_n+1),
       ("stress slot barriers",77,2*stress_n),("stress vertex barrier",78,1),("stress viewport transitions",79,1),
       ("scissor list rc",80,0),("scissor transition packets",81,2),("clipped x",82,0),("clipped y",83,60),("clipped width",84,5),("clipped height",85,4),
       ("scissor transition getter",86,2),("scissor list primitives",87,4),
       ("extreme scissor rc",88,0),("extreme clip packets",89,1),("extreme clip x",90,0),("extreme clip y",91,0),("extreme clip width",92,2),("extreme clip height",93,3),
-      ("hostile scissor refused",94,(-1)&0xffffffffffffffff),("hostile scissor pre-begin",95,0),("hostile scissor pre-allocation",96,0),
+      ("hostile scissor refused",94,(-2)&0xffffffffffffffff),("hostile scissor pre-begin",95,0),("hostile scissor pre-allocation",96,0),
       ("one draw cache barriers",97,1),("stress cache barriers",98,1),("alias cache barriers",99,1),
       ("indexed rc",100,0),("indexed excludes array packet",101,0),("indexed primitive packets",102,1),("index setup packets",103,1),
       ("index setup bind base",104,0x02202000),("index setup byte size",105,32),("hardware uint16 type",106,1),("firstIndex byte offset",107,4),
       ("indexed count",108,3),("draw slot scanned max",109,2),("indexed cache inputs",110,4),("indexed resource inputs",111,1),
-      ("index range refused",112,(-1)&0xffffffffffffffff),("index range pre-begin",113,0),("index range pre-allocation",114,0),
-      ("max vertex refused",115,(-1)&0xffffffffffffffff),("max vertex pre-begin",116,0),("max vertex pre-allocation",117,0),
+      ("index range refused",112,(-2)&0xffffffffffffffff),("index range pre-begin",113,0),("index range pre-allocation",114,0),
+      ("max vertex refused",115,(-2)&0xffffffffffffffff),("max vertex pre-begin",116,0),("max vertex pre-allocation",117,0),
       ("selected index cache start",118,0x02202004),("selected index cache bytes",119,6),
       ("subviewport rc",120,0),("subviewport scaling packet",121,1),("subviewport offset packet",122,1),
       ("subviewport X scaling",123,0x45800000),("subviewport Y scaling",124,0x45800000),
       ("subviewport fine X",125,4096),("subviewport fine Y",126,4096),
       ("subviewport clip packet",127,1),("subviewport clip width",128,32),("subviewport clip height",129,32),
-      ("subviewport primitive",130,1),("oversized viewport refused",131,(-1)&0xffffffffffffffff),
+      ("subviewport primitive",130,1),("oversized viewport refused",131,(-2)&0xffffffffffffffff),
       ("oversized viewport pre-begin",132,0),("oversized viewport pre-allocation",133,0),
       ("indexed subviewport rc",134,0),("indexed subviewport packet",135,1),("indexed subviewport excludes array packet",136,0),
       ("translated viewport rc",137,0),("translated viewport scale packet",138,1),("translated viewport offset packet",139,1),
       ("translated viewport X scale",140,0x45800000),("translated viewport Y scale",141,0x45800000),
       ("translated viewport fine X",142,6144),("translated viewport fine Y",143,7168),
       ("translated clip X",144,8),("translated clip Y",145,12),("translated clip width",146,32),("translated clip height",147,32),("translated primitive",148,1),
-      ("cross-edge viewport refused",149,(-1)&0xffffffffffffffff),("cross-edge viewport pre-begin",150,0),("cross-edge viewport pre-allocation",151,0),
+      ("cross-edge viewport refused",149,(-2)&0xffffffffffffffff),("cross-edge viewport pre-begin",150,0),("cross-edge viewport pre-allocation",151,0),
       ("array strip rc",152,0),("array strip V3D mode",153,5),("array strip primitive",154,1),
       ("indexed strip rc",155,0),("indexed strip V3D mode",156,5),("indexed strip packet",157,1),("indexed strip excludes array packet",158,0),
-      ("hostile topology refused",159,(-1)&0xffffffffffffffff),("hostile topology pre-begin",160,0),("hostile topology pre-allocation",161,0),
+      ("hostile topology refused",159,(-2)&0xffffffffffffffff),("hostile topology pre-begin",160,0),("hostile topology pre-allocation",161,0),
     ): need(name,i,w)
     if 0x03000000 <= s[57] < 0x03000000 + 4096*896: bad.append("stable record pointer still aliases the freed arena")
     return bad

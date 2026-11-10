@@ -3,15 +3,23 @@
 ; MMIO, no board, and every cache range and BCL packet remains observable.
 
 XIncludeFile "Anvil/Graphics/Vulkan/vk_foundation.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_ir.pbi"
+XIncludeFile "Anvil/Graphics/V3D42/qpu_encode.pbi"
 
 #ANVIL_VK_MAX_PIPELINES = 4
 #ANVIL_VK_MAX_RECORDED_DRAWS = 4096
 #V3D_OK = 0
 #V3D_ERR_CL_ARGS = 27
+#V3D_ERR_NOINIT = 11
+#V3D_ERR_MMU_OFF = 17
+#V3D_ERR_CSD_ARGS = 23
+#V3D_CSD_CFG5_FLAG_MASK = 7
 #NEON_OK = 0
 #DSP_DMA_LINKED = 0
 #NEON_ERR_LIST = 12
+#NEON_ERR_RECORDS = 8
 #V3D_OFMT_RGBA8 = 1
+#V3D_BF_ONE = 1
 #V3D_BF_SRC_ALPHA = 6
 #V3D_BF_INV_SRC_ALPHA = 7
 #V3D_BM_ADD = 0
@@ -21,6 +29,7 @@ XIncludeFile "Anvil/Graphics/Vulkan/vk_foundation.pbi"
 #AVKQ_OFF_SHREC = 3840
 #AVKQ_PRIM_TRIANGLES = 4
 #AVKQ_PRIM_TRIANGLE_STRIP = 5
+#AVKQ_PRIM_TRIANGLE_FAN = 6
 #GATE_STRESS_DRAWS = 3505
 
 Global Dim avkqVaryComps.i[#ANVIL_VK_MAX_PIPELINES + 1]
@@ -102,6 +111,18 @@ Procedure.i V3dTileHeightOf(a.i) : ProcedureReturn 64 : EndProcedure
 Procedure.i V3dError() : ProcedureReturn 0 : EndProcedure
 Procedure.i V3dCounterHz() : ProcedureReturn 54000000 : EndProcedure
 Procedure.i V3dTicks() : ProcedureReturn 0 : EndProcedure
+; This fixture exercises draw-list construction, not private CSD compute.
+; Keep the unused CSD boundary explicitly unavailable if it is reached.
+Global v3d_ready.i,v3d_mmuOn.i
+Procedure.i V3dCsdBegin(x.i,y.i,z.i,size.i,supergroup.i) : ProcedureReturn #V3D_ERR_NOINIT : EndProcedure
+Procedure.i V3dCsdCode(base.i,bytes.i,flags.i) : ProcedureReturn #V3D_ERR_NOINIT : EndProcedure
+Procedure.i V3dCsdUniforms(base.i,bytes.i) : ProcedureReturn #V3D_ERR_NOINIT : EndProcedure
+Procedure V3dCsdOutput(base.i,bytes.i) : EndProcedure
+Procedure.i V3dCsdSubmit() : ProcedureReturn #V3D_ERR_NOINIT : EndProcedure
+Procedure.i V3dCsdWait(timeout.i) : ProcedureReturn #V3D_ERR_NOINIT : EndProcedure
+Procedure.i V3dCsdDoneBefore() : ProcedureReturn 0 : EndProcedure
+Procedure.i V3dCsdDoneAfter() : ProcedureReturn 0 : EndProcedure
+Procedure.i V3dCsdCleanResult() : ProcedureReturn #V3D_ERR_NOINIT : EndProcedure
 
 Procedure GateCacheObserve(addr.i, bytes.i)
   gateCache = gateCache + 1
@@ -160,9 +181,19 @@ EndProcedure
 Procedure V3dClIndexedPrims(a.i,b.i,c.i,d.i)
   gateIndexed=gateIndexed+1 : gateIndexMode=a : gateIndexCount=b : gateIndexType=c : gateIndexOffset=d
 EndProcedure
+Procedure V3dClBaseVertexBaseInstance(base.i,instance.i) : EndProcedure
+Procedure V3dClVertexArrayInstancedPrims(mode.i,length.i,instances.i,first.i)
+  V3dClVertexArrayPrims(mode,length,first)
+EndProcedure
+Procedure V3dClIndexedInstancedPrims(mode.i,length.i,instances.i,type.i,offset.i)
+  V3dClIndexedPrims(mode,length,type,offset)
+EndProcedure
 Procedure.i V3dClError() : ProcedureReturn gateClError : EndProcedure
 
 Procedure.i Neon_Ready() : ProcedureReturn gateReady : EndProcedure
+Procedure.i NeonHardwareReady() : ProcedureReturn gateReady : EndProcedure
+Global gateTicks.i
+Procedure.i Micros() : gateTicks=gateTicks+1 : ProcedureReturn gateTicks : EndProcedure
 Procedure.i Neon_Error() : ProcedureReturn 0 : EndProcedure
 Procedure.i Neon_BclBytes() : ProcedureReturn gateBclBytes : EndProcedure
 Procedure.i Neon_CapacityPhysicalW() : ProcedureReturn 4096 : EndProcedure
@@ -182,6 +213,15 @@ Procedure.i NeonRebindSurface(base.i,w.i,h.i,pitch.i,bytes.i,fmt.i,rot.i)
 EndProcedure
 Procedure.i NeonFrameBegin(c.i) : gateBegin = gateBegin + 1 : ProcedureReturn #NEON_OK : EndProcedure
 Procedure.i NeonFrameEnd() : gateEnd = gateEnd + 1 : ProcedureReturn #NEON_OK : EndProcedure
+Procedure.i NeonHardwareRebindSurface(base.i,w.i,h.i,pitch.i,bytes.i,fmt.i,rot.i)
+  ProcedureReturn NeonRebindSurface(base,w,h,pitch,bytes,fmt,rot)
+EndProcedure
+Procedure.i NeonHardwareFrameBeginLoad(colour.i,load.i) : ProcedureReturn NeonFrameBegin(colour) : EndProcedure
+Procedure.i NeonHardwareFrameEnd() : ProcedureReturn NeonFrameEnd() : EndProcedure
+Procedure.i NeonHardwareFrameKick() : ProcedureReturn #NEON_OK : EndProcedure
+Procedure.i NeonHardwareFrameDone() : ProcedureReturn 1 : EndProcedure
+Procedure.i NeonHardwareFrameJoin() : ProcedureReturn NeonFrameEnd() : EndProcedure
+Procedure.i NeonHardwareClearRect(x.i,y.i,w.i,h.i,colour.i) : ProcedureReturn #NEON_ERR_LIST : EndProcedure
 
 Procedure.i avkHeapBind() : ProcedureReturn #VK_SUCCESS : EndProcedure
 Procedure.i avkInternalAlloc(bytes.i)
@@ -204,6 +244,7 @@ Procedure.i AnvilVkPipelineTopology(p.i) : ProcedureReturn gateTopology : EndPro
 Procedure.i AnvilVkPipelineDynamicViewport(p.i) : ProcedureReturn gateDynamicViewport : EndProcedure
 Procedure.i avkqF32FromInt(v.i) : If v=8192 : ProcedureReturn $46000000 : EndIf : If v=4096 : ProcedureReturn $45800000 : EndIf : ProcedureReturn 0 : EndProcedure
 Procedure.i AnvilVkPipelineUsesPushConstants(p.i) : ProcedureReturn 0 : EndProcedure
+Procedure.i AnvilVkPipelineBindingRate(p.i,b.i) : ProcedureReturn #VK_VERTEX_INPUT_RATE_VERTEX : EndProcedure
 Procedure.i AnvilVkPipelineUsesUniformBuffer(p.i) : ProcedureReturn gateUseUbo[p] : EndProcedure
 Procedure.i AnvilVkPipelineUsesSampledImage(p.i) : ProcedureReturn gateUseSample[p] : EndProcedure
 Procedure.i AnvilVkV3dViewportHalfWidthBits(p.i) : ProcedureReturn $42000000 + p : EndProcedure
@@ -235,6 +276,7 @@ Procedure.i AnvilVkV3dDrawCacheRangeBytes(p.i,k.i) : ProcedureReturn 64 : EndPro
 Procedure.i AnvilVkV3dFragmentUniforms(a.i,b.i,c.i,d.i,e.i) : ProcedureReturn 0 : EndProcedure
 Procedure.i AnvilVkV3dBuildRecord(a.i,b.i,c.i,d.i,e.i) : ProcedureReturn 0 : EndProcedure
 
+XIncludeFile "Anvil/Graphics/Vulkan/vk_draw_batch.pbi"
 XIncludeFile "RaspberryPi4/Lib/Vulkan/vk_v3d_backend.pi4"
 
 #OUT = $07000000
@@ -266,6 +308,10 @@ Procedure Fill(n.i, mask.i)
     draws[i]\viewportX=0 : draws[i]\viewportY=0 : draws[i]\viewportW=64 : draws[i]\viewportH=64
     draws[i]\bindingCount=1 : draws[i]\bindings=@binds[i]
     draws[i]\vertexCount=3 : draws[i]\firstVertex=i*3 : draws[i]\sampleMask=mask
+    ; Exercise distinct hardware slots rather than the separate singleton
+    ; compactor: nonzero firstInstance deliberately prevents range merging.
+    draws[i]\kind=#ANVIL_VK_RENDER_OP_DRAW : draws[i]\loadColor=0
+    draws[i]\instanceCount=1 : draws[i]\firstInstance=1
     draws[i]\indexBase=0 : draws[i]\indexBytes=0 : draws[i]\indexType=0
     draws[i]\maxVertex=i*3+2
     draws[i]\pushBase=0 : draws[i]\pushBytes=0

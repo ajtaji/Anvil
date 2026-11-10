@@ -27,7 +27,7 @@ def main():
  r=Path(__file__).resolve().parents[1];d=a.out.resolve();d.mkdir(parents=True,exist_ok=False)
  names=['RaspberryPi4/Lib/Vulkan/vk_v3d_backend.pi4','RaspberryPi4/Lib/Vulkan/vk_v3d_shader.pi4','Anvil/Graphics/Vulkan/vk_foundation.pbi']
  backend,shader,foundation=[(r/n).read_text(encoding='utf8') for n in names];old=a.previous.read_text(encoding='utf8')
- s='#ANVIL_VK_RENDER_OP_CLEAR_RECT=1\n#ANVIL_VK_BLEND_SRC_OVER=1\n#AVKQ_F_ZERO=0\n'
+ s='#ANVIL_VK_RENDER_OP_CLEAR_RECT=1\n#ANVIL_VK_BLEND_SRC_OVER=1\n#ANVIL_VK_BLEND_ALPHA_ONE=2\n#AVKQ_F_ZERO=0\n'
  for name in ['AnvilVkBackendDraw','AnvilVkBackendDrawList']:s+=struct(foundation,name)+'\n'
  for name in ['AvkV3dNormalizedScissor','AvkV3dViewportState']:s+=struct(backend,name)+'\n'
  s+=proc(shader,'avkqF32FromInt')+'\n'

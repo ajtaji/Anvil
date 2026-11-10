@@ -99,9 +99,16 @@ full RGBA and display CRCs at alpha zero, quarter, half and one, including a
 second scissored attachment-LOAD pass. The shared software executor separately
 checks both equations against expected pixels.
 
-Transfer and ordered draw-list capabilities are not enabled. Resident Neon
-callers still need a portable alpha-equation migration and safe display
-backbuffer ownership. The graphics boot composition remains unfinished.
+Shared Neon textured, line and outline pipeline builders now request ONE for
+source alpha, and V3D emits that equation while retaining its older mode.
+Native GPU cases execute the production textured pipeline builder and atlas
+fragment shader, including push tint, zero UBO, binding1 sampling, dynamic state
+and exact RGBA/display CRCs. Separate V3D packet and closed-list CPU checks do
+not establish physical Pi4 GPU pixels; that hardware proof remains owed.
+
+Native transfer and ordered draw-list capabilities are not enabled. Full
+resident resource/upload integration and safe display backbuffer ownership
+still precede the graphics boot composition.
 The counted monitor still boots to text.
 
 @SECTION Evidence and remaining work
