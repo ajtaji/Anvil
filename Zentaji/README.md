@@ -31,12 +31,18 @@ latching, pending timeout, foreign-owner quarantine and release. A headless fram
 must match the independently calculated CRC of the expected displayed pixels.
 The original memory and text gates remain green.
 
+The combined `tools/zentaji_vulkan_present_check.py` also executes real owned
+startup, protected memory admission, public Vulkan image/allocation/barrier/
+clear/fence calls, native display latch and an independent expected frame CRC.
+It releases scanout before destroying the live Vulkan image/allocation.
+
 These components are not yet connected to the counted monitor composition or
-the shared Vulkan/Neon Arcade presentation adapter. The shipped monitor remains
+the resident shared Vulkan/Neon Arcade presentation adapter. The shipped monitor remains
 text; shader/draw/transfer/sampling integration and graphical boot remain owed.
 
 ```text
 python tools/zentaji_graphics_memory_check.py --compiler <Forge executable> --zen-tools <tools/zentaji directory>
+python tools/zentaji_vulkan_present_check.py --compiler <Forge executable> --zen-tools <tools/zentaji directory>
 ```
 
 ## Native text output
