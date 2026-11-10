@@ -204,8 +204,17 @@ configurations on both Windows and Linux. These are headless Linux component
 proofs; full platform, visible-input and physical-device acceptance remain owed.
 Separate native Linux FMATH conformance failures remain under repair; this
 result covers the textured-upload composition.
-Resident font integration and safe ownership of configured display backbuffers
-still precede graphics boot.
+Resident font integration and the managed display adapter still precede
+graphics boot.
+
+The managed display owner now leases private planes carved outside the Vulkan
+heap. Writer tokens survive plane rotation and are never reused on display
+restart. DMA completion and a retired producer GPU fence precede presentation;
+pending latches and submitted or quarantined writers prevent reuse/release.
+The composition pins its source and holds the external GPU lease. The native
+`tools/zentaji_display_writer_check.py` case checks two GPU colors, DMA row/page
+guards, actual scanout CRCs, stale tokens, premature presentation/release and
+real DMA ownership loss. This primitive is not yet the resident Neon adapter.
 
 These components are not yet connected to the counted monitor composition or
 the resident shared Vulkan/Neon Arcade presentation adapter. The shipped monitor remains
