@@ -1,0 +1,206 @@
+; Native Vulkan pipeline publication and one closed draw submission.
+; SPDX-License-Identifier: MIT
+; Included after vk_zentaji_backend.pbi's queue, heap and polling owners.
+; The shared resource engine pins all referenced allocations until retirement.
+; Independently recheck required physical extents before touching the controller.
+XIncludeFile "Zentaji/Lib/Vulkan/vk_zentaji_shader.pbi"
+Structure AvkZenPipeline
+ base.i : bytes.i : varyings.i : pushBytes.i : uniformBytes.i
+EndStructure
+Global Dim avkZenPipelines.AvkZenPipeline[#ANVIL_VK_MAX_PIPELINES+1]
+Global Dim avkZenAttributes.AvkZenShaderAttribute[#ANVIL_SPV_MAX_ATTRS]
+Global avkZenShaderTarget.AvkZenShaderTarget,avkZenVertex.AvkZenShaderResult,avkZenFragment.AvkZenShaderResult
+
+Procedure.i avkZenHeapRange(base.i,bytes.i)
+ If avkZenUp=0 Or bytes<1 Or bytes>avkZenHeapBytes Or base<avkZenHeapBase : ProcedureReturn 0 : EndIf
+ ProcedureReturn Bool(base<=avkZenHeapBase+avkZenHeapBytes-bytes)
+EndProcedure
+Procedure.i avkZenRamRange(base.i,bytes.i)
+ If base<1 Or bytes<1 Or bytes>avkZenQueue\ram : ProcedureReturn 0 : EndIf
+ ProcedureReturn Bool(base<=avkZenQueue\ram-bytes)
+EndProcedure
+Procedure.i avkZenOverlaps(base.i,bytes.i,other.i,otherBytes.i)
+ If bytes<1 Or otherBytes<1 : ProcedureReturn 0 : EndIf
+ ; All intervals have already passed bounded RAM/heap-range validation.
+ ProcedureReturn Bool(base<other+otherBytes And other<base+bytes)
+EndProcedure
+Procedure.i avkZenU32Float(value.i)
+ Protected exponent.i=127,shift.i,n.i=value
+ ; Exact IEEE binary32 encoding of a nonnegative whole viewport coordinate.
+ ; Values are bounded to 16384; no rounding or host float mode is involved.
+ If value=0 : ProcedureReturn 0 : EndIf
+ While n>1 : n=n>>1 : exponent=exponent+1 : shift=shift+1 : Wend
+ ProcedureReturn (exponent<<23)|((value<<(23-shift))&$7FFFFF)
+EndProcedure
+Procedure avkZenBlankCommand()
+ Protected n.i
+ For n=0 To 7 : avkZenCommand[n]=0 : Next
+EndProcedure
+Procedure.i avkZenAppendCommand()
+ ProcedureReturn ZentajiGraphicsAppend(@avkZenQueue,@avkZenCommand[0])
+EndProcedure
+Procedure.i avkBackendPipelineBytes()
+ ProcedureReturn 2*#AVK_ZEN_SHADER_CODE_BYTES
+EndProcedure
+Procedure.i avkBackendPipelineBuild(*build.AnvilVkBackendPipelineBuildInfo)
+ Protected pipe.i,n.i,binding.i,rc.i,uniformBinding.i=-1
+ If *build=0 : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf
+ pipe=*build\pipeline
+ If pipe<1 Or pipe>#ANVIL_VK_MAX_PIPELINES Or *build\vertexIr=0 Or *build\fragmentIr=0 : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf
+ If avkZenPipelines[pipe]\base<>0 Or avkZenPending<>0 : ProcedureReturn #ANVIL_VK_ERR_STATE : EndIf
+ If *build\bytes<>avkBackendPipelineBytes() Or (*build\base&4095)<>0 Or avkZenHeapRange(*build\base,*build\bytes)=0 : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf
+ avkZenShaderTarget\attributeCount=AnvilVkPipelineAttrCount(pipe)
+ avkZenShaderTarget\attributes=@avkZenAttributes[0] : avkZenShaderTarget\invertY=1
+ If avkZenShaderTarget\attributeCount<1 Or avkZenShaderTarget\attributeCount>#ANVIL_SPV_MAX_ATTRS : ProcedureReturn #VK_ERROR_FEATURE_NOT_PRESENT : EndIf
+ For n=0 To avkZenShaderTarget\attributeCount-1
+  binding=AnvilVkPipelineAttrBinding(pipe,n)
+  avkZenAttributes[n]\location=n : avkZenAttributes[n]\binding=binding
+  avkZenAttributes[n]\offset=AnvilVkPipelineAttrOffset(pipe,n)
+  avkZenAttributes[n]\components=AnvilVkPipelineAttrComponents(pipe,n)
+  avkZenAttributes[n]\stride=AnvilVkPipelineBindingStride(pipe,binding)
+  avkZenAttributes[n]\instanceRate=AnvilVkPipelineBindingRate(pipe,binding)
+ Next
+ avkZenShaderTarget\code=*build\base : avkZenShaderTarget\capacity=#AVK_ZEN_SHADER_CODE_BYTES
+ rc=AnvilVkZentajiShaderCompile(*build\vertexIr,@avkZenShaderTarget,@avkZenVertex)
+ If rc<>0 : ProcedureReturn #VK_ERROR_FEATURE_NOT_PRESENT : EndIf
+ avkZenShaderTarget\code=*build\base+#AVK_ZEN_SHADER_CODE_BYTES
+ rc=AnvilVkZentajiShaderCompile(*build\fragmentIr,@avkZenShaderTarget,@avkZenFragment)
+ If rc<>0 : ProcedureReturn #VK_ERROR_FEATURE_NOT_PRESENT : EndIf
+ If avkZenVertex\uniformBytes<>0 : uniformBinding=avkZenVertex\uniformBinding : EndIf
+ If avkZenFragment\uniformBytes<>0
+  If uniformBinding<>-1 And uniformBinding<>avkZenFragment\uniformBinding : ProcedureReturn #VK_ERROR_FEATURE_NOT_PRESENT : EndIf
+ EndIf
+ ; Publish only executable addresses and bounded resource requirements.
+ ; Neither IR pointer nor caller-owned shader bytes survive this transaction.
+ avkZenPipelines[pipe]\bytes=*build\bytes
+ avkZenPipelines[pipe]\varyings=avkZenVertex\varyingCount
+ avkZenPipelines[pipe]\pushBytes=avkZenVertex\pushBytes
+ If avkZenFragment\pushBytes>avkZenPipelines[pipe]\pushBytes : avkZenPipelines[pipe]\pushBytes=avkZenFragment\pushBytes : EndIf
+ avkZenPipelines[pipe]\uniformBytes=avkZenVertex\uniformBytes
+ If avkZenFragment\uniformBytes>avkZenPipelines[pipe]\uniformBytes : avkZenPipelines[pipe]\uniformBytes=avkZenFragment\uniformBytes : EndIf
+ avkZenPipelines[pipe]\base=*build\base
+ ProcedureReturn #VK_SUCCESS
+EndProcedure
+Procedure avkBackendPipelineRelease(pipe.i)
+ If pipe<1 Or pipe>#ANVIL_VK_MAX_PIPELINES : ProcedureReturn : EndIf
+ avkZenPipelines[pipe]\base=0 : avkZenPipelines[pipe]\bytes=0
+ avkZenPipelines[pipe]\varyings=0 : avkZenPipelines[pipe]\pushBytes=0 : avkZenPipelines[pipe]\uniformBytes=0
+EndProcedure
+Procedure.i avkBackendDrawSupported(base.i,bytes.i,w.i,h.i,pitch.i)
+ ProcedureReturn avkBackendClearSupported(base,bytes,w,h,pitch)
+EndProcedure
+Procedure.i avkZenDrawPreflight(*d.AnvilVkBackendDraw)
+ Protected pipe.i,n.i,width.i,maxIndex.i,last.i,indexBytes.i,value.i,bytes.i,first.i,rate.i
+ Protected *bind.AnvilVkBackendBinding
+ If *d=0 : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf
+ pipe=*d\pipeline
+ If pipe<1 Or pipe>#ANVIL_VK_MAX_PIPELINES : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf
+ If avkZenPipelines[pipe]\base=0 Or avkZenHeapRange(avkZenPipelines[pipe]\base,avkZenPipelines[pipe]\bytes)=0 : ProcedureReturn #ANVIL_VK_ERR_STATE : EndIf
+ If *d\kind<>#ANVIL_VK_RENDER_OP_DRAW Or (*d\loadColor<>0 And *d\loadColor<>1) Or (*d\sampleMask<>0 And *d\sampleMask<>1) : ProcedureReturn #VK_ERROR_FEATURE_NOT_PRESENT : EndIf
+ If *d\blendMode<>#ANVIL_VK_BLEND_DISABLED Or *d\sampledImage<>0 : ProcedureReturn #VK_ERROR_FEATURE_NOT_PRESENT : EndIf
+ If avkBackendDrawSupported(*d\targetBase,*d\targetBytes,*d\width,*d\height,*d\pitch)<>#VK_SUCCESS : ProcedureReturn #VK_ERROR_FEATURE_NOT_PRESENT : EndIf
+ If avkZenOverlaps(*d\targetBase,*d\targetBytes,avkZenPipelines[pipe]\base,avkZenPipelines[pipe]\bytes)<>0 : ProcedureReturn #VK_ERROR_FEATURE_NOT_PRESENT : EndIf
+ If *d\viewportX<0 Or *d\viewportY<0 Or *d\viewportW<1 Or *d\viewportH<1 Or *d\viewportW>*d\width Or *d\viewportH>*d\height Or *d\viewportX>*d\width-*d\viewportW Or *d\viewportY>*d\height-*d\viewportH : ProcedureReturn #VK_ERROR_FEATURE_NOT_PRESENT : EndIf
+ If *d\scissorW<0 Or *d\scissorW>$FFFFFFFF Or *d\scissorH<0 Or *d\scissorH>$FFFFFFFF Or *d\scissorX<-$80000000 Or *d\scissorX>$7FFFFFFF Or *d\scissorY<-$80000000 Or *d\scissorY>$7FFFFFFF : ProcedureReturn #VK_ERROR_FEATURE_NOT_PRESENT : EndIf
+ If *d\vertexCount<1 Or *d\vertexCount>$1000000 Or *d\instanceCount<1 Or *d\instanceCount>$1000000/ *d\vertexCount Or *d\firstVertex<0 Or *d\firstVertex>$FFFFFFFF-*d\vertexCount Or *d\firstInstance<0 Or *d\firstInstance>$FFFFFFFF : ProcedureReturn #VK_ERROR_FEATURE_NOT_PRESENT : EndIf
+ If AnvilVkPipelineTopology(pipe)<#VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST Or AnvilVkPipelineTopology(pipe)>#VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN : ProcedureReturn #VK_ERROR_FEATURE_NOT_PRESENT : EndIf
+ maxIndex=*d\firstVertex+*d\vertexCount-1
+ If *d\indexBase<>0
+  width=0
+  If *d\indexType=#VK_INDEX_TYPE_UINT16 : width=2 : EndIf
+  If *d\indexType=#VK_INDEX_TYPE_UINT32 : width=4 : EndIf
+  If width=0 : ProcedureReturn #VK_ERROR_FEATURE_NOT_PRESENT : EndIf
+  last=*d\firstVertex+*d\vertexCount
+  If *d\indexBytes<width Or last>*d\indexBytes/width Or avkZenHeapRange(*d\indexBase,*d\indexBytes)=0 : ProcedureReturn #VK_ERROR_FEATURE_NOT_PRESENT : EndIf
+  If avkZenOverlaps(*d\targetBase,*d\targetBytes,*d\indexBase+*d\firstVertex*width,*d\vertexCount*width)<>0 : ProcedureReturn #VK_ERROR_FEATURE_NOT_PRESENT : EndIf
+  maxIndex=0
+  For n=*d\firstVertex To last-1
+   If width=2 : value=PeekU(*d\indexBase+n*2) : Else : value=PeekL(*d\indexBase+n*4)&$FFFFFFFF : EndIf
+   If value>maxIndex : maxIndex=value : EndIf
+  Next
+  If maxIndex<>*d\maxVertex : ProcedureReturn #VK_ERROR_FEATURE_NOT_PRESENT : EndIf
+ EndIf
+ If *d\bindingCount<1 Or *d\bindingCount>#ANVIL_VK_MAX_BINDINGS Or *d\bindingCount<>AnvilVkPipelineBindingCount(pipe) Or *d\bindings=0 : ProcedureReturn #VK_ERROR_FEATURE_NOT_PRESENT : EndIf
+ For n=0 To *d\bindingCount-1
+  *bind=*d\bindings+n*SizeOf(AnvilVkBackendBinding)
+  If *bind\stride<1 Or *bind\stride<>AnvilVkPipelineBindingStride(pipe,n) : ProcedureReturn #VK_ERROR_FEATURE_NOT_PRESENT : EndIf
+  rate=AnvilVkPipelineBindingRate(pipe,n) : last=maxIndex+1 : first=0
+  If *d\indexBase=0 : first=*d\firstVertex : EndIf
+  If rate=#VK_VERTEX_INPUT_RATE_INSTANCE : first=*d\firstInstance : last=first+*d\instanceCount : EndIf
+  If last>avkZenHeapBytes/ *bind\stride : ProcedureReturn #VK_ERROR_FEATURE_NOT_PRESENT : EndIf
+  bytes=last* *bind\stride
+  If avkZenHeapRange(*bind\base,bytes)=0 Or avkZenOverlaps(*d\targetBase,*d\targetBytes,*bind\base+first* *bind\stride,(last-first)* *bind\stride)<>0 : ProcedureReturn #VK_ERROR_FEATURE_NOT_PRESENT : EndIf
+ Next
+ bytes=avkZenPipelines[pipe]\pushBytes
+ If bytes<>0
+  If *d\pushBytes<bytes Or avkZenRamRange(*d\pushBase,bytes)=0 : ProcedureReturn #VK_ERROR_FEATURE_NOT_PRESENT : EndIf
+  If avkZenOverlaps(*d\targetBase,*d\targetBytes,*d\pushBase,bytes)<>0 : ProcedureReturn #VK_ERROR_FEATURE_NOT_PRESENT : EndIf
+ EndIf
+ bytes=avkZenPipelines[pipe]\uniformBytes
+ If bytes<>0
+  If *d\uniformBytes<bytes Or avkZenHeapRange(*d\uniformBase,bytes)=0 : ProcedureReturn #VK_ERROR_FEATURE_NOT_PRESENT : EndIf
+  If avkZenOverlaps(*d\targetBase,*d\targetBytes,*d\uniformBase,bytes)<>0 : ProcedureReturn #VK_ERROR_FEATURE_NOT_PRESENT : EndIf
+ EndIf
+ ProcedureReturn #VK_SUCCESS
+EndProcedure
+Procedure.i avkBackendSubmitDraw(*d.AnvilVkBackendDraw)
+ Protected rc.i,n.i,pipe.i,meta.i,pitch.i,x.i,y.i,right.i,bottom.i,width.i
+ Protected *bind.AnvilVkBackendBinding
+ rc=avkZenDrawPreflight(*d)
+ If rc<>#VK_SUCCESS : ProcedureReturn avkBackendRefuseBeforeLaunch(rc) : EndIf
+ If avkZenLease<>#ANVIL_VK_GPU_LEASE_QUEUE Or avkZenPending<>0 Or avkZenQueue\state<>1 Or ZentajiGraphicsOwned(@avkZenQueue)=0 : ProcedureReturn avkBackendRefuseBeforeLaunch(#VK_ERROR_DEVICE_LOST) : EndIf
+ pipe=*d\pipeline : meta=avkZenQueue\list+2112 : pitch=*d\pitch : If pitch=0 : pitch=*d\width*4 : EndIf
+ ; This private page is pinned until the queue retires. The resource engine
+ ; retains push/UBO/binding allocations; the GPU sees no application handles.
+ For n=0 To 31 : PokeQ(meta+n*8,0) : Next
+ PokeQ(meta,*d\pushBase) : PokeQ(meta+8,*d\uniformBase)
+ For n=0 To *d\bindingCount-1
+  *bind=*d\bindings+n*SizeOf(AnvilVkBackendBinding)
+  x=*bind\base
+  If AnvilVkPipelineBindingRate(pipe,n)=#VK_VERTEX_INPUT_RATE_INSTANCE : x=x+*d\firstInstance* *bind\stride : EndIf
+  PokeQ(meta+32+n*8,x)
+ Next
+ If ZentajiGraphicsBegin(@avkZenQueue)=0 : ProcedureReturn avkBackendRefuseBeforeLaunch(#VK_ERROR_DEVICE_LOST) : EndIf
+ avkZenBlankCommand() : avkZenCommand[0]=1 : avkZenCommand[1]=*d\targetBase
+ PokeL(@avkZenCommand[0]+16,pitch) : PokeW(@avkZenCommand[0]+20,*d\width) : PokeW(@avkZenCommand[0]+22,*d\height) : PokeA(@avkZenCommand[0]+24,2)
+ If avkZenAppendCommand()=0 : ProcedureReturn avkBackendRefuseBeforeLaunch(#VK_ERROR_DEVICE_LOST) : EndIf
+ avkZenBlankCommand() : avkZenCommand[0]=4
+ PokeL(@avkZenCommand[0]+16,*d\width) : PokeL(@avkZenCommand[0]+20,*d\height)
+ If avkZenAppendCommand()=0 : ProcedureReturn avkBackendRefuseBeforeLaunch(#VK_ERROR_DEVICE_LOST) : EndIf
+ If *d\loadColor=0
+  avkZenBlankCommand() : avkZenCommand[0]=$105 : PokeL(@avkZenCommand[0]+8,*d\clearBgra)
+  If avkZenAppendCommand()=0 : ProcedureReturn avkBackendRefuseBeforeLaunch(#VK_ERROR_DEVICE_LOST) : EndIf
+ EndIf
+ avkZenBlankCommand() : avkZenCommand[0]=3
+ PokeL(@avkZenCommand[0]+8,avkZenU32Float(*d\viewportX)) : PokeL(@avkZenCommand[0]+12,avkZenU32Float(*d\viewportY))
+ PokeL(@avkZenCommand[0]+16,avkZenU32Float(*d\viewportW)) : PokeL(@avkZenCommand[0]+20,avkZenU32Float(*d\viewportH))
+ PokeL(@avkZenCommand[0]+28,$3F800000)
+ If avkZenAppendCommand()=0 : ProcedureReturn avkBackendRefuseBeforeLaunch(#VK_ERROR_DEVICE_LOST) : EndIf
+ x=*d\scissorX : y=*d\scissorY : right=x+*d\scissorW : bottom=y+*d\scissorH
+ If x<0 : x=0 : EndIf : If y<0 : y=0 : EndIf
+ If right>*d\width : right=*d\width : EndIf : If bottom>*d\height : bottom=*d\height : EndIf
+ If right<x : right=x : EndIf : If bottom<y : bottom=y : EndIf
+ avkZenBlankCommand() : avkZenCommand[0]=4
+ PokeL(@avkZenCommand[0]+8,x) : PokeL(@avkZenCommand[0]+12,y)
+ PokeL(@avkZenCommand[0]+16,right) : PokeL(@avkZenCommand[0]+20,bottom)
+ If avkZenAppendCommand()=0 : ProcedureReturn avkBackendRefuseBeforeLaunch(#VK_ERROR_DEVICE_LOST) : EndIf
+ avkZenBlankCommand() : avkZenCommand[0]=6
+ avkZenCommand[1]=avkZenPipelines[pipe]\base : avkZenCommand[2]=avkZenCommand[1]+#AVK_ZEN_SHADER_CODE_BYTES
+ PokeA(@avkZenCommand[0]+26,avkZenPipelines[pipe]\varyings)
+ avkZenCommand[5]=avkZenQueue\list+2560 : avkZenCommand[6]=256
+ If avkZenAppendCommand()=0 : ProcedureReturn avkBackendRefuseBeforeLaunch(#VK_ERROR_DEVICE_LOST) : EndIf
+ avkZenBlankCommand() : avkZenCommand[0]=7 : avkZenCommand[1]=meta
+ If avkZenAppendCommand()=0 : ProcedureReturn avkBackendRefuseBeforeLaunch(#VK_ERROR_DEVICE_LOST) : EndIf
+ If *d\sampleMask<>0
+  avkZenBlankCommand() : avkZenCommand[0]=9
+  PokeL(@avkZenCommand[0]+16,*d\firstVertex) : PokeL(@avkZenCommand[0]+20,*d\vertexCount) : PokeL(@avkZenCommand[0]+24,*d\instanceCount)
+  PokeA(@avkZenCommand[0]+28,AnvilVkPipelineTopology(pipe)-#VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST)
+  avkZenCommand[4]=*d\indexBase
+  width=0 : If *d\indexType=#VK_INDEX_TYPE_UINT16 : width=2 : EndIf : If *d\indexType=#VK_INDEX_TYPE_UINT32 : width=4 : EndIf
+  PokeA(@avkZenCommand[0]+40,width)
+  If avkZenAppendCommand()=0 : ProcedureReturn avkBackendRefuseBeforeLaunch(#VK_ERROR_DEVICE_LOST) : EndIf
+ EndIf
+ If ZentajiGraphicsSubmit(@avkZenQueue)=0 : ProcedureReturn avkBackendRefuseBeforeLaunch(#VK_ERROR_DEVICE_LOST) : EndIf
+ avkZenPending=1 : avkZenNativeError=0
+ ProcedureReturn #ANVIL_VK_JOB_PENDING
+EndProcedure

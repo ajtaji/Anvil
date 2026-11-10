@@ -133,7 +133,7 @@ def main():
             report=native_report
             assert result.states==[3,0] and result.exit_code==42,(tiling,result.states,result.exit_code,report)
             assert registers[128:253]==kept and registers[255]==0x1F00000,tiling
-            assert report[:8]==(0,-20001,7,arena+4096,0x3FF000,-8,-2,0),report
+            assert report[:8]==(0,-20001,0x40000F,arena+4096,0x3FF000,-8,-2,0),report
             width,height=(512,2000) if tiling==2 else (33,17)
             size=width*height*4
             assert report[8:12]==(arena+4096,size,4096,width*4 if tiling!=0 else 0),report
@@ -141,15 +141,17 @@ def main():
             pixel=struct.pack('<I',0x803380B2)
             assert ram[arena+4096:arena+4096+size]==pixel*(width*height),tiling
             assert ram[arena+4096+size:arena+0x400000]==b'\xA5'*(0x400000-4096-size),tiling
-            commands=bytearray(256)
+            commands=bytearray(320)
             commands[0]=1
             struct.pack_into('<QIHHB',commands,8,arena+4096,width*4,width,height,2)
-            struct.pack_into('<H',commands,64,0x105)
-            struct.pack_into('<I',commands,72,0x803380B2)
-            commands[128]=10
-            struct.pack_into('<QQ',commands,136,arena+2048,1)
-            assert ram[arena:arena+256]==commands,tiling
-            assert ram[arena+256:arena+2048]==b'\xA5'*(2048-256),tiling
+            commands[64]=4
+            struct.pack_into('<ii',commands,80,width,height)
+            struct.pack_into('<H',commands,128,0x105)
+            struct.pack_into('<I',commands,136,0x803380B2)
+            commands[192]=10
+            struct.pack_into('<QQ',commands,200,arena+2048,1)
+            assert ram[arena:arena+320]==commands,tiling
+            assert ram[arena+320:arena+2048]==b'\xA5'*(2048-320),tiling
             assert struct.unpack_from('<Q',ram,arena+2048)[0]==1,tiling
             if tiling==2:assert report[20]>0,(tiling,'GPU completion did not use hardware sleep')
             assert ram[arena+2112:arena+4096]==b'\xA5'*(4096-2112),tiling

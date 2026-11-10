@@ -1,4 +1,5 @@
-; Typed shader IR -> native Zentaji shader instructions.\n; SPDX-License-Identifier: MIT
+; Typed shader IR -> native Zentaji shader instructions.
+; SPDX-License-Identifier: MIT
 ; Requires vk_ir.pbi. This is a compiler, not a pixel renderer: the native GPU
 ; executes the published code on its isolated shader context. There is no CPU
 ; rasterisation or shader fallback. No Vulkan capability is enabled by this file.

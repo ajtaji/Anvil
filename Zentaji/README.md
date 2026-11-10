@@ -50,8 +50,29 @@ typed-IR adaptation and generated shaders on the GPU. Six cases check exact
 triangle pixels, interpolated RGB, push/UBO reads, scalar/vector arithmetic,
 viewport orientation, padding/guards and atomic refusal. It separately compares
 one generated shader against independent assembly. Shader sampling and the
-remaining IR operations are still refused, and this module does not enable a
-Vulkan draw capability until backend pipeline/submission integration is proven.
+remaining IR operations are still refused, and unsupported shader operations remain explicit refusals. The native backend
+now connects this lowerer to public Vulkan pipeline creation and draw submission.
+
+The native Vulkan backend now advertises opaque drawing and attachment loads.
+Pipeline creation publishes two immutable native shader entries, retaining
+resource extents rather than shader-module pointers. Submission rechecks target,
+index and binding intervals, push/UBO extents, viewport/scissor and queue ownership
+before launch. Draw metadata and scratch stay in the protected command page.
+Each clear resets full-target scissor state left by earlier draws.
+
+tools/zentaji_vulkan_draw_check.py qualifies seven public API cases: actual
+pipeline/render-pass/vertex/push/queue/fence execution, source-module destruction,
+pre-launch refusal, scissor followed by full clear, uint16/uint32 indices using
+nontrivial vertices, two hardware instances, zero sample mask and a second
+scissored pass with LOAD preserving earlier pixels. Three cases also match an
+independent headless frame CRC. Per-instance attribute addressing is implemented
+but is not claimed as qualified by the instance-count case.
+
+Blend, sampled-image, transfer and ordered draw-list capabilities remain absent.
+In particular, native blend mode 1 and the shared API validator currently use
+different alpha equations; do not advertise blend until the contract is resolved
+and exact alpha/colour pixels are qualified. The resident Neon Arcade adapter
+still needs these remaining capabilities and production composition wiring.
 
 These components are not yet connected to the counted monitor composition or
 the resident shared Vulkan/Neon Arcade presentation adapter. The shipped monitor remains
@@ -61,6 +82,7 @@ text; shader/draw/transfer/sampling integration and graphical boot remain owed.
 python tools/zentaji_graphics_memory_check.py --compiler <Forge executable> --zen-tools <tools/zentaji directory>
 python tools/zentaji_vulkan_present_check.py --compiler <Forge executable> --zen-tools <tools/zentaji directory>
 python tools/zentaji_shader_check.py --compiler <Forge executable> --zen-tools <tools/zentaji directory>
+python tools/zentaji_vulkan_draw_check.py --compiler <Forge executable> --zen-tools <tools/zentaji directory>
 ```
 
 ## Native text output

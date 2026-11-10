@@ -3,8 +3,8 @@
 ; The boot owner supplies an already protected, permanently pinned RAM window.
 ; Its first page belongs to commands/fences; only later pages are Vulkan memory.
 ; Hardware completion orders coherent RAM writes before fences/status. No CPU
-; pixel fallback is used. Draw/transfer/sample capabilities remain absent until
-; their native implementations are connected. This backend does not own display.
+; pixel fallback is used. Draw uses typed-IR native shader lowering; transfer
+; and sampled-image capabilities remain absent. This backend does not own display.
 #ANVIL_VULKAN_BACKEND_PRESENT=3
 #AVK_ZEN_IMAGE_LAYOUT=3
 #AVK_ZEN_DISPLAY=$FFFF0000000C0000
@@ -38,7 +38,7 @@ EndProcedure
 
 Procedure.i avkBackendCaps()
  If avkZenUp=0 Or avkZenQueue\lost<>0 : ProcedureReturn 0 : EndIf
- ProcedureReturn #ANVIL_VK_CAP_DEVICE | #ANVIL_VK_CAP_CLEAR_COLOR | #ANVIL_VK_CAP_GPU
+ ProcedureReturn #ANVIL_VK_CAP_DEVICE | #ANVIL_VK_CAP_CLEAR_COLOR | #ANVIL_VK_CAP_GPU | #ANVIL_VK_CAP_DRAW | #ANVIL_VK_CAP_ATTACHMENT_LOAD
 EndProcedure
 
 Procedure.i avkBackendName()
@@ -285,6 +285,11 @@ Procedure.i avkBackendSubmitClear(base.i, bytes.i, w.i, h.i, pitch.i, bgra.i, lo
  PokeL(@avkZenCommand[0]+16,pitch) : PokeW(@avkZenCommand[0]+20,w) : PokeW(@avkZenCommand[0]+22,h)
  PokeA(@avkZenCommand[0]+24,2)
  If ZentajiGraphicsAppend(@avkZenQueue,@avkZenCommand[0])=0 : ProcedureReturn avkBackendRefuseBeforeLaunch(#VK_ERROR_DEVICE_LOST) : EndIf
+ ; Controller state survives submissions. Reset the full-target scissor
+ ; before a load clear, even when a preceding draw installed a smaller one.
+ For n=0 To 7 : avkZenCommand[n]=0 : Next
+ avkZenCommand[0]=4 : PokeL(@avkZenCommand[0]+16,w) : PokeL(@avkZenCommand[0]+20,h)
+ If ZentajiGraphicsAppend(@avkZenQueue,@avkZenCommand[0])=0 : ProcedureReturn avkBackendRefuseBeforeLaunch(#VK_ERROR_DEVICE_LOST) : EndIf
  If loadColor=0
   For n=0 To 7 : avkZenCommand[n]=0 : Next
   avkZenCommand[0]=$105 : PokeL(@avkZenCommand[0]+8,bgra)
@@ -320,21 +325,4 @@ Procedure.i avkBackendTicksUs()
  ProcedureReturn HwMicros()
 EndProcedure
 
-Procedure.i avkBackendPipelineBytes()
-  ProcedureReturn 0
-EndProcedure
-
-Procedure.i avkBackendPipelineBuild(*build.AnvilVkBackendPipelineBuildInfo)
-  ProcedureReturn #VK_ERROR_FEATURE_NOT_PRESENT
-EndProcedure
-
-Procedure avkBackendPipelineRelease(pipe.i)
-EndProcedure
-
-Procedure.i avkBackendDrawSupported(base.i, bytes.i, w.i, h.i, pitch.i)
-  ProcedureReturn #VK_ERROR_FEATURE_NOT_PRESENT
-EndProcedure
-
-Procedure.i avkBackendSubmitDraw(*d.AnvilVkBackendDraw)
- ProcedureReturn avkBackendRefuseBeforeLaunch(#VK_ERROR_FEATURE_NOT_PRESENT)
-EndProcedure
+XIncludeFile "Zentaji/Lib/Vulkan/vk_zentaji_draw.pbi"
