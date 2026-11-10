@@ -13,6 +13,8 @@ IncludeFile "Zentaji/Board/console.pbi"
 IncludeFile "Anvil/Core/state.pbi"
 IncludeFile "Anvil/Core/input_events.pbi"
 IncludeFile "Anvil/Core/text_edit.pbi"
+Procedure.i ScreenProportionalAdvance(previous.i,c.i) : ProcedureReturn 8*65536 : EndProcedure
+IncludeFile "Anvil/Core/console_grid.pbi"
 Procedure.i PrepareIdle()
   PokeQ(#ZEN_IDLE_INTC+$120,3)
   PokeQ(#ZEN_IDLE_INTC+$F008,2)
@@ -72,7 +74,46 @@ Procedure.i Main(scenario.i)
     ProcedureReturn 42
   EndIf
   If UartAttach()<>1 Or UartRunning()<>1 : ProcedureReturn 5 : EndIf
-  If scenario=14
+  If scenario=22
+    UartMirror(1) : UartAuxMirror(1)
+    UartScreenStyle(#UART_SCREEN_STYLE_PROMPT) : UartWrite(65)
+    UartScreenStyle(#UART_SCREEN_STYLE_NORMAL) : UartWrite(0) : UartWrite(255)
+    UartMessageSetDrain(@TestConsoleDrain) : UartMessageBegin() : UartWrite(66) : UartWriteNl() : UartMessageEnd()
+    If testDrained<>3 Or PeekA($D0000)<>66 Or UartMirrorCount()<>3 Or (uart_auxHead-uart_auxTail)<>3 : ProcedureReturn 150 : EndIf
+    If UartMirrorGet()<>65 Or UartMirrorReadStyle()<>1 : ProcedureReturn 151 : EndIf
+    If UartMirrorGet()<>0 Or UartMirrorReadStyle()<>0 : ProcedureReturn 152 : EndIf
+    If UartMirrorGet()<>255 Or UartMirrorReadStyle()<>0 Or UartMirrorGet()<>-1 : ProcedureReturn 153 : EndIf
+    If UartAuxGet()<>65 Or UartAuxGet()<>0 Or UartAuxGet()<>255 Or UartAuxGet()<>-1 : ProcedureReturn 154 : EndIf
+  ElseIf scenario=23
+    UartMirror(1) : UartAuxMirror(1)
+    For n=0 To 8192 : UartWrite(n&255) : Next
+    If UartMirrorCount()<>8191 Or (uart_auxHead-uart_auxTail)<>8191 Or UartMirrorLost()<>2 Or uart_auxLost<>2 : ProcedureReturn 155 : EndIf
+    For n=0 To 8190
+      If UartMirrorGet()<>(n&255) Or UartAuxGet()<>(n&255) : ProcedureReturn 156 : EndIf
+    Next
+  ElseIf scenario=24
+    UartMirror(1) : UartAuxMirror(1)
+    If UartInit(1)<>1 : ProcedureReturn 157 : EndIf
+    For n=1 To 4096 : PokeQ(#ZEN_CONSOLE+$40,85) : Next
+    UartWrite(33)
+    If UartDropped()<>1 Or UartMirrorCount()<>0 Or (uart_auxHead-uart_auxTail)<>0 : ProcedureReturn 158 : EndIf
+  ElseIf scenario=25
+    ConGridInit(6,3) : UartMirror(1) : UartMirrorSetDrain(@ConMirrorDrain)
+    For n=0 To 10000 : UartWrite(65) : Next
+    ConDrainRing()
+    If UartMirrorLost()<>0 Or UartMirrorCount()<>0 Or UartDropped()<>0 : ProcedureReturn 159 : EndIf
+    For n=0 To 5
+      If ConGridCell(0,n)<>65 Or ConGridCell(1,n)<>65 : ProcedureReturn 160 : EndIf
+    Next
+    If ConGridCell(2,4)<>65 Or ConGridCell(2,5)<>32 Or ConGridCurC()<>5 Or ConGridCurR()<>2 : ProcedureReturn 161 : EndIf
+  ElseIf scenario=26
+    UartMirror(1) : UartWrite(65) : UartMirror(0) : UartAuxMirror(1) : UartWrite(66)
+    If UartMirrorCount()<>0 Or (uart_auxHead-uart_auxTail)<>1 : ProcedureReturn 162 : EndIf
+    UartMirror(1) : UartScreenStyle(999) : UartWrite(67)
+    If UartMirrorGet()<>67 Or UartMirrorReadStyle()<>0 Or UartAuxGet()<>66 Or UartAuxGet()<>67 : ProcedureReturn 163 : EndIf
+    UartAuxMirror(0)
+    If (uart_auxHead-uart_auxTail)<>0 Or UartMirrorLost()<>0 Or uart_auxLost<>0 : ProcedureReturn 164 : EndIf
+  ElseIf scenario=14
     UartMessageBegin() : UartWrite(65) : UartMessageEnd()
     If UartMessageBytes()<>0 Or UartMessageActive()<>0 Or UartMessageDepth()<>0 : ProcedureReturn 34 : EndIf
   ElseIf scenario=15
@@ -189,7 +230,7 @@ def main():
         p=subprocess.run([str(x) for x in args],cwd=ROOT,env=env,capture_output=True,text=True,encoding='utf-8',errors='replace',timeout=60)
         assert p.returncode==0,(p.returncode,p.stdout[-3000:],p.stderr)
         return p.stdout
-    expected={0:'Zentaji café'.encode()+b'\r\n\0\xff',2:b'ab\x08 \x08C',10:b'A',12:b'Hi',13:b'AB',14:b'A',15:b'C',17:b'F',18:b'B'}
+    expected={0:'Zentaji café'.encode()+b'\r\n\0\xff',2:b'ab\x08 \x08C',10:b'A',12:b'Hi',13:b'AB',14:b'A',15:b'C',17:b'F',18:b'B',22:b'A\0\xff',23:bytes(n&255 for n in range(8193)),25:b'A'*10001,26:b'ABC'}
     incoming={1:b'\0\x7f\xff',2:b'ab\x08C\r\n',4:b'Q',6:b'Q',8:b'AB',9:b'AB',12:b'Hi\x03',13:b'A\r\nB\r',20:b'Q',21:b'Q'}
     with I.NativeRunner() as runner, tempfile.TemporaryDirectory(prefix='anvil-zen-console-') as tmp:
         td=Path(tmp);src=td/'console.zentaji';image=td/'console.zex'
@@ -207,20 +248,21 @@ def main():
             return m
         def states(out):return [s for s in out.splitlines() if s.startswith('STATE ')]
         def match(m,native,scenario):
-            assert m.cores[0].r[1]==42,(scenario,m.cores[0].state,hex(m.cores[0].pc),hex(m.cores[0].r[1]),{k:hex(v) for k,v in m.cores[0].cr.items()},bytes(m.serial[0].out),native[-1200:])
+            assert m.cores[0].r[1]==42,(scenario,m.cores[0].state,hex(m.cores[0].pc),hex(m.cores[0].r[1]),{k:hex(v) for k,v in m.cores[0].cr.items()},len(m.serial[0].out),bytes(m.serial[0].out)[-96:],native[-1200:])
             assert (td/'final.bin').read_bytes()==m.ram,scenario
             I.assert_same_state(native,m)
             want=expected.get(scenario,b'')
-            assert bytes(m.serial[0].out)==want,(scenario,bytes(m.serial[0].out),want)
+            assert bytes(m.serial[0].out)==want,(scenario,len(m.serial[0].out),len(want),bytes(m.serial[0].out)[-96:],want[-96:])
             serial=[s.split(' ',1)[1] for s in native.splitlines() if s.startswith('SERIAL0 ')]
-            assert (serial[0] if serial else '')==want.hex().upper(),(scenario,serial,want)
-        for scenario in range(20):
+            assert (serial[0] if serial else '')==want.hex().upper(),(scenario,[(len(s),s[-192:]) for s in serial],len(want),want[-96:])
+        for scenario in (*range(20),22,23,24,25,26):
+            budget={23:16000000,25:20000000}.get(scenario,4000000)
             m=machine(scenario);c=m.cores[0];kept=list(c.r[128:253]);vectors=list(c.v[32:])
             assert not L.capture(m,str(td))
-            native=run([L.EXE,td/'machine.txt','--max','4000000','--ram',td/'final.bin']);m=runner.execute(m,4000000,td);c=m.cores[0]
+            native=run([L.EXE,td/'machine.txt','--max',str(budget),'--ram',td/'final.bin']);m=runner.execute(m,budget,td);c=m.cores[0]
             match(m,native,scenario)
             assert c.r[128:253]==kept and c.v[32:]==vectors and c.r[255]==0xF0000
-        print('PASS 20 actual console/input/editor/message-routing native state/RAM/output cases: byte/UTF8, nondestructive ready, CRLF/edit/cancel, bounded pressure/drain, baud/adoption/detach, DMA ownership and timer-backed input; unbound/nested/newline/partial diversion, drop-newest overflow, wrap, fatal abandon and unbind/rebind')
+        print('PASS 25 actual console/input/editor/message-routing native state/RAM/output cases, including shared screen/aux byte/style fan-out, diversion exclusion, drop-newest overflow, refused-write exclusion, reset and lossless UART-to-model draining')
         results=[]
         for scenario in (20,21):
             m=machine(scenario);assert not L.capture(m,str(td));rec=td/('recorded%d.txt'%scenario)

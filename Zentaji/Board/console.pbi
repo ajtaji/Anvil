@@ -3,6 +3,7 @@
 ; Background-message routing is shared monitor policy above the transport.
 XIncludeFile "Zentaji/Board/prompt_idle.pbi"
 XIncludeFile "Anvil/Core/console_messages.pbi"
+XIncludeFile "Anvil/Core/console_mirror.pbi"
 XIncludeFile "Zentaji/Board/text.pbi"
 #ZEN_CONSOLE = $FFFF000000100000
 #ZEN_CONSOLE_POLLS = 4096
@@ -65,7 +66,14 @@ EndProcedure
 Procedure UartWrite(c.i)
   If UartMessageActive()<>0 : UartMessagePut(c) : ProcedureReturn : EndIf
   ZentajiTextByte(c)
-  If ZentajiConsolePut(c)=0 : zenConsoleDropped=zenConsoleDropped+1 : EndIf
+  If ZentajiConsolePut(c)=0
+    zenConsoleDropped=zenConsoleDropped+1
+  Else
+    ; The shared model and auxiliary tap see accepted bytes exactly once.
+    ; A diverted message or refused transport write never enters either ring.
+    If uart_mirrorOn<>0 : uart_MirrorPut(c) : EndIf
+    If uart_auxOn<>0 : uart_AuxPut(c) : EndIf
+  EndIf
 EndProcedure
 
 XIncludeFile "Anvil/Core/console_bytes.pbi"

@@ -29,6 +29,14 @@ The existing A64 capture/console gate also passes four rotations, exact RLE CRCs
 45150 lossless bytes and styled terminal operations. Resident Zentaji console
 rendering is still being connected; the counted monitor remains text-only.
 
+The Zentaji UART can now feed both shared output taps after an accepted serial
+write. Diverted messages and refused writes stay out; the prompt's screen style
+is metadata only. Taps remain off until a consumer enables them. The expanded
+`zentaji_console_check.py` executes 25 native transport/model cases, including
+bounded overflow and 10001 lossless UART-to-grid bytes. Its live sleeping-input
+check retains exact native replay. The counted text monitor has been rebuilt and
+qualified through actual ROM disk/host-file boot, storage, text and keyboard paths.
+
 ## Native graphics bring-up
 
 The graphics components now reserve an immutable, page-aligned arena below the
