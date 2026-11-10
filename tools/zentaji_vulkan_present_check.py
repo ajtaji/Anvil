@@ -67,7 +67,7 @@ def main():
         final=(td/'final.bin').read_bytes();report=struct.unpack_from('<32q',final,ref.sym['GLOBAL_REPORT'])
         assert ' exit=2A ' in end,(end,report)
         arena=(((32<<20)-(1<<20)-meta['stack_bytes'])&-4096)-0x400000
-        assert report[:5]==(0,-20001,0x1C0012F,arena+4096,0x3ff000),report
+        assert report[:5]==(0,-20001,0x1C001EF,arena+4096,0x3ff000),report
         assert report[8:12]==(arena+4096,33*17*4,4096,33*4),report
         assert report[12:20]==(1,0,0,0,0,0,0,0) and report[21:24]==(1,1,1),report
         assert final[arena+4096:arena+4096+33*17*4]==struct.pack('<I',0x803380B2)*(33*17)

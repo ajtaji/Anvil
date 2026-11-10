@@ -166,12 +166,46 @@ last sampler with no launch and same-command/fence retry, and a real later shade
 fault with retained resource/destroy refusal and unsignalled fence. The maximum
 4096-record list is preflighted; it is not claimed as a full execution stress run.
 
-Native transfer remains absent. Resident resource/upload integration and safe
-ownership of configured display backbuffers still precede graphics boot.
+Native transfer uses Board/dma_transfer.pbi's dedicated channel7 with pinned
+48-byte descriptors, up to 85 rows per batch. It bounds complete pitched spans
+before launch, rejects overlapping data/private metadata and detects foreign ownership.
+The hardware moves bytes at its own rate; bounded waits use timer/WFI when busy.
+A deadline never cancels DMA or proves retirement. Timeout, device error or
+foreign configuration permanently quarantines this owner until reset.
+
+The Vulkan backend shares the first 2 KB of its idle private page between retired
+GPU commands and DMA descriptors under the existing queue lease, 42 rows per batch.
+The retired GPU fence at +2048 remains intact for presentation. It supplies buffer copy/fill/
+update, pitched linear image upload/readback, whole optimal-image upload and
+whole optimal-to-optimal copy. A foreign channel at initialization leaves
+graphics usable with BUFFER_TRANSFER/LINEAR_TRANSFER absent. Display buffers
+remain conservatively excluded from both transfer source and destination spans.
+Partial optimal rectangles and optimal readback remain unsupported.
+
+tools/zentaji_dma_transfer_check.py checks nine native cases: 100-row copy/fill
+across descriptor batches, reuse, bounds/alias/context refusals, foreign initial/
+idle registers, a real later descriptor fault, timeout with late completion,
+and disjoint rows sharing one allocation without touching the source bytes.
+tools/zentaji_vulkan_upload_check.py follows mapped staging data through public
+fill/copy/update/upload commands and the production Neon sampling shader. It
+checks linear/optimal and nearest/bilinear, all channel values/bytes and scanout
+CRCs; linear cases also check pitched readback and optimal cases whole-image
+copies between separate allocations. A 100-row backend copy crosses three
+descriptor batches and proves the retired GPU fence stays intact. Two owner-loss
+cases additionally check repeated public device loss, unsignalled fences and
+retained buffers/memory/images with destruction refused. These are Windows component proofs.
+
+The qualified Linux ASM runtime matches uploaded/copied bytes and preserves the
+GPU fence in the optimal/bilinear case, but 13 red-channel results are one level
+below the independent expectation. An isolated native ASM probe confirms that
+the emulator's current ZG3Rne helper rounds values just above a half downward on
+Linux. Native-core rounding repair and Linux pixel parity remain owed.
+Resident font integration and safe ownership of configured display backbuffers
+still precede graphics boot.
 
 These components are not yet connected to the counted monitor composition or
 the resident shared Vulkan/Neon Arcade presentation adapter. The shipped monitor remains
-text; resident adapter integration, transfer and graphical boot remain owed.
+text; resident adapter/font integration and graphical boot remain owed.
 
 ```text
 python tools/zentaji_graphics_memory_check.py --compiler <Forge executable> --zen-tools <tools/zentaji directory>

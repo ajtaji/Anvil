@@ -85,11 +85,9 @@ private optimal layout. An explicit backend capability controls optimal color
 attachments in both the format query and image creation, so a backend that only
 samples optimal images does not acquire render-target support implicitly.
 
-Native public-API cases render a source image on the GPU, transition its layout
-with a barrier, and sample it into a second image. Independent expectations check
-all RGBA pixels, fractional alpha at filtered edges, unchanged source contents,
-in-flight sampler/view/image retention and exact scanout CRCs. Malformed or
-aliased sampled descriptors are refused before launch.
+Native cases render, transition and sample real GPU images, checking RGBA pixels,
+filtered alpha, source immutability, retained resources and scanout CRCs.
+Malformed or aliased descriptors are refused before launch.
 Native blending supports SRC_ALPHA/ONE_MINUS_SRC_ALPHA for RGB and
 ONE/ONE_MINUS_SRC_ALPHA for alpha, both ADD. The older SRC_ALPHA-for-alpha
 equation has its own portable mode and capability and is refused on this native
@@ -110,8 +108,10 @@ reuse one pinned page after each GPU fence, clearing the pass only once. Final
 retirement signals the public fence; later faults quarantine all flight
 resources until reset.
 
-Native transfer, resident resource/upload integration and safe display
-backbuffer ownership remain unfinished. The counted monitor still boots to text.
+Owned DMA supplies buffer copy/fill/update, linear transfers and whole optimal
+uploads/copies. The CPU writes descriptors; DMA writes pixels. Timer/WFI waits
+retire work; failures quarantine resources. Resident fonts/backbuffer ownership
+remain unfinished. The monitor still boots to text.
 
 @SECTION Evidence and remaining work
 

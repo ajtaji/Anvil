@@ -4,11 +4,13 @@
 ; Its first page belongs to commands/fences; only later pages are Vulkan memory.
 ; Hardware completion orders coherent RAM writes before fences/status. No CPU
 ; pixel fallback is used. Draw uses typed-IR native shader lowering and the
-; real ROM TEX2D sampler. Transfer remains absent. This backend does not own display.
+; real ROM TEX2D sampler. DMA owns transfers. This backend does not own display.
+XIncludeFile "Zentaji/Board/dma_transfer.pbi"
 #ANVIL_VULKAN_BACKEND_PRESENT=3
 #AVK_ZEN_IMAGE_LAYOUT=3
 #AVK_ZEN_DISPLAY=$FFFF0000000C0000
 Global avkZenQueue.ZentajiGraphicsQueue
+Global avkZenDma.ZentajiDmaTransfer
 Global avkZenUp.i,avkZenHeapBase.i,avkZenHeapBytes.i,avkZenLease.i,avkZenPending.i,avkZenNativeError.i
 Global avkZenListActive.i,avkZenListBase.i,avkZenListCount.i,avkZenListIndex.i
 Global Dim avkZenCommand.q[8]
@@ -19,6 +21,9 @@ Procedure.i AnvilVkZentajiWindow(base.i,bytes.i)
  If base<1 Or (base&4095)<>0 Or bytes<8192 Or (bytes&4095)<>0 Or base>ram Or bytes>ram-base : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf
  If ZentajiGraphicsBind(@avkZenQueue,15,base,4096,base,2048,base+2048)=0 : ProcedureReturn #VK_ERROR_INITIALIZATION_FAILED : EndIf
  avkZenHeapBase=base+4096 : avkZenHeapBytes=bytes-4096 : avkZenUp=1
+ ; A foreign DMA channel leaves graphics usable with transfer caps absent.
+ ; Leave the retired GPU fence at +2048 intact for display provenance.
+ ZentajiDmaBind(@avkZenDma,base,2048)
  ProcedureReturn #VK_SUCCESS
 EndProcedure
 
@@ -38,8 +43,10 @@ Procedure.i avkZenOffscreen(base.i,bytes.i)
 EndProcedure
 
 Procedure.i avkBackendCaps()
+ Protected transfer.i
+ If avkZenDma\state=1 And avkZenDma\lost=0 : transfer=#ANVIL_VK_CAP_BUFFER_TRANSFER|#ANVIL_VK_CAP_LINEAR_TRANSFER : EndIf
  If avkZenUp=0 Or avkZenQueue\lost<>0 : ProcedureReturn 0 : EndIf
- ProcedureReturn #ANVIL_VK_CAP_DEVICE | #ANVIL_VK_CAP_CLEAR_COLOR | #ANVIL_VK_CAP_GPU | #ANVIL_VK_CAP_DRAW | #ANVIL_VK_CAP_ATTACHMENT_LOAD | #ANVIL_VK_CAP_OPTIMAL_COLOR_ATTACHMENT | #ANVIL_VK_CAP_BLEND_ALPHA_ONE | #ANVIL_VK_CAP_DRAW_LIST | #ANVIL_VK_CAP_CLEAR_ATTACHMENT_RECT
+ ProcedureReturn transfer | #ANVIL_VK_CAP_DEVICE | #ANVIL_VK_CAP_CLEAR_COLOR | #ANVIL_VK_CAP_GPU | #ANVIL_VK_CAP_DRAW | #ANVIL_VK_CAP_ATTACHMENT_LOAD | #ANVIL_VK_CAP_OPTIMAL_COLOR_ATTACHMENT | #ANVIL_VK_CAP_BLEND_ALPHA_ONE | #ANVIL_VK_CAP_DRAW_LIST | #ANVIL_VK_CAP_CLEAR_ATTACHMENT_RECT
 EndProcedure
 
 Procedure.i avkBackendName()
@@ -70,6 +77,7 @@ Procedure.i avkBackendGpuLeaseAcquire(owner.i)
 EndProcedure
 
 Procedure.i avkBackendGpuLeaseRelease(owner.i)
+ If avkZenDma\state=3 Or avkZenDma\lost<>0 : ProcedureReturn 0 : EndIf
  If owner<1 Or avkZenLease<>owner Or avkZenPending<>0 Or avkZenListActive<>0 Or avkZenQueue\state<>1 Or avkZenQueue\lost<>0 : ProcedureReturn 0 : EndIf
  If ZentajiGraphicsOwned(@avkZenQueue)=0 : ProcedureReturn 0 : EndIf
  avkZenLease=0 : ProcedureReturn 1
@@ -156,7 +164,7 @@ Procedure.i avkBackendImagePlan(width.i, height.i, format.i, tiling.i, usage.i, 
  *plan\backendLayout=0 : *plan\paddedWidth=0 : *plan\paddedHeight=0
  If width<1 Or height<1 Or width>16384 Or height>16384 Or format<>#VK_FORMAT_B8G8R8A8_UNORM : ProcedureReturn #VK_ERROR_FORMAT_NOT_SUPPORTED : EndIf
  If tiling<>#VK_IMAGE_TILING_LINEAR And tiling<>#VK_IMAGE_TILING_OPTIMAL : ProcedureReturn #VK_ERROR_FORMAT_NOT_SUPPORTED : EndIf
- If (usage&~(#VK_IMAGE_USAGE_TRANSFER_DST_BIT|#VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT|#VK_IMAGE_USAGE_SAMPLED_BIT))<>0 : ProcedureReturn #VK_ERROR_FORMAT_NOT_SUPPORTED : EndIf
+ If (usage&~(#VK_IMAGE_USAGE_TRANSFER_DST_BIT|#VK_IMAGE_USAGE_TRANSFER_SRC_BIT|#VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT|#VK_IMAGE_USAGE_SAMPLED_BIT))<>0 : ProcedureReturn #VK_ERROR_FORMAT_NOT_SUPPORTED : EndIf
  *plan\bytes=width*height*4 : *plan\alignment=4096
  *plan\paddedWidth=width : *plan\paddedHeight=height
  If tiling=#VK_IMAGE_TILING_LINEAR
@@ -165,26 +173,6 @@ Procedure.i avkBackendImagePlan(width.i, height.i, format.i, tiling.i, usage.i, 
   *plan\backendLayout=#AVK_ZEN_IMAGE_LAYOUT
  EndIf
  ProcedureReturn #VK_SUCCESS
-EndProcedure
-
-Procedure.i avkBackendImageCopyValidate(*copy.AnvilVkBackendImageCopy)
-    ProcedureReturn -1
-  EndProcedure
-
-Procedure.i avkBackendImageCopyBatchReady()
-    ProcedureReturn 0
-  EndProcedure
-
-Procedure.i avkBackendSubmitImageCopy(*copy.AnvilVkBackendImageCopy)
- ProcedureReturn avkBackendRefuseBeforeLaunch(#VK_ERROR_FEATURE_NOT_PRESENT)
-EndProcedure
-
-Procedure.i avkBackendTiledImageCopyValidate(*copy.AnvilVkBackendTiledImageCopy)
-    ProcedureReturn -1
-  EndProcedure
-
-Procedure.i avkBackendSubmitTiledImageCopy(*copy.AnvilVkBackendTiledImageCopy)
- ProcedureReturn avkBackendRefuseBeforeLaunch(#VK_ERROR_FEATURE_NOT_PRESENT)
 EndProcedure
 
 Procedure.i avkBackendTiledRectCopyValidate(*copy.AnvilVkBackendTiledRectCopy)
@@ -248,18 +236,6 @@ Procedure.i avkBackendTiledMicroReadbackValidate(*copy.AnvilVkBackendTiledReadba
   EndProcedure
 
 Procedure.i avkBackendSubmitTiledMicroReadback(*copy.AnvilVkBackendTiledReadback)
- ProcedureReturn avkBackendRefuseBeforeLaunch(#VK_ERROR_FEATURE_NOT_PRESENT)
-EndProcedure
-
-Procedure.i avkBackendSubmitBufferCopy(source.i, destination.i, bytes.i)
- ProcedureReturn avkBackendRefuseBeforeLaunch(#VK_ERROR_FEATURE_NOT_PRESENT)
-EndProcedure
-
-Procedure.i avkBackendSubmitBufferCopyRows(source.i, sourcePitch.i, destination.i, destinationPitch.i, rowBytes.i, rows.i)
- ProcedureReturn avkBackendRefuseBeforeLaunch(#VK_ERROR_FEATURE_NOT_PRESENT)
-EndProcedure
-
-Procedure.i avkBackendSubmitBufferFill(destination.i, bytes.i, data.i)
  ProcedureReturn avkBackendRefuseBeforeLaunch(#VK_ERROR_FEATURE_NOT_PRESENT)
 EndProcedure
 
@@ -329,3 +305,5 @@ EndProcedure
 
 XIncludeFile "Zentaji/Lib/Vulkan/vk_zentaji_draw.pbi"
 XIncludeFile "Zentaji/Lib/Vulkan/vk_zentaji_list.pbi"
+
+XIncludeFile "Zentaji/Lib/Vulkan/vk_zentaji_transfer.pbi"
