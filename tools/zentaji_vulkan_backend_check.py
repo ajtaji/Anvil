@@ -133,7 +133,7 @@ def main():
             report=native_report
             assert result.states==[3,0] and result.exit_code==42,(tiling,result.states,result.exit_code,report)
             assert registers[128:253]==kept and registers[255]==0x1F00000,tiling
-            assert report[:8]==(0,-20001,0x1C0000F,arena+4096,0x3FF000,-8,-2,0),report
+            assert report[:8]==(0,-20001,0x1C0012F,arena+4096,0x3FF000,-8,-2,0),report
             width,height=(512,2000) if tiling==2 else (33,17)
             size=width*height*4
             assert report[8:12]==(arena+4096,size,4096,width*4 if tiling!=0 else 0),report

@@ -10,6 +10,7 @@
 #AVK_ZEN_DISPLAY=$FFFF0000000C0000
 Global avkZenQueue.ZentajiGraphicsQueue
 Global avkZenUp.i,avkZenHeapBase.i,avkZenHeapBytes.i,avkZenLease.i,avkZenPending.i,avkZenNativeError.i
+Global avkZenListActive.i,avkZenListBase.i,avkZenListCount.i,avkZenListIndex.i
 Global Dim avkZenCommand.q[8]
 
 Procedure.i AnvilVkZentajiWindow(base.i,bytes.i)
@@ -38,7 +39,7 @@ EndProcedure
 
 Procedure.i avkBackendCaps()
  If avkZenUp=0 Or avkZenQueue\lost<>0 : ProcedureReturn 0 : EndIf
- ProcedureReturn #ANVIL_VK_CAP_DEVICE | #ANVIL_VK_CAP_CLEAR_COLOR | #ANVIL_VK_CAP_GPU | #ANVIL_VK_CAP_DRAW | #ANVIL_VK_CAP_ATTACHMENT_LOAD | #ANVIL_VK_CAP_OPTIMAL_COLOR_ATTACHMENT | #ANVIL_VK_CAP_BLEND_ALPHA_ONE
+ ProcedureReturn #ANVIL_VK_CAP_DEVICE | #ANVIL_VK_CAP_CLEAR_COLOR | #ANVIL_VK_CAP_GPU | #ANVIL_VK_CAP_DRAW | #ANVIL_VK_CAP_ATTACHMENT_LOAD | #ANVIL_VK_CAP_OPTIMAL_COLOR_ATTACHMENT | #ANVIL_VK_CAP_BLEND_ALPHA_ONE | #ANVIL_VK_CAP_DRAW_LIST | #ANVIL_VK_CAP_CLEAR_ATTACHMENT_RECT
 EndProcedure
 
 Procedure.i avkBackendName()
@@ -63,13 +64,13 @@ Procedure.i avkBackendSubmitCompute(*job.AnvilVkBackendComputeJob, *result.Anvil
 EndProcedure
 
 Procedure.i avkBackendGpuLeaseAcquire(owner.i)
- If (owner<>#ANVIL_VK_GPU_LEASE_QUEUE And owner<>#ANVIL_VK_GPU_LEASE_EXTERNAL) Or avkZenLease<>0 Or avkZenPending<>0 Or avkZenQueue\state<>1 : ProcedureReturn 0 : EndIf
+ If (owner<>#ANVIL_VK_GPU_LEASE_QUEUE And owner<>#ANVIL_VK_GPU_LEASE_EXTERNAL) Or avkZenLease<>0 Or avkZenPending<>0 Or avkZenListActive<>0 Or avkZenQueue\state<>1 : ProcedureReturn 0 : EndIf
  If ZentajiGraphicsOwned(@avkZenQueue)=0 : ProcedureReturn 0 : EndIf
  avkZenLease=owner : ProcedureReturn 1
 EndProcedure
 
 Procedure.i avkBackendGpuLeaseRelease(owner.i)
- If owner<1 Or avkZenLease<>owner Or avkZenPending<>0 Or avkZenQueue\state<>1 Or avkZenQueue\lost<>0 : ProcedureReturn 0 : EndIf
+ If owner<1 Or avkZenLease<>owner Or avkZenPending<>0 Or avkZenListActive<>0 Or avkZenQueue\state<>1 Or avkZenQueue\lost<>0 : ProcedureReturn 0 : EndIf
  If ZentajiGraphicsOwned(@avkZenQueue)=0 : ProcedureReturn 0 : EndIf
  avkZenLease=0 : ProcedureReturn 1
 EndProcedure
@@ -301,7 +302,7 @@ Procedure.i avkBackendSubmitClear(base.i, bytes.i, w.i, h.i, pitch.i, bgra.i, lo
  ProcedureReturn #ANVIL_VK_JOB_PENDING
 EndProcedure
 
-Procedure.i avkBackendPoll()
+Procedure.i avkZenPollOne()
  Protected result.i
  If avkZenPending=0 : ProcedureReturn 1 : EndIf
  result=ZentajiGraphicsPoll(@avkZenQueue)
@@ -327,3 +328,4 @@ Procedure.i avkBackendTicksUs()
 EndProcedure
 
 XIncludeFile "Zentaji/Lib/Vulkan/vk_zentaji_draw.pbi"
+XIncludeFile "Zentaji/Lib/Vulkan/vk_zentaji_list.pbi"

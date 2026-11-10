@@ -151,9 +151,23 @@ property grader and adding ALPHA_ONE/hostile-mode checks. These V3D checks do
 not execute a Pi4 GPU; that physical pixel proof remains owed. The repaired
 fixture also compiles for Pi4.
 
-Native transfer and ordered draw-list capabilities remain absent. Resident
-resource/upload integration and safe ownership of configured display backbuffers
-still precede the graphics boot composition.
+The native backend now advertises ordered draw lists and rectangular attachment
+clears. It preflights every record and nested snapshot before launching any item,
+then reuses its pinned command page only after the preceding real GPU fence.
+Only the first item applies the render-pass clear; later items preserve pixels.
+The public fence signals only after final retirement. A later fault quarantines
+the lease and all flight resources until reset instead of permitting retry/free.
+
+tools/zentaji_vulkan_list_check.py executes six production Neon textured draws
+with distinct push tints/scissors and an interleaved GPU rectangle clear. Eight
+native cases check all RGBA pixels, final fence/scanout CRCs, linear/optimal
+sources, both filters, clear-only lists, complete admission bounds, an unsupported
+last sampler with no launch and same-command/fence retry, and a real later shader
+fault with retained resource/destroy refusal and unsignalled fence. The maximum
+4096-record list is preflighted; it is not claimed as a full execution stress run.
+
+Native transfer remains absent. Resident resource/upload integration and safe
+ownership of configured display backbuffers still precede graphics boot.
 
 These components are not yet connected to the counted monitor composition or
 the resident shared Vulkan/Neon Arcade presentation adapter. The shipped monitor remains

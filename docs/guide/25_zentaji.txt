@@ -99,17 +99,19 @@ full RGBA and display CRCs at alpha zero, quarter, half and one, including a
 second scissored attachment-LOAD pass. The shared software executor separately
 checks both equations against expected pixels.
 
-Shared Neon textured, line and outline pipeline builders now request ONE for
-source alpha, and V3D emits that equation while retaining its older mode.
-Native GPU cases execute the production textured pipeline builder and atlas
-fragment shader, including push tint, zero UBO, binding1 sampling, dynamic state
-and exact RGBA/display CRCs. Separate V3D packet and closed-list CPU checks do
-not establish physical Pi4 GPU pixels; that hardware proof remains owed.
+Shared Neon textured, line and outline builders request ONE for source alpha;
+V3D supports both alpha modes. Native GPU cases execute the production textured
+builder and atlas shader with push tint, zero UBO, binding1 sampling, dynamic
+state and exact RGBA/display CRCs. V3D packet/list CPU checks leave physical
+Pi4 GPU pixel proof owed.
 
-Native transfer and ordered draw-list capabilities are not enabled. Full
-resident resource/upload integration and safe display backbuffer ownership
-still precede the graphics boot composition.
-The counted monitor still boots to text.
+Ordered lists preflight every item before launch. Draws and rectangle clears
+reuse one pinned page after each GPU fence, clearing the pass only once. Final
+retirement signals the public fence; later faults quarantine all flight
+resources until reset.
+
+Native transfer, resident resource/upload integration and safe display
+backbuffer ownership remain unfinished. The counted monitor still boots to text.
 
 @SECTION Evidence and remaining work
 
@@ -122,8 +124,6 @@ The established multi-target host Forge build retains its C backend. The
 Zentaji emulator, assembler and focused native tools use the ASM backend only.
 The planned built-in self-hosted Forge targets only Zentaji and remains unfinished.
 
-Windows component cases and a separate Linux ASM headless blend/LOAD case
-establish their stated native execution paths. Visible Linux input, physical
-input/rumble and full Linux acceptance remain separate proofs, as does reference
-instruction-cost timing on an otherwise idle host.
-`Zentaji/README.md` lists the component checks and their current boundaries.
+Windows and Linux component proofs have explicit scopes. Full Linux acceptance,
+visible/physical input, rumble and idle-host cost calibration remain owed;
+see `Zentaji/README.md` for checks and boundaries.

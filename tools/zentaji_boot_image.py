@@ -41,8 +41,17 @@ def source(image,stack_bytes=65536):
     payload=image[64:]
     padded=payload+bytes(-len(payload)%8)
     lines=[f'.equ ZEN_VECTOR_BASE,${vector:X}',f'.equ ZEN_COMPILED_ENTRY,${h["entry"]:X}',f'.equ ZEN_IMAGE_LOAD,${h["load"]:X}',f'.equ ZEN_STACK_BYTES,{stack_bytes}',f'.org ${h["load"]:X}']
+    emitted=0
     for i in range(0,len(padded),64):
-        lines.append('.word '+','.join(f'${int.from_bytes(padded[j:j+8],"little"):016X}' for j in range(i,min(i+64,len(padded)),8)))
+        block=padded[i:i+64]
+        # Compiled globals include large zero-filled tables. Forward .org has
+        # exactly the same zero-padding semantics without millions of literal
+        # operands. Keep every nonzero payload byte and its address unchanged.
+        if not any(block):continue
+        if emitted!=i:lines.append(f'.org ${h["load"]+i:X}')
+        lines.append('.word '+','.join(f'${int.from_bytes(block[j:j+8],"little"):016X}' for j in range(0,len(block),8)))
+        emitted=i+len(block)
+    if emitted!=len(padded):lines.append(f'.org ${h["load"]+len(padded):X}')
     h['startup_line_offset']=len(lines)
     lines.append(STARTUP.read_text(encoding='utf-8'))
     return '\n'.join(lines)+'\n',h,vector

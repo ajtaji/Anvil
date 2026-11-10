@@ -25,6 +25,12 @@ Procedure.i avkZenOverlaps(base.i,bytes.i,other.i,otherBytes.i)
  ; All intervals have already passed bounded RAM/heap-range validation.
  ProcedureReturn Bool(base<other+otherBytes And other<base+bytes)
 EndProcedure
+; Portable flight snapshots must not reside in the private command page:
+; staging the next hardware list would overwrite them before the GPU reads them.
+Procedure.i avkZenClientRange(base.i,bytes.i)
+ If avkZenRamRange(base,bytes)=0 : ProcedureReturn 0 : EndIf
+ ProcedureReturn Bool(avkZenOverlaps(base,bytes,avkZenQueue\list,4096)=0)
+EndProcedure
 Procedure.i avkZenU32Float(value.i)
  Protected exponent.i=127,shift.i,n.i=value
  ; Exact IEEE binary32 encoding of a nonnegative whole viewport coordinate.
@@ -48,7 +54,7 @@ Procedure.i avkBackendPipelineBuild(*build.AnvilVkBackendPipelineBuildInfo)
  If *build=0 : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf
  pipe=*build\pipeline
  If pipe<1 Or pipe>#ANVIL_VK_MAX_PIPELINES Or *build\vertexIr=0 Or *build\fragmentIr=0 : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf
- If avkZenPipelines[pipe]\base<>0 Or avkZenPending<>0 : ProcedureReturn #ANVIL_VK_ERR_STATE : EndIf
+ If avkZenPipelines[pipe]\base<>0 Or avkZenPending<>0 Or avkZenListActive<>0 : ProcedureReturn #ANVIL_VK_ERR_STATE : EndIf
  If *build\bytes<>avkBackendPipelineBytes() Or (*build\base&4095)<>0 Or avkZenHeapRange(*build\base,*build\bytes)=0 : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf
  avkZenShaderTarget\attributeCount=AnvilVkPipelineAttrCount(pipe)
  avkZenShaderTarget\attributes=@avkZenAttributes[0] : avkZenShaderTarget\invertY=1
@@ -101,7 +107,7 @@ EndProcedure
 ; filters are explicitly refused rather than choosing one silently.
 Procedure.i avkZenSamplePitch(*s.AnvilVkBackendSampledImage)
  Protected pitch.i,span.i
- If avkZenRamRange(*s,SizeOf(AnvilVkBackendSampledImage))=0 : ProcedureReturn 0 : EndIf
+ If avkZenClientRange(*s,SizeOf(AnvilVkBackendSampledImage))=0 : ProcedureReturn 0 : EndIf
  If *s\width<1 Or *s\width>16384 Or *s\height<1 Or *s\height>16384 : ProcedureReturn 0 : EndIf
  If *s\format<>#VK_FORMAT_B8G8R8A8_UNORM Or *s\layout<>#VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : ProcedureReturn 0 : EndIf
  If *s\magFilter<>*s\minFilter Or (*s\minFilter<>#VK_FILTER_NEAREST And *s\minFilter<>#VK_FILTER_LINEAR) : ProcedureReturn 0 : EndIf
@@ -125,17 +131,18 @@ Procedure.i avkZenDrawPreflight(*d.AnvilVkBackendDraw)
  Protected pipe.i,n.i,width.i,maxIndex.i,last.i,indexBytes.i,value.i,bytes.i,first.i,rate.i
  Protected *bind.AnvilVkBackendBinding
  Protected *sample.AnvilVkBackendSampledImage,pitch.i
- If *d=0 : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf
+ If avkZenClientRange(*d,SizeOf(AnvilVkBackendDraw))=0 : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf
  pipe=*d\pipeline
  If pipe<1 Or pipe>#ANVIL_VK_MAX_PIPELINES : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf
  If avkZenPipelines[pipe]\base=0 Or avkZenHeapRange(avkZenPipelines[pipe]\base,avkZenPipelines[pipe]\bytes)=0 : ProcedureReturn #ANVIL_VK_ERR_STATE : EndIf
  If *d\kind<>#ANVIL_VK_RENDER_OP_DRAW Or (*d\loadColor<>0 And *d\loadColor<>1) Or (*d\sampleMask<>0 And *d\sampleMask<>1) : ProcedureReturn #VK_ERROR_FEATURE_NOT_PRESENT : EndIf
  If *d\blendMode<>#ANVIL_VK_BLEND_DISABLED And *d\blendMode<>#ANVIL_VK_BLEND_ALPHA_ONE : ProcedureReturn #VK_ERROR_FEATURE_NOT_PRESENT : EndIf
  If avkBackendDrawSupported(*d\targetBase,*d\targetBytes,*d\width,*d\height,*d\pitch)<>#VK_SUCCESS : ProcedureReturn #VK_ERROR_FEATURE_NOT_PRESENT : EndIf
+ If avkZenOverlaps(*d\targetBase,*d\targetBytes,*d,SizeOf(AnvilVkBackendDraw))<>0 : ProcedureReturn #VK_ERROR_FEATURE_NOT_PRESENT : EndIf
  If avkZenOverlaps(*d\targetBase,*d\targetBytes,avkZenPipelines[pipe]\base,avkZenPipelines[pipe]\bytes)<>0 : ProcedureReturn #VK_ERROR_FEATURE_NOT_PRESENT : EndIf
  If avkZenPipelines[pipe]\sampledBinding>=0
   *sample=*d\sampledImage : pitch=avkZenSamplePitch(*sample)
-  If pitch=0 : ProcedureReturn #VK_ERROR_FEATURE_NOT_PRESENT : EndIf
+  If pitch=0 Or avkZenOverlaps(*d\targetBase,*d\targetBytes,*sample,SizeOf(AnvilVkBackendSampledImage))<>0 : ProcedureReturn #VK_ERROR_FEATURE_NOT_PRESENT : EndIf
   If avkZenOverlaps(*d\targetBase,*d\targetBytes,*sample\base,(*sample\height-1)*pitch+*sample\width*4)<>0 : ProcedureReturn #VK_ERROR_FEATURE_NOT_PRESENT : EndIf
  ElseIf *d\sampledImage<>0
   ProcedureReturn #VK_ERROR_FEATURE_NOT_PRESENT
@@ -161,6 +168,8 @@ Procedure.i avkZenDrawPreflight(*d.AnvilVkBackendDraw)
   If maxIndex<>*d\maxVertex : ProcedureReturn #VK_ERROR_FEATURE_NOT_PRESENT : EndIf
  EndIf
  If *d\bindingCount<1 Or *d\bindingCount>#ANVIL_VK_MAX_BINDINGS Or *d\bindingCount<>AnvilVkPipelineBindingCount(pipe) Or *d\bindings=0 : ProcedureReturn #VK_ERROR_FEATURE_NOT_PRESENT : EndIf
+ If avkZenClientRange(*d\bindings,*d\bindingCount*SizeOf(AnvilVkBackendBinding))=0 : ProcedureReturn #VK_ERROR_FEATURE_NOT_PRESENT : EndIf
+ If avkZenOverlaps(*d\targetBase,*d\targetBytes,*d\bindings,*d\bindingCount*SizeOf(AnvilVkBackendBinding))<>0 : ProcedureReturn #VK_ERROR_FEATURE_NOT_PRESENT : EndIf
  For n=0 To *d\bindingCount-1
   *bind=*d\bindings+n*SizeOf(AnvilVkBackendBinding)
   If *bind\stride<1 Or *bind\stride<>AnvilVkPipelineBindingStride(pipe,n) : ProcedureReturn #VK_ERROR_FEATURE_NOT_PRESENT : EndIf
@@ -173,7 +182,7 @@ Procedure.i avkZenDrawPreflight(*d.AnvilVkBackendDraw)
  Next
  bytes=avkZenPipelines[pipe]\pushBytes
  If bytes<>0
-  If *d\pushBytes<bytes Or avkZenRamRange(*d\pushBase,bytes)=0 : ProcedureReturn #VK_ERROR_FEATURE_NOT_PRESENT : EndIf
+  If *d\pushBytes<bytes Or avkZenClientRange(*d\pushBase,bytes)=0 : ProcedureReturn #VK_ERROR_FEATURE_NOT_PRESENT : EndIf
   If avkZenOverlaps(*d\targetBase,*d\targetBytes,*d\pushBase,bytes)<>0 : ProcedureReturn #VK_ERROR_FEATURE_NOT_PRESENT : EndIf
  EndIf
  bytes=avkZenPipelines[pipe]\uniformBytes
@@ -183,7 +192,7 @@ Procedure.i avkZenDrawPreflight(*d.AnvilVkBackendDraw)
  EndIf
  ProcedureReturn #VK_SUCCESS
 EndProcedure
-Procedure.i avkBackendSubmitDraw(*d.AnvilVkBackendDraw)
+Procedure.i avkZenSubmitOne(*d.AnvilVkBackendDraw,preserve.i)
  Protected rc.i,n.i,pipe.i,meta.i,pitch.i,x.i,y.i,right.i,bottom.i,width.i,texture.i
  Protected *bind.AnvilVkBackendBinding
  Protected *sample.AnvilVkBackendSampledImage
@@ -219,7 +228,7 @@ Procedure.i avkBackendSubmitDraw(*d.AnvilVkBackendDraw)
  avkZenBlankCommand() : avkZenCommand[0]=4
  PokeL(@avkZenCommand[0]+16,*d\width) : PokeL(@avkZenCommand[0]+20,*d\height)
  If avkZenAppendCommand()=0 : ProcedureReturn avkBackendRefuseBeforeLaunch(#VK_ERROR_DEVICE_LOST) : EndIf
- If *d\loadColor=0
+ If *d\loadColor=0 And preserve=0
   avkZenBlankCommand() : avkZenCommand[0]=$105 : PokeL(@avkZenCommand[0]+8,*d\clearBgra)
   If avkZenAppendCommand()=0 : ProcedureReturn avkBackendRefuseBeforeLaunch(#VK_ERROR_DEVICE_LOST) : EndIf
  EndIf
