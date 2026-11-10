@@ -45,17 +45,23 @@ Lib/Vulkan/vk_zentaji_shader.pbi now lowers verified typed IR into native
 GPU shader code. It resolves declared input locations and block offsets,
 supports scalar/vector constants, loads, composite extract/construct, stores
 and float32 add/subtract/multiply, and records required push/uniform extents.
+It also lowers combined-image sampling through the actual TEX2D boot-ROM
+service. SSA registers avoid the ROM's documented scratch range, the GPU return
+link is retained, and dead inputs do not manufacture resource requirements.
 Vertex bindings include per-instance inputs. A target flag adapts Vulkan's
 positive viewport Y to the native rasterizer without changing the SSA value.
 Code is published only after successful validation and bounded emission;
 unsupported operations and exhausted code/register storage leave it unchanged.
 
 The native-only tools/zentaji_shader_check.py executes real SPIR-V parsing,
-typed-IR adaptation and generated shaders on the GPU. Six cases check exact
+typed-IR adaptation and generated shaders on the GPU. Eight cases check exact
 triangle pixels, interpolated RGB, push/UBO reads, scalar/vector arithmetic,
 viewport orientation, padding/guards and atomic refusal. It separately compares
-one generated shader against independent assembly. Shader sampling and the
-remaining IR operations are still refused, and unsupported shader operations remain explicit refusals. The native backend
+one generated shader against independent assembly. Two additional cases execute
+nearest/bilinear sampling through the real ROM and compare complete triangle
+pixels with independent integer-filter expectations. The public backend still
+refuses sampled-image draws until descriptor/pipeline integration is qualified;
+remaining unsupported IR operations are explicit refusals. The native backend
 now connects this lowerer to public Vulkan pipeline creation and draw submission.
 
 The native Vulkan backend now advertises opaque drawing and attachment loads.

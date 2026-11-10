@@ -8,7 +8,8 @@
 ;
 ; ABI: r1 vertex index, r4 instance index, r3 pinned draw metadata. Metadata
 ; qwords 0/1 are push/UBO pointers; qwords 4..19 are vertex binding bases.
-; r8..r10 are address temporaries, r16..r239 hold immutable scalar SSA lanes.
+; r8..r10 are address temporaries, r61..r239 hold immutable scalar SSA lanes.
+; r15..r60 are reserved for the ROM sampler; r240 saves the GPU return link.
 ; r254 is the GPU return sentinel. v0 is clip position / fragment RGBA;
 ; v1..v15 carry vertex locations 0..14 into interpolated fragment inputs.
 ; Each lane is the exact float32 bit pattern, without host float conversion.
@@ -41,12 +42,14 @@ Structure AvkZenShaderTarget Align #PB_Structure_AlignC
 EndStructure
 Structure AvkZenShaderResult Align #PB_Structure_AlignC
  codeBytes.i : registers.i : varyingCount.i
- pushBytes.i : uniformBytes.i : uniformBinding.i
+ pushBytes.i : uniformBytes.i : uniformBinding.i : sampledBinding.i
 EndStructure
 Global Dim avkZsCode.q[#AVK_ZEN_SHADER_CODE_BYTES/8]
 Global Dim avkZsReg.i[(#ANVIL_IR_MAX_ID+1)*4]
+Global Dim avkZsNeeded.a[#ANVIL_IR_MAX_ID+1]
+Global Dim avkZsSampler.a[#ANVIL_IR_MAX_ID+1]
 Global avkZsWords.i,avkZsNext.i,avkZsError.i,avkZsRoot.i,avkZsMember.i,avkZsVarying.i,avkZsPrimary.i
-Global avkZsPushBytes.i,avkZsUniformBytes.i,avkZsUniformVariable.i,avkZsUniformBinding.i
+Global avkZsPushBytes.i,avkZsUniformBytes.i,avkZsUniformVariable.i,avkZsUniformBinding.i,avkZsSampledBinding.i
 
 Procedure.i avkZsFail(code.i)
  If avkZsError=0 : avkZsError=code : EndIf
@@ -142,10 +145,20 @@ Procedure.i avkZsValue(*m.AvkIrModule,id.i,lane.i)
  ProcedureReturn avkZsReg[id*4+lane]
 EndProcedure
 Procedure.i avkZsInput(*m.AvkIrModule,*target.AvkZenShaderTarget,*node.AvkIrNode)
- Protected *v.AvkIrVariable,*a.AvkZenShaderAttribute,*found.AvkZenShaderAttribute
+ Protected *v.AvkIrVariable,*a.AvkZenShaderAttribute,*found.AvkZenShaderAttribute,*type.AvkIrType
  Protected count.i,location.i,offset.i,n.i,reg.i,index.i
  *v=avkZsPointer(*m,*node\operand0)
  If *v=0 : ProcedureReturn 0 : EndIf
+ If *v\storageClass=#ANVIL_IR_STORAGE_UNIFORM_CONSTANT
+  *type=avkIrFindType(*m,*node\resultType)
+  If *type=0 : ProcedureReturn avkZsFail(#AVK_ZEN_SHADER_ERR_IR) : EndIf
+  If *type\kind<>#ANVIL_IR_TYPE_SAMPLED_IMAGE : ProcedureReturn avkZsFail(#AVK_ZEN_SHADER_ERR_UNSUPPORTED) : EndIf
+  location=avkZsDecoration(*m,avkZsRoot,-1,#ANVIL_IR_DEC_BINDING)
+  If location<0 Or avkZsDecoration(*m,avkZsRoot,-1,#ANVIL_IR_DEC_DESCRIPTOR_SET)<>0 : ProcedureReturn avkZsFail(#AVK_ZEN_SHADER_ERR_LAYOUT) : EndIf
+  If avkZsSampledBinding>=0 And avkZsSampledBinding<>location : ProcedureReturn avkZsFail(#AVK_ZEN_SHADER_ERR_UNSUPPORTED) : EndIf
+  avkZsSampledBinding=location : avkZsSampler[*node\sourceId]=1
+  ProcedureReturn 1
+ EndIf
  count=avkIrFloatLanes(*m,*node\resultType)
  If count<1 : ProcedureReturn avkZsFail(#AVK_ZEN_SHADER_ERR_UNSUPPORTED) : EndIf
  If *v\storageClass=#ANVIL_IR_STORAGE_INPUT
@@ -204,6 +217,33 @@ Procedure.i avkZsInput(*m.AvkIrModule,*target.AvkZenShaderTarget,*node.AvkIrNode
  EndIf
  ProcedureReturn Bool(avkZsError=0)
 EndProcedure
+Procedure.i avkZsSample(*m.AvkIrModule,*node.AvkIrNode)
+ Protected lane.i,reg.i
+ If *m\stage<>#ANVIL_IR_STAGE_FRAGMENT Or avkZsSampler[*node\operand0]=0 : ProcedureReturn avkZsFail(#AVK_ZEN_SHADER_ERR_UNSUPPORTED) : EndIf
+ For lane=0 To 1
+  reg=avkZsValue(*m,*node\operand1,lane)
+  ; v20.xy carries the actual typed UV value, including arithmetic/composite
+  ; results. No lookup substitutes one original input variable for that value.
+  avkZsEmit($D2|(20<<8)|(reg<<16)|(lane<<32)|(10<<40))
+ Next
+ ; The ROM contract (tools/zentaji/bootrom.zen TEX2D) preserves r1..r14,
+ ; r61..r255, all vectors except v20 and every mask. SSA allocation starts
+ ; at r61, so no live scalar needs a stack spill or a second shader executor.
+ ; Save the GPU sentinel in r240, select descriptor zero from the pinned
+ ; r5 table, call the real ROM entry, and restore the GPU's original link.
+ avkZsBinary($10,240,254,0)
+ avkZsLiteral(20,0)
+ avkZsEmit($34|(8<<8)) : avkZsEmit($FFFF000000000138)
+ avkZsEmit($9D|(8<<8)|(254<<16))
+ avkZsBinary($10,254,240,0)
+ For lane=0 To 3
+  reg=avkZsAllocate()
+  ; VEXT.f32 retains the ROM's once-rounded channel/255 bits as immutable SSA.
+  avkZsEmit($D3|(reg<<8)|(20<<16)|(lane<<32)|(10<<40))
+  avkZsReg[*node\sourceId*4+lane]=reg
+ Next
+ ProcedureReturn Bool(avkZsError=0)
+EndProcedure
 Procedure.i avkZsOutput(*m.AvkIrModule,*node.AvkIrNode,invertY.i)
  Protected *v.AvkIrVariable,slot.i,location.i,builtin.i,count.i,n.i,reg.i
  *v=avkZsPointer(*m,*node\operand0)
@@ -258,13 +298,27 @@ Procedure.i AnvilVkZentajiShaderCompile(*m.AvkIrModule,*target.AvkZenShaderTarge
    If *other\binding=*attr\binding And (*other\stride<>*attr\stride Or *other\instanceRate<>*attr\instanceRate) : ProcedureReturn #AVK_ZEN_SHADER_ERR_LAYOUT : EndIf
   Next
  Next
- avkZsPushBytes=0 : avkZsUniformBytes=0 : avkZsUniformVariable=0 : avkZsUniformBinding=-1
- avkZsWords=0 : avkZsNext=16 : avkZsError=0 : avkZsVarying=0 : avkZsPrimary=0
+ avkZsPushBytes=0 : avkZsUniformBytes=0 : avkZsUniformVariable=0 : avkZsUniformBinding=-1 : avkZsSampledBinding=-1
+ avkZsWords=0 : avkZsNext=61 : avkZsError=0 : avkZsVarying=0 : avkZsPrimary=0
  For n=0 To #ANVIL_IR_MAX_ID
+  avkZsNeeded[n]=0 : avkZsSampler[n]=0
   For k=0 To 3 : avkZsReg[n*4+k]=0 : Next
+ Next
+ ; Verified SSA definitions precede their uses. One reverse pass marks the
+ ; dependency graph of every observable Store. Skip dead loads/arithmetic so
+ ; unused declarations never manufacture a descriptor or binding requirement.
+ For n=*m\nodeCount-1 To 0 Step -1
+  *node=avkIrNodeAt(*m,n)
+  If *node\kind=#ANVIL_IR_OP_STORE Or (*node\sourceId>0 And avkZsNeeded[*node\sourceId]<>0)
+   For k=0 To *node\operandCount-1
+    a=avkIrOperand(*node,k)
+    If a>0 And a<=#ANVIL_IR_MAX_ID : avkZsNeeded[a]=1 : EndIf
+   Next
+  EndIf
  Next
  For n=0 To *m\nodeCount-1
   *node=avkIrNodeAt(*m,n)
+  If *node\sourceId>0 And avkZsNeeded[*node\sourceId]=0 : Continue : EndIf
   Select *node\kind
    Case #ANVIL_IR_OP_LOAD
     avkZsInput(*m,*target,*node)
@@ -282,6 +336,8 @@ Procedure.i AnvilVkZentajiShaderCompile(*m.AvkIrModule,*target.AvkZenShaderTarge
      a=avkZsValue(*m,*node\operand0,k) : b=avkZsValue(*m,*node\operand1,k) : reg=avkZsAllocate()
      avkZsBinary(op,reg,a,b) : avkZsReg[*node\sourceId*4+k]=reg
     Next
+   Case #ANVIL_IR_OP_IMAGE_SAMPLE_IMPLICIT_LOD
+    avkZsSample(*m,*node)
    Case #ANVIL_IR_OP_STORE
     avkZsOutput(*m,*node,*target\invertY)
    Case #ANVIL_IR_OP_RETURN
@@ -295,7 +351,8 @@ Procedure.i AnvilVkZentajiShaderCompile(*m.AvkIrModule,*target.AvkZenShaderTarge
  If avkZsPrimary=0 : ProcedureReturn #AVK_ZEN_SHADER_ERR_LAYOUT : EndIf
  If avkZsWords>*target\capacity/8 : ProcedureReturn #AVK_ZEN_SHADER_ERR_SPACE : EndIf
  For n=0 To avkZsWords-1 : PokeQ(*target\code+n*8,avkZsCode[n]) : Next
+ *out\sampledBinding=avkZsSampledBinding
  *out\pushBytes=avkZsPushBytes : *out\uniformBytes=avkZsUniformBytes : *out\uniformBinding=avkZsUniformBinding
- *out\codeBytes=avkZsWords*8 : *out\registers=avkZsNext-16 : *out\varyingCount=avkZsVarying
+ *out\codeBytes=avkZsWords*8 : *out\registers=avkZsNext-61 : *out\varyingCount=avkZsVarying
  ProcedureReturn 0
 EndProcedure

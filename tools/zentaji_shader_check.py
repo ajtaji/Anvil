@@ -39,7 +39,10 @@ Procedure.i Main(table.i,source.i,context.i)
  If ZentajiMemoryBind(context)<>1 Or ZentajiMemoryGraphicsInit($200000)<>1 : ProcedureReturn 1 : EndIf
  base=zenMemoryGraphicsBase : vsBase=base+8192 : fsBase=vsBase+65536+4096
  meta=base+180224 : vertices=base+184320 : uniform=base+188416 : image=base+196608
- If phase=1
+ If phase>=6
+  bytes=vtpBuildVsD()
+  If AnvilVkSpirvWalkIr(@vtpVsD[0],bytes)<>0 : ProcedureReturn 27 : EndIf
+ ElseIf phase=1
   bytes=vtpBuildVsB()
   If AnvilVkSpirvWalkIr(@vtpVsB[0],bytes)<>0 : ProcedureReturn 2 : EndIf
  Else
@@ -70,7 +73,10 @@ Procedure.i Main(table.i,source.i,context.i)
   irV\module\nodeCount=irV\module\nodeCount+3
   irV\blocks[0]\nodeCount=irV\module\nodeCount : irV\module\idBound=26
  EndIf
- If phase=1
+ If phase>=6
+  bytes=vtpBuildFsD()
+  If AnvilVkSpirvWalkIr(@vtpFsD[0],bytes)<>0 : ProcedureReturn 28 : EndIf
+ ElseIf phase=1
   bytes=vtpBuildFsB()
   If AnvilVkSpirvWalkIr(@vtpFsB[0],bytes)<>0 : ProcedureReturn 5 : EndIf
  ElseIf phase=2
@@ -98,8 +104,9 @@ Procedure.i Main(table.i,source.i,context.i)
  EndIf
  attributes[0]\location=0 : attributes[0]\binding=0 : attributes[0]\stride=24 : attributes[0]\components=2
  attributes[1]\location=1 : attributes[1]\binding=0 : attributes[1]\stride=24 : attributes[1]\components=4 : attributes[1]\offset=8
+ If phase>=6 : attributes[0]\stride=16 : attributes[1]\stride=16 : attributes[1]\components=2 : EndIf
  target\invertY=Bool(phase=4)
- target\code=vsBase : target\capacity=8 : target\attributes=@attributes[0] : target\attributeCount=1+Bool(phase=1)
+ target\code=vsBase : target\capacity=8 : target\attributes=@attributes[0] : target\attributeCount=1+Bool(phase=1 Or phase>=6)
  For n=0 To 63 : PokeA(vsBase+n,$A5) : Next
  report[0]=AnvilVkZentajiShaderCompile(@irV,@target,@vs)
  If report[0]<>#AVK_ZEN_SHADER_ERR_SPACE : ProcedureReturn 9 : EndIf
@@ -108,13 +115,15 @@ Procedure.i Main(table.i,source.i,context.i)
  report[1]=AnvilVkZentajiShaderCompile(@irV,@target,@vs)
  If report[1]<>#AVK_ZEN_SHADER_ERR_LAYOUT : ProcedureReturn 11 : EndIf
  For n=0 To 63 : If PeekA(vsBase+n)<>$A5 : ProcedureReturn 12 : EndIf : Next
- attributes[0]\stride=24
+ attributes[0]\stride=24 : If phase>=6 : attributes[0]\stride=16 : EndIf
  report[2]=AnvilVkZentajiShaderCompile(@irV,@target,@vs)
  If report[2]<>0 : ProcedureReturn 13 : EndIf
  target\code=fsBase
  report[3]=AnvilVkZentajiShaderCompile(@irF,@target,@fs)
  If report[3]<>0 : ProcedureReturn 14 : EndIf
- If phase=1
+ If phase>=6
+  If fs\pushBytes<>0 Or fs\uniformBytes<>0 Or fs\sampledBinding<>0 : ProcedureReturn 29 : EndIf
+ ElseIf phase=1
   If fs\pushBytes<>0 Or fs\uniformBytes<>0 : ProcedureReturn 24 : EndIf
  ElseIf phase=2
   If fs\pushBytes<>0 Or fs\uniformBytes<>16 Or fs\uniformBinding<>0 : ProcedureReturn 25 : EndIf
@@ -137,6 +146,10 @@ Procedure.i Main(table.i,source.i,context.i)
  If ZentajiGraphicsAppend(@queue,@command[0])<>1 : ProcedureReturn 18 : EndIf
  Blank() : command[0]=7 : command[1]=meta
  If ZentajiGraphicsAppend(@queue,@command[0])<>1 : ProcedureReturn 19 : EndIf
+ If phase>=6
+  Blank() : command[0]=8 : command[1]=base+172032
+  If ZentajiGraphicsAppend(@queue,@command[0])<>1 : ProcedureReturn 30 : EndIf
+ EndIf
  Blank() : command[0]=9 : command[1]=vertices
  PokeL(@command[0]+20,3) : PokeL(@command[0]+24,1)
  If ZentajiGraphicsAppend(@queue,@command[0])<>1 Or ZentajiGraphicsSubmit(@queue)<>1 : ProcedureReturn 20 : EndIf
@@ -169,13 +182,20 @@ def main():
         assert image.read_bytes()==zexpack.header(org,org,data)+data
         wrapped,meta,_,_=B.pack(image.read_bytes(),zt/'zasm.exe',source_map=json.loads(Path(str(image)+'.zmap').read_text(encoding='utf-8-sig')))
         ram=8<<20;arena=(((ram-(1<<20)-meta['stack_bytes'])&-4096)-(2<<20))
-        for phase in range(6):
+        for phase in range(8):
             m=F.Fixture(ram_size=ram,cores=2);m.load_image(wrapped)
             struct.pack_into('<q',m.ram,ref.sym['GLOBAL_PHASE'],phase)
             positions=[(-1,-1),(1,-1),(-1,1)]
             colors=[(1,0,0,1),(0,1,0,1),(0,0,1,1)]
             for i,(position,color) in enumerate(zip(positions,colors)):
-                struct.pack_into('<6f',m.ram,arena+184320+i*24,*position,*color)
+                if phase>=6:
+                    uv=[(0,0),(1,0),(0,1)][i]
+                    struct.pack_into('<4f',m.ram,arena+184320+i*16,*position,*uv)
+                else:struct.pack_into('<6f',m.ram,arena+184320+i*24,*position,*color)
+            if phase>=6:
+                texture=[0xffff0000,0xff00ff00,0xff0000ff,0xffffffff]
+                struct.pack_into('<4I',m.ram,arena+167936,*texture)
+                struct.pack_into('<QHHIBBB5xQ',m.ram,arena+172032,arena+167936,2,2,8,2,1,int(phase==7),0)
             begin=arena+196608;pitch=80
             m.ram[begin-16:begin+pitch*16+16]=b'\xA5'*(pitch*16+32)
             assert not F.capture(m,str(td))
@@ -191,7 +211,18 @@ def main():
                     pixel=0
                     covered=(x+y<15) if phase==4 else (y>x)
                     if covered:
-                        if phase==1:
+                        if phase>=6:
+                            if phase==6:
+                                pixel=texture[((31-2*y)//16)*2+(2*x+1)//16]&0xffffff
+                            else:
+                                ix,fx=divmod(32*x-112,256);iy,fy=divmod(368-32*y,256)
+                                weights=[(256-fx)*(256-fy),fx*(256-fy),(256-fx)*fy,fx*fy]
+                                taps=[texture[min(1,max(0,ty))*2+min(1,max(0,tx))] for tx,ty in ((ix,iy),(ix+1,iy),(ix,iy+1),(ix+1,iy+1))]
+                                pixel=0
+                                for shift in (0,8,16):
+                                    value=(sum(((tap>>shift)&255)*weight for tap,weight in zip(taps,weights))+32768)//65536
+                                    pixel|=value<<shift
+                        elif phase==1:
                             r=round((y-x)*255/16);g=round((2*x+1)*255/32);b=round((31-2*y)*255/32)
                             pixel=(r<<16)|(g<<8)|b
                         else:pixel=0x800000 if phase==5 else 0xFF0000
@@ -199,8 +230,8 @@ def main():
             assert final[begin:begin+pitch*16]==expected,(phase,'independent triangle/interpolated-colour/padding oracle',report)
             assert final[begin-16:begin]==b'\xA5'*16 and final[begin+pitch*16:begin+pitch*16+16]==b'\xA5'*16
             if phase==0:
-                assembly='LD64 r8,[r3+32]\nLIQ r9,24\nMUL r9,r1,r9\nADD r8,r8,r9\nLD32U r16,[r8]\nLD32U r17,[r8+4]\nLIQ r18,0\nLIQ r19,$3F800000\n'
-                for lane,reg in enumerate((16,17,18,19)):assembly+=f'VINS v0,r{reg},r0,v{lane},0,10\n'
+                assembly='LD64 r8,[r3+32]\nLIQ r9,24\nMUL r9,r1,r9\nADD r8,r8,r9\nLD32U r61,[r8]\nLD32U r62,[r8+4]\nLIQ r63,0\nLIQ r64,$3F800000\n'
+                for lane,reg in enumerate((61,62,63,64)):assembly+=f'VINS v0,r{reg},r0,v{lane},0,10\n'
                 assembly+='JR r254\n'
                 _,code=A.Asm().assemble(assembly)
                 assert final[arena+8192:arena+8192+report[4]]==code,'independent instruction encoder mismatch'
