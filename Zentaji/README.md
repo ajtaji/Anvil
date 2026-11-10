@@ -202,8 +202,10 @@ match. A Linux public owner-loss case also retains resources and refuses
 destruction. The native helper passes 29,301 inputs under 12 host floating-point
 configurations on both Windows and Linux. These are headless Linux component
 proofs; full platform, visible-input and physical-device acceptance remain owed.
-Separate native Linux FMATH conformance failures remain under repair; this
-result covers the textured-upload composition.
+The strict-arithmetic compiler repair at `943213eab` passes independent native
+FMATH/VMATH checks on Windows and Linux: 142,117 scalar bit/flag outcomes and
+4,560 vector operations. Full Linux frontend and interaction/platform
+qualification remains open.
 Resident font integration and the managed display adapter still precede
 graphics boot.
 
