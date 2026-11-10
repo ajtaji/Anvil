@@ -20,10 +20,13 @@ XIncludeFile "Anvil/Graphics/Vulkan/neon_vk_chrome.pbi"
 XIncludeFile "Anvil/Graphics/Vulkan/neon_vk_lifecycle.pbi"
 XIncludeFile "Anvil/Graphics/Vulkan/neon_vk_port.pbi"
 XIncludeFile "Anvil/Graphics/Vulkan/neon_vk_font_port.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/neon_vk_sprite_port.pbi"
 ; Existing immutable data asset only; no Pi 4 hardware module is included.
 XIncludeFile "RaspberryPi4/Monitor/anvil_boot_ttf.pi4"
 
 XIncludeFile "Zentaji/Board/neon_surface.pbi"
+XIncludeFile "Anvil/Core/font_cmd.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/neon_vk_resident_state.pbi"
 
 Global zngUp.i,zngFault.i,zngLineHeight.i,zngSuspended.i
 Global zngFont.NeonVkPortFontRef
@@ -132,6 +135,12 @@ EndProcedure
 Procedure.i ZentajiNeonConsoleSuspend()
  If zngUp=0 : ProcedureReturn 1 : EndIf
  If zngSuspended<>0 Or nvcInFrame<>0 Or NeonVkChromePresentPending()<>0 : ProcedureReturn 0 : EndIf
+ ; Service applications borrow this resident owner. Ordinary supervisor
+ ; payloads receive released hardware, as before; they may own another driver.
+ If GraphicsServiceState()=1
+  If ZentajiGraphicsDisplayOwned()<>1 Or ZentajiDmaOwned(@avkZenDma)<>1 : ProcedureReturn 0 : EndIf
+  ConNoRenderer() : zngSuspended=2 : ProcedureReturn 1
+ EndIf
  If vkDeviceWaitIdle(znsDev)<>0 : ProcedureReturn 0 : EndIf
  If ZentajiGraphicsDisplayRelease()<>1 : ProcedureReturn 0 : EndIf
  If zngDmaDown()<>1 : ProcedureReturn 0 : EndIf
@@ -140,6 +149,14 @@ Procedure.i ZentajiNeonConsoleSuspend()
 EndProcedure
 Procedure.i ZentajiNeonConsoleResume()
  If zngUp=0 : ProcedureReturn 1 : EndIf
+ If zngSuspended=2
+  ; Shared PmfEnter also calls Leave, idempotently, after HwPayloadRun. Retire
+  ; it here before the console can submit work or reuse a payload font cache.
+  If GraphicsServiceLeave()<>0 : ProcedureReturn 0 : EndIf
+  If ZentajiGraphicsDisplayOwned()<>1 Or znsState<>2 : ProcedureReturn 0 : EndIf
+  zngSuspended=0 : ConSetRenderer(@zngPaint) : ConGridMarkAll()
+  ProcedureReturn ZentajiNeonConsolePump()
+ EndIf
  If zngSuspended<>1 Or PeekQ(#ZEN_GFX_DISPLAY+$50)<>znsWidth Or PeekQ(#ZEN_GFX_DISPLAY+$58)<>znsHeight : ProcedureReturn 0 : EndIf
  If ZentajiGraphicsBind(@avkZenQueue,15,zenMemoryGraphicsBase,4096,zenMemoryGraphicsBase,2048,zenMemoryGraphicsBase+2048)<>1 : ProcedureReturn 0 : EndIf
  If ZentajiDmaBind(@avkZenDma,zenMemoryGraphicsBase,2048)<>1 : ProcedureReturn 0 : EndIf
@@ -156,8 +173,39 @@ EndProcedure
 Procedure.i ZentajiNeonConsoleBind()
  If zngUp<>1 Or AnvilPromptServicesPresent()<>0 : ProcedureReturn 0 : EndIf
  If AnvilPromptServicesBind(@ZentajiNeonConsoleService)<>1 : ProcedureReturn 0 : EndIf
+ If GraphicsServiceBind(@VulkanNeonServiceDispatch,@VulkanNeonServiceReset)<>0 : ProcedureReturn 0 : EndIf
  ProcedureReturn ZentajiPayloadGraphicsBind(@ZentajiNeonConsoleSuspend,@ZentajiNeonConsoleResume)
 EndProcedure
+
+; Hardware hooks for the existing shared resident Neon application service.
+; The native backend has no qualified particle compute path yet; report its
+; absence while preserving the same protocol and explicit request refusal.
+Procedure.i AvsSurfaceFlags()
+ ProcedureReturn #NEON_SERVICE_VULKAN | #NEON_SERVICE_FONT_REFS | #NEON_SERVICE_SPRITES | #NEON_SERVICE_FONT_BYTES | #NEON_SERVICE_MAPPING | #NEON_SERVICE_FONT_SPACING | #NEON_SERVICE_FONT_SNAP | #NEON_SERVICE_FONT_CONTROLS | #NEON_SERVICE_FONT_DERIVE | #NEON_SERVICE_TARGETS | #NEON_SERVICE_TARGET_CONTINUATION | #NEON_SERVICE_TARGET_LOAD | #NEON_SERVICE_TARGET_RETRO | #NEON_SERVICE_FONT_CARETS | #NEON_SERVICE_ROLE_CARETS
+EndProcedure
+Procedure.i AvsSurfacePresentError() : ProcedureReturn #NEON_SERVICE_ERR_PROVIDER : EndProcedure
+Procedure.i AvsSurfaceRetireReady()
+ If ZentajiGraphicsDisplayOwned()<>1 : ProcedureReturn 0 : EndIf
+ If ZentajiGraphicsOwned(@avkZenQueue)<>1 Or avkZenQueue\state<>1 : ProcedureReturn 0 : EndIf
+ If ZentajiDmaOwned(@avkZenDma)<>1 Or avkZenDma\state<>1 : ProcedureReturn 0 : EndIf
+ ProcedureReturn 1
+EndProcedure
+Procedure.i AvsSurfaceStart()
+ If zngUp<>1 Or zngSuspended<>2 Or znsState<>2 Or ZentajiGraphicsDisplayOwned()<>1 : ProcedureReturn #NEON_SERVICE_ERR_STATE : EndIf
+ avsLogicalW=znsWidth : avsLogicalH=znsHeight
+ ProcedureReturn 0
+EndProcedure
+Procedure.i AvsSurfaceStop()
+ ProcedureReturn ZentajiNeonSurfaceChromeReset()
+EndProcedure
+Procedure.i AvsSurfacePresent()
+ Protected started.i
+ started=Ticks()
+ If ZentajiNeonSurfacePresent()<>1 : ProcedureReturn #NEON_SERVICE_ERR_PROVIDER : EndIf
+ avsCopyDmaTicks=0 : avsCopyCleanTicks=0 : avsCopyPublishTicks=Ticks()-started
+ ProcedureReturn 0
+EndProcedure
+XIncludeFile "Anvil/Graphics/Vulkan/neon_vk_resident_service.pbi"
 Procedure.i ZentajiNeonConsoleStop()
  If zngUp=0 : ProcedureReturn 1 : EndIf
  If zngSuspended<>0 : ProcedureReturn 0 : EndIf

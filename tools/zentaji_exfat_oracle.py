@@ -10,20 +10,22 @@ def checksum(data, bits=32, skip=()):
     return value
 
 
-def build(part=1):
+def build(part=1,cluster_shift=0):
+    assert 0<=cluster_shift<=3
+    cluster_bytes=512<<cluster_shift
     image=bytearray(((part+2048+7)&-8)*512)
     def put(at,fmt,*values):struct.pack_into('<'+fmt,image,at,*values)
     image[450]=7;put(454,'II',part,2048);put(510,'H',0xaa55)
     boot=part*512
     image[boot:boot+11]=b'\xeb\x76\x90EXFAT   '
     put(boot+64,'QQIIIIIIHH',part,2048,24,2,26,128,4,0x12345678,0x100,0)
-    image[boot+108:boot+113]=bytes([9,0,1,0x80,2])
+    image[boot+108:boot+113]=bytes([9,cluster_shift,1,0x80,2])
     for sector in range(11):put(boot+sector*512+510,'H',0xaa55)
     for cl in (2,3,4):put((part+24)*512+cl*4,'I',0xffffffff)
     image[(part+26)*512]=7
     table=list(range(97))+list(range(65,91))+[0xffff,65413]
-    upcase=struct.pack('<125H',*table);image[(part+27)*512:(part+27)*512+250]=upcase
-    root=(part+28)*512;image[root]=0x81;put(root+20,'IQ',2,16)
+    upcase=struct.pack('<125H',*table);upcase_at=(part+26)*512+cluster_bytes;image[upcase_at:upcase_at+250]=upcase
+    root=(part+26)*512+2*cluster_bytes;image[root]=0x81;put(root+20,'IQ',2,16)
     image[root+32]=0x82;put(root+36,'I',checksum(upcase));put(root+52,'IQ',3,250)
     value=checksum(image[boot:boot+11*512],skip=(106,107,112))
     for offset in range(0,512,4):put(boot+11*512+offset,'I',value)
@@ -110,8 +112,9 @@ def check(medium,initial,payload,epoch_min=1794009600,epoch_max=None):
 def seed_file(image,payload,name='SEED.BIN'):
     """Seed an independent contiguous file; the guest must use its file APIs."""
     part=struct.unpack_from('<I',image,454)[0]
-    assert 1<=len(payload)<=125*512 and 1<=len(name)<=15
-    clusters=(len(payload)+511)//512
+    cluster_bytes=512<<image[part*512+109]
+    assert 1<=len(payload)<=125*cluster_bytes and 1<=len(name)<=15
+    clusters=(len(payload)+cluster_bytes-1)//cluster_bytes
     entries=bytearray(96);entries[0]=0x85;entries[1]=2
     struct.pack_into('<H',entries,4,32)
     entries[32]=0xc0;entries[33]=3;entries[35]=len(name)
@@ -119,29 +122,32 @@ def seed_file(image,payload,name='SEED.BIN'):
     struct.pack_into('<Q',entries,40,len(payload));struct.pack_into('<I',entries,52,5);struct.pack_into('<Q',entries,56,len(payload))
     entries[64]=0xc1;entries[66:66+len(name)*2]=name.encode('utf-16le')
     struct.pack_into('<H',entries,2,checksum(entries,16,(2,3)))
-    root=(part+28)*512;image[root+64:root+160]=entries
+    root=(part+26)*512+2*cluster_bytes;image[root+64:root+160]=entries
     image[(part+26)*512:(part+26)*512+16]=((1<<(clusters+3))-1).to_bytes(16,'little')
     image[part*512+112]=(clusters+3)*100//128
-    image[(part+29)*512:(part+29)*512+len(payload)]=payload
+    at=(part+26)*512+3*cluster_bytes
+    assert at+len(payload)<=len(image)
+    image[at:at+len(payload)]=payload
 
 
 def root_files(medium):
     """Read/check the small proof volume independently of the guest filesystem."""
     u32=lambda at:struct.unpack_from('<I',medium,at)[0]
     part=u32(454);boot=part*512
+    cluster_bytes=512<<medium[boot+109]
     assert part==4096 and struct.unpack_from('<H',medium,boot+106)[0]&0xa==0
     value=checksum(medium[boot:boot+11*512],skip=(106,107,112))
     assert medium[boot+11*512:boot+12*512]==struct.pack('<I',value)*128
     heap=(part+26)*512;fat=(part+24)*512;used=set()
     def stream(first,flags,length):
         out=bytearray();cl=first
-        for _ in range((length+511)//512):
+        for _ in range((length+cluster_bytes-1)//cluster_bytes):
             assert 2<=cl<130 and cl not in used,('cluster ownership',cl)
-            used.add(cl);out+=medium[heap+(cl-2)*512:heap+(cl-1)*512]
+            used.add(cl);out+=medium[heap+(cl-2)*cluster_bytes:heap+(cl-1)*cluster_bytes]
             cl=cl+1 if flags&2 else u32(fat+cl*4)
         if not flags&2:assert cl>=0xfffffff8
         return bytes(out[:length])
-    bitmap=stream(2,0,16);stream(3,0,250);raw=stream(4,0,512)
+    bitmap=stream(2,0,16);stream(3,0,250);raw=stream(4,0,cluster_bytes)
     result={};index=64
     while index<len(raw) and raw[index]:
         if not raw[index]&128:index+=32;continue

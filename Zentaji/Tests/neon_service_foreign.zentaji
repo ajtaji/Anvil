@@ -1,0 +1,17 @@
+; A real service-backed application leaves its context open, then changes one
+; native owner's configuration without launching foreign work. Return must
+; quarantine that context before any target/Chrome resources are destroyed.
+EnableFloatingPoint
+XIncludeFile "Anvil/Math/float32.pbi"
+XIncludeFile "Anvil/Hal/neon_service_api.pbi"
+XIncludeFile "Anvil/Graphics/neon_service_client.pbi"
+Procedure.i Main(services.i)
+ If NeonServiceBind(services,#NEON_SERVICE_VULKAN)<>0 : ProcedureReturn $BAD01 : EndIf
+ If NeonServiceOpen()<>0 : ProcedureReturn $BAD02 : EndIf
+ If NeonServiceBegin(0.2,0.3,0.4,1.0)<>0 : ProcedureReturn $BAD03 : EndIf
+ If NeonServiceEnd()<>0 : ProcedureReturn $BAD04 : EndIf
+ ; Preserve page alignment for address registers; change ownership metadata
+ ; without kicking a queue or relying on an invalid-address hardware fault.
+ PokeQ(#ZEN_SERVICE_FOREIGN_REG,PeekQ(#ZEN_SERVICE_FOREIGN_REG) ! 4096)
+ ProcedureReturn 0
+EndProcedure

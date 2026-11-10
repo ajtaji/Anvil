@@ -179,7 +179,7 @@ FrameBegin; the frame is presented through native GPU/DMA ownership and the
 real display latch. The prompt scheduler supplies screen updates while input
 is waiting and retains the existing timer/WFI idle path.
 
-Before entering a returning PMF application, the monitor retires graphics
+Before entering an ordinary supervisor PMF application, the monitor retires graphics
 work and releases the queue, display and DMA channel. CPU-side renderer objects
 remain in protected monitor RAM. On return, ownership is validated before
 rebinding and repainting the retained model. A foreign or uncertain owner
@@ -198,11 +198,54 @@ value and RAM effect. The graphical prompt must survive the application.
 The captured PNG comes from the native displayed plane. The check refuses
 cell-text output, missing presentation, stale source hashes or Vulkan faults.
 
+Add `--keyboard` with `--exercise` to use native keyboard events and Backspace
+editing instead of UART input. This injects device events; it does not prove
+the physical host-keyboard/window path.
+
 The separate zentaji_neon_surface_check.py also checks two exact font frames
 against independent geometry, 514 glyph quads in two draws, a 12000-quad vertex
 buffer, its untouched tail, preserved display planes and clean shutdown.
 These are native execution proofs; visible host-window and physical-input
 acceptance retain their separate scopes.
+
+@SECTION Resident graphical applications
+
+The resident Neon application provider uses the same service-table slot 38 and
+request contract as Anvil on Pi4. Its context/font epochs, validation, sprites,
+targets, mapping and caret handling now live in the shared Vulkan service
+module. Boards supply surface start, retirement and presentation hooks. A
+Zentaji application includes the existing Neon service client and retained-UI
+library; it does not include or initialize another hardware renderer.
+
+A service-backed PMF application borrows the protected resident GPU/display/DMA
+owner. Console painting is suspended while that scope is active. Before the
+console resumes, Anvil closes the service scope, retires target and Chrome
+resources, creates a fresh Chrome cache and restores the selected font.
+This also handles an application that returns without explicitly closing its
+service context. Failed or foreign ownership pins the context and resources
+and stops the monitor before a restored prompt can be displayed.
+
+The native backend does not advertise particle compute. Its requests return
+an explicit provider refusal. Other unsupported native shader operations retain
+their backend refusals; the presence of a service contract is not a claim that
+every optional GPU feature is implemented.
+
+@FRAG
+python tools/zentaji_graphical_boot_check.py --zen-tools ZEN --keep PROOF --resident
+@ENDFRAG
+
+This runs the existing shared retained-UI service application twice through
+the actual ROM, filesystem, PMF hash check and service table. Each session must
+report all 22 application assertions, produce the expected coloured shapes and
+visible TrueType title/button ink, and match the other session's displayed
+frame byte for byte. The final service and target scopes must be retired and
+the graphical prompt restored. The capture reads the actual display plane.
+
+The separate zentaji_neon_service_return_check.py exercises returning service
+applications that change DMA, GPU queue or display configuration. It requires
+fail-stop 0x5B07, no second prompt, retained live context/target/Chrome resources
+and no Vulkan faults. This is ownership-quarantine evidence, not isolation from
+a malicious supervisor application.
 
 @SECTION Evidence and remaining work
 

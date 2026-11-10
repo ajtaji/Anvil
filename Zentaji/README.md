@@ -9,6 +9,16 @@
 
 # Zentaji backend bring-up
 
+Resident graphical applications use Anvil's existing slot38 Neon service and
+retained-UI client. Protocol ownership and dispatch are shared with Pi4;
+Zentaji supplies native surface/presentation and return-cleanup hooks.
+`tools/zentaji_graphical_boot_check.py --resident` runs the existing shared
+retained-UI application twice and checks its real frames and restored prompt.
+`tools/zentaji_neon_service_return_check.py` checks that foreign DMA/GPU/display
+ownership pins resources and stops before a false prompt. Particle compute is
+not advertised by the native provider; full desktop and platform acceptance
+remain unfinished.
+
 The counted Zentaji board now boots Anvil through the machine ROM and owned
 supervisor startup. It uses the shared command loop, serial console, clock,
 settings and FAT32/exFAT storage code. Ordinary and service-backed PMFBOOT

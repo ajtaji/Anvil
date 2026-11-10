@@ -141,6 +141,26 @@ Procedure.i ZentajiNeonSurfacePresent()
  ProcedureReturn 1
 EndProcedure
 
+; End an application Chrome scope while retaining the board's checked Vulkan
+; device, target and display owner. Destroying Chrome retires sprite/font GPU
+; allocations; recreating it gives the console a fresh cache and draw state.
+; No allocator/device reset is used: every public resource must really retire.
+Procedure.i ZentajiNeonSurfaceChromeReset()
+ Protected cfg.NeonVkLifecycleConfig,vertices.i
+ If znsState<>2 Or nvcInFrame<>0 Or NeonVkChromePresentPending()<>0 : ProcedureReturn 0 : EndIf
+ If ZentajiGraphicsDisplayOwned()<>1 : ProcedureReturn znsFail(15) : EndIf
+ If ZentajiGraphicsOwned(@avkZenQueue)<>1 Or avkZenQueue\state<>1 : ProcedureReturn znsFail(20) : EndIf
+ If ZentajiDmaOwned(@avkZenDma)<>1 Or avkZenDma\state<>1 : ProcedureReturn znsFail(21) : EndIf
+ cfg\physicalDevice=znsPhys : cfg\device=znsDev : cfg\queue=znsQueue : cfg\commandPool=znsPool
+ cfg\renderPass=znsPass : cfg\framebuffer=znsFramebuffer
+ cfg\width=znsWidth : cfg\height=znsHeight : cfg\maxQuads=nvlMaxQuads : vertices=nvlMaxVertexQuads
+ If NeonShutdown()<>#NEON_OK : ProcedureReturn znsFail(16) : EndIf
+ If NeonVkLifecycleConfigureCapacities(@cfg,vertices)<>#NEON_OK : ProcedureReturn znsFail(17) : EndIf
+ If NeonVkPortCanvas(znsWidth,znsHeight,znsWidth,znsHeight)<>#NEON_OK : ProcedureReturn znsFail(18) : EndIf
+ If NeonInit()<>#NEON_OK : ProcedureReturn znsFail(19) : EndIf
+ ProcedureReturn 1
+EndProcedure
+
 Procedure.i ZentajiNeonSurfaceStop()
  Protected faults.i
  If znsState<>2 Or nvcInFrame<>0 Or NeonVkChromePresentPending()<>0 : ProcedureReturn 0 : EndIf
