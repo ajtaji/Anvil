@@ -44,16 +44,16 @@ EndStructure
 Procedure.i nceBoxUnbound(x.f,y.f,w.f,h.f,r.f,g.f,b.f,a.f)
   ProcedureReturn #NCE_ERR_RENDERER
 EndProcedure
-Procedure.i nceTextUnbound(font.i,x.f,y.f,text.i,r.f,g.f,b.f,a.f)
+Procedure.i nceTextUnbound(font.i,x.f,y.f,*text,r.f,g.f,b.f,a.f)
   ProcedureReturn #NCE_ERR_RENDERER
 EndProcedure
-Procedure.f nceWidthUnbound(font.i,text.i)
+Procedure.f nceWidthUnbound(font.i,*text)
   ProcedureReturn -1.0
 EndProcedure
 Procedure.f nceHeightUnbound(font.i)
   ProcedureReturn -1.0
 EndProcedure
-Procedure.i ncePrepareUnbound(font.i,text.i)
+Procedure.i ncePrepareUnbound(font.i,*text)
   ProcedureReturn #NCE_ERR_RENDERER
 EndProcedure
 Procedure.i nceClipUnbound(x.f,y.f,w.f,h.f)

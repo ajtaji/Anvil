@@ -39,16 +39,16 @@ EndStructure
 Procedure.i ncmBoxUnbound(x.f,y.f,w.f,h.f,r.f,g.f,b.f,a.f)
   ProcedureReturn #NCM_ERR_RENDERER
 EndProcedure
-Procedure.i ncmTextUnbound(font.i,x.f,y.f,text.i,r.f,g.f,b.f,a.f)
+Procedure.i ncmTextUnbound(font.i,x.f,y.f,*text,r.f,g.f,b.f,a.f)
   ProcedureReturn #NCM_ERR_RENDERER
 EndProcedure
-Procedure.f ncmWidthUnbound(font.i,text.i)
+Procedure.f ncmWidthUnbound(font.i,*text)
   ProcedureReturn -1.0
 EndProcedure
 Procedure.f ncmHeightUnbound(font.i)
   ProcedureReturn -1.0
 EndProcedure
-Procedure.i ncmPrepareUnbound(font.i,text.i)
+Procedure.i ncmPrepareUnbound(font.i,*text)
   ProcedureReturn #NCM_ERR_RENDERER
 EndProcedure
 Procedure.i ncmClipUnbound(x.f,y.f,w.f,h.f)

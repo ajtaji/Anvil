@@ -92,6 +92,9 @@ Procedure NcaCheck(actual.i,expected.i)
   If actual<>expected And ncaFailure=0 : ncaFailure=ncaChecks : ncaCoreFailure=ncaChecks : EndIf
   PokeI(#NCA_REPORT+16,ncaFailure) : PokeI(#NCA_REPORT+64,ncaChecks) : PokeI(#NCA_REPORT+72,ncaCoreFailure)
 EndProcedure
+; The legacy touch transport checks install an explicit controlled table.
+; Native-input applications use the real NUI provider and do not install it.
+CompilerIf #NCA_NATIVE=0
 Procedure.i NcaMockPoll(dest.i)
   Protected i.i
   If ncaMockResult=1 : For i=0 To 31 Step 8 : PokeI(dest+i,PeekI(@ncaMockEvent+i)) : Next : EndIf
@@ -143,6 +146,7 @@ Procedure NcaPointerChecks()
   NcaCheck(NeonServicePointerUnbind(@ncaTestPointer),0)
   NcaCheck(NeonServicePointerPoll(@ncaTestPointer),#NPT_ERR_STATE)
 EndProcedure
+CompilerEndIf
 Procedure.i NcaBuildTabs()
   Protected rc.i
   rc=NeonChromeTabsBeginBuild(@ncaTabs) : If rc<>0 : ProcedureReturn rc : EndIf
@@ -274,7 +278,7 @@ Procedure.i NcaSetup(services.i)
   CompilerIf #NCA_ASSETS=1
   If NcaAssetFonts()<>0 : ProcedureReturn -1 : EndIf
   CompilerElse
-  ncaFont=NeonServiceFontRegister(0,0,16) : ncaSmall=NeonServiceFontRegister(0,1,14)
+  ncaFont=NeonServiceFontRegister(#NCA_FONT_SLOT,0,16) : ncaSmall=NeonServiceFontRegister(#NCA_FONT_SLOT,1,14)
   CompilerEndIf
   If ncaFont<1 Or ncaSmall<1 : NcaStep(-20) : ProcedureReturn -1 : EndIf
   If NcaStep(NeonServiceChromeMenuInstall())<>0 : ProcedureReturn -1 : EndIf
@@ -556,7 +560,9 @@ Procedure.i Main(services.i)
   CompilerIf #NCA_RETRO=1
   PokeI(#NCA_REPORT+13312,$4E435031) : PokeI(#NCA_REPORT+13320,90) : PokeI(#NCA_REPORT+13328,#NCA_PRESENT_PACED)
   CompilerEndIf
+  CompilerIf #NCA_NATIVE=0
   NcaPointerChecks() : If ncaFailure<>0 : ProcedureReturn ncaFailure : EndIf
+  CompilerEndIf
   If NcaSetup(services)<>0 : ProcedureReturn ncaFailure : EndIf
   started=ncaClock() : If started<0 : NcaStep(started) : ProcedureReturn ncaFailure : EndIf
   For i=0 To 89
