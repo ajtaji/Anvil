@@ -10,6 +10,7 @@ import subprocess
 import sys
 import threading
 import time
+import zlib
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -27,7 +28,9 @@ def main():
     image = ROOT / 'build/zentaji/anvil.zex'
     raw = image.read_bytes()
     digest = hashlib.sha256(raw).hexdigest()
-    assert digest == json.loads(Path(str(image)+'.boot.json').read_text())['image_sha256']
+    meta = json.loads(Path(str(image)+'.boot.json').read_text())
+    assert digest == meta['image_sha256']
+    stage = (meta['image_end'] + 4095) & -4096
     fixture = F.Fixture(ram_size=128 << 20, cores=2,
                         hostfiles=[['anvil.zex', bytearray(raw), False]],
                         display_modes=[(1024, 768, 60000)])
@@ -73,6 +76,42 @@ def main():
                 assert expected in reply.splitlines(), reply
             else:
                 assert expected in reply, reply
+        # Exercise the shared memory handlers in the live payload window.
+        # Check resulting bytes through an independently computed CRC.
+        expected_crc = zlib.crc32(bytes([0xA5]) * 16)
+        for word in (f'fill.b {stage:X} A5 10',
+                     f'copy.b {stage:X} {stage+0x20:X} 10',
+                     f'compare.b {stage:X} {stage+0x20:X} 10',
+                     f'md.b {stage:X} 10'):
+            reply = client.command(word).decode()
+            transcript.append(reply)
+            assert '!!' not in reply and 'does not know the command' not in reply, reply
+            if word.startswith('compare'):
+                assert 'are the same.' in reply, reply
+            if word.startswith('md'):
+                assert 'A5 A5 A5 A5' in reply.upper(), reply
+        for address in (stage, stage+0x20):
+            reply = client.command(f'crc32 {address:X} 10').decode()
+            transcript.append(reply)
+            assert f'The CRC32 is {expected_crc:08X}.' in reply, reply
+        reply = client.command(f'write {stage+0x40:X} 12345678').decode()
+        transcript.append(reply)
+        assert '!!' not in reply and 'does not know the command' not in reply, reply
+        word_crc = zlib.crc32(bytes.fromhex('78563412'))
+        reply = client.command(f'crc32 {stage+0x40:X} 4').decode()
+        transcript.append(reply)
+        assert f'The CRC32 is {word_crc:08X}.' in reply, reply
+        transcript.append(client.command(f'base {stage:X}').decode())
+        reply = client.command('md.b 0 10').decode()
+        transcript.append(reply)
+        assert 'A5 A5 A5 A5' in reply.upper(), reply
+        transcript.append(client.command('base 0').decode())
+        reply = client.command('fill.b 1000 A5 10').decode()
+        transcript.append(reply)
+        assert 'runs into the monitor itself' in reply and 'Nothing was written' in reply, reply
+        reply = client.command('fill.b 8000000 A5 10').decode()
+        transcript.append(reply)
+        assert 'was refused' in reply and 'beyond the RAM fitted' in reply, reply
         # Real transport fragments, including editor correction, not timed fixtures.
         client.socket.sendall(b'echo LIVE READX')
         time.sleep(.05)
@@ -115,7 +154,7 @@ def main():
         serial = bytes.fromhex(re.search(r'^SERIAL0 ([0-9A-Fa-f]+)$', ''.join(lines), re.M)[1]).decode()
         assert 'Anvil stopped.' in serial and 'HOST_GPU_REFUSED' not in ''.join(lines)
         (td/'result.json').write_text(json.dumps(dict(passed=True, image_sha256=digest,
-            port=port, transcript=transcript, checks=['sequential commands','exclusive client',
+            port=port, transcript=transcript, checks=['sequential commands','exclusive client', 'shared memory commands and CRC',
             'fragmented input and backspace','unknown command','timeout','reconnect',
             'expected-line failure status','clean halt']), indent=2)+'\n')
         print('PASS actual Anvil: live UART commands, editing, replies, timeout, reconnect, clean halt')

@@ -1,9 +1,9 @@
 EnableFloatingPoint
 ; Zentaji serial/storage monitor composition. The ROM loads the owned startup
 ; envelope; Main receives its validated table/source/context, never ARM registers.
-#ANVIL_BUILD = 31 ; pmf:build
-#ANVIL_BUILD_DATE = 20261110 ; pmf:builddate
-#ANVIL_BUILD_TIME = 231637 ; pmf:buildtime
+#ANVIL_BUILD = 32 ; pmf:build
+#ANVIL_BUILD_DATE = 20261111 ; pmf:builddate
+#ANVIL_BUILD_TIME = 000802 ; pmf:buildtime
 #CAP_TOUCH=0
 #CAP_PWM=0
 #CAP_NET=0
@@ -48,6 +48,15 @@ XIncludeFile "Anvil/Core/argfmt.pbi"
 XIncludeFile "Anvil/Core/settings_cmd.pbi"
 XIncludeFile "Anvil/Core/time_cmd.pbi"
 XIncludeFile "Anvil/Core/crc.pbi"
+Global gBase.i
+; Guest RAM is coherent. The shared monitor has no data-cache flush to issue.
+Procedure CacheFlushRange(lo.i,hi.i)
+EndProcedure
+; Zentaji payloads enter through the validated PMF boot path.
+Procedure RunAt(address.i)
+ PrintN("Raw entry is unavailable. Use boot with a PMF payload.")
+EndProcedure
+XIncludeFile "Anvil/Core/memcmd.pbi"
 XIncludeFile "Zentaji/Board/identity.pbi"
 XIncludeFile "Anvil/Core/flow_cmd.pbi"
 XIncludeFile "Anvil/Core/layout_cmd.pbi"
@@ -71,6 +80,7 @@ Procedure ZentajiShellHelp()
  PrintN("  version [full], map, echo [-n] <words>, sleep <seconds>, messages")
  PrintN("  mount, load, save, ls/dir, cat, mkdir, rmdir, rm/del, rename/mv")
  PrintN("  settings, printenv, setenv, saveenv, env, setexpr, time, force")
+ PrintN("  memory/md, write/poke, fill/mw, copy/cp, compare/cmp, base, crc32/checksum")
  PrintN("  halt                 cleanly release storage and stop this monitor")
  PrintN("  boot <file> / mem <address>, boot status/ok/clear")
  PrintN("PMF service-table applications are supported; raw run is not available.")
@@ -97,6 +107,20 @@ Procedure.i HwCommandDispatch(c.i)
   CmdVersion()
  ElseIf WordIs("map")<>0
   CmdMap()
+ ElseIf WordIs("memory")<>0 Or WordIs("dump")<>0 Or WordIs("md")<>0 Or LetterIs(109)<>0
+  CmdMem()
+ ElseIf WordIs("write")<>0 Or WordIs("poke")<>0 Or LetterIs(119)<>0
+  CmdWrite()
+ ElseIf WordIs("fill")<>0 Or WordIs("mw")<>0
+  CmdFill()
+ ElseIf WordIs("copy")<>0 Or WordIs("cp")<>0
+  CmdCopy()
+ ElseIf WordIs("compare")<>0 Or WordIs("cmp")<>0
+  CmdCompare()
+ ElseIf WordIs("base")<>0
+  CmdBase()
+ ElseIf WordIs("crc32")<>0 Or WordIs("checksum")<>0
+  CmdCrc32()
  ElseIf WordIs("echo")<>0
   CmdEcho()
  ElseIf WordIs("sleep")<>0

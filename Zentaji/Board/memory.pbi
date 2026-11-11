@@ -154,7 +154,13 @@ Procedure.i HwAddrCheck(lo.i,hi.i,forWrite.i)
   zenMemoryAddrWhy="this range is not an admitted positive RAM interval; device and ROM apertures require deliberate inspection"
   ProcedureReturn #HW_ADDR_UNKNOWN
  EndIf
- If lo<zenMemoryRam And hi<zenMemoryRam : ProcedureReturn #HW_ADDR_SAFE : EndIf
+ If lo<zenMemoryRam And hi<zenMemoryRam
+  If forWrite=1 And (lo<HwPayLo(0) Or hi>HwPayHi(0))
+   zenMemoryAddrWhy="the write extends outside the Zentaji payload window"
+   ProcedureReturn #HW_ADDR_UNKNOWN
+  EndIf
+  ProcedureReturn #HW_ADDR_SAFE
+ EndIf
  zenMemoryAddrLo=zenMemoryRam : zenMemoryAddrHi=$7FFFFFFFFFFFFFFF
  zenMemoryAddrWhy="this address is beyond the RAM fitted to the Zentaji machine"
  ProcedureReturn #HW_ADDR_ABSENT
