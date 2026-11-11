@@ -29,6 +29,7 @@ XIncludeFile "Zentaji/Board/neon_resize.pbi"
 XIncludeFile "Anvil/Graphics/anvil_logo.pbi"
 XIncludeFile "Anvil/Core/build_identity.pbi"
 XIncludeFile "Anvil/Graphics/Vulkan/neon_vk_banner.pbi"
+XIncludeFile "Anvil/Graphics/banner_glint.pbi"
 XIncludeFile "Anvil/Core/font_cmd.pbi"
 XIncludeFile "Anvil/Graphics/Vulkan/neon_vk_resident_state.pbi"
 
@@ -38,6 +39,7 @@ Global zngFont.NeonVkPortFontRef
 Global zngBanner.NeonVkBannerArgs
 Global zngPresented.i,zngPainting.i,zngCursorRow.i=-1,zngCursorPen.i
 Global zngClockSecond.i=-2,zngClockDirty.i
+Global zngGlintPhase.i=-1,zngGlintTime.q,zngGlintDirty.i
 Global Dim zngClockText.a[128]
 Global Dim zngClear.l[4]
 Global Dim zngAtlas.a[#NEON_ATLAS_MAXBYTES]
@@ -92,6 +94,20 @@ Procedure.i zngClockPoll()
  If changed<>0 : zngClockDirty=1 : gConDirty=1 : EndIf
  ProcedureReturn 1
 EndProcedure
+
+; The same service-driven eight-step glint used by the Pi4 banner. No
+; private animation loop: the ordinary timer/WFI prompt pump advances it.
+Procedure zngGlintPoll()
+ Protected now.q
+ If zngPainting<>0 : ProcedureReturn : EndIf
+ now=HwMicros()
+ If zngGlintPhase>=0 And now>=zngGlintTime And now-zngGlintTime<#BANNER_ANIM_MS*1000 : ProcedureReturn : EndIf
+ zngGlintPhase=zngGlintPhase+1
+ If zngGlintPhase>=#BANNER_ANIM_PHASES : zngGlintPhase=0 : EndIf
+ zngGlintTime=now : zngGlintDirty=1 : gConDirty=1
+ zngBanner\glintActive=1
+ zngBanner\glintX=BannerGlintX(zngGlintPhase) : zngBanner\glintY=BannerGlintY(zngGlintPhase)
+EndProcedure
 ; Use Anvil's existing banner composition and immutable logo, not an app UI.
 ; Warm all title/caption glyphs while idle; drawing inside a frame never rasterizes.
 Procedure.i zngBannerPrepare()
@@ -99,7 +115,7 @@ Procedure.i zngBannerPrepare()
  zngBanner\logoWidth=#ANVIL_PIC_W : zngBanner\logoHeight=#ANVIL_PIC_H
  zngBanner\platformText="bare-metal monitor   -   Zentaji   -   Zentaji64"
  zngBanner\buildText=AnvilBuildLabel(#ANVIL_BUILD,#ANVIL_BUILD_DATE,#ANVIL_BUILD_TIME)
- zngBanner\clockText=@zngClockText[0] : zngBanner\glintActive=0
+ zngBanner\clockText=@zngClockText[0]
  If NeonVkChromeFontHeightSet(#NEON_FONT_BOLD,48)<>0 : ProcedureReturn 0 : EndIf
  If NeonVkChromeFontHeightSet(#NEON_FONT_SMALL,16)<>0 : ProcedureReturn 0 : EndIf
  If NeonVkChromeWarmTrueTypeText(48,"PureMetal Forge")<0 : ProcedureReturn 0 : EndIf
@@ -117,14 +133,16 @@ EndProcedure
 ; This is the same public Chrome transaction layer used by the Pi4 monitor.
 Procedure zngPaint()
  Protected row.i,col.i,count.i,style.i,x.f,y.f,r.f,g.f,b.f,cursor.i,pen.i
- Protected full.i,moved.i,rows.i,py.i,clock.i
+ Protected full.i,moved.i,rows.i,py.i,clock.i,glint.i
  If zngUp=0 Or zngSuspended<>0 Or zngFault<>0 Or zngPainting<>0 : ProcedureReturn : EndIf
  If zngClockPoll()<>1 : zngFault=10 : ProcedureReturn : EndIf
+ zngGlintPoll()
  zngPainting=1
  cursor=ConGridCurR()-ConViewTop() : pen=gConCurPen
  full=Bool(zngPresented=0 Or ConGridFullClear()<>0)
  moved=Bool(cursor<>zngCursorRow Or pen<>zngCursorPen)
  clock=zngClockDirty
+ glint=zngGlintDirty
  ; Warm every changed run before either frame transaction begins.
  For row=0 To ConGridRows()-1
   zngRows[row]=Bool(full<>0 Or ConGridRowDirty(row)<>0 Or (moved<>0 And (row=cursor Or row=zngCursorRow)))
@@ -139,12 +157,15 @@ Procedure zngPaint()
   If NeonVkChromeFontHeightSet(#NEON_FONT_SMALL,16)<>0 : zngFault=8 : zngPainting=0 : ProcedureReturn : EndIf
   If NeonVkChromeWarmTrueTypeText(16,@zngClockText[0])<0 : zngFault=8 : zngPainting=0 : ProcedureReturn : EndIf
  EndIf
- If full=0 And rows=0 And clock=0 : ConGridClearDirty() : zngPainting=0 : ProcedureReturn : EndIf
+ If full=0 And rows=0 And clock=0 And glint=0 : ConGridClearDirty() : zngPainting=0 : ProcedureReturn : EndIf
  If full<>0
   If NeonVkChromeBegin(@zngClear[0])<>0 : zngFault=2 : zngPainting=0 : ProcedureReturn : EndIf
   If NeonVkBannerRender(@zngBanner)<>0 : zngFault=9 : zngPainting=0 : ProcedureReturn : EndIf
  Else
   If NeonVkChromeBeginLoad()<>0 : zngFault=2 : zngPainting=0 : ProcedureReturn : EndIf
+  If glint<>0
+   If NeonVkBannerGlintRender(@zngBanner,1)<>0 : zngFault=12 : zngPainting=0 : ProcedureReturn : EndIf
+  EndIf
   If clock<>0
    If NeonVkBannerClockRender(@zngBanner,1)<>0 : zngFault=9 : zngPainting=0 : ProcedureReturn : EndIf
   EndIf
@@ -175,7 +196,7 @@ Procedure zngPaint()
  EndIf
  If NeonVkChromeEnd()<>0 : zngFault=6 : zngPainting=0 : ProcedureReturn : EndIf
  If ZentajiNeonSurfacePresent()<>1 : zngFault=7 : zngPainting=0 : ProcedureReturn : EndIf
- zngPresented=1 : zngCursorRow=cursor : zngCursorPen=pen : zngClockDirty=0
+ zngPresented=1 : zngCursorRow=cursor : zngCursorPen=pen : zngClockDirty=0 : zngGlintDirty=0
  ConGridClearDirty() ; native monitor frame checkpoint
  zngPainting=0
 EndProcedure
@@ -215,6 +236,7 @@ Procedure.i ZentajiNeonConsolePump()
   ConGridMarkAll()
  EndIf
  If zngClockPoll()<>1 : zngFault=10 : ProcedureReturn 0 : EndIf
+ zngGlintPoll()
  ScreenPump()
  ProcedureReturn Bool(zngFault=0 And znsState=2)
 EndProcedure

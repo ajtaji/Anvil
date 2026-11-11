@@ -10,6 +10,30 @@ def png(path,bgra,w,h):
   for x in range(w):
    at=(y*w+x)*4;rows.extend((bgra[at+2],bgra[at+1],bgra[at]))
  path.write_bytes(b'\x89PNG\r\n\x1a\n'+chunk(b'IHDR',struct.pack('>IIBBBBB',w,h,8,2,0,0,0))+chunk(b'IDAT',zlib.compress(rows))+chunk(b'IEND',b''))
+def expected_logo(phase=-1):
+ logo=bytearray()
+ for kind,row in re.findall(r'^\s*Data\.(a|b|w|l|q)\s+([^;\r\n]+)',(ROOT/'Anvil/Graphics/anvil_logo.pbi').read_text(encoding='utf-8'),re.M|re.I):
+  size={'a':1,'b':1,'w':2,'l':4,'q':8}[kind.lower()]
+  for token in row.split(','):
+   token=token.strip();value=int(token[1:],16) if token.startswith('$') else int(token)
+   logo.extend((value&((1<<(8*size))-1)).to_bytes(size,'little'))
+ assert len(logo)==76*74*3,len(logo)
+ result=bytearray()
+ for i in range(0,len(logo),3):result.extend((logo[i+2],logo[i+1],logo[i],255))
+ if phase>=0:
+  positions=((13,17),(20,14),(27,11),(34,9),(41,10),(48,11),(55,13),(62,15))
+  assert phase<len(positions),phase
+  x,y=positions[phase]
+  for dx,dy,colour in ((0,0,(64,176,255,255)),(-1,0,(240,232,226,255)),(1,0,(240,232,226,255)),(0,-1,(240,232,226,255)),(0,1,(240,232,226,255))):
+   at=((y+dy)*76+x+dx)*4;result[at:at+4]=bytes(colour)
+ return bytes(result)
+
+def assert_logo(frame,width,phase=-1):
+ actual=b''.join(frame[((y+12)*width+width-88)*4:((y+12)*width+width-12)*4] for y in range(74))
+ wanted=expected_logo(phase)
+ assert actual==wanted,('Missing/corrupt Anvil logo or sparkle',phase)
+ return hashlib.sha256(actual).hexdigest()
+
 def main():
  ap=argparse.ArgumentParser(description=__doc__);ap.add_argument('--zen-tools',type=Path,required=True);ap.add_argument('--keep',type=Path,required=True);ap.add_argument('--exercise',action='store_true');ap.add_argument('--keyboard',action='store_true',help='Exercise native keyboard events and Backspace editing instead of UART commands (requires --exercise)');ap.add_argument('--resident',action='store_true',help='Run the existing shared retained-UI service application twice and inspect its real frames');a=ap.parse_args()
  if a.resident:a.exercise=True
@@ -176,23 +200,12 @@ def main():
  png(td/'anvil-graphical-prompt.png',frame,w,h);(td/'console.txt').write_text(text)
  # Verify the actual boot header, independently of the generic text grid.
  # Read immutable RGB asset literals; no second CPU or renderer is executed.
- logo=bytearray()
- for kind,row in re.findall(r'^\s*Data\.(a|b|w|l|q)\s+([^;\r\n]+)',(ROOT/'Anvil/Graphics/anvil_logo.pbi').read_text(encoding='utf-8'),re.M|re.I):
-  size={'a':1,'b':1,'w':2,'l':4,'q':8}[kind.lower()]
-  for token in row.split(','):
-   token=token.strip();value=int(token[1:],16) if token.startswith('$') else int(token)
-   logo.extend((value&((1<<(8*size))-1)).to_bytes(size,'little'))
- assert len(logo)==76*74*3,len(logo)
- for y in range(74):
-  for x in range(76):
-   rgb=logo[(y*76+x)*3:(y*76+x+1)*3]
-   actual=frame[((y+12)*w+(w-76-12+x))*4:((y+12)*w+(w-76-12+x))*4+4]
-   assert actual==bytes((rgb[2],rgb[1],rgb[0],255)),('Missing/corrupt Anvil logo',x,y,actual,bytes(rgb))
+ assert_logo(frame,w,q('zngGlintPhase'))
  assert frame[0:4]==bytes((40,0,0,255)),'Missing banner background'
  assert all(frame[(114*w+x)*4:(114*w+x)*4+4]==bytes((48,148,255,255)) for x in range(24,w-24)),'Missing orange header rule'
  assert q('gConRows')==(h-128-8)//q('zngLineHeight'),'Console overlaps the header band'
  print('PASS real Anvil boot header:5624 exact logo pixels, banner background/rule, reserved console band.',flush=True)
- (td/'result.json').write_text(json.dumps(dict(image_sha256=meta['image_sha256'],entry=meta['entry'],breakpoint=pc,width=w,height=h,shown=shown,frames=q('zgdSequence'),font='Anvil shared TrueType boot font',symbols_sha256=hashlib.sha256((td/'symbols.json').read_bytes()).hexdigest(),header_logo_pixels=5624,header_console_top=128,colours=len(colours),frame_sha256=hashlib.sha256(frame).hexdigest(),exercise=a.exercise,input_transport='keyboard' if a.keyboard else 'uart',payload_marker=struct.unpack_from('<q',ram,marker)[0] if a.exercise and not a.resident else None,payload_return=q('gGoRc') if a.exercise else None,resident_sessions=len(resident_frames),resident_frame_sha256=hashlib.sha256(resident_frames[0]).hexdigest() if resident_frames else None),indent=2))
+ (td/'result.json').write_text(json.dumps(dict(image_sha256=meta['image_sha256'],entry=meta['entry'],breakpoint=pc,width=w,height=h,shown=shown,frames=q('zgdSequence'),font='Anvil shared TrueType boot font',symbols_sha256=hashlib.sha256((td/'symbols.json').read_bytes()).hexdigest(),header_logo_pixels=5624,glint_phase=q('zngGlintPhase'),header_console_top=128,colours=len(colours),frame_sha256=hashlib.sha256(frame).hexdigest(),exercise=a.exercise,input_transport='keyboard' if a.keyboard else 'uart',payload_marker=struct.unpack_from('<q',ram,marker)[0] if a.exercise and not a.resident else None,payload_return=q('gGoRc') if a.exercise else None,resident_sessions=len(resident_frames),resident_frame_sha256=hashlib.sha256(resident_frames[0]).hexdigest() if resident_frames else None),indent=2))
  print('PASS actual ROM-loaded counted Anvil image: shared TrueType/Neon graphical prompt, native display enabled, cell-text disabled, no Vulkan faults; screenshot '+str(td/'anvil-graphical-prompt.png'))
  if a.resident:print('PASS existing shared retained-UI service application twice: 22 assertions per session, real matching native frames, return=0, retired scopes, graphical prompt restored')
  elif a.exercise:print('PASS '+('native keyboard with Backspace editing' if a.keyboard else 'UART')+': GRAPHICS READY command, filesystem PMF application, RAM marker=1, return=42, graphical prompt restored')

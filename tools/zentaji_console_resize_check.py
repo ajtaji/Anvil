@@ -2,7 +2,7 @@
 import argparse,hashlib,json,re,sys
 from pathlib import Path
 from zentaji_boot_session import ROOT,Session,source_pc,monitor
-from zentaji_graphical_boot_check import png
+from zentaji_graphical_boot_check import png,assert_logo
 
 def main():
  ap=argparse.ArgumentParser(description=__doc__)
@@ -28,9 +28,10 @@ def main():
  with (td/'machine.txt').open('a') as f:
   f.write('\ndisplay-size 640 480\nresize 1500000000 1024 768\nresize 2000000000 800 600\n')
  results=[];saved_lines=None;first=True;seen=set()
- with Session(zt,td,timeout=1200) as s:
+ with Session(zt,td,timeout=300) as s:
   s.breakpoint(checkpoint)
-  for count in range(40):
+  # The restored 350ms sparkle adds frames between scheduled resize events.
+  for count in range(80):
    s.run_to(checkpoint,step=not first);first=False
    assert s.q(symbols,'zngFault')==0 and s.q(symbols,'avkFaultCount')==0
    w,h=[s.q(symbols,n) for n in ('zgdWidth','zgdHeight')]
@@ -47,7 +48,7 @@ def main():
    assert all(frame[(114*w+x)*4:(114*w+x)*4+4]==bytes((48,148,255,255)) for x in range(24,w-24))
    # The immutable logo occupies the same76x74 pixels at the new right edge.
    logo=b''.join(frame[((y+12)*w+w-88)*4:((y+12)*w+w-12)*4] for y in range(74))
-   if results:assert hashlib.sha256(logo).hexdigest()==results[0]['logo_sha256']
+   assert_logo(frame,w,s.q(symbols,'zngGlintPhase'))
    assert s.q(symbols,'znsWidth')==w and s.q(symbols,'znsHeight')==h
    assert s.q(symbols,'zgdPitch')==w*4 and s.q(symbols,'zgdEnabled')==1
    png(td/f'anvil-{w}x{h}.png',frame,w,h)

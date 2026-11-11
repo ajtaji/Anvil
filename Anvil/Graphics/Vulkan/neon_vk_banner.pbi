@@ -59,6 +59,32 @@ Procedure.i NeonVkBannerClockRender(*args.NeonVkBannerArgs,clear.i)
   ProcedureReturn NeonVkChromeError()
 EndProcedure
 
+; Repaint the immutable logo beneath a moving glint in a LOAD frame.
+; The title, clock, label and console remain untouched.
+Procedure.i NeonVkBannerGlintRender(*args.NeonVkBannerArgs,restoreLogo.i)
+  Protected rc.i,logoX.i,logoY.i=12,steel.i=Neon_RGB(226,232,240),warm.i=Neon_RGB(255,176,64)
+  If *args=0 : ProcedureReturn #NEON_VK_CHROME_ERR_ARGS : EndIf
+  logoX=*args\width-*args\logoWidth-12
+  If logoX<0 : logoX=0 : EndIf
+  If restoreLogo<>0
+    rc=NeonVkChromeLogo(logoX,logoY)
+    If rc<>#NEON_VK_CHROME_OK : ProcedureReturn rc : EndIf
+  EndIf
+  If *args\glintActive <> 0
+    rc = NeonVkChromeBox(logoX + *args\glintX, logoY + *args\glintY, 1, 1, warm)
+    If rc <> #NEON_VK_CHROME_OK : ProcedureReturn rc : EndIf
+    rc = NeonVkChromeBox(logoX + *args\glintX - 1, logoY + *args\glintY, 1, 1, steel)
+    If rc <> #NEON_VK_CHROME_OK : ProcedureReturn rc : EndIf
+    rc = NeonVkChromeBox(logoX + *args\glintX + 1, logoY + *args\glintY, 1, 1, steel)
+    If rc <> #NEON_VK_CHROME_OK : ProcedureReturn rc : EndIf
+    rc = NeonVkChromeBox(logoX + *args\glintX, logoY + *args\glintY - 1, 1, 1, steel)
+    If rc <> #NEON_VK_CHROME_OK : ProcedureReturn rc : EndIf
+    rc = NeonVkChromeBox(logoX + *args\glintX, logoY + *args\glintY + 1, 1, 1, steel)
+    If rc <> #NEON_VK_CHROME_OK : ProcedureReturn rc : EndIf
+  EndIf
+  ProcedureReturn #NEON_VK_CHROME_OK
+EndProcedure
+
 Procedure.i NeonVkBannerRender(*args.NeonVkBannerArgs)
   Define tb0.i, tb1.i
   Define rc.i, logoX.i, logoY.i, labelX.i, titleX.i
@@ -106,17 +132,6 @@ Procedure.i NeonVkBannerRender(*args.NeonVkBannerArgs)
   labelX = logoX + (*args\logoWidth - labelWidth) / 2
   rc = Neon_Text(#NEON_FONT_SMALL, labelX, logoY + *args\logoHeight + 6, "A N V I L", warm)
   If rc <> #NEON_VK_CHROME_OK : ProcedureReturn rc : EndIf
-  If *args\glintActive <> 0
-    rc = NeonVkChromeBox(logoX + *args\glintX, logoY + *args\glintY, 1, 1, warm)
-    If rc <> #NEON_VK_CHROME_OK : ProcedureReturn rc : EndIf
-    rc = NeonVkChromeBox(logoX + *args\glintX - 1, logoY + *args\glintY, 1, 1, steel)
-    If rc <> #NEON_VK_CHROME_OK : ProcedureReturn rc : EndIf
-    rc = NeonVkChromeBox(logoX + *args\glintX + 1, logoY + *args\glintY, 1, 1, steel)
-    If rc <> #NEON_VK_CHROME_OK : ProcedureReturn rc : EndIf
-    rc = NeonVkChromeBox(logoX + *args\glintX, logoY + *args\glintY - 1, 1, 1, steel)
-    If rc <> #NEON_VK_CHROME_OK : ProcedureReturn rc : EndIf
-    rc = NeonVkChromeBox(logoX + *args\glintX, logoY + *args\glintY + 1, 1, 1, steel)
-    If rc <> #NEON_VK_CHROME_OK : ProcedureReturn rc : EndIf
-  EndIf
-  ProcedureReturn #NEON_VK_CHROME_OK
+  ProcedureReturn NeonVkBannerGlintRender(*args,0)
 EndProcedure
+

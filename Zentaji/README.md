@@ -16,8 +16,24 @@ include of that same source. Zentaji supplies its own identity and native
 presentation, with console rows below the reserved 128-pixel top band.
 The boot-only graphical check verifies all 5624 logo pixels, the orange rule
 and console band on Anvil itself, without compiling or loading an application.
-The current adapter still redraws the complete console on a model change;
-preserving the completed image and repainting dirty rows/bands remains owed.
+The adapter preserves the completed image and repaints changed console rows,
+the clock band, or the logo animation through the shared LOAD transaction.
+The logo uses the same eight-step,350ms glint as Pi4, now shared in
+`Anvil/Graphics/banner_glint.pbi`; the ordinary timer/WFI prompt pump advances
+it without a separate animation loop. The clock uses the board RTC. Visible
+Zentaji boot seeds that RTC from host UTC; deterministic headless fixtures
+retain their fixed epoch unless an explicit recorded seed is supplied.
+
+Window resize requests negotiate the active guest dimensions and replace the
+native render target while preserving console text, styles and cursor. The
+existing target survives a refused or stale request. The graphics arena sets
+the maximum admitted target size; a window-aware boot reserves resize capacity
+before applications are admitted. `zentaji_console_resize_check.py` observes
+the actual monitor at640x480,1024x768 and800x600. The console-damage check
+observes all eight glint phases, clock changes, typed X/Backspace and an echo
+command while independently checking preserved pixels and the complete logo.
+These native frame checks do not establish host-GPU acceleration or live
+performance: the emulator's production host-GPU renderer remains unfinished.
 
 Resident graphical applications use Anvil's existing slot38 Neon service and
 retained-UI client. Protocol ownership and dispatch are shared with Pi4;
@@ -67,7 +83,7 @@ language maps, independent assembler bytes and the native CPU. It checks exact
 model state, callback ordering/uninstall/reset and 10001 bytes without loss.
 The existing A64 capture/console gate also passes four rotations, exact RLE CRCs,
 45150 lossless bytes and styled terminal operations. Resident Zentaji console
-rendering is still being connected; the counted monitor remains text-only.
+rendering now uses this shared model in the counted graphical monitor.
 
 The Zentaji UART can now feed both shared output taps after an accepted serial
 write. Diverted messages and refused writes stay out; the prompt's screen style
