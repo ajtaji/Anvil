@@ -36,6 +36,14 @@ Procedure.i Main()
  If paints<>1 Or overlays<>1 : ProcedureReturn 106 : EndIf
  ConOverlayReset() : If resets<>1 : ProcedureReturn 107 : EndIf
  ConNoOverlay() : ConOverlayReset() : If resets<>1 : ProcedureReturn 108 : EndIf
+ ConGridProportionalSet(80,1) : ConGridResize(10,5)
+ If ConGridCell(0,0)<>97 Or ConGridCell(1,2)<>112 Or ConGridCellStyle(1,2)<>1 : ProcedureReturn 114 : EndIf
+ If ConGridCurC()<>4 Or ConGridCurR()<>1 Or gConCurPen<>2097152 : ProcedureReturn 115 : EndIf
+ ConGridResize(4,1)
+ If ConGridCell(0,0)<>99 Or ConGridCell(0,3)<>113 Or ConGridCellStyle(0,2)<>1 : ProcedureReturn 116 : EndIf
+ If ConGridCurC()<>3 Or ConGridCurR()<>0 Or gConCurPen<>1572864 : ProcedureReturn 117 : EndIf
+ ConGridResize(6,3) : ConGridProportionalSet(0,0)
+ If ConGridCell(0,0)<>99 Or ConGridCell(0,4)<>32 Or ConGridCell(1,0)<>32 : ProcedureReturn 118 : EndIf
  ConGridClear() : UartMirrorSetDrain(@ConMirrorDrain)
  For i=0 To 10000 : uart_MirrorPut(65) : Next
  ConDrainRing()

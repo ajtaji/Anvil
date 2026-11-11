@@ -25,6 +25,7 @@ XIncludeFile "Anvil/Graphics/Vulkan/neon_vk_sprite_port.pbi"
 XIncludeFile "RaspberryPi4/Monitor/anvil_boot_ttf.pi4"
 
 XIncludeFile "Zentaji/Board/neon_surface.pbi"
+XIncludeFile "Zentaji/Board/neon_resize.pbi"
 XIncludeFile "Anvil/Graphics/anvil_logo.pbi"
 XIncludeFile "Anvil/Core/build_identity.pbi"
 XIncludeFile "Anvil/Graphics/Vulkan/neon_vk_banner.pbi"
@@ -35,6 +36,10 @@ Global zngUp.i,zngFault.i,zngLineHeight.i,zngSuspended.i
 Global zngFont.NeonVkPortFontRef
 #ZNG_CONSOLE_TOP=128
 Global zngBanner.NeonVkBannerArgs
+Global zngPresented.i,zngPainting.i,zngCursorRow.i=-1,zngCursorPen.i
+Global zngClockSecond.i=-2,zngClockDirty.i
+Global Dim zngClockText.a[128]
+Global Dim zngClear.l[4]
 Global Dim zngAtlas.a[#NEON_ATLAS_MAXBYTES]
 Global Dim zngUV.a[4096]
 Global Dim zngBitmap.a[95*16]
@@ -57,6 +62,7 @@ Procedure.i ScreenProportionalAdvance(previous.i,current.i)
  ProcedureReturn NeonVkChromeMeasureWidthControls(zngFont\face,@zngPair[0],0,1)-total
 EndProcedure
 XIncludeFile "Anvil/Core/console_grid.pbi"
+Global Dim zngRows.a[#CON_MAXROWS]
 
 Procedure.i zngRunX(row.i,col.i)
  Protected i.i,whole.i,first.i
@@ -67,6 +73,25 @@ Procedure.i zngRunX(row.i,col.i)
  first=NeonVkChromeMeasureWidthControls(zngFont\face,@zngPair[0],0,1)
  ProcedureReturn whole-first
 EndProcedure
+; The caption owner guarantees at most127 bytes. Keep a stable copy through
+; preparation/submission: nested idle services must not change warmed text.
+; A second transition asks the shared pump for work without marking text rows.
+Procedure.i zngClockPoll()
+ Protected seconds.i,*text,i.i,changed.i,length.i
+ If zngPainting<>0 : ProcedureReturn 1 : EndIf
+ seconds=WallClockNow()
+ If seconds=zngClockSecond : ProcedureReturn 1 : EndIf
+ *text=WallClockCaption()
+ While length<128 And PeekA(*text+length)<>0 : length=length+1 : Wend
+ If length>=128 : ProcedureReturn 0 : EndIf
+ For i=0 To length
+  If zngClockText[i]<>PeekA(*text+i) : changed=1 : EndIf
+ Next
+ For i=0 To length : zngClockText[i]=PeekA(*text+i) : Next
+ zngClockSecond=seconds
+ If changed<>0 : zngClockDirty=1 : gConDirty=1 : EndIf
+ ProcedureReturn 1
+EndProcedure
 ; Use Anvil's existing banner composition and immutable logo, not an app UI.
 ; Warm all title/caption glyphs while idle; drawing inside a frame never rasterizes.
 Procedure.i zngBannerPrepare()
@@ -74,7 +99,7 @@ Procedure.i zngBannerPrepare()
  zngBanner\logoWidth=#ANVIL_PIC_W : zngBanner\logoHeight=#ANVIL_PIC_H
  zngBanner\platformText="bare-metal monitor   -   Zentaji   -   Zentaji64"
  zngBanner\buildText=AnvilBuildLabel(#ANVIL_BUILD,#ANVIL_BUILD_DATE,#ANVIL_BUILD_TIME)
- zngBanner\clockText=WallClockCaption() : zngBanner\glintActive=0
+ zngBanner\clockText=@zngClockText[0] : zngBanner\glintActive=0
  If NeonVkChromeFontHeightSet(#NEON_FONT_BOLD,48)<>0 : ProcedureReturn 0 : EndIf
  If NeonVkChromeFontHeightSet(#NEON_FONT_SMALL,16)<>0 : ProcedureReturn 0 : EndIf
  If NeonVkChromeWarmTrueTypeText(48,"PureMetal Forge")<0 : ProcedureReturn 0 : EndIf
@@ -84,42 +109,75 @@ Procedure.i zngBannerPrepare()
  If NeonVkChromeWarmTrueTypeText(16,"A N V I L")<0 : ProcedureReturn 0 : EndIf
  ProcedureReturn 1
 EndProcedure
+; The first frame clears the attachment and draws the shared header. Later
+; transactions LOAD that completed attachment, clear/repaint only dirty rows,
+; and retain every other pixel. Cursor movement restores both its old and new
+; rows so deleting text or moving over ink cannot leave a trail. The bundled
+;16-pixel face fits the measured line box; each dirty row is restored in full.
+; This is the same public Chrome transaction layer used by the Pi4 monitor.
 Procedure zngPaint()
- Protected row.i,col.i,count.i,style.i,x.f,y.f,r.f,g.f,b.f,cursor.i
- If zngUp=0 Or zngSuspended<>0 Or zngFault<>0 : ProcedureReturn : EndIf
- ; Atlas preparation happens while idle, before the frame transaction.
+ Protected row.i,col.i,count.i,style.i,x.f,y.f,r.f,g.f,b.f,cursor.i,pen.i
+ Protected full.i,moved.i,rows.i,py.i,clock.i
+ If zngUp=0 Or zngSuspended<>0 Or zngFault<>0 Or zngPainting<>0 : ProcedureReturn : EndIf
+ If zngClockPoll()<>1 : zngFault=10 : ProcedureReturn : EndIf
+ zngPainting=1
+ cursor=ConGridCurR()-ConViewTop() : pen=gConCurPen
+ full=Bool(zngPresented=0 Or ConGridFullClear()<>0)
+ moved=Bool(cursor<>zngCursorRow Or pen<>zngCursorPen)
+ clock=zngClockDirty
+ ; Warm every changed run before either frame transaction begins.
  For row=0 To ConGridRows()-1
-  ConGridRowText(row,@zngRow[0])
-  If NeonVkPortFontWarm(@zngFont,@zngRow[0])<>0 : zngFault=1 : ProcedureReturn : EndIf
+  zngRows[row]=Bool(full<>0 Or ConGridRowDirty(row)<>0 Or (moved<>0 And (row=cursor Or row=zngCursorRow)))
+  If zngRows[row]<>0
+   rows=rows+1 : ConGridRowText(row,@zngRow[0])
+   If NeonVkPortFontWarm(@zngFont,@zngRow[0])<>0 : zngFault=1 : zngPainting=0 : ProcedureReturn : EndIf
+  EndIf
  Next
- If zngBannerPrepare()<>1 : zngFault=8 : ProcedureReturn : EndIf
- If NeonVkPortFrameBegin(0.025,0.035,0.055,1.0)<>0 : zngFault=2 : ProcedureReturn : EndIf
- If NeonVkBannerRender(@zngBanner)<>0 : zngFault=9 : ProcedureReturn : EndIf
- For row=0 To ConGridRows()-1
-  col=0
-  While col<ConGridCols()
-   style=ConGridCellStyle(row,col)
-   count=ConGridStyleRunText(row,col,@zngRun[0])
-   If count<1 : zngFault=3 : ProcedureReturn : EndIf
-   If zngRun[0]<>0
-    x=8.0+MathFFromInt(zngRunX(row,col))/65536.0
-    y=MathFFromInt(#ZNG_CONSOLE_TOP+row*zngLineHeight)
-    r=0.85 : g=0.87 : b=0.91
-    If style=#UART_SCREEN_STYLE_PROMPT : r=0.35 : g=0.85 : b=0.95 : EndIf
-    If NeonVkPortFontText(@zngFont,x,y,@zngRun[0],r,g,b,1.0,1,1)<>0 : zngFault=4 : ProcedureReturn : EndIf
-   EndIf
-   col=col+count
-  Wend
- Next
- cursor=ConGridCurR()-ConViewTop()
- If cursor>=0 And cursor<ConGridRows()
-  x=8.0+MathFFromInt(gConCurPen)/65536.0
-  y=MathFFromInt(#ZNG_CONSOLE_TOP+(cursor+1)*zngLineHeight-2)
-  If NeonVkPortBox(x,y,2.0,1.0,0.35,0.85,0.95,1.0,1,1)<>0 : zngFault=5 : ProcedureReturn : EndIf
+ If full<>0
+  If zngBannerPrepare()<>1 : zngFault=8 : zngPainting=0 : ProcedureReturn : EndIf
+ ElseIf clock<>0
+  If NeonVkChromeFontHeightSet(#NEON_FONT_SMALL,16)<>0 : zngFault=8 : zngPainting=0 : ProcedureReturn : EndIf
+  If NeonVkChromeWarmTrueTypeText(16,@zngClockText[0])<0 : zngFault=8 : zngPainting=0 : ProcedureReturn : EndIf
  EndIf
- If NeonVkPortFrameEnd()<>0 : zngFault=6 : ProcedureReturn : EndIf
- If ZentajiNeonSurfacePresent()<>1 : zngFault=7 : ProcedureReturn : EndIf
- ConGridClearDirty()
+ If full=0 And rows=0 And clock=0 : ConGridClearDirty() : zngPainting=0 : ProcedureReturn : EndIf
+ If full<>0
+  If NeonVkChromeBegin(@zngClear[0])<>0 : zngFault=2 : zngPainting=0 : ProcedureReturn : EndIf
+  If NeonVkBannerRender(@zngBanner)<>0 : zngFault=9 : zngPainting=0 : ProcedureReturn : EndIf
+ Else
+  If NeonVkChromeBeginLoad()<>0 : zngFault=2 : zngPainting=0 : ProcedureReturn : EndIf
+  If clock<>0
+   If NeonVkBannerClockRender(@zngBanner,1)<>0 : zngFault=9 : zngPainting=0 : ProcedureReturn : EndIf
+  EndIf
+ EndIf
+ For row=0 To ConGridRows()-1
+  If zngRows[row]<>0
+   py=#ZNG_CONSOLE_TOP+row*zngLineHeight
+   If full=0
+    If NeonVkChromeBox(0,py,znsWidth,zngLineHeight,Neon_RGB(6,9,14))<>0 : zngFault=4 : zngPainting=0 : ProcedureReturn : EndIf
+   EndIf
+   col=0
+   While col<ConGridCols()
+    style=ConGridCellStyle(row,col) : count=ConGridStyleRunText(row,col,@zngRun[0])
+    If count<1 : zngFault=3 : zngPainting=0 : ProcedureReturn : EndIf
+    If zngRun[0]<>0
+     x=8.0+MathFFromInt(zngRunX(row,col))/65536.0 : y=MathFFromInt(py)
+     r=0.85 : g=0.87 : b=0.91
+     If style=#UART_SCREEN_STYLE_PROMPT : r=0.35 : g=0.85 : b=0.95 : EndIf
+     If NeonVkPortFontText(@zngFont,x,y,@zngRun[0],r,g,b,1.0,1,1)<>0 : zngFault=4 : zngPainting=0 : ProcedureReturn : EndIf
+    EndIf
+    col=col+count
+   Wend
+  EndIf
+ Next
+ If cursor>=0 And cursor<ConGridRows()
+  x=8.0+MathFFromInt(pen)/65536.0 : y=MathFFromInt(#ZNG_CONSOLE_TOP+(cursor+1)*zngLineHeight-2)
+  If NeonVkPortBox(x,y,2.0,1.0,0.35,0.85,0.95,1.0,1,1)<>0 : zngFault=5 : zngPainting=0 : ProcedureReturn : EndIf
+ EndIf
+ If NeonVkChromeEnd()<>0 : zngFault=6 : zngPainting=0 : ProcedureReturn : EndIf
+ If ZentajiNeonSurfacePresent()<>1 : zngFault=7 : zngPainting=0 : ProcedureReturn : EndIf
+ zngPresented=1 : zngCursorRow=cursor : zngCursorPen=pen : zngClockDirty=0
+ ConGridClearDirty() ; native monitor frame checkpoint
+ zngPainting=0
 EndProcedure
 Procedure.i ZentajiNeonConsoleStart()
  Protected cols.i,rows.i
@@ -127,6 +185,8 @@ Procedure.i ZentajiNeonConsoleStart()
  neon_texSrc=@zngAtlas[0] : neon_glyphUV=@zngUV[0]
  If NeonBitmapFontBind(@zngBitmap[0],8,16,32,126)<>1 : ProcedureReturn 0 : EndIf
  NeonFontDefaults()
+ zngClear[0]=GraphicsF32ByteBits(6) : zngClear[1]=GraphicsF32ByteBits(9)
+ zngClear[2]=GraphicsF32ByteBits(14) : zngClear[3]=GraphicsF32ByteBits(255)
  If AnvilTrueTypeSlotLoad(#ANVIL_TTS_BOOT_SLOT,?anvilBootTtf,#ANVIL_BOOT_TTF_BYTES)<>1 : ProcedureReturn 0 : EndIf
  If AnvilTrueTypeSlotSelect(#ANVIL_TTS_BOOT_SLOT)<>1 : ProcedureReturn 0 : EndIf
  If NeonVkPortFontBind(@zngFont,#ANVIL_TTS_BOOT_SLOT,#NEON_FONT_UI,16)<>0 : ProcedureReturn 0 : EndIf
@@ -143,7 +203,18 @@ Procedure.i ZentajiNeonConsoleStart()
  zngUp=1 : ProcedureReturn 1
 EndProcedure
 Procedure.i ZentajiNeonConsolePump()
+ Protected resized.i,cols.i,rows.i
  If zngUp=0 Or zngSuspended<>0 : ProcedureReturn 1 : EndIf
+ If zngPainting<>0 : ProcedureReturn 1 : EndIf
+ resized=ZentajiNeonSurfaceResize()
+ If resized=0 : zngFault=11 : ProcedureReturn 0 : EndIf
+ If resized=2
+  cols=(znsWidth-16)/4 : rows=(znsHeight-#ZNG_CONSOLE_TOP-8)/zngLineHeight
+  ConGridResize(cols,rows) : gConPixelWidth=znsWidth-16
+  zngPresented=0 : zngCursorRow=-1 : zngClockDirty=1
+  ConGridMarkAll()
+ EndIf
+ If zngClockPoll()<>1 : zngFault=10 : ProcedureReturn 0 : EndIf
  ScreenPump()
  ProcedureReturn Bool(zngFault=0 And znsState=2)
 EndProcedure
@@ -164,13 +235,13 @@ Procedure.i ZentajiNeonConsoleSuspend()
  ; payloads receive released hardware, as before; they may own another driver.
  If GraphicsServiceState()=1
   If ZentajiGraphicsDisplayOwned()<>1 Or ZentajiDmaOwned(@avkZenDma)<>1 : ProcedureReturn 0 : EndIf
-  ConNoRenderer() : zngSuspended=2 : ProcedureReturn 1
+  zngPresented=0 : ConNoRenderer() : zngSuspended=2 : ProcedureReturn 1
  EndIf
  If vkDeviceWaitIdle(znsDev)<>0 : ProcedureReturn 0 : EndIf
  If ZentajiGraphicsDisplayRelease()<>1 : ProcedureReturn 0 : EndIf
  If zngDmaDown()<>1 : ProcedureReturn 0 : EndIf
  If ZentajiGraphicsRelease(@avkZenQueue)<>1 : ProcedureReturn 0 : EndIf
- ConNoRenderer() : zngSuspended=1 : ProcedureReturn 1
+ zngPresented=0 : ConNoRenderer() : zngSuspended=1 : ProcedureReturn 1
 EndProcedure
 Procedure.i ZentajiNeonConsoleResume()
  If zngUp=0 : ProcedureReturn 1 : EndIf
@@ -221,6 +292,7 @@ Procedure.i AvsSurfaceStart()
  ProcedureReturn 0
 EndProcedure
 Procedure.i AvsSurfaceStop()
+ zngPresented=0
  ProcedureReturn ZentajiNeonSurfaceChromeReset()
 EndProcedure
 Procedure.i AvsSurfacePresent()

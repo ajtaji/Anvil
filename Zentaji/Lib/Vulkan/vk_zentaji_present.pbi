@@ -23,6 +23,11 @@ Procedure.i AnvilVkZentajiDisplayWindow()
  w=PeekQ(#ZEN_GFX_DISPLAY+$50) : h=PeekQ(#ZEN_GFX_DISPLAY+$58)
  If w<1 Or w>16384 Or h<1 Or h>16384 : ProcedureReturn #VK_ERROR_INITIALIZATION_FAILED : EndIf
  span=(w*h*4+4095)&-4096 : displayBytes=span*buffers
+ If PeekQ(#ZEN_GFX_DISPLAY+$B0)<>0
+  zgdCapacitySpan=((zenMemoryGraphicsBytes-$1000000)/(buffers+2))&-4096
+  If zgdCapacitySpan<span : ProcedureReturn #VK_ERROR_OUT_OF_DEVICE_MEMORY : EndIf
+  span=zgdCapacitySpan : displayBytes=span*buffers
+ EndIf
  If displayBytes>zenMemoryGraphicsBytes-8192 : ProcedureReturn #VK_ERROR_OUT_OF_DEVICE_MEMORY : EndIf
  windowBytes=zenMemoryGraphicsBytes-displayBytes : base=zenMemoryGraphicsBase+windowBytes
  If ZentajiGraphicsDisplayManagedStart(base)<>1 : ProcedureReturn #VK_ERROR_INITIALIZATION_FAILED : EndIf

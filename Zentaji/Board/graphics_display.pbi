@@ -10,6 +10,7 @@ Global zgdUp.i,zgdLost.i,zgdBase.i,zgdSpan.i,zgdPitch.i,zgdWidth.i,zgdHeight.i,z
 Global zgdPending.i,zgdRequested.i,zgdShown.i,zgdEnabled.i,zgdSequence.q
 Global zgdManaged.i,zgdWriter.i,zgdWriteIndex.i,zgdWriteDma.i,zgdWriteLaunches.i
 Global zgdWriteToken.q,zgdWriteSerial.q
+Global zgdCapacitySpan.i
 
 Procedure.i ZentajiGraphicsDisplayOwned()
  Protected n.i,status.i
@@ -57,6 +58,7 @@ Procedure.i ZentajiGraphicsDisplayStart(base.i)
  w=PeekQ(#ZEN_GFX_DISPLAY+$50) : h=PeekQ(#ZEN_GFX_DISPLAY+$58)
  If w<1 Or w>16384 Or h<1 Or h>16384 : ProcedureReturn 0 : EndIf
  pitch=w*4 : span=(pitch*h+4095)&-4096
+ If zgdCapacitySpan>span : span=zgdCapacitySpan : EndIf
  last=zenMemoryGraphicsBase+zenMemoryGraphicsBytes
  If base<zenMemoryGraphicsBase+4096 Or (base&4095)<>0 Or base>last Or span>(last-base)/buffers : ProcedureReturn 0 : EndIf
  zgdBuffers=buffers

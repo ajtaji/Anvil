@@ -376,7 +376,52 @@ Procedure ConGridInit(cols.i, rows.i)
   gConReady = 1
 EndProcedure
 
-; Scroll the whole grid up one row. The dirty flags shift with the content
+  ; Change geometry without throwing away the session. Keep the cursor's row
+  ; visible on shrink and preserve cell styles alongside the retained text.
+  Procedure ConGridResize(cols.i,rows.i)
+    Protected oldCols.i=gConCols,oldRows.i=gConRows,r.i,c.i,top.i,copyCols.i,copyRows.i
+    Protected Dim text.a[#CON_CELLS]
+    Protected Dim style.a[#CON_CELLS]
+    If cols<1 : cols=1 : EndIf
+    If rows<1 : rows=1 : EndIf
+    If cols>#CON_MAXCOLS : cols=#CON_MAXCOLS : EndIf
+    If rows>#CON_MAXROWS : rows=#CON_MAXROWS : EndIf
+    If cols=oldCols And rows=oldRows : ProcedureReturn : EndIf
+    If gConCurR>=rows : top=gConCurR-rows+1 : EndIf
+    copyCols=oldCols : If copyCols>cols : copyCols=cols : EndIf
+    copyRows=oldRows-top : If copyRows>rows : copyRows=rows : EndIf
+    For r=0 To copyRows-1
+      For c=0 To copyCols-1
+        text[r*cols+c]=gConGrid[(r+top)*oldCols+c]
+        style[r*cols+c]=gConStyle[(r+top)*oldCols+c]
+      Next
+    Next
+    ConOverlayReset()
+    gConCols=cols : gConRows=rows : gConCurR=gConCurR-top
+    If gConCurC>=cols : gConCurC=cols-1 : EndIf
+    For r=0 To rows-1
+      For c=0 To cols-1
+        gConGrid[r*cols+c]=32 : gConStyle[r*cols+c]=#UART_SCREEN_STYLE_NORMAL
+        If r<copyRows And c<copyCols
+          gConGrid[r*cols+c]=text[r*cols+c] : gConStyle[r*cols+c]=style[r*cols+c]
+        EndIf
+      Next
+    Next
+    gConViewRows=0 : gConViewTopLast=0 : gConScrollN=0
+    gConCurPen=0
+    If gConProportional<>0
+      For c=0 To gConCurC-1
+        If c=0
+          gConCurPen=gConCurPen+ScreenProportionalAdvance(0,gConGrid[gConCurR*cols+c])
+        Else
+          gConCurPen=gConCurPen+ScreenProportionalAdvance(gConGrid[gConCurR*cols+c-1],gConGrid[gConCurR*cols+c])
+        EndIf
+      Next
+    EndIf
+    gConFullClear=1 : ConGridMarkAll()
+  EndProcedure
+
+  ; Scroll the whole grid up one row. The dirty flags shift with the content
 ; so a renderer that hardware-scrolls the picture only has to repaint the
 ; rows that genuinely changed, exactly like the DMA console always did.
 Procedure ConGridScroll()
