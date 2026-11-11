@@ -4,6 +4,20 @@
 XIncludeFile "Anvil/Hal/prompt_idle.pbi"
 XIncludeFile "Anvil/Core/prompt_services.pbi"
 
+; Optional prompt-only wait. Device/payload completion waits keep using the
+; ordinary hardware wait; this registration changes only the idle scheduler.
+Procedure AnvilPromptIdleWaitDefault()
+  HwPromptIdleWait()
+EndProcedure
+Global *anvil_promptIdleWait=@AnvilPromptIdleWaitDefault
+Global anvil_promptIdleWaitActive.i
+Procedure.i AnvilPromptIdleWaitBind(provider.i)
+  If anvil_promptIdleWaitActive<>0 : ProcedureReturn 0 : EndIf
+  *anvil_promptIdleWait=@AnvilPromptIdleWaitDefault
+  If provider<>0 : *anvil_promptIdleWait=provider : EndIf
+  ProcedureReturn 1
+EndProcedure
+
 Global anvil_promptServiceSlot.i = 0
 Global anvil_promptWindowStart.q = 0
 Global anvil_promptIdleTicks.q = 0
@@ -117,7 +131,8 @@ Procedure AnvilSchedulerIdleIfSafe()
     EndIf
   CompilerEndIf
   t0 = Ticks()
-  HwPromptIdleWait()
+  If anvil_promptIdleWaitActive<>0 : ProcedureReturn : EndIf
+  anvil_promptIdleWaitActive=1 : anvil_promptIdleWait() : anvil_promptIdleWaitActive=0
   dt = Ticks() - t0
   If dt > 0
     anvil_promptIdleTicks = anvil_promptIdleTicks + dt

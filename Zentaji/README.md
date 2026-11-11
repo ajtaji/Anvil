@@ -33,7 +33,10 @@ the actual monitor at640x480,1024x768 and800x600. The console-damage check
 observes all eight glint phases, clock changes, typed X/Backspace and an echo
 command while independently checking preserved pixels and the complete logo.
 These native frame checks do not establish host-GPU acceleration or live
-performance: the emulator's production host-GPU renderer remains unfinished.
+performance. The separate host-GPU boot check now proves the counted build31
+monitor at1024x768: shared header, all5624 logo pixels, a presented sparkle phase,
+resident prompt and zero graphics faults. Full shader ISA, replay/snapshot
+integration and platform/performance acceptance remain unfinished.
 
 Resident graphical applications use Anvil's existing slot38 Neon service and
 retained-UI client. Protocol ownership and dispatch are shared with Pi4;
@@ -496,6 +499,28 @@ separate from that interval.
 The actual `Anvil/Core/prompt_scheduler.pbi` decides whether work, queued input
 or software PWM allows sleeping. `HwPromptBoardService()` currently has no
 additional board maintenance hook.
+
+The monitor binds `ZentajiPromptEventIdleWait()` as a prompt-only provider.
+It temporarily borrows otherwise unconfigured serial/input interrupt lines,
+enables receive/key/mouse wakeups, and sleeps for at most 16ms. Already queued
+input skips sleeping. Before returning it restores interrupt routing, enables,
+timer ownership and CPU STATUS; it does not consume input events. A drained
+serial receive latch is cleared before the final FIFO recheck. Foreign device
+or interrupt ownership falls back to the original bounded wait.
+
+The shared scheduler's optional provider uses its existing hardware wait by
+default and after unbinding. Binding while a provider is active is refused.
+GPU, DMA and disk completion waits keep their original 2ms bound. The 16ms
+prompt bound is a hardware deadline, not a guarantee of host scheduling latency.
+
+`tools/zentaji_event_idle_check.py` checks 28 native cases across both cores:
+timer and early event wakeups, queued input, foreign ownership, unbinding,
+STATUS restoration, stale receive status and binding refusal during a callback.
+`tools/zentaji_host_gpu_boot_check.py --zen-tools ZEN --keep PROOF` boots the
+counted monitor through the actual ROM on the host GPU at 1024x768 and checks
+the shared header, exact logo/sparkle pixels and guest graphics fault state.
+It deliberately observes the resident prompt for 20 seconds; that deadline is
+not a normal guest exit, a calibration result, or physical-input acceptance.
 
 Run the focused proof with the current external Forge and matching Zentaji tools:
 

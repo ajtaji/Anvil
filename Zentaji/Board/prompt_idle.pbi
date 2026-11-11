@@ -111,3 +111,44 @@ EndProcedure
 Procedure HwPromptBoardService()
   ; No optional board maintenance hook is installed by this backend.
 EndProcedure
+
+; Prompt-only event sleep. Borrow only unconfigured interrupt lines and disabled
+; device sources, with IE off, then restore them before returning. Device waits
+; retain their original 2ms bound. Foreign ownership uses that same safe wait.
+#ZEN_IDLE_SERIAL=$FFFF000000100000
+#ZEN_IDLE_INPUT=$FFFF0000000A0000
+Procedure.i ZentajiPromptEventIdleReady()
+ If PeekQ(#ZEN_IDLE_INTC+$200)<>0 Or PeekQ(#ZEN_IDLE_INTC+$208)<>0 Or PeekQ(#ZEN_IDLE_INTC+$2C0)<>0 Or PeekQ(#ZEN_IDLE_INTC+$2C8)<>0 : ProcedureReturn 0 : EndIf
+ If (PeekQ(#ZEN_IDLE_SERIAL)&$FFFF)<>17 Or PeekQ(#ZEN_IDLE_SERIAL+$20)<>0 Or (PeekQ(#ZEN_IDLE_SERIAL+8)&$30)<>0 : ProcedureReturn 0 : EndIf
+ If (PeekQ(#ZEN_IDLE_INPUT)&$FFFF)<>11 Or PeekQ(#ZEN_IDLE_INPUT+$10)<>0 Or PeekQ(#ZEN_IDLE_INPUT+$20)<>0 Or PeekQ(#ZEN_IDLE_INPUT+$B0)<>0 : ProcedureReturn 0 : EndIf
+ If PeekQ(#ZEN_IDLE_INTC+$F010)>=15 Or TickHz()>$7FFFFFFFFFFFFFFF/16000 : ProcedureReturn 0 : EndIf
+ ProcedureReturn 1
+EndProcedure
+
+Procedure ZentajiPromptEventIdleWait()
+ Protected status.i,enabled.q,priority.i,route.q,period.q
+ If HwPromptIdleReady()=0 : ProcedureReturn : EndIf
+ status=ZenCpuIrqDisable()
+ If HwPromptIdleReady()=0 : ZenCpuSwapStatus(status) : ProcedureReturn : EndIf
+ If ZentajiPromptEventIdleReady()=0
+  ZenCpuSwapStatus(status) : HwPromptIdleWait() : ProcedureReturn
+ EndIf
+ enabled=PeekQ(#ZEN_IDLE_INTC+$F008)
+ priority=PeekQ(#ZEN_IDLE_INTC+$F010)+1 : route=1<<ZenCpuCoreId()
+ period=(TickHz()*16000)/1000000
+ ; RX reasons are latched. Acknowledge only an already drained console RX
+ ; reason, then recheck its FIFO after arming so an arrival cannot be lost.
+ If PeekQ(#ZEN_IDLE_SERIAL+$50)=0 : PokeQ(#ZEN_IDLE_SERIAL+$18,1) : EndIf
+ PokeQ(#ZEN_IDLE_INTC+$200,priority) : PokeQ(#ZEN_IDLE_INTC+$208,route)
+ PokeQ(#ZEN_IDLE_INTC+$2C0,priority) : PokeQ(#ZEN_IDLE_INTC+$2C8,route)
+ PokeQ(#ZEN_IDLE_INTC+$F008,enabled|$4100)
+ PokeQ(#ZEN_IDLE_SERIAL+$20,1) : PokeQ(#ZEN_IDLE_INPUT+$20,3)
+ PokeQ(#ZEN_IDLE_TIMER,Ticks()+period) : PokeQ(#ZEN_IDLE_TIMER+$10,3)
+ If PeekQ(#ZEN_IDLE_SERIAL+$50)=0 And PeekQ(#ZEN_IDLE_INPUT+$48)=0 And (PeekQ(#ZEN_IDLE_INPUT+$18)&3)=0 : ZenCpuWait() : EndIf
+ PokeQ(#ZEN_IDLE_SERIAL+$20,0) : PokeQ(#ZEN_IDLE_INPUT+$20,0)
+ PokeQ(#ZEN_IDLE_TIMER+$10,0) : PokeQ(#ZEN_IDLE_TIMER+$18,1) : PokeQ(#ZEN_IDLE_TIMER,zenIdleOldCompare)
+ PokeQ(#ZEN_IDLE_INTC+$F008,enabled)
+ PokeQ(#ZEN_IDLE_INTC+$208,0) : PokeQ(#ZEN_IDLE_INTC+$200,0)
+ PokeQ(#ZEN_IDLE_INTC+$2C8,0) : PokeQ(#ZEN_IDLE_INTC+$2C0,0)
+ ZenCpuSwapStatus(status)
+EndProcedure
