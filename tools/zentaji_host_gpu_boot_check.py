@@ -14,6 +14,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--zen-tools', type=Path, required=True)
     ap.add_argument('--keep', type=Path, required=True)
+    ap.add_argument('--keyboard', action='store_true',
+                    help='Exercise native HID editing and command dispatch in the booted monitor')
     args = ap.parse_args()
     from PIL import Image
     zt = args.zen_tools.resolve()
@@ -39,6 +41,22 @@ def main():
     fixture = F.Fixture(ram_size=128 << 20, cores=2,
                         hostfiles=[['anvil.zex', bytearray(raw), False]],
                         display_modes=[(1024, 768, 60000)])
+    if args.keyboard:
+        # Native TIME_HZ is 100 MHz. Start at ten seconds, then deliver
+        # distinct key-down/up events 20 ms apart through the input device.
+        # The shared editor must correct READX to READY before dispatch.
+        for index, ch in enumerate('echo GPU READX\bY\r'):
+            if ch == '\r':
+                usage, mods, text = 40, 0, 0
+            elif ch == '\b':
+                usage, mods, text = 42, 0, 0
+            elif ch == ' ':
+                usage, mods, text = 44, 0, 32
+            else:
+                usage, mods, text = 4 + ord(ch.lower()) - ord('a'), int(ch.isupper()), ord(ch)
+            tick = 1_000_000_000 + index * 2_000_000
+            fixture.input_feed(tick, 'key', usage, 1, mods, 0, text)
+            fixture.input_feed(tick + 1_000_000, 'key', usage, 0, mods, 0, 0)
     fixture.power_on(0, 0)
     fixture.write(td)
     command = [str(zt / 'zenwin.exe'), str(td / 'machine.txt'),
@@ -55,6 +73,10 @@ def main():
         'error: the live session did not finish within 20 s of host time.'], (run.returncode, errors, output[-2000:])
     serial = bytes.fromhex(re.search(r'^SERIAL0 ([0-9A-Fa-f]+)$', output, re.M)[1]).decode('utf-8')
     assert 'Type help for the available commands.' in serial and serial.endswith('pmf> '), serial
+    if args.keyboard:
+        # Require the command's output on its own line, not merely the
+        # editor echoing the keys. No serial input is supplied by this check.
+        assert '\r\nGPU READY\r\n' in serial, serial
     ram = (td / 'ram-final.bin').read_bytes()
     names = ('zngUp', 'zngFault', 'zngSuspended', 'avkFaultCount', 'avkZenNativeError', 'zgdSequence', 'zngGlintPhase')
     state = {name: int.from_bytes(ram[asm.sym['GLOBAL_' + name.upper()]:asm.sym['GLOBAL_' + name.upper()] + 8], 'little') for name in names}
@@ -75,10 +97,13 @@ def main():
     profiles = [{key: int(value) for key, value in re.findall(r'(\w+)=(\d+)', line)} for line in output.splitlines() if line.startswith('PROFILE ')]
     assert profiles and profiles[-1]['watched_fetches'] + profiles[-1]['compared_fetches'] > 0, 'No host GPU submissions'
     result = dict(image_sha256=digest, state=state, presented_sparkle=phase,
-                  profiles=profiles, observation_deadline=True)
+                  profiles=profiles, observation_deadline=True,
+                  keyboard_edit_dispatch=args.keyboard)
     (td / 'result.json').write_text(json.dumps(result, indent=2) + '\n')
     print('PASS actual ROM -> Anvil prompt, host GPU, 1024x768 shared header/logo/sparkle, zero graphics faults')
     print(json.dumps(state))
+    if args.keyboard:
+        print('PASS native HID -> shared editor backspace correction -> echo command -> prompt')
 
 
 if __name__ == '__main__':
