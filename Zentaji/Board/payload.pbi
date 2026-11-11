@@ -57,8 +57,30 @@ pay_failure_halt:
   HALT r1
  EndASM
 EndProcedure
+; LASTRUN uses Anvil's fixed-width serial format. This board records the
+; most recent successful return within the current monitor session.
+Global zenRunNumber.i, zenRunAddress.i, zenRunResult.q, zenRunMillis.q = -1
+
+Procedure ZentajiLastRun()
+ Print("LASTRUN ") : PutHex8(zenRunNumber)
+ If zenRunNumber=0
+  Print(" 00")
+ Else
+  Print(" 02")
+ EndIf
+ Print(" 00 00 ") : PutHex16(zenRunResult)
+ Print(" ") : PutHex16(zenRunAddress)
+ Print(" ") : PutHex16(zenRunMillis)
+ PrintN(" 0000000000000000 0000000000000000 0000000000000000")
+ If zenRunNumber=0
+  PrintN("No payload has returned during this monitor session.")
+ Else
+  Print("The last payload returned with r1 = $") : PutHex16(zenRunResult) : PrintNl()
+ EndIf
+EndProcedure
+
 Procedure.i HwPayloadRun(entry.i,argument.i,stack.i,stackBytes.i)
- Protected hadStorage.i,entered.i,code.i,services.i
+ Protected hadStorage.i,entered.i,code.i,services.i,startUs.q,endUs.q
  gGoRc=0
  services=Bool(argument<>0)
  If services<>0
@@ -109,7 +131,9 @@ Procedure.i HwPayloadRun(entry.i,argument.i,stack.i,stackBytes.i)
  UartOff()
  EndIf
  gGoAddr=entry
+ startUs=HwMicros()
  entered=ZentajiPayloadEnter(zenMemoryContext,entry,argument,stack,stackBytes)
+ endUs=HwMicros()
  code=ZentajiPayloadLastError() : gGoRc=ZentajiPayloadReturnValue()
  ; The CPU boundary has restored owned SP/vectors/FP state with IE masked.
  ; Do not overwrite foreign live hardware to make recovery appear successful.
@@ -146,6 +170,10 @@ Procedure.i HwPayloadRun(entry.i,argument.i,stack.i,stackBytes.i)
  If entered=0
   Print("!! the Zentaji CPU entry refused the payload, code ") : PrintDec(code) : PrintN(".")
  Else
+  zenRunNumber=(zenRunNumber&$FFFFFFFF)+1
+  If zenRunNumber>$FFFFFFFF : zenRunNumber=1 : EndIf
+  zenRunAddress=entry : zenRunResult=gGoRc : zenRunMillis=-1
+  If startUs>=0 And endUs>=startUs : zenRunMillis=(endUs-startUs)/1000 : EndIf
   Print("The payload returned, r1 = $") : PutHex16(gGoRc) : PrintNl()
  EndIf
  ProcedureReturn entered

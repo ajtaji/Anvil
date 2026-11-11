@@ -1,9 +1,9 @@
 EnableFloatingPoint
 ; Zentaji serial/storage monitor composition. The ROM loads the owned startup
 ; envelope; Main receives its validated table/source/context, never ARM registers.
-#ANVIL_BUILD = 32 ; pmf:build
+#ANVIL_BUILD = 33 ; pmf:build
 #ANVIL_BUILD_DATE = 20261111 ; pmf:builddate
-#ANVIL_BUILD_TIME = 000802 ; pmf:buildtime
+#ANVIL_BUILD_TIME = 001612 ; pmf:buildtime
 #CAP_TOUCH=0
 #CAP_PWM=0
 #CAP_NET=0
@@ -27,7 +27,8 @@ XIncludeFile "Anvil/Core/state.pbi"
 XIncludeFile "Anvil/Core/input_events.pbi"
 XIncludeFile "Anvil/Core/text_edit.pbi"
 Global gBootTicks.i
-Global zenShellStop.i
+Global zenShellStop.i, zenShellReset.i
+#ZEN_MONITOR_POWER = $FFFF000000020000
 XIncludeFile "Anvil/Core/messages.pbi"
 XIncludeFile "Anvil/Core/parse.pbi"
 XIncludeFile "Anvil/Core/rxbreak.pbi"
@@ -81,6 +82,7 @@ Procedure ZentajiShellHelp()
  PrintN("  mount, load, save, ls/dir, cat, mkdir, rmdir, rm/del, rename/mv")
  PrintN("  settings, printenv, setenv, saveenv, env, setexpr, time, force")
  PrintN("  memory/md, write/poke, fill/mw, copy/cp, compare/cmp, base, crc32/checksum")
+ PrintN("  uptime/up, last run, reset/reboot")
  PrintN("  halt                 cleanly release storage and stop this monitor")
  PrintN("  boot <file> / mem <address>, boot status/ok/clear")
  PrintN("PMF service-table applications are supported; raw run is not available.")
@@ -145,13 +147,30 @@ Procedure.i HwCommandDispatch(c.i)
   CmdForce()
  ElseIf WordIs("boot")<>0
   CmdBoot()
- ElseIf WordIs("halt")<>0
+ ElseIf WordIs("uptime")<>0 Or WordIs("up")<>0
   SkipSpace()
   If gLine[gPos]<>0
-   PrintN("halt takes no arguments; the monitor is still running.")
+   PrintN("!! uptime takes no arguments.")
+  Else
+   Print("uptime ") : PrintDec(msg_Secs()) : PrintN(" boots ?")
+  EndIf
+ ElseIf WordIs("last")<>0
+  SkipSpace()
+  gWordAt=gPos : SkipWord() : gWordLen=gPos-gWordAt
+  SkipSpace()
+  If WordIs("run")<>0 And gLine[gPos]=0
+   ZentajiLastRun()
+  Else
+   PrintN("!! last takes exactly one word: last run.")
+  EndIf
+ ElseIf WordIs("halt")<>0 Or WordIs("reset")<>0 Or WordIs("reboot")<>0
+  SkipSpace()
+  If gLine[gPos]<>0
+   PrintN("!! halt and reset take no arguments. The monitor is still running.")
   ElseIf ZentajiStorageDown()=0
    UartWriteStr(ZentajiStorageErrorText()) : PrintNl()
   Else
+   zenShellReset=Bool(WordIs("halt")=0)
    zenShellStop=1
   EndIf
  Else
@@ -216,11 +235,19 @@ Procedure.i Main(table.i,source.i,context.i)
  BootFileWait()
  PrintN("Type help for the available commands.")
  AnvilCommandLoop()
- PrintN("Anvil stopped.") : UartDrain()
+ If zenShellReset<>0
+  PrintN("Resetting Zentaji through the boot ROM.")
+ Else
+  PrintN("Anvil stopped.")
+ EndIf
+ UartDrain()
  If ZentajiInputPayload(1,0)=0 : ZentajiPayloadRecoveryFailed($5B06,"Monitor exit failed (0x5B06): native input ownership changed.") : EndIf
  If ZentajiNeonConsoleStop()<>1 : ZentajiPayloadRecoveryFailed($5C01,"Monitor exit failed (0x5C01): graphics work could not retire.") : EndIf
  If ZentajiTextRelease()=0 : ZentajiPayloadRecoveryFailed($5B05,"Monitor exit failed (0x5B05): native text or display ownership changed.") : EndIf
  If ZentajiPromptIdleRelease()=0 : ProcedureReturn 4 : EndIf
  UartOff()
+ If zenShellReset<>0
+  PokeQ(#ZEN_MONITOR_POWER+$50,$5E7)
+ EndIf
  ProcedureReturn 0
 EndProcedure

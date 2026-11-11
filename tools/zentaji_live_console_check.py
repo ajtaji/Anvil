@@ -2,6 +2,7 @@
 import argparse
 import hashlib
 import json
+import os
 from pathlib import Path
 import queue
 import re
@@ -19,11 +20,14 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--zen-tools', type=Path, required=True)
     parser.add_argument('--keep', type=Path, required=True)
+    parser.add_argument('--compiler')
     args = parser.parse_args()
     zt, td = args.zen_tools.resolve(), args.keep.resolve()
     td.mkdir(parents=True, exist_ok=True)
     sys.path.insert(0, str(zt))
     import zen_native_fixture as F
+    import zentaji_exfat_oracle as E
+    from pmf_compiler import resolve_compiler
     from zen_console import Console
     image = ROOT / 'build/zentaji/anvil.zex'
     raw = image.read_bytes()
@@ -31,13 +35,25 @@ def main():
     meta = json.loads(Path(str(image)+'.boot.json').read_text())
     assert digest == meta['image_sha256']
     stage = (meta['image_end'] + 4095) & -4096
+    # Put a real compiler-produced PMF on a disposable disk.
+    source, app = td/'return.zentaji', td/'return.zex'
+    source.write_text('Procedure.q Main()\n ProcedureReturn 42\nEndProcedure\n')
+    compile_app = subprocess.run(
+        [str(resolve_compiler(args.compiler)), '--compile', str(source), '--entry-returns',
+         '--load-addr', hex(stage+8), '--stack-addr', hex(stage+0x200000), '-o', str(app)],
+        cwd=ROOT, env=dict(os.environ, PMF_ROOT=str(ROOT)),
+        capture_output=True, text=True, timeout=45)
+    assert compile_app.returncode == 0, (compile_app.stdout, compile_app.stderr)
+    disk = E.build(4096)
+    E.seed_file(disk, Path(str(app)+'.pmf').read_bytes(), 'APP.PMF')
     fixture = F.Fixture(ram_size=128 << 20, cores=2,
                         hostfiles=[['anvil.zex', bytearray(raw), False]],
+                        disks={0: (bytearray(disk), False)},
                         display_modes=[(1024, 768, 60000)])
     fixture.power_on(0, 0)
     fixture.write(td)
     command = [str(zt/'zenwin.exe'), str(td/'machine.txt'), '--headless', '--live',
-               '--fast', '--max', '2000000000', '--live-seconds', '60',
+               '--fast', '--max', '2000000000', '--live-seconds', '120',
                '--serial-listen', '0', '--screenshot', str(td/'frame.png')]
     process = subprocess.Popen(command, cwd=ROOT, stdout=subprocess.PIPE,
                                stderr=subprocess.STDOUT, text=True, encoding='utf-8', errors='replace')
@@ -76,6 +92,23 @@ def main():
                 assert expected in reply.splitlines(), reply
             else:
                 assert expected in reply, reply
+        uptime = client.command('uptime').decode()
+        transcript.append(uptime)
+        assert re.search(r'^uptime \d+ boots \?\r?$', uptime, re.M), uptime
+        empty_record = client.command('last run').decode()
+        transcript.append(empty_record)
+        assert 'LASTRUN 00000000 00 00 00' in empty_record, empty_record
+        reply = client.command('boot APP.PMF').decode()
+        transcript.append(reply)
+        assert 'The payload returned, r1 = $000000000000002A' in reply, reply
+        reply = client.command('last run').decode()
+        transcript.append(reply)
+        assert re.search(r'^LASTRUN 00000001 02 00 00 000000000000002A [0-9A-F]{16} [0-9A-F]{16} ', reply, re.M), reply
+        refused = client.command('boot MISSING.PMF').decode()
+        transcript.append(refused)
+        assert 'The payload returned' not in refused, refused
+        transcript.append(client.command('last run').decode())
+        assert transcript[-1] == reply, transcript[-1]
         # Exercise the shared memory handlers in the live payload window.
         # Check resulting bytes through an independently computed CRC.
         expected_crc = zlib.crc32(bytes([0xA5]) * 16)
@@ -148,6 +181,19 @@ def main():
         time.sleep(.1)
         client = Console(port, 10)
         client.prompt()
+        before = client.command('up').decode()
+        transcript.append(before)
+        prior = int(re.search(r'^uptime (\d+) boots \?', before, re.M)[1])
+        client.timeout = 30
+        reply = client.command('reset').decode()
+        transcript.append(reply)
+        assert 'Resetting Zentaji through the boot ROM.' in reply, reply
+        assert 'Zentaji boot ROM v1' in reply and 'Type help for the available commands.' in reply, reply
+        after = client.command('uptime').decode()
+        transcript.append(after)
+        assert int(re.search(r'^uptime (\d+) boots \?', after, re.M)[1]) < prior, (before, after)
+        transcript.append(client.command('last run').decode())
+        assert 'LASTRUN 00000000 00 00 00' in transcript[-1], transcript[-1]
         client.socket.sendall(b'halt\r')
         assert process.wait(timeout=20) == 0, ''.join(lines)[-2000:]
         thread.join(timeout=3)
@@ -156,7 +202,7 @@ def main():
         (td/'result.json').write_text(json.dumps(dict(passed=True, image_sha256=digest,
             port=port, transcript=transcript, checks=['sequential commands','exclusive client', 'shared memory commands and CRC',
             'fragmented input and backspace','unknown command','timeout','reconnect',
-            'expected-line failure status','clean halt']), indent=2)+'\n')
+            'expected-line failure status','payload return record','ROM reset and uptime','clean halt']), indent=2)+'\n')
         print('PASS actual Anvil: live UART commands, editing, replies, timeout, reconnect, clean halt')
     finally:
         if client:
