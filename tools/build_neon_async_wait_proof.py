@@ -15,7 +15,7 @@ ap.add_argument('--target',choices=['pi4','pi3','unoq','rockpi4c'],required=True
 ap.add_argument('--mutate-early-release',action='store_true',help='Restore the faulty pre-error pending clear in a private candidate; never runs it.')
 a=ap.parse_args();root=Path(__file__).resolve().parents[1];out=a.out.resolve();out.mkdir(parents=True,exist_ok=False)
 owner=root/'Anvil/Graphics/Vulkan/neon_vk_chrome.pbi';raw=owner.read_bytes();source=raw.decode('utf-8-sig')
-names=['nvcFail','NeonVkChromeAsync','NeonVkChromeFramePending','NeonVkChromeFinish']
+names=['nvcFail','NeonVkChromeAsync','NeonVkChromeFramePending','NeonVkChromeFinishWithin','NeonVkChromeFinish']
 bodies=[];identities={}
 for name in names:
  matches=list(re.finditer(r'^Procedure\.i '+name+r'\([^\n]*\n.*?^EndProcedure',source,re.M|re.S))

@@ -43,7 +43,7 @@ def main():
   assert sha(reference_frame)==rr['frame_sha256']
  tick=int(re.search(r'^END .* time=([0-9A-Fa-f]+)',(proof/'native.log').read_text(),re.M)[1],16)
  prompt=source_pc(mapping,ROOT/'Anvil/Core/command_loop.pbi','ReadLine()')
- frame_pc=source_pc(mapping,ROOT/'Zentaji/Board/neon_console.pbi','native monitor frame checkpoint')
+ frame_pc=source_pc(mapping,ROOT/'Zentaji/Board/neon_console.pbi','zngPresented=1')
  m=F.Fixture(ram_size=128<<20,cores=2,hostfiles=[['anvil.zex',bytearray(raw),False]],display_modes=[(640,480,60000)])
  def key(at,char):
   if char=='\r':usage,mods,scalar=40,0,0
@@ -51,15 +51,17 @@ def main():
   elif char==' ':usage,mods,scalar=44,0,32
   else:usage,mods,scalar=4+ord(char.lower())-97,int(char.isupper()),ord(char)
   m.input_feed(at,'key',usage,1,mods,0,scalar);m.input_feed(at+100000,'key',usage,0,mods,0,0)
- key(tick+20000000,'X');key(tick+80000000,'\b')
- for index,char in enumerate('echo ROW TESTX\bY\r'):key(tick+140000000+index*4000000,char)
+ # Let each isolated edit retire through the asynchronous scanout before
+ # typing the next command. The deterministic device charges drawing time.
+ key(tick+20000000,'X');key(tick+300000000,'\b')
+ for index,char in enumerate('echo ROW TESTX\bY\r'):key(tick+600000000+index*4000000,char)
  m.power_on(0,0);m.write(td)
- frames=[];first=None;previous=None;saw_x=False;saw_undo=False;clock_frames=0;glint_frames=0;prompts=0;phases=set()
+ frames=[];first=None;previous=None;saw_x=False;saw_undo=False;saw_command_frame=False;clock_frames=0;glint_frames=0;prompts=0;phases=set()
  with Session(zt,td,timeout=300) as s:
   s.breakpoint(prompt);s.breakpoint(frame_pc);first_run=True
   # The command can finish before the 2.8-second animation cycle. Keep
   # observing the idle prompt until every phase has actually been presented.
-  while prompts<2 or phases!=set(range(8)):
+  while not saw_command_frame or phases!=set(range(8)):
    if not first_run:s.request('step 1')
    first_run=False;started=time.monotonic();s.request('run')
    while True:
@@ -70,7 +72,6 @@ def main():
    pc=int(re.search(r'pc=\$([0-9A-Fa-f]+)',event)[1],16)
    if pc==prompt:
     prompts+=1
-    if prompts==1:assert first is not None
     continue
    assert pc==frame_pc,event
    assert len(frames)<160,'Unexpected excessive repainting before the second real prompt'
@@ -110,6 +111,8 @@ def main():
     if line=='pmf>' and saw_x and not saw_undo:
      outside_equal(first,frame,w,h,set(),lh,clock)
      png(td/'backspace-restored.png',frame,w,h);saw_undo=True;record['backspace_restored']=True
+   if prompts>=2 and line=='pmf>' and s.q(symbols,'gConDirty')==0:
+    saw_command_frame=True
    frames.append(record);previous=frame
    print('Native monitor frame',record['index'],'rows',record['dirty_rows'],'draws',draw,'vertices',vertices,'line',repr(line),flush=True)
   assert saw_x and saw_undo and clock_frames>=1 and glint_frames>=1 and phases==set(range(8)),(saw_x,saw_undo,clock_frames,glint_frames,sorted(phases))

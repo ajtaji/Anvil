@@ -131,10 +131,32 @@ EndProcedure
 ; rows so deleting text or moving over ink cannot leave a trail. The bundled
 ;16-pixel face fits the measured line box; each dirty row is restored in full.
 ; This is the same public Chrome transaction layer used by the Pi4 monitor.
+; 1 retired (or no frame), 0 still pending, -1 failed. Poll from the
+; console service. Ownership handoffs use the existing bounded wait.
+Procedure.i zngRetireFrame(timeoutNs.i)
+ Protected rc.i
+ If NeonVkChromeFramePending()=0 : ProcedureReturn 1 : EndIf
+ zngPainting=1
+ rc=NeonVkChromeFinishWithin(timeoutNs)
+ If rc=#VK_TIMEOUT And timeoutNs=0
+  zngPainting=0 : ProcedureReturn 0
+ EndIf
+ If rc=#VK_SUCCESS : rc=NeonVkChromeAsync(0) : EndIf
+ If rc<>#VK_SUCCESS
+  zngFault=6
+ ElseIf ZentajiNeonSurfacePresent()<>1
+  zngFault=7
+ Else
+  zngPresented=1
+ EndIf
+ zngPainting=0
+ ProcedureReturn 1-2*Bool(zngFault<>0)
+EndProcedure
+
 Procedure zngPaint()
  Protected row.i,col.i,count.i,style.i,x.f,y.f,r.f,g.f,b.f,cursor.i,pen.i
  Protected full.i,moved.i,rows.i,py.i,clock.i,glint.i
- If zngUp=0 Or zngSuspended<>0 Or zngFault<>0 Or zngPainting<>0 : ProcedureReturn : EndIf
+ If zngUp=0 Or zngSuspended<>0 Or zngFault<>0 Or zngPainting<>0 Or NeonVkChromeFramePending()<>0 : ProcedureReturn : EndIf
  If zngClockPoll()<>1 : zngFault=10 : ProcedureReturn : EndIf
  zngGlintPoll()
  zngPainting=1
@@ -158,6 +180,7 @@ Procedure zngPaint()
   If NeonVkChromeWarmTrueTypeText(16,@zngClockText[0])<0 : zngFault=8 : zngPainting=0 : ProcedureReturn : EndIf
  EndIf
  If full=0 And rows=0 And clock=0 And glint=0 : ConGridClearDirty() : zngPainting=0 : ProcedureReturn : EndIf
+ If NeonVkChromeAsync(1)<>#VK_SUCCESS : zngFault=2 : zngPainting=0 : ProcedureReturn : EndIf
  If full<>0
   If NeonVkChromeBegin(@zngClear[0])<>0 : zngFault=2 : zngPainting=0 : ProcedureReturn : EndIf
   If NeonVkBannerRender(@zngBanner)<>0 : zngFault=9 : zngPainting=0 : ProcedureReturn : EndIf
@@ -195,9 +218,9 @@ Procedure zngPaint()
   If NeonVkPortBox(x,y,2.0,1.0,0.35,0.85,0.95,1.0,1,1)<>0 : zngFault=5 : zngPainting=0 : ProcedureReturn : EndIf
  EndIf
  If NeonVkChromeEnd()<>0 : zngFault=6 : zngPainting=0 : ProcedureReturn : EndIf
- If ZentajiNeonSurfacePresent()<>1 : zngFault=7 : zngPainting=0 : ProcedureReturn : EndIf
- zngPresented=1 : zngCursorRow=cursor : zngCursorPen=pen : zngClockDirty=0 : zngGlintDirty=0
- ConGridClearDirty() ; native monitor frame checkpoint
+ zngCursorRow=cursor : zngCursorPen=pen : zngClockDirty=0 : zngGlintDirty=0
+ ; Later UART output can dirty the grid while this frame owns the target.
+ ConGridClearDirty()
  zngPainting=0
 EndProcedure
 Procedure.i ZentajiNeonConsoleStart()
@@ -224,9 +247,12 @@ Procedure.i ZentajiNeonConsoleStart()
  zngUp=1 : ProcedureReturn 1
 EndProcedure
 Procedure.i ZentajiNeonConsolePump()
- Protected resized.i,cols.i,rows.i
+ Protected resized.i,cols.i,rows.i,retired.i
  If zngUp=0 Or zngSuspended<>0 : ProcedureReturn 1 : EndIf
  If zngPainting<>0 : ProcedureReturn 1 : EndIf
+ If zngFault<>0 : ProcedureReturn 0 : EndIf
+ retired=zngRetireFrame(0)
+ If retired<=0 : ProcedureReturn Bool(retired=0) : EndIf
  resized=ZentajiNeonSurfaceResize()
  If resized=0 : zngFault=11 : ProcedureReturn 0 : EndIf
  If resized=2
@@ -252,7 +278,8 @@ Procedure.i zngDmaDown()
 EndProcedure
 Procedure.i ZentajiNeonConsoleSuspend()
  If zngUp=0 : ProcedureReturn 1 : EndIf
- If zngSuspended<>0 Or nvcInFrame<>0 Or NeonVkChromePresentPending()<>0 : ProcedureReturn 0 : EndIf
+ If zngSuspended<>0 Or zngPainting<>0 Or nvcInFrame<>0 Or NeonVkChromePresentPending()<>0 : ProcedureReturn 0 : EndIf
+ If zngRetireFrame(#NEON_VK_CHROME_WAIT_NS)<>1 : ProcedureReturn 0 : EndIf
  ; Service applications borrow this resident owner. Ordinary supervisor
  ; payloads receive released hardware, as before; they may own another driver.
  If GraphicsServiceState()=1
@@ -327,7 +354,8 @@ EndProcedure
 XIncludeFile "Anvil/Graphics/Vulkan/neon_vk_resident_service.pbi"
 Procedure.i ZentajiNeonConsoleStop()
  If zngUp=0 : ProcedureReturn 1 : EndIf
- If zngSuspended<>0 : ProcedureReturn 0 : EndIf
+ If zngSuspended<>0 Or zngPainting<>0 : ProcedureReturn 0 : EndIf
+ If zngRetireFrame(#NEON_VK_CHROME_WAIT_NS)<>1 : ProcedureReturn 0 : EndIf
  If ZentajiNeonSurfaceStop()<>1 : ProcedureReturn 0 : EndIf
  If zngDmaDown()<>1 Or ZentajiGraphicsRelease(@avkZenQueue)<>1 : ProcedureReturn 0 : EndIf
  ConNoRenderer() : UartMirrorSetDrain(0) : UartMirror(0)

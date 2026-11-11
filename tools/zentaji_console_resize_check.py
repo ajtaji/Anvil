@@ -20,7 +20,7 @@ def main():
    path=Path(source['path']).resolve();assert path.is_relative_to(ROOT.resolve())
    assert hashlib.sha256(path.read_bytes().replace(b'\r',b'')).hexdigest()==source['sha256'],path
  else:raw,meta,mapping,symbols=monitor(zt)
- checkpoint=source_pc(mapping,ROOT/'Zentaji/Board/neon_console.pbi','native monitor frame checkpoint')
+ checkpoint=source_pc(mapping,ROOT/'Zentaji/Board/neon_console.pbi','zngPresented=1')
  m=F.Fixture(ram_size=128<<20,cores=2,hostfiles=[['anvil.zex',bytearray(raw),False]],display_modes=[(640,480,60000)])
  m.input_feed(1000000000,'key',27,1,1,0,88)
  m.input_feed(1000100000,'key',27,0,1,0,0)

@@ -51,6 +51,9 @@ def main():
  # of thousands of code records referring to the same small set of paths.
  source_paths={row['path']:Path(row['path']).resolve() for row in mapping['sources']}
  pc=next(int(row['pc'],16) for row in mapping['code'] if row['line']==line and source_paths[row['source']]==source.resolve())
+ frame_source=(ROOT/'Zentaji/Board/neon_console.pbi').resolve()
+ frame_line=next(i for i,text in enumerate(frame_source.read_text().splitlines(),1) if text.strip()=='zngPresented=1')
+ frame_pc=next(int(row['pc'],16) for row in mapping['code'] if row['line']==frame_line and source_paths[row['source']]==frame_source)
  ref=A.Asm();ref.assemble(Path(str(image)+'.compiled.asm').read_text(encoding='utf-8-sig'))
  (td/'symbols.json').write_text(json.dumps(ref.sym))
  m=F.Fixture(ram_size=128<<20,cores=2,hostfiles=[['anvil.zex',bytearray(raw),False]],display_modes=[(640,480,60000)])
@@ -169,6 +172,21 @@ def main():
    if stop < stops-1:
     send('step 1');reply=next_line();assert 'error:' not in reply,reply
     send('run')
+  # A UART prompt can be available while its first scanout is still pending.
+  # Capture the frame only after the monitor has presented it.
+  assert len(events)==stops and all('DBG breakpoint ' in item for item in events),events
+  send(f'break 0 ${frame_pc:X}');reply=next_line();assert 'error:' not in reply,reply
+  send('step 1');reply=next_line();assert 'error:' not in reply,reply
+  for _ in range(8):
+   send('run')
+   while True:
+    reply=next_line()
+    if 'DBG EVENT ' in reply:break
+   assert 'DBG breakpoint ' in reply and f'pc=${frame_pc:X}' in reply,reply
+   if observed_q('gConDirty')==0:break
+   send('step 1');reply=next_line();assert 'error:' not in reply,reply
+  else:
+   raise AssertionError('The final prompt frame was never presented')
   send('quit');p.stdin.close();p.wait(timeout=30);worker.join(timeout=10)
   while not replies.empty():
    row=replies.get_nowait()

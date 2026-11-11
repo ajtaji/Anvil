@@ -4792,20 +4792,24 @@ Procedure.i NeonVkChromeFramePending()
 EndProcedure
 
 ; Waits for the frame End submitted and publishes it. Nothing pending: at once.
-Procedure.i NeonVkChromeFinish()
+Procedure.i NeonVkChromeFinishWithin(timeoutNs.i)
   Define rc.i, fenceHandle.i
   If nvcFramePending = 0
     ProcedureReturn #VK_SUCCESS
   EndIf
   nvcSubmitStage = 4
   fenceHandle = nvcFence
-  rc = vkWaitForFences(nvcDevice, 1, @fenceHandle, 1, #NEON_VK_CHROME_WAIT_NS)
+  rc = vkWaitForFences(nvcDevice, 1, @fenceHandle, 1, timeoutNs)
   nvcSubmitRc = rc
   If rc <> #VK_SUCCESS : ProcedureReturn nvcFail(rc) : EndIf
   ; A failed wait does not establish completion. Keep the submitted frame's
   ; resources owned and Begin refused until a later wait actually succeeds.
   nvcFramePending = 0
   ProcedureReturn nvcFramePublish()
+EndProcedure
+
+Procedure.i NeonVkChromeFinish()
+  ProcedureReturn NeonVkChromeFinishWithin(#NEON_VK_CHROME_WAIT_NS)
 EndProcedure
 
 Procedure.i nvcFramePublish()
