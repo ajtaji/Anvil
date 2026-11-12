@@ -4,6 +4,26 @@ Anvil has one portable monitor core and one hardware composition per target.
 The top-level board entry chooses the target drivers and includes them in the
 order required by the compiler.
 
+## Primary development machine
+
+Zentaji is Anvil's primary development machine. Keep new Anvil commands,
+protocols and policy in the shared core so the same source can be built for
+Raspberry Pi 4, Pi 5, Pi 3 and other targets. Keep register access, hardware
+queues, interrupts and device discovery in the board or architecture backend.
+Develop and exercise shared behavior on Zentaji, then qualify each physical
+board's backend against the same contract when porting it.
+
+The journaled filesystem belongs in shared storage code behind the block
+read, write and flush interface. Zentaji supplies the disk queue adapter.
+The existing FAT32 and exFAT drivers remain useful for interchange. Raw
+Ethernet on Zentaji uses Anvil's shared network stack through the board's
+link interface. The host-socket device is a separate transport. Keep its
+registers and rings in the Zentaji backend and use the shared interfaces
+where their semantics match.
+
+Zentaji's built-in PureMetal Forge emits code for the Zentaji ISA. Its
+editor uses Anvil's shared console and storage services.
+
 ## Architecture and privileged execution contract
 
 Anvil supports different CPU architectures. Shared command, scheduler, storage

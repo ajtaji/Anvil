@@ -1,6 +1,6 @@
 @CHAPTER Anvil on Zentaji
 
-@INTRO Zentaji is a custom emulated computer with its own 64-bit instruction set. Its boot ROM loads Anvil as the selected bootloader and resident monitor. The production composition now presents its shared terminal through the Neon/Vulkan renderer and the existing TrueType library when the fitted RAM admits graphics. The full Neon Arcade desktop and self-hosted Forge remain unfinished.
+@INTRO Zentaji is a custom emulated computer with its own 64-bit instruction set. Its boot ROM loads Anvil as the selected bootloader and resident monitor. The production composition now presents its shared terminal through the Neon/Vulkan renderer and the existing TrueType library when the fitted RAM admits graphics. The built-in Forge can edit, compile and run a core of PureMetal on Zentaji. The full Neon Arcade desktop and language coverage remain unfinished.
 
 @SECTION Build and boot
 
@@ -272,6 +272,42 @@ Independent float32 wire records, all 33 application assertions and the vertex
 tail beyond 60000 vertices must match. The returning monitor must retire the
 particle allocations and restore its graphical prompt without Vulkan faults.
 
+@SECTION Built-in PureMetal Forge
+
+Type `forge` at Anvil to enter the editor. Type EXIT to return to Anvil.
+From a UART script, prefix the same commands with `forge` to keep the
+standard Anvil prompt after every command.
+
+@FRAG
+forge print 2+2*3
+forge new
+forge add Procedure.q Main()
+forge add Protected answer.q = 7
+forge add answer = answer * 6
+forge add ProcedureReturn answer
+forge add EndProcedure
+forge run
+forge save ANSWER.ZEN
+forge compile ANSWER.PMF
+boot ANSWER.PMF
+@ENDFRAG
+
+The editor also accepts source lines directly. Use `list` to see the
+current buffer and `load <path>` to replace it from disk. Quote paths with
+spaces. The editor accepts up to 8192 ASCII bytes. The compiler accepts a
+single `Procedure.q Main()` with initialized `Protected` quad variables,
+assignments and one final `ProcedureReturn`. Expressions accept decimal and
+PureMetal dollar-prefixed hexadecimal integers, parentheses, unary signs,
+addition, subtraction and multiplication. Arithmetic wraps to 64 bits.
+Diagnostics report the source line and column.
+
+The guest compiler emits native Zentaji code. `compile` writes a hashed
+PMFBOOT v2 container using the running monitor's payload window. Use
+`boot` to run that file from Anvil. The image's load and stack addresses
+are bound to that window. Compile from source again if a monitor build or
+machine configuration moves the window. The full PureMetal language and
+the immediate graphics and sound commands remain unfinished.
+
 @SECTION Evidence and remaining work
 
 Acceptance runs the shipped native ASM-built Zentaji tools against explicit
@@ -281,7 +317,7 @@ expected data; they do not execute a second CPU/device machine.
 
 The established multi-target host Forge build retains its C backend. The
 Zentaji emulator, assembler and focused native tools use the ASM backend only.
-The planned built-in self-hosted Forge targets only Zentaji and remains unfinished.
+The built-in guest Forge targets Zentaji.
 
 Windows and Linux component proofs have explicit scopes. Full Linux acceptance,
 visible/physical input, rumble and idle-host cost calibration remain owed;

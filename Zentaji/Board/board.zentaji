@@ -1,9 +1,9 @@
 EnableFloatingPoint
 ; Zentaji serial/storage monitor composition. The ROM loads the owned startup
 ; envelope; Main receives its validated table/source/context, never ARM registers.
-#ANVIL_BUILD = 34 ; pmf:build
+#ANVIL_BUILD = 37 ; pmf:build
 #ANVIL_BUILD_DATE = 20261111 ; pmf:builddate
-#ANVIL_BUILD_TIME = 011222 ; pmf:buildtime
+#ANVIL_BUILD_TIME = 195852 ; pmf:buildtime
 #CAP_TOUCH=0
 #CAP_PWM=0
 #CAP_NET=0
@@ -75,6 +75,7 @@ XIncludeFile "Anvil/Core/pmfboot.pbi"
 XIncludeFile "Anvil/Core/bootfile_cmd.pbi"
 XIncludeFile "Anvil/Core/command_loop.pbi"
 XIncludeFile "Zentaji/Board/neon_console.pbi"
+XIncludeFile "Zentaji/Forge/shell.pbi"
 
 Procedure ZentajiShellHelp()
  PrintN("Anvil Zentaji commands:")
@@ -83,6 +84,7 @@ Procedure ZentajiShellHelp()
  PrintN("  settings, printenv, setenv, saveenv, env, setexpr, time, force")
  PrintN("  memory/md, write/poke, fill/mw, copy/cp, compare/cmp, base, crc32/checksum")
  PrintN("  uptime/up, last run, reset/reboot")
+ PrintN("  forge [command]       built-in Zentaji PureMetal compiler and editor")
  PrintN("  halt                 cleanly release storage and stop this monitor")
  PrintN("  boot <file> / mem <address>, boot status/ok/clear")
  PrintN("PMF service-table applications are supported; raw run is not available.")
@@ -147,6 +149,8 @@ Procedure.i HwCommandDispatch(c.i)
   CmdForce()
  ElseIf WordIs("boot")<>0
   CmdBoot()
+ ElseIf WordIs("forge")<>0
+  CmdZentajiForge()
  ElseIf WordIs("uptime")<>0 Or WordIs("up")<>0
   SkipSpace()
   If gLine[gPos]<>0

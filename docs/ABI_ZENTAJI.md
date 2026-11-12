@@ -64,11 +64,11 @@ side buttons do not silently change this existing ABI. Gamepad/rumble lanes are
 unclaimed. Ordinary payloads receive the input device quiescent and must restore
 uncaptured mode with device interrupts disabled. The application text interface
 is versioned independently of the input wire.
-The self-hosted editor/compiler remains future work. UTC/provenance slots read the RTC
+UTC/provenance slots read the RTC
 through the declared hardware capability. Each UTC record uses a single latched
 seconds/nanoseconds sample and contains seven 32-bit fields, including truncated
 milliseconds. Manual time/timezone changes affect the monitor software clock;
 the application UTC service continues to report the hardware RTC. Invalid samples
 return UNSET with a zeroed record. Uncertainty and authoritative-sync time remain
 unknown (-1). No RTC alarm, timezone or NVRAM register is written.
-The built-in interactive Zentaji-only Forge is still future work.
+The built-in Zentaji Forge emits returning PMFBOOT v2 payloads for the running monitor window. The current integer compiler emits leaf procedures with a return value in r1 and the existing link in r254. The container carries architecture 2, target 1, the initial stack and the SHA-256 of the code.

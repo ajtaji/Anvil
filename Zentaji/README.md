@@ -5,7 +5,7 @@
 > `tools/zentaji_graphical_boot_check.py` captures the actual displayed plane;
 > `--exercise` checks the command/application path. Earlier text-only status
 > below records the preceding bring-up. Full desktop, visible/physical input,
-> cross-host graphics and self-hosted Forge remain unfinished.
+> cross-host graphics and full self-hosted Forge language support remain unfinished.
 
 # Zentaji backend bring-up
 
@@ -64,13 +64,28 @@ supervisor startup. It uses the shared command loop, serial console, clock,
 settings and FAT32/exFAT storage code. Ordinary and service-backed PMFBOOT
 applications load from files or memory and return. Hardware text output mirrors
 serial on admitted display profiles. Native keyboard/mouse input uses the shared
-event pipeline and resident service; self-hosted Forge remains unfinished. The
-shared monitor owns scheduler and command policy.
+event pipeline and resident service. The shared monitor owns scheduler and command policy.
 
 Acceptance executes the shipped ASM tools against explicit instruction/register
 effects, bytes/pixels, ABI boundaries and application behavior. Python helpers
 write fixture data or calculate mathematical/byte expectations. Observation
 helpers read native state and take debugger snapshots of native execution.
+
+## Built-in Zentaji Forge
+
+Anvil's `forge` command opens the guest editor. From an unattended UART
+session, `forge print 2+2`, `forge load PROGRAM.ZEN`, `forge run`, and
+`forge compile PROGRAM.PMF` leave the normal Anvil prompt available. The
+compiler emits Zentaji scalar instructions for an integer PureMetal core.
+Immediate expressions and editor runs call the compiler's own native
+leaf code. Saved PMFBOOT v2 files use Anvil's validated payload loader.
+The host compiler builds the monitor image.
+The running guest compiles editor input and files using its own CPU.
+
+`tools/zentaji_guest_forge_check.py` drives the real ROM-booted monitor
+over UART, inspects the written disk, and checks both emitted opcodes and
+executed return values. See the Zentaji guide chapter for supported syntax
+and commands.
 
 ## Shared console model
 
