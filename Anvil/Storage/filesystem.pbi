@@ -23,8 +23,8 @@
 ;  ONE VOLUME IS MOUNTED AT A TIME, because each driver keeps one volume's
 ;  state. A path on another partition unmounts the current one cleanly and
 ;  mounts its own before the operation; a file left open refuses the switch
-;  rather than having its volume taken away underneath it. Mounting reads
-;  and never writes, so switching costs a few block reads and nothing else.
+;  rather than having its volume taken away underneath it. Mounting a
+;  journaled volume can replay a committed transaction.
 ;
 ;  BOTH FORMATS TAKE THE SAME PATHS. Since 2026-09-17 a FAT32 volume has
 ;  folders at any depth, long names, mkdir, rmdir and rename exactly as an
@@ -41,6 +41,12 @@
 #FS_FAT = 1
 #FS_EXFAT = 2
 #FS_FACADE = 3                  ; error kind only: this layer refused
+#FS_JOURNAL = 4
+
+CompilerIf Defined(ANVIL_JOURNAL_FS, #PB_Constant)
+XIncludeFile "Anvil/Storage/journal_fs.pbi"
+Global fs_journalCapacity.i,fs_journalWriter.i
+CompilerEndIf
 
 #FS_MAX_PARTITION = 4
 #FS_DEFAULT_PARTITION = 1
@@ -99,6 +105,18 @@ Procedure FsSetRangeWriter(address.i)
   FatSetRangeWriter(address)
   ExFatSetRangeWriter(address)
 EndProcedure
+
+CompilerIf Defined(ANVIL_JOURNAL_FS, #PB_Constant)
+Procedure FsSetJournalDevice(capacity.i,writer.i)
+ fs_journalCapacity=capacity : fs_journalWriter=writer
+EndProcedure
+
+Procedure.i fs_TryJournal(partition.i)
+ Protected flusher.i
+ If fs_journalWriter<>0 : flusher=*fs_flusher : EndIf
+ ProcedureReturn JfTryMount(partition,fs_journalCapacity,*fs_reader,fs_journalWriter,flusher)
+EndProcedure
+CompilerEndIf
 
 Procedure FsSetBlockFlusher(address.i)
   *fs_flusher = address
@@ -164,6 +182,16 @@ Procedure.i fs_Mount(partition.i)
   fs_Begin()
   fs_kind = #FS_NONE
   fs_partition = 0
+  CompilerIf Defined(ANVIL_JOURNAL_FS, #PB_Constant)
+  Define journalResult.i=fs_TryJournal(partition)
+  If journalResult>0
+   fs_kind=#FS_JOURNAL : fs_partition=partition
+   ProcedureReturn 1
+  ElseIf journalResult<0
+   fs_errorKind=#FS_JOURNAL
+   ProcedureReturn 0
+  EndIf
+  CompilerEndIf
   If ExFatMount(partition) <> 0
     fs_kind = #FS_EXFAT
     fs_partition = partition
@@ -186,10 +214,20 @@ EndProcedure
 
 Procedure.i FsMount(partition.i)
   If FsMountPending()<>0 : ProcedureReturn fs_Fail(#FS_E_BUSY) : EndIf
+  CompilerIf Defined(ANVIL_JOURNAL_FS, #PB_Constant)
+  If fs_kind=#FS_JOURNAL
+   If jfFile<>0 : ProcedureReturn fs_Fail(#FS_E_BUSY) : EndIf
+   If JfFlush()=0 : fs_errorKind=#FS_JOURNAL : ProcedureReturn 0 : EndIf
+   jfReset()
+  EndIf
+  CompilerEndIf
   ProcedureReturn fs_Mount(partition)
 EndProcedure
 
 Procedure.i FsIsOpen()
+  CompilerIf Defined(ANVIL_JOURNAL_FS, #PB_Constant)
+  If fs_kind=#FS_JOURNAL : ProcedureReturn Bool(jfFile<>0) : EndIf
+  CompilerEndIf
   If fs_kind = #FS_EXFAT
     ProcedureReturn exfat_open
   EndIf
@@ -201,6 +239,14 @@ EndProcedure
 
 Procedure.i fs_Unmount()
   fs_Begin()
+  CompilerIf Defined(ANVIL_JOURNAL_FS, #PB_Constant)
+  If fs_kind=#FS_JOURNAL
+   If jfFile<>0 : ProcedureReturn fs_Fail(#FS_E_BUSY) : EndIf
+   If JfFlush()=0 : fs_errorKind=#FS_JOURNAL : ProcedureReturn 0 : EndIf
+   jfReset() : fs_kind=#FS_NONE : fs_partition=0
+   ProcedureReturn 1
+  EndIf
+  CompilerEndIf
   If fs_kind = #FS_EXFAT
     If ExFatUnmount() = 0
       fs_errorKind = #FS_EXFAT
@@ -246,7 +292,11 @@ Procedure.i FsSelectPartition(partition.i)
     ProcedureReturn fs_Fail(#FS_E_NO_READER)
   EndIf
   If fs_kind <> #FS_NONE
-    FsUnmount()
+    If FsUnmount()=0
+      CompilerIf Defined(ANVIL_JOURNAL_FS, #PB_Constant)
+      If fs_kind=#FS_JOURNAL : ProcedureReturn 0 : EndIf
+      CompilerEndIf
+    EndIf
     fs_kind = #FS_NONE
     fs_partition = 0
   EndIf
@@ -279,13 +329,24 @@ EndProcedure
 
 Procedure.i FsMountStep(handle.i)
   Define rc.i,kind.i
+  CompilerIf Defined(ANVIL_JOURNAL_FS, #PB_Constant)
+  Define journalResult.i
+  CompilerEndIf
   If fs_mountRunning<>0 : fs_Fail(#FS_E_BUSY) : ProcedureReturn -1 : EndIf
   If handle<=0 Or handle<>fs_mountHandle : fs_Fail(#FS_E_MOUNT_HANDLE) : ProcedureReturn -1 : EndIf
   fs_Begin() : fs_mountRunning=1 : rc=0 : kind=#FS_NONE
   Select fs_mountPhase
     Case 0
       If fs_kind<>#FS_NONE
-        If fs_Unmount()=0 : rc=-1 : EndIf
+        If fs_Unmount()=0
+          CompilerIf Defined(ANVIL_JOURNAL_FS, #PB_Constant)
+          If fs_kind=#FS_JOURNAL
+            fs_mountRunning=0 : fs_mountHandle=0
+            ProcedureReturn -1
+          EndIf
+          CompilerEndIf
+          rc=-1
+        EndIf
       EndIf
       ; Cancellation from a provider callback must stop before starting a
       ; replacement driver job or the synchronous recovery fallback.
@@ -295,11 +356,21 @@ Procedure.i FsMountStep(handle.i)
           If rc<>0 : kind=fs_kind : Else : rc=-1 : EndIf
         Else
           fs_kind=#FS_NONE : fs_partition=0
-          fs_mountDriver=ExFatMountBegin(fs_mountTarget)
-          If fs_mountDriver=0
-            fs_errorKind=#FS_EXFAT : rc=-1
-          Else
-            fs_mountPhase=1
+          CompilerIf Defined(ANVIL_JOURNAL_FS, #PB_Constant)
+          journalResult=fs_TryJournal(fs_mountTarget)
+          If journalResult>0
+           rc=1 : kind=#FS_JOURNAL
+          ElseIf journalResult<0
+           rc=-1 : fs_errorKind=#FS_JOURNAL
+          EndIf
+          CompilerEndIf
+          If rc=0 And handle=fs_mountHandle
+            fs_mountDriver=ExFatMountBegin(fs_mountTarget)
+            If fs_mountDriver=0
+              fs_errorKind=#FS_EXFAT : rc=-1
+            Else
+              fs_mountPhase=1
+            EndIf
           EndIf
         EndIf
       EndIf
@@ -325,6 +396,9 @@ Procedure.i FsMountStep(handle.i)
   EndSelect
   fs_mountRunning=0
   If handle<>fs_mountHandle
+    CompilerIf Defined(ANVIL_JOURNAL_FS, #PB_Constant)
+    If kind=#FS_JOURNAL : jfReset() : EndIf
+    CompilerEndIf
     fs_kind=#FS_NONE : fs_partition=0
     fs_Fail(#FS_E_MOUNT_HANDLE) : ProcedureReturn -1
   EndIf
@@ -385,6 +459,9 @@ Procedure.i FsOpen(*path)
   If fs_Volume(*path) = 0
     ProcedureReturn 0
   EndIf
+  CompilerIf Defined(ANVIL_JOURNAL_FS, #PB_Constant)
+  If fs_kind=#FS_JOURNAL : ProcedureReturn JfOpen(fs_rest) : EndIf
+  CompilerEndIf
   If fs_kind = #FS_EXFAT
     ProcedureReturn ExFatOpen(fs_rest)
   EndIf
@@ -395,6 +472,9 @@ Procedure.i FsCreate(*path)
   If fs_Volume(*path) = 0
     ProcedureReturn 0
   EndIf
+  CompilerIf Defined(ANVIL_JOURNAL_FS, #PB_Constant)
+  If fs_kind=#FS_JOURNAL : ProcedureReturn JfCreate(fs_rest,#JF_FILE,*fs_writer) : EndIf
+  CompilerEndIf
   If fs_kind = #FS_EXFAT
     ProcedureReturn ExFatCreate(fs_rest)
   EndIf
@@ -404,6 +484,9 @@ EndProcedure
 Procedure.i FsRead(*dst, count.i)
   If FsMountPending()<>0 : fs_Fail(#FS_E_BUSY) : ProcedureReturn -1 : EndIf
   fs_Begin()
+  CompilerIf Defined(ANVIL_JOURNAL_FS, #PB_Constant)
+  If fs_kind=#FS_JOURNAL : ProcedureReturn JfRead(*dst,count) : EndIf
+  CompilerEndIf
   If fs_kind = #FS_EXFAT
     ProcedureReturn ExFatRead(*dst, count)
   EndIf
@@ -416,6 +499,9 @@ EndProcedure
 Procedure.i FsWrite(*src, count.i)
   If FsMountPending()<>0 : fs_Fail(#FS_E_BUSY) : ProcedureReturn -1 : EndIf
   fs_Begin()
+  CompilerIf Defined(ANVIL_JOURNAL_FS, #PB_Constant)
+  If fs_kind=#FS_JOURNAL : ProcedureReturn JfWrite(*src,count,*fs_writer) : EndIf
+  CompilerEndIf
   If fs_kind = #FS_EXFAT
     ProcedureReturn ExFatWrite(*src, count)
   EndIf
@@ -428,6 +514,9 @@ EndProcedure
 Procedure.i FsSeek(position.i)
   If FsMountPending()<>0 : fs_Fail(#FS_E_BUSY) : ProcedureReturn 0 : EndIf
   fs_Begin()
+  CompilerIf Defined(ANVIL_JOURNAL_FS, #PB_Constant)
+  If fs_kind=#FS_JOURNAL : ProcedureReturn JfSeek(position) : EndIf
+  CompilerEndIf
   If fs_kind = #FS_EXFAT
     ProcedureReturn ExFatSeek(position)
   EndIf
@@ -440,6 +529,9 @@ EndProcedure
 Procedure.i FsTruncate(length.i)
   If FsMountPending()<>0 : fs_Fail(#FS_E_BUSY) : ProcedureReturn 0 : EndIf
   fs_Begin()
+  CompilerIf Defined(ANVIL_JOURNAL_FS, #PB_Constant)
+  If fs_kind=#FS_JOURNAL : ProcedureReturn JfTruncate(length,*fs_writer) : EndIf
+  CompilerEndIf
   If fs_kind = #FS_EXFAT
     ProcedureReturn ExFatTruncate(length)
   EndIf
@@ -451,6 +543,12 @@ EndProcedure
 
 Procedure.i FsOverwrite(*src, length.i)
   If FsMountPending()<>0 : fs_Fail(#FS_E_BUSY) : ProcedureReturn 0 : EndIf
+  CompilerIf Defined(ANVIL_JOURNAL_FS, #PB_Constant)
+  If fs_kind=#FS_JOURNAL
+   fs_Begin()
+   ProcedureReturn JfOverwrite(*src,length,*fs_writer)
+  EndIf
+  CompilerEndIf
   If FsTruncate(0) = 0
     ProcedureReturn 0
   EndIf
@@ -498,6 +596,9 @@ EndProcedure
 
 Procedure FsClose()
   If FsMountPending()<>0 : fs_Fail(#FS_E_BUSY) : ProcedureReturn : EndIf
+  CompilerIf Defined(ANVIL_JOURNAL_FS, #PB_Constant)
+  If fs_kind=#FS_JOURNAL : jfFile=0 : jfPosition=0 : ProcedureReturn : EndIf
+  CompilerEndIf
   If fs_kind = #FS_EXFAT
     ExFatClose()
   ElseIf fs_kind = #FS_FAT
@@ -507,6 +608,9 @@ EndProcedure
 
 Procedure.i FsSize()
   If FsMountPending()<>0 : fs_Fail(#FS_E_BUSY) : ProcedureReturn 0 : EndIf
+  CompilerIf Defined(ANVIL_JOURNAL_FS, #PB_Constant)
+  If fs_kind=#FS_JOURNAL : ProcedureReturn JfSize() : EndIf
+  CompilerEndIf
   If fs_kind = #FS_EXFAT
     ProcedureReturn ExFatSize()
   EndIf
@@ -518,6 +622,9 @@ EndProcedure
 
 Procedure.i FsTell()
   If FsMountPending()<>0 : fs_Fail(#FS_E_BUSY) : ProcedureReturn 0 : EndIf
+  CompilerIf Defined(ANVIL_JOURNAL_FS, #PB_Constant)
+  If fs_kind=#FS_JOURNAL : ProcedureReturn jfPosition : EndIf
+  CompilerEndIf
   If fs_kind = #FS_EXFAT
     ProcedureReturn ExFatTell()
   EndIf
@@ -532,6 +639,9 @@ Procedure.i FsErrorKind()
   If fs_errorKind <> #FS_NONE
     ProcedureReturn fs_errorKind
   EndIf
+  CompilerIf Defined(ANVIL_JOURNAL_FS, #PB_Constant)
+  If fs_kind=#FS_JOURNAL : ProcedureReturn #FS_JOURNAL : EndIf
+  CompilerEndIf
   If fs_kind = #FS_EXFAT
     ProcedureReturn #FS_EXFAT
   EndIf
@@ -547,6 +657,9 @@ Procedure.i FsLastError()
   If k = #FS_FACADE
     ProcedureReturn fs_error
   EndIf
+  CompilerIf Defined(ANVIL_JOURNAL_FS, #PB_Constant)
+  If k=#FS_JOURNAL : ProcedureReturn jfError : EndIf
+  CompilerEndIf
   If k = #FS_EXFAT
     ProcedureReturn ExFatLastError()
   EndIf
@@ -556,6 +669,9 @@ EndProcedure
 Procedure.i FsErrorIsNotFound()
   Define k.i
   k = FsErrorKind()
+  CompilerIf Defined(ANVIL_JOURNAL_FS, #PB_Constant)
+  If k=#FS_JOURNAL : ProcedureReturn Bool(jfError=#JF_E_MISSING) : EndIf
+  CompilerEndIf
   If k = #FS_EXFAT
     ProcedureReturn Bool(ExFatLastError() = #EXFAT_E_NOT_FOUND)
   EndIf
@@ -568,6 +684,9 @@ EndProcedure
 Procedure.i FsErrorIsNoWriter()
   Define k.i
   k = FsErrorKind()
+  CompilerIf Defined(ANVIL_JOURNAL_FS, #PB_Constant)
+  If k=#FS_JOURNAL : ProcedureReturn Bool(jfError=#JF_E_RO) : EndIf
+  CompilerEndIf
   If k = #FS_EXFAT
     ProcedureReturn Bool(ExFatLastError() = #EXFAT_E_NO_WRITER)
   EndIf
@@ -594,6 +713,9 @@ Procedure.i FsErrorText()
     EndSelect
     ProcedureReturn "volume error: an unknown internal refusal; record the number and stop using the medium"
   EndIf
+  CompilerIf Defined(ANVIL_JOURNAL_FS, #PB_Constant)
+  If k=#FS_JOURNAL : ProcedureReturn JfErrorText() : EndIf
+  CompilerEndIf
   If k = #FS_EXFAT
     ProcedureReturn ExFatErrorText()
   EndIf
@@ -604,6 +726,9 @@ Procedure.i FsDirOpen(*path)
   If fs_Volume(*path) = 0
     ProcedureReturn 0
   EndIf
+  CompilerIf Defined(ANVIL_JOURNAL_FS, #PB_Constant)
+  If fs_kind=#FS_JOURNAL : ProcedureReturn JfDirOpen(fs_rest) : EndIf
+  CompilerEndIf
   If fs_kind = #FS_EXFAT
     ProcedureReturn ExFatDirOpen(fs_rest)
   EndIf
@@ -613,6 +738,9 @@ EndProcedure
 Procedure.i FsDirRewind()
   If FsMountPending()<>0 : fs_Fail(#FS_E_BUSY) : ProcedureReturn 0 : EndIf
   fs_Begin()
+  CompilerIf Defined(ANVIL_JOURNAL_FS, #PB_Constant)
+  If fs_kind=#FS_JOURNAL : ProcedureReturn JfDirRewind() : EndIf
+  CompilerEndIf
   If fs_kind = #FS_EXFAT
     ProcedureReturn ExFatDirRewind()
   EndIf
@@ -625,6 +753,9 @@ EndProcedure
 Procedure.i FsDirNext()
   If FsMountPending()<>0 : fs_Fail(#FS_E_BUSY) : ProcedureReturn -1 : EndIf
   fs_Begin()
+  CompilerIf Defined(ANVIL_JOURNAL_FS, #PB_Constant)
+  If fs_kind=#FS_JOURNAL : ProcedureReturn JfDirNext() : EndIf
+  CompilerEndIf
   If fs_kind = #FS_EXFAT
     ProcedureReturn ExFatDirNext()
   EndIf
@@ -636,6 +767,9 @@ EndProcedure
 
 Procedure.i FsDirNameUtf8(*dst, capacity.i)
   If FsMountPending()<>0 : fs_Fail(#FS_E_BUSY) : ProcedureReturn 0 : EndIf
+  CompilerIf Defined(ANVIL_JOURNAL_FS, #PB_Constant)
+  If fs_kind=#FS_JOURNAL : ProcedureReturn JfDirName(*dst,capacity) : EndIf
+  CompilerEndIf
   If fs_kind = #FS_EXFAT
     ProcedureReturn ExFatDirNameUtf8(*dst, capacity)
   EndIf
@@ -647,6 +781,12 @@ EndProcedure
 
 Procedure.i FsDirIsDir()
   If FsMountPending()<>0 : fs_Fail(#FS_E_BUSY) : ProcedureReturn 0 : EndIf
+  CompilerIf Defined(ANVIL_JOURNAL_FS, #PB_Constant)
+  If fs_kind=#FS_JOURNAL
+   If jfCurrent=0 : ProcedureReturn 0 : EndIf
+   ProcedureReturn Bool(PeekA(jfCurrent)=#JF_DIR)
+  EndIf
+  CompilerEndIf
   If fs_kind = #FS_EXFAT
     ProcedureReturn ExFatDirIsDir()
   EndIf
@@ -655,6 +795,12 @@ EndProcedure
 
 Procedure.i FsDirSize()
   If FsMountPending()<>0 : fs_Fail(#FS_E_BUSY) : ProcedureReturn 0 : EndIf
+  CompilerIf Defined(ANVIL_JOURNAL_FS, #PB_Constant)
+  If fs_kind=#FS_JOURNAL
+   If jfCurrent=0 : ProcedureReturn 0 : EndIf
+   ProcedureReturn PeekQ(jfCurrent+16)
+  EndIf
+  CompilerEndIf
   If fs_kind = #FS_EXFAT
     ProcedureReturn ExFatDirSize()
   EndIf
@@ -665,6 +811,9 @@ Procedure.i FsMkdir(*path)
   If fs_Volume(*path) = 0
     ProcedureReturn 0
   EndIf
+  CompilerIf Defined(ANVIL_JOURNAL_FS, #PB_Constant)
+  If fs_kind=#FS_JOURNAL : ProcedureReturn JfCreate(fs_rest,#JF_DIR,*fs_writer) : EndIf
+  CompilerEndIf
   If fs_kind = #FS_EXFAT
     ProcedureReturn ExFatMkdir(fs_rest)
   EndIf
@@ -675,6 +824,9 @@ Procedure.i FsRemove(*path)
   If fs_Volume(*path) = 0
     ProcedureReturn 0
   EndIf
+  CompilerIf Defined(ANVIL_JOURNAL_FS, #PB_Constant)
+  If fs_kind=#FS_JOURNAL : ProcedureReturn JfRemove(fs_rest,*fs_writer) : EndIf
+  CompilerEndIf
   If fs_kind = #FS_EXFAT
     ProcedureReturn ExFatRemove(fs_rest)
   EndIf
@@ -711,6 +863,9 @@ Procedure.i FsRename(*oldPath, *newPath)
   If FsSelectPartition(oldPartition) = 0
     ProcedureReturn 0
   EndIf
+  CompilerIf Defined(ANVIL_JOURNAL_FS, #PB_Constant)
+  If fs_kind=#FS_JOURNAL : ProcedureReturn JfRename(oldRest,fs_rest,*fs_writer) : EndIf
+  CompilerEndIf
   If fs_kind = #FS_EXFAT
     ProcedureReturn ExFatRename(oldRest, fs_rest)
   EndIf
@@ -720,6 +875,9 @@ EndProcedure
 Procedure.i FsFlush()
   If FsMountPending()<>0 : fs_Fail(#FS_E_BUSY) : ProcedureReturn 0 : EndIf
   fs_Begin()
+  CompilerIf Defined(ANVIL_JOURNAL_FS, #PB_Constant)
+  If fs_kind=#FS_JOURNAL : ProcedureReturn JfFlush() : EndIf
+  CompilerEndIf
   If fs_kind = #FS_EXFAT
     ProcedureReturn ExFatFlush()
   EndIf
@@ -742,6 +900,9 @@ EndProcedure
 
 Procedure.i FsBytesPerCluster()
   If FsMountPending()<>0 : fs_Fail(#FS_E_BUSY) : ProcedureReturn 0 : EndIf
+  CompilerIf Defined(ANVIL_JOURNAL_FS, #PB_Constant)
+  If fs_kind=#FS_JOURNAL : ProcedureReturn #FSJ_BYTES : EndIf
+  CompilerEndIf
   If fs_kind = #FS_EXFAT
     ProcedureReturn ExFatBytesPerCluster()
   EndIf
@@ -768,6 +929,9 @@ Procedure.i FsExtentOf(*path, *firstLba, *blocks, *bytes)
   If fs_Volume(*path) = 0
     ProcedureReturn 0
   EndIf
+  CompilerIf Defined(ANVIL_JOURNAL_FS, #PB_Constant)
+  If fs_kind=#FS_JOURNAL : ProcedureReturn JfExtent(fs_rest,*firstLba,*blocks,*bytes) : EndIf
+  CompilerEndIf
   If fs_kind = #FS_EXFAT
     ProcedureReturn ExFatExtentOf(fs_rest, *firstLba, *blocks, *bytes)
   EndIf

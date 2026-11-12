@@ -4,6 +4,7 @@
 ; Select explicitly, or adopt the validated ROM disk choice with FromBoot.
 XIncludeFile "Anvil/Storage/fat32.pbi"
 XIncludeFile "Anvil/Storage/exfat.pbi"
+#ANVIL_JOURNAL_FS=1
 XIncludeFile "Anvil/Storage/filesystem.pbi"
 XIncludeFile "Anvil/Storage/hwfile.pbi"
 #ZEN_STORAGE_E_ARGUMENT=1
@@ -62,6 +63,7 @@ Procedure.i ZentajiStorageFromBoot(context.i,partition.i)
 EndProcedure
 
 Procedure.i ZentajiStorageUp()
+ Protected journalWriter.i
  zenStorageError=0 : zenStorageDetail=0
  If zenStorageConfigured=0 : ProcedureReturn ZentajiStorageFail(#ZEN_STORAGE_E_UNCONFIGURED,0) : EndIf
  If ZenCpuStatus()<>0 Or HwPromptIdleReady()=0 : ProcedureReturn ZentajiStorageFail(#ZEN_STORAGE_E_CONTEXT,0) : EndIf
@@ -80,6 +82,8 @@ Procedure.i ZentajiStorageUp()
  ; Do not reset a working file, mount job, current volume or driver caches.
  If gHwFileMounted<>0 And (FsType()<>#FS_NONE Or FsMountPending()<>0) : ProcedureReturn 1 : EndIf
  FsSetRangeReader(@ZentajiDiskRead) : FsSetRangeWriter(0) : FsSetBlockFlusher(@ZentajiDiskFlush)
+ If (PeekQ(zenDisk\base+$58)&1)=0 : journalWriter=@ZentajiDiskWriteBuffered : EndIf
+ FsSetJournalDevice(ZentajiDiskSectors(),journalWriter)
  If FsMount(zenStoragePartition)=0
   gHwFileMounted=0 : gHwFileWritable=0 : gHwFileWriter=0
   ProcedureReturn ZentajiStorageFail(#ZEN_STORAGE_E_VOLUME,FsErrorText())
@@ -110,7 +114,11 @@ Procedure HwStorageReport()
   PrintN("No filesystem partition is currently mounted.") : ProcedureReturn
  EndIf
  Print("Mounted partition ") : PrintDec(FsPartition())
- If FsType()=#FS_EXFAT : Print(" uses exFAT") : Else : Print(" uses FAT32") : EndIf
+ Select FsType()
+  Case #FS_EXFAT : Print(" uses exFAT")
+  Case #FS_JOURNAL : Print(" uses AnvilFS")
+  Case #FS_FAT : Print(" uses FAT32")
+ EndSelect
  If gHwFileWritable<>0 : PrintN("; writes are available.") : Else : PrintN("; the medium is read-only.") : EndIf
 EndProcedure
 
@@ -143,6 +151,7 @@ Procedure.i ZentajiStorageDown()
  gHwFileMounted=0 : gHwFileWritable=0 : gHwFileWriter=0
  If ZentajiDiskClose()=0 : ProcedureReturn ZentajiStorageFail(#ZEN_STORAGE_E_DISK,ZentajiDiskErrorText()) : EndIf
  zenStorageAcquired=0
+ FsSetJournalDevice(0,0)
  FsSetRangeReader(0) : FsSetRangeWriter(0) : FsSetBlockFlusher(0)
  ProcedureReturn 1
 EndProcedure

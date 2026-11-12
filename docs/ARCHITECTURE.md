@@ -13,8 +13,12 @@ queues, interrupts and device discovery in the board or architecture backend.
 Develop and exercise shared behavior on Zentaji, then qualify each physical
 board's backend against the same contract when porting it.
 
-The journaled filesystem belongs in shared storage code behind the block
-read, write and flush interface. Zentaji supplies the disk queue adapter.
+AnvilFS is the journaled filesystem in shared storage. It uses the same
+path and file interfaces as the other formats. A port opts in with
+`#ANVIL_JOURNAL_FS` and supplies the device sector count and block reader.
+Writable mounts also require an aligned 4 KiB writer and a flush that
+makes completed writes durable across reset. The normal file writer
+still controls mutation admission. Zentaji supplies the disk queue adapter.
 The existing FAT32 and exFAT drivers remain useful for interchange. Raw
 Ethernet on Zentaji uses Anvil's shared network stack through the board's
 link interface. The host-socket device is a separate transport. Keep its
@@ -85,7 +89,7 @@ changing the rule or treating current firmware behavior as an exception.
 | Portable core | `Anvil/Core/*.pbi` | Command loop, parsing, settings, transfer and boot logic, hashes, network orchestration, and hardware-independent commands |
 | Hardware contract | `Anvil/Hal/*.pbi` | Named `Hw*` entry points and the versioned service-table ABI |
 | Architecture | `Anvil/Kernel/` | CPU-specific entry, exceptions, contexts and idle mechanisms; AArch64 implementations do not define the contract of other ISAs |
-| Filesystems | `Anvil/Storage/*.pbi` | FAT32, exFAT, and the one path and partition layer over them. A board supplies a block reader and writer by pointer and nothing else |
+| Filesystems | `Anvil/Storage/*.pbi` | FAT32, exFAT, AnvilFS, and their shared path and partition layer. A board supplies its block I/O callbacks |
 | File seam | `Anvil/Storage/hwfile.pbi` | The `HwFile*` / `HwDir*` families over those filesystems, for **any** board with a block device. The board sets three values - mounted, writable, and the ranged writer - and writes no file code of its own. A board without a block device answers the same seam differently; the UNO Q does it through UEFI |
 | A/B records | `Anvil/Storage/ab_record.pbi` | The two-slot boot-control record: layout, checksum, state machine and handoff page, driven by two caller-supplied callbacks. No filesystem and no chip in it, so a board reaches its records by name through the shared layer rather than by walking a cluster chain |
 | Graphics experiments | `Anvil/Graphics/Vulkan/*` | Shared Vulkan object and command layer with a bounded Pi 4 V3D physical device; other board monitor paths have no production Vulkan hardware backend |

@@ -899,6 +899,35 @@ caches. The hardware read-only flag controls file-write admission. Shared
 HwFile operations arm the writer only around a change and disarm it afterwards.
 `HwStorageReport()` reports the selected device and currently mounted format.
 
+### AnvilFS data disk
+
+Create an image from the Anvil repository and attach it as disk 0 when the
+Zentaji ROM boots Anvil from the `anvil.zex` host-file slot.
+
+```text
+python tools/anvilfs_image.py projects.img --size-mib 64 --source projects
+python tools/anvilfs_image.py projects.img --list
+python tools/anvilfs_image.py projects.img --extract "notes/read me.txt" --to readme.txt
+```
+
+Omit `--source` to start with an empty volume. The monitor uses the existing
+`mount`, `ls`, `cat`, `load`, `save`, `mkdir`, `rename`, `rm`, and `rmdir`
+commands. The image uses MBR partition 1, supports nested directories and
+case-sensitive UTF-8 components up to 255 bytes, and has 128 file and
+directory entries. Quote paths containing spaces.
+The host listing and extraction commands accept a clean AnvilFS partition 1
+and open the image read-only. For pending journal replay, boot Anvil with the
+disk attached writable before reading it on the host.
+
+Version 1 allocates one contiguous 4 KiB-aligned extent per nonempty file.
+An update needs enough contiguous free space for the new extent while the
+old file remains allocated. The data flush precedes the journaled directory
+update. A writable mount replays committed metadata after interruption, and
+a read-only mount requires a clean journal. The format uses MBR type `0xDA`,
+an `ANVLFS1` superblock, the shared redo journal, and a checksummed entry
+table. AnvilFS is a data volume, and the ROM still loads the configured
+Anvil boot image.
+
 `ZentajiStorageDown()` refuses open files or a pending mount, explicitly flushes
 before unmounting, and releases the queues only after success. A failed flush
 retains ownership for diagnosis/retry. It clears file admission and callbacks

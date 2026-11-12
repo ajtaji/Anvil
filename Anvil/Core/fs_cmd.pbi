@@ -127,7 +127,7 @@ Procedure CmdFat()
   EndIf
   If n < 0
     PrintN("!! load needs a valid path. Put a path containing spaces in double")
-    PrintN("   quotes; an exFAT path may be at most 1023 UTF-8 bytes.")
+    PrintN("   quotes. The command accepts paths up to 1023 UTF-8 bytes.")
     ProcedureReturn
   EndIf
 
@@ -145,8 +145,8 @@ Procedure CmdFat()
     Print("!! the file ")
     UartWriteStr(@gName[0])
     PrintN(" could not be opened, so nothing was loaded")
-    PrintN("   and memory is untouched. Paths are case-insensitive; quote one that")
-    PrintN("   contains spaces, and start it with N: for partition N (2:/name) -")
+    PrintN("   and memory is untouched. Quote a path that contains spaces and")
+    PrintN("   start it with N: for partition N (2:/name) -")
     PrintN("   with no N: it is partition 1. Type f to see the partitions.")
     Print("   The medium said: ")
     UartWriteStr(HwFileErrorText())   ; a POINTER - see the note on SdErrorText
@@ -298,7 +298,7 @@ Procedure CmdSave()
   EndIf
   If i < 0
     PrintN("!! save needs a valid path. Put a path containing spaces in double")
-    PrintN("   quotes; an exFAT path may be at most 1023 UTF-8 bytes.")
+    PrintN("   quotes. The command accepts paths up to 1023 UTF-8 bytes.")
     ProcedureReturn
   EndIf
 
@@ -608,7 +608,7 @@ Procedure CmdFatls()
   n = ParseStoragePath()
   If n < 0
     PrintN("!! ls needs a valid directory path. Put one containing spaces in")
-    PrintN("   double quotes; an exFAT path may be at most 1023 UTF-8 bytes.")
+    PrintN("   double quotes. The command accepts paths up to 1023 UTF-8 bytes.")
     ProcedureReturn
   EndIf
   If n = 0
@@ -744,7 +744,7 @@ Procedure CmdFatls()
     PrintN("   command stops here rather than scrolling a directory without end.")
   EndIf
 
-  PrintN("  Case is not significant. ls N:/folder lists a folder on partition N.")
+  PrintN("  ls N:/folder lists a folder on partition N.")
 EndProcedure
 
 
@@ -805,13 +805,13 @@ Procedure CmdCat()
     PrintN("!! cat needs the name of a file to print, and none was given, so")
     PrintN("   nothing was read.")
     PrintN("   cat CONFIG.TXT         or   cat 2:/notes/readme.txt")
-    PrintN("   Case does not matter. Quote a path that contains spaces, and start")
-    PrintN("   it with N: for partition N; with no N: it is partition 1.")
+    PrintN("   Quote a path that contains spaces. Start with N: for partition N,")
+    PrintN("   or omit the prefix to read from partition 1.")
     ProcedureReturn
   EndIf
   If n < 0
     PrintN("!! cat needs a valid path. Put a path containing spaces in double")
-    PrintN("   quotes; an exFAT path may be at most 1023 UTF-8 bytes.")
+    PrintN("   quotes. The command accepts paths up to 1023 UTF-8 bytes.")
     ProcedureReturn
   EndIf
   nm = 0
@@ -956,7 +956,7 @@ Procedure.i fs_cmd_PathOrSay(*cmd, *usage)
     PrintN(" needs a path, and none was given, so nothing was changed.")
   Else
     PrintN(" needs a valid path. Put a path containing spaces in double")
-    PrintN("   quotes; an exFAT path may be at most 1023 UTF-8 bytes. Nothing was changed.")
+    PrintN("   quotes. The command accepts paths up to 1023 UTF-8 bytes. Nothing was changed.")
   EndIf
   Print("   ")
   UartWriteStr(*usage)

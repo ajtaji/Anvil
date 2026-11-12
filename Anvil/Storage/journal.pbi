@@ -40,6 +40,10 @@ Structure FsJournal
  blocks.q[#FSJ_BYTES/8*#FSJ_MAX_BLOCKS]
 EndStructure
 
+; One journal owns the block transport at a time. Keeping the transport
+; addresses in dedicated globals gives Forge a bounded indirect call graph.
+Global fsjOwner.i,fsjReader.i,fsjWriter.i,fsjFlusher.i
+
 Procedure.i fsjFail(*j.FsJournal,error.i)
  *j\error=error
  ProcedureReturn 0
@@ -51,7 +55,7 @@ EndProcedure
 Procedure.i FsJournalBind(*j.FsJournal,first.i,limit.i,log.i,reader.i,writer.i,flusher.i)
  Protected span.i=(#FSJ_MAX_BLOCKS+2)*#FSJ_SECTORS
  If *j=0 : ProcedureReturn 0 : EndIf
- If *j\state<>0 : ProcedureReturn fsjFail(*j,#FSJ_E_STATE) : EndIf
+ If *j\state<>0 Or fsjOwner<>0 : ProcedureReturn fsjFail(*j,#FSJ_E_STATE) : EndIf
  If reader=0 Or Bool(writer=0)<>Bool(flusher=0) Or first<0 Or limit<=first Or log<first
   ProcedureReturn fsjFail(*j,#FSJ_E_RANGE)
  EndIf
@@ -59,9 +63,19 @@ Procedure.i FsJournalBind(*j.FsJournal,first.i,limit.i,log.i,reader.i,writer.i,f
   ProcedureReturn fsjFail(*j,#FSJ_E_RANGE)
  EndIf
  *j\reader=reader : *j\writer=writer : *j\flusher=flusher
+ fsjOwner=*j : fsjReader=reader : fsjWriter=writer : fsjFlusher=flusher
  *j\first=first : *j\limit=limit : *j\log=log : *j\logLimit=log+span
  *j\state=#FSJ_RECOVER : *j\uncertain=0 : *j\error=0
  ProcedureReturn 1
+EndProcedure
+
+; The caller owns device lifetime. After abandoning uncertain I/O, a
+; subsequent writable mount must fence outstanding device writes first.
+Procedure FsJournalUnbind(*j.FsJournal)
+ If fsjOwner<>0 And fsjOwner=*j
+  *j\state=0
+  fsjOwner=0 : fsjReader=0 : fsjWriter=0 : fsjFlusher=0
+ EndIf
 EndProcedure
 
 Procedure.i fsjHomeValid(*j.FsJournal,lba.q)
@@ -75,15 +89,15 @@ Procedure fsjZero(marker.i)
 EndProcedure
 
 Procedure.i fsjRead(*j.FsJournal,lba.i,buffer.i)
- ProcedureReturn CallFunctionFast(*j\reader,lba,#FSJ_SECTORS,buffer)
+ ProcedureReturn CallFunctionFast(fsjReader,lba,#FSJ_SECTORS,buffer)
 EndProcedure
 
 Procedure.i fsjWrite(*j.FsJournal,lba.i,buffer.i)
- ProcedureReturn CallFunctionFast(*j\writer,lba,#FSJ_SECTORS,buffer)
+ ProcedureReturn CallFunctionFast(fsjWriter,lba,#FSJ_SECTORS,buffer)
 EndProcedure
 
 Procedure.i fsjFlush(*j.FsJournal)
- ProcedureReturn CallFunctionFast(*j\flusher)
+ ProcedureReturn CallFunctionFast(fsjFlusher)
 EndProcedure
 
 ; Both copies use the same bytes. At most one marker may be torn by a
