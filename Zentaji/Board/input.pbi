@@ -214,6 +214,10 @@ Procedure.i ZentajiInputDispatch(op.i,context.i,request.i,bytes.i)
 EndProcedure
 
 Procedure.i ZentajiPromptInputs(operation.i)
+ CompilerIf Defined(ANVIL_ZENTAJI_NET, #PB_Constant)
+ If operation=#APS_NET_INPUT : ProcedureReturn NetConsoleGetc() : EndIf
+ If operation=#APS_CLAIM_LOCAL : NetConsoleClaimLocal() : ProcedureReturn 0 : EndIf
+ CompilerEndIf
  If operation=#APS_NET_INPUT : ProcedureReturn -1 : EndIf
  If operation=#APS_KEYBOARD And ziOwned=0 And ziUp<>0 And InputFocus()=#AIF_COMMAND_LINE
   ziPromptAdmitted=0

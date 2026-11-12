@@ -1050,15 +1050,23 @@ Global net_dropCount.i
 ; other end never answers.
 ; ----------------------------------------------------------------------
 Procedure.i net_Ticks()
+  CompilerIf Defined(ANVIL_NET_USE_BOARD_CLOCK, #PB_Constant)
+    ProcedureReturn Ticks()
+  CompilerElse
   ASM
     mrs x0, cntpct_el0
   EndASM
+  CompilerEndIf
 EndProcedure
 
 Procedure.i net_TickHz()
+  CompilerIf Defined(ANVIL_NET_USE_BOARD_CLOCK, #PB_Constant)
+    ProcedureReturn TickHz()
+  CompilerElse
   ASM
     mrs x0, cntfrq_el0
   EndASM
+  CompilerEndIf
 EndProcedure
 
 Procedure.i net_MsToTicks(ms.i)
@@ -2947,7 +2955,11 @@ EndProcedure
 Procedure.i NetTcp6Select(destination.i,source.i)
  If destination=0 Or source=0 Or net_tcp6SelectHook=0 : ProcedureReturn -881 : EndIf
  If source<destination+16 And destination<source+16 : ProcedureReturn -881 : EndIf
+ CompilerIf Not Defined(ANVIL_NET_IPV4_ONLY, #PB_Constant)
  ProcedureReturn net_tcp6SelectHook(destination,source)
+ CompilerElse
+ ProcedureReturn -881
+ CompilerEndIf
 EndProcedure
 Procedure NetSetTcp6ScopedSelectHook(selectSource.i)
  *net_tcp6ScopedSelectHook=selectSource
@@ -2956,19 +2968,31 @@ Procedure.i NetTcp6SelectOn(kind.i,destination.i,source.i)
  Define rc.i
  If kind<1 Or kind>=#NET_IF_KINDS Or destination=0 Or source=0 Or net_tcp6ScopedSelectHook=0 : ProcedureReturn -881 : EndIf
  If source<destination+16 And destination<source+16 : ProcedureReturn -881 : EndIf
+ CompilerIf Not Defined(ANVIL_NET_IPV4_ONLY, #PB_Constant)
  rc=net_tcp6ScopedSelectHook(kind,destination,source)
+ CompilerElse
+ rc=-881
+ CompilerEndIf
  If rc>0 And rc<>kind : ProcedureReturn -883 : EndIf
  ProcedureReturn rc
 EndProcedure
 Procedure.i NetTcp6SourceValid(kind.i,source.i)
  If source=0 Or kind<1 Or kind>=#NET_IF_KINDS : ProcedureReturn 0 : EndIf
  If net_tcp6SourceHook=0 : ProcedureReturn 0 : EndIf
+ CompilerIf Not Defined(ANVIL_NET_IPV4_ONLY, #PB_Constant)
  ProcedureReturn net_tcp6SourceHook(kind,source)
+ CompilerElse
+ ProcedureReturn 0
+ CompilerEndIf
 EndProcedure
 Procedure.i NetTcp6Resolve(kind.i,source.i,destination.i,mac.i)
  If NetTcp6SourceValid(kind,source)<>1 Or destination=0 Or mac=0 : ProcedureReturn -881 : EndIf
  If net_tcp6ResolveHook=0 : ProcedureReturn -883 : EndIf
+ CompilerIf Not Defined(ANVIL_NET_IPV4_ONLY, #PB_Constant)
  ProcedureReturn net_tcp6ResolveHook(kind,source,destination,mac)
+ CompilerElse
+ ProcedureReturn -883
+ CompilerEndIf
 EndProcedure
 Procedure.i NetTcp6SegBuf()
  ProcedureReturn @net_out[54]
@@ -4166,7 +4190,11 @@ Procedure.i NetInput(kind.i, *frame, length.i)
     EndIf
     net_ipv6InputBusy = 1
     net_udpRxFamily=4 : net_udpRxFrom6=0 : net_udpRxTo6=0
+    CompilerIf Not Defined(ANVIL_NET_IPV4_ONLY, #PB_Constant)
     r = net_ipv6InputHook(kind,*frame,length,@net_out[0],1514)
+    CompilerElse
+    r = 0
+    CompilerEndIf
     net_ipv6InputBusy = 0
     If r = #NET_IN_TCP And net_tcpRxFamily=6 : ProcedureReturn #NET_IN_TCP : EndIf
     If r = #NET_IN_UDP And net_udpRxFamily=6 : ProcedureReturn #NET_IN_UDP : EndIf

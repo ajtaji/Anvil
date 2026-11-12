@@ -270,7 +270,9 @@ Procedure NetConsoleLlTick()
   If *gConLlTick = 0
     ProcedureReturn
   EndIf
+  CompilerIf Not Defined(ANVIL_NET_NO_LINKLOCAL, #PB_Constant)
   gConLlTick()
+  CompilerEndIf
 EndProcedure
 
 Procedure netcon_InPush(c.i)
@@ -967,9 +969,11 @@ Procedure.i NetServiceInput(kind.i, *frame, rc.i)
   EndIf
   If rc = #NET_IN_UDP
     If NetUdpRxFamily()=6
+      CompilerIf Not Defined(ANVIL_NET_IPV4_ONLY, #PB_Constant)
       If *gNetUdp6SvcHook<>0
         If gNetUdp6SvcHook(kind)<>0 : ProcedureReturn 1 : EndIf
       EndIf
+      CompilerEndIf
       If *gNetDatagramHook<>0
         If gNetDatagramHook(kind)<>0 : ProcedureReturn 1 : EndIf
       EndIf
@@ -991,11 +995,13 @@ Procedure.i NetServiceInput(kind.i, *frame, rc.i)
     If NtpServiceInput(kind) <> 0
       ProcedureReturn 1
     EndIf
+    CompilerIf Not Defined(ANVIL_NET_NO_LEGACY_UDP_HOOK, #PB_Constant)
     If *gNetUdpSvcHook <> 0
       If gNetUdpSvcHook(kind) <> 0
         ProcedureReturn 1
       EndIf
     EndIf
+    CompilerEndIf
     If *gNetDatagramHook<>0
       If gNetDatagramHook(kind)<>0 : ProcedureReturn 1 : EndIf
     EndIf

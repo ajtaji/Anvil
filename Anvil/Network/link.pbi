@@ -609,16 +609,20 @@ Procedure.i LinkTxReceipt(kind.i,token.i)
 EndProcedure
 
 Procedure LinkTxProgress(kind.i)
+  CompilerIf Not Defined(ANVIL_LINK_SYNCHRONOUS, #PB_Constant)
   If *gLinkTxProgressHook <> 0 : gLinkTxProgressHook(kind) : EndIf
+  CompilerEndIf
 EndProcedure
 
 Procedure.i LinkSendFrame(kind.i, frame.i, bytes.i)
   Define rc.i
   If frame=0 Or bytes<14 Or bytes>LinkTxMaxOn(kind) : ProcedureReturn 0 : EndIf
+  CompilerIf Not Defined(ANVIL_LINK_SYNCHRONOUS, #PB_Constant)
   If *gLinkTxSubmitHook <> 0
     rc=gLinkTxSubmitHook(kind,frame,bytes)
     If rc<>-2 : ProcedureReturn rc : EndIf
   EndIf
+  CompilerEndIf
   ProcedureReturn HwLinkSend(kind,frame,bytes,100)
 EndProcedure
 

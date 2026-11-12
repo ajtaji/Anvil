@@ -130,6 +130,7 @@ EndProcedure
 ;  exact defect shipped once in this file, in PutClockRow(), and the
 ;  warning is recorded there.
 ; ----------------------------------------------------------------------
+CompilerIf Not Defined(ANVIL_NET_NO_LEGACY_DIAGNOSTICS, #PB_Constant)
 Procedure EthWhyGenet()
   Print("   The Ethernet controller said: ")
   CompilerIf #PMF_CHIP = 2712
@@ -142,6 +143,7 @@ Procedure EthWhyGenet()
   CompilerEndIf
   PrintNl()
 EndProcedure
+CompilerEndIf
 
 Procedure EthWhyNet()
   Print("   The network stack said: ")
@@ -149,11 +151,13 @@ Procedure EthWhyNet()
   PrintNl()
 EndProcedure
 
+CompilerIf Not Defined(ANVIL_NET_NO_LEGACY_DIAGNOSTICS, #PB_Constant)
 Procedure EthWhyTftp()
   Print("   The transfer said: ")
   UartWriteStr(TftpErrorText())
   PrintNl()
 EndProcedure
+CompilerEndIf
 
 ; ----------------------------------------------------------------------
 ;  EthMacFetch - this board's own hardware address, from the firmware.

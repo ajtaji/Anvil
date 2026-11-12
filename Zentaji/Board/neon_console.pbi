@@ -334,6 +334,10 @@ EndProcedure
 Procedure.i ZentajiNeonConsoleService(operation.i)
  If operation=#APS_SCREEN
   If ZentajiNeonConsolePump()<>1 : ZentajiPayloadRecoveryFailed($5C01,"Console graphics failed (0x5C01): display ownership or presentation was lost.") : EndIf
+ Else
+  CompilerIf Defined(ANVIL_ZENTAJI_NET, #PB_Constant)
+  ProcedureReturn ZentajiNetworkService(operation)
+  CompilerEndIf
  EndIf
  ProcedureReturn 0
 EndProcedure

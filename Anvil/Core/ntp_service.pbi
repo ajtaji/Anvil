@@ -19,7 +19,9 @@ XIncludeFile "Anvil/Core/dns_policy.pbi"
 ; reported as such by wallclock.pbi.
 ; ======================================================================
 
+CompilerIf Not Defined(ANVIL_ZENTAJI_NET, #PB_Constant)
 EnableExplicit
+CompilerEndIf
 
 #NTP_SERVICE_IDLE      = 0
 #NTP_SERVICE_SELECT    = 1

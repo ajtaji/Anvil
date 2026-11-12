@@ -81,6 +81,9 @@ EndProcedure
 
 Procedure.i HwPayloadRun(entry.i,argument.i,stack.i,stackBytes.i)
  Protected hadStorage.i,entered.i,code.i,services.i,startUs.q,endUs.q
+ CompilerIf Defined(ANVIL_ZENTAJI_NET, #PB_Constant)
+ Protected hadEthernet.i
+ CompilerEndIf
  gGoRc=0
  services=Bool(argument<>0)
  If services<>0
@@ -123,6 +126,15 @@ Procedure.i HwPayloadRun(entry.i,argument.i,stack.i,stackBytes.i)
  zenPayConfig=PeekQ(#ZEN_IDLE_INTC+$120) : zenPayRoute=PeekQ(#ZEN_IDLE_INTC+$220)
  zenPayRouteMask=PeekQ(#ZEN_IDLE_INTC+$228) : zenPayEnable=PeekQ(#ZEN_IDLE_INTC+$F008)
  zenPayThreshold=PeekQ(#ZEN_IDLE_INTC+$F010)
+ CompilerIf Defined(ANVIL_ZENTAJI_NET, #PB_Constant)
+ hadEthernet=zeOpen
+ If hadEthernet<>0
+  If ZentajiEthernetOwned()=0 : ZentajiPayloadRecoveryFailed($5B08,"Payload admission failed (0x5B08): Ethernet ownership changed.") : EndIf
+  If services=0
+   If ZentajiEthernetClose()=0 : ZentajiPayloadRecoveryFailed($5B08,"Payload admission failed (0x5B08): Ethernet could not be quiesced.") : EndIf
+  EndIf
+ EndIf
+ CompilerEndIf
  If zenPayloadGraphicsDown()<>1 : ZentajiPayloadRecoveryFailed($5B07,"Payload admission failed (0x5B07): graphics ownership could not retire.") : EndIf
  If ZentajiInputPayload(1,services)=0 : ZentajiPayloadRecoveryFailed($5B06,"Payload admission failed (0x5B06): native input ownership changed.") : EndIf
  If services=0
@@ -166,6 +178,11 @@ Procedure.i HwPayloadRun(entry.i,argument.i,stack.i,stackBytes.i)
   If UartAttach()=0 Or HwPromptIdleReady()=0 : ZentajiPayloadRecoveryFailed($5B02,"Payload return failed (0x5B02): timer, interrupt or serial ownership changed. Restore device state before returning.") : EndIf
   If hadStorage<>0 And ZentajiDiskOwned()=0 : ZentajiPayloadRecoveryFailed($5B03,"Payload return failed (0x5B03): storage ownership could not be reacquired. Check disk queues and configuration.") : EndIf
  EndIf
+ CompilerIf Defined(ANVIL_ZENTAJI_NET, #PB_Constant)
+ If hadEthernet<>0
+  If ZentajiEthernetOpen()=0 : ZentajiPayloadRecoveryFailed($5B08,"Payload return failed (0x5B08): Ethernet ownership could not be restored.") : EndIf
+ EndIf
+ CompilerEndIf
  If zenPayloadGraphicsUp()<>1 : ZentajiPayloadRecoveryFailed($5B07,"Payload return failed (0x5B07): graphics ownership could not be restored.") : EndIf
  If entered=0
   Print("!! the Zentaji CPU entry refused the payload, code ") : PrintDec(code) : PrintN(".")

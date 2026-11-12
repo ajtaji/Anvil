@@ -885,6 +885,19 @@ submission, refusal to reconfigure an acquired medium, refusal to shut down an
 open file, clean shutdown, repeated shutdown and reopen. These are component
 compositions with actual device queues; no monitor command parser is substituted.
 
+## Ethernet through the host NAT
+
+Add `net` to the Zentaji machine description and run it with the native
+live host. In Anvil, `net` shows attachment and address state, `dhcp` requests
+a lease, and `ping` and `dns` use Anvil's shared IPv4 stack. The default NAT
+lease is `10.0.2.15`, with gateway `10.0.2.2` and DNS `10.0.2.3`.
+
+The shared UDP console is available on guest port 5555 once Anvil has a
+lease. A machine description line such as `forward udp 15555 5555 127.0.0.1`
+allows a local UDP client to send commands. The serial console is available
+throughout, including when Ethernet is detached. This composition supports
+IPv4. The emulator's host-socket device is a separate interface.
+
 ## Board storage lifecycle
 
 Include `Board/storage.pbi` after the boot-context, console, disk, HAL and wall

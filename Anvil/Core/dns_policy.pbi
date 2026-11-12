@@ -53,11 +53,19 @@ Procedure NetDnsLearned6Bind(selectFn.i,validFn.i)
 EndProcedure
 Procedure.i NetDnsLearned6Select(*lease.NetDns6Lease)
  If *lease=0 Or dnsLearned6Select=0 Or dnsLearned6Valid=0 : ProcedureReturn 0 : EndIf
+ CompilerIf Not Defined(ANVIL_NET_IPV4_ONLY, #PB_Constant)
  ProcedureReturn dnsLearned6Select(*lease)
+ CompilerElse
+ ProcedureReturn 0
+ CompilerEndIf
 EndProcedure
 Procedure.i NetDnsLearned6Valid(*lease.NetDns6Lease)
  If *lease=0 Or dnsLearned6Valid=0 : ProcedureReturn 0 : EndIf
+ CompilerIf Not Defined(ANVIL_NET_IPV4_ONLY, #PB_Constant)
  ProcedureReturn dnsLearned6Valid(*lease)
+ CompilerElse
+ ProcedureReturn 0
+ CompilerEndIf
 EndProcedure
 
 
