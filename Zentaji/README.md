@@ -18,6 +18,10 @@ The boot-only graphical check verifies all 5624 logo pixels, the orange rule
 and console band on Anvil itself, without compiling or loading an application.
 The adapter preserves the completed image and repaints changed console rows,
 the clock band, or the logo animation through the shared LOAD transaction.
+Payload handoff and monitor shutdown drain the pending console frame before
+releasing graphics ownership. Each retired native draw renews the two-second
+stall budget for the next draw. A stalled queue retains its resources and
+the handoff fails.
 The logo uses the same eight-step,350ms glint as Pi4, now shared in
 `Anvil/Graphics/banner_glint.pbi`; the ordinary timer/WFI prompt pump advances
 it without a separate animation loop. The clock uses the board RTC. Visible

@@ -94,7 +94,15 @@ def main():
                     continue
                 try:
                     reply = client.command(command).decode("utf-8")
-                except (ConnectionError, TimeoutError) as error:
+                except ConnectionError as error:
+                    # The UART can close before the emulator prints its guest
+                    # exit code. Give a halted guest time to publish that report.
+                    try:
+                        proc.wait(timeout=3)
+                    except subprocess.TimeoutExpired:
+                        pass
+                    raise RuntimeError(f"{label} stopped during {command!r}") from error
+                except TimeoutError as error:
                     raise RuntimeError(f"{label} stopped during {command!r}") from error
                 transcript.append(reply)
                 assert expected in reply, (command, reply)
@@ -111,6 +119,10 @@ def main():
             (folder / "transcript.log").write_text("".join(transcript[transcript_start:]), encoding="utf-8")
         log = "".join(lines)
         assert "HOST_GPU_ERROR" not in log and "HOST_GPU_REFUSED" not in log
+        # A guest HALT error can still produce a zero host process exit.
+        end = re.search(r"^END steps=\d+ exit=([0-9A-Fa-f]+) powered=1 ", log, re.M)
+        assert end is not None, f"{label} has no guest exit report in {folder / 'run.log'}"
+        assert int(end[1], 16) == 0, f"{label} guest exit 0x{end[1]}, see {folder / 'run.log'}"
         return (folder / "disk0.img").read_bytes()
 
     source = f'projects/{LONG_NAME}'

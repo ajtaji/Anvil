@@ -131,14 +131,13 @@ EndProcedure
 ; rows so deleting text or moving over ink cannot leave a trail. The bundled
 ;16-pixel face fits the measured line box; each dirty row is restored in full.
 ; This is the same public Chrome transaction layer used by the Pi4 monitor.
-; 1 retired (or no frame), 0 still pending, -1 failed. Poll from the
-; console service. Ownership handoffs use the existing bounded wait.
-Procedure.i zngRetireFrame(timeoutNs.i)
+; 1 retired (or no frame), 0 still pending, -1 failed.
+Procedure.i zngRetireFrame()
  Protected rc.i
  If NeonVkChromeFramePending()=0 : ProcedureReturn 1 : EndIf
  zngPainting=1
- rc=NeonVkChromeFinishWithin(timeoutNs)
- If rc=#VK_TIMEOUT And timeoutNs=0
+ rc=NeonVkChromeFinishWithin(0)
+ If rc=#VK_TIMEOUT
   zngPainting=0 : ProcedureReturn 0
  EndIf
  If rc=#VK_SUCCESS : rc=NeonVkChromeAsync(0) : EndIf
@@ -151,6 +150,29 @@ Procedure.i zngRetireFrame(timeoutNs.i)
  EndIf
  zngPainting=0
  ProcedureReturn 1-2*Bool(zngFault<>0)
+EndProcedure
+
+; The native backend retires a finite ordered draw list one draw at a time.
+; A long list can exceed the ordinary fence timeout while making progress.
+; During ownership handoff, give each successive draw the same stall budget.
+; Backend polling sleeps on the board timer while a native draw is pending.
+Procedure.i zngDrainFrame()
+ Protected draw.i=avkZenListIndex,result.i,polls.i
+ Protected stalledSince.q=HwMicros(),now.q
+ If NeonVkChromeFramePending()=0 : ProcedureReturn 1 : EndIf
+ For polls=1 To #ANVIL_VK_WAIT_MAX_POLLS
+  result=zngRetireFrame()
+  If result<>0 : ProcedureReturn Bool(result=1) : EndIf
+  now=HwMicros()
+  If now<stalledSince : Break : EndIf
+  If avkZenListIndex>draw
+   draw=avkZenListIndex : stalledSince=now
+  ElseIf now-stalledSince>=#NEON_VK_CHROME_WAIT_NS/#ANVIL_VK_NS_PER_US
+   Break
+  EndIf
+ Next
+ zngFault=6
+ ProcedureReturn 0
 EndProcedure
 
 Procedure zngPaint()
@@ -251,7 +273,7 @@ Procedure.i ZentajiNeonConsolePump()
  If zngUp=0 Or zngSuspended<>0 : ProcedureReturn 1 : EndIf
  If zngPainting<>0 : ProcedureReturn 1 : EndIf
  If zngFault<>0 : ProcedureReturn 0 : EndIf
- retired=zngRetireFrame(0)
+ retired=zngRetireFrame()
  If retired<=0 : ProcedureReturn Bool(retired=0) : EndIf
  resized=ZentajiNeonSurfaceResize()
  If resized=0 : zngFault=11 : ProcedureReturn 0 : EndIf
@@ -279,7 +301,7 @@ EndProcedure
 Procedure.i ZentajiNeonConsoleSuspend()
  If zngUp=0 : ProcedureReturn 1 : EndIf
  If zngSuspended<>0 Or zngPainting<>0 Or nvcInFrame<>0 Or NeonVkChromePresentPending()<>0 : ProcedureReturn 0 : EndIf
- If zngRetireFrame(#NEON_VK_CHROME_WAIT_NS)<>1 : ProcedureReturn 0 : EndIf
+ If zngDrainFrame()<>1 : ProcedureReturn 0 : EndIf
  ; Service applications borrow this resident owner. Ordinary supervisor
  ; payloads receive released hardware, as before; they may own another driver.
  If GraphicsServiceState()=1
@@ -355,7 +377,7 @@ XIncludeFile "Anvil/Graphics/Vulkan/neon_vk_resident_service.pbi"
 Procedure.i ZentajiNeonConsoleStop()
  If zngUp=0 : ProcedureReturn 1 : EndIf
  If zngSuspended<>0 Or zngPainting<>0 : ProcedureReturn 0 : EndIf
- If zngRetireFrame(#NEON_VK_CHROME_WAIT_NS)<>1 : ProcedureReturn 0 : EndIf
+ If zngDrainFrame()<>1 : ProcedureReturn 0 : EndIf
  If ZentajiNeonSurfaceStop()<>1 : ProcedureReturn 0 : EndIf
  If zngDmaDown()<>1 Or ZentajiGraphicsRelease(@avkZenQueue)<>1 : ProcedureReturn 0 : EndIf
  ConNoRenderer() : UartMirrorSetDrain(0) : UartMirror(0)
