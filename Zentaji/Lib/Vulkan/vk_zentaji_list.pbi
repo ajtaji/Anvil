@@ -117,3 +117,7 @@ Procedure.i avkBackendPoll()
  EndIf
  ProcedureReturn 0
 EndProcedure
+
+Procedure.i avkBackendFenceProgress()
+ ProcedureReturn avkZenListIndex
+EndProcedure

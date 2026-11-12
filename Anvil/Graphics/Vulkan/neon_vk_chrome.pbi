@@ -355,6 +355,7 @@ Global nvcTTMeasuredProbe.i
 Global nvcTTMetricsStateProbe.i
 Global nvcSubmitStage.i
 Global nvcSubmitRc.i
+Global nvcFenceProgressProbe.i
 Global Dim nvcTTFontHeight.i[4]
 Global Dim nvcTTSlot.i[#NEON_VK_CHROME_TT_CACHE_MAX]
 Global Dim nvcTTGen.i[#NEON_VK_CHROME_TT_CACHE_MAX]
@@ -849,6 +850,12 @@ Procedure.i nvcBufferCreate(bytes.i, usage.i, *outBuffer, *outMemory)
   ProcedureReturn #VK_SUCCESS
 EndProcedure
 
+; Optional board callback returning the completed steps of a bounded submission.
+; Its result must be monotonic while the renderer waits for that submission.
+Procedure NeonVkChromeFenceProgressBind(probe.i)
+  nvcFenceProgressProbe = probe
+EndProcedure
+
 ; One ordered submission seam serves the one-time atlas upload at Create and
 ; each completed frame. Therefore frame End still has exactly one submission,
 ; while resource initialization does not duplicate queue/fence ownership.
@@ -877,7 +884,7 @@ Procedure.i nvcSubmitAndWait()
   EndIf
   If rc = #VK_SUCCESS And nvcSubmitNoWait = 0
     nvcSubmitStage = 4
-    rc = vkWaitForFences(nvcDevice, 1, @fenceHandle, 1, #NEON_VK_CHROME_WAIT_NS)
+    rc = avkWaitForFences(nvcDevice, 1, @fenceHandle, 1, #NEON_VK_CHROME_WAIT_NS, nvcFenceProgressProbe)
   EndIf
   nvcSubmitRc = rc
   ProcedureReturn rc
