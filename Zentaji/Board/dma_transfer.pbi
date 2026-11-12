@@ -8,6 +8,7 @@
 Structure ZentajiDmaTransfer
  owner.i : state.i : lost.i : error.i : ram.i : scratch.i : capacity.i
  source.i : destination.i : count.i : mode.i : status.i : launches.i : sleeps.i
+ copyBase.i : copyBytes.i
 EndStructure
 Global zenDmaTransferOwner.i
 
@@ -48,7 +49,7 @@ Procedure.i ZentajiDmaBind(*q.ZentajiDmaTransfer,scratch.i,capacity.i)
  Next
  If PeekQ(#ZEN_DMA_CHANNEL+$30)<>0 Or PeekQ(#ZEN_DMA_CHANNEL+$38)<>0 : ProcedureReturn ZentajiDmaFail(*q,4) : EndIf
  *q\owner=ZenCpuCoreId() : *q\ram=ram : *q\scratch=scratch : *q\capacity=capacity
- *q\source=0 : *q\destination=0 : *q\count=0 : *q\mode=0 : *q\error=0
+ *q\source=0 : *q\destination=0 : *q\count=0 : *q\mode=0 : *q\error=0 : *q\copyBytes=0
  *q\state=1 : zenDmaTransferOwner=*q
  ProcedureReturn 1
 EndProcedure
@@ -75,11 +76,24 @@ Procedure.i ZentajiDmaRowsValid(*q.ZentajiDmaTransfer,source.i,sourcePitch.i,des
  ProcedureReturn 1
 EndProcedure
 Procedure.i ZentajiDmaStartRows(*q.ZentajiDmaTransfer,source.i,sourcePitch.i,destination.i,destinationPitch.i,rowBytes.i,rows.i,fill.i)
- Protected n.i,at.i,link.i,mode.i=0
+ Protected n.i,at.i,link.i,mode.i=0,alignment.i
  If *q\state<>1 Or ZentajiDmaOwned(*q)=0 : ProcedureReturn 0 : EndIf
  If rows>*q\capacity/48 Or ZentajiDmaRowsValid(*q,source,sourcePitch,destination,destinationPitch,rowBytes,rows,fill)=0 : ProcedureReturn ZentajiDmaFail(*q,1) : EndIf
  If HwPromptIdleReady()=0 : ProcedureReturn ZentajiDmaFail(*q,3) : EndIf
- If fill<>0 : mode=$201 : EndIf
+ If fill<>0
+  mode=$201
+ Else
+  ; A wide element covers the same bytes within each native DMA burst.
+  alignment=source|destination|rowBytes
+  If rows>1 : alignment=alignment|sourcePitch|destinationPitch : EndIf
+  If (alignment&7)=0
+   mode=$300
+  ElseIf (alignment&3)=0
+   mode=$200
+  ElseIf (alignment&1)=0
+   mode=$100
+  EndIf
+ EndIf
  For n=0 To rows-1
   at=*q\scratch+n*48 : link=0
   If n+1<rows : link=at+48 : EndIf
@@ -93,6 +107,7 @@ Procedure.i ZentajiDmaStartRows(*q.ZentajiDmaTransfer,source.i,sourcePitch.i,des
  PokeQ(#ZEN_DMA_CHANNEL,PeekQ(*q\scratch)) : PokeQ(#ZEN_DMA_CHANNEL+8,destination)
  PokeQ(#ZEN_DMA_CHANNEL+$10,rowBytes) : PokeQ(#ZEN_DMA_CHANNEL+$18,mode)
  PokeQ(#ZEN_DMA_CHANNEL+$20,PeekQ(*q\scratch+32))
+ *q\copyBytes=0
  *q\state=3 : *q\error=0 : *q\launches=*q\launches+1
  PokeQ(#ZEN_DMA_CHANNEL+$28,1)
  ProcedureReturn 1
@@ -123,6 +138,12 @@ Procedure.i ZentajiDmaRows(*q.ZentajiDmaTransfer,source.i,sourcePitch.i,destinat
  Protected done.i,batch.i,src.i,start.i=HwMicros(),deadline.i,now.i
  If timeoutUs<1 Or timeoutUs>1000000 Or start<0 Or start>$7FFFFFFFFFFFFFFF-timeoutUs : ProcedureReturn ZentajiDmaFail(*q,8) : EndIf
  If ZentajiDmaRowsValid(*q,source,sourcePitch,destination,destinationPitch,rowBytes,rows,fill)=0 : ProcedureReturn ZentajiDmaFail(*q,1) : EndIf
+ ; Packed rows already passed full-span range and overlap checks.
+ ; One descriptor avoids a timer wake and resubmission at every batch boundary.
+ If rows>1 And destinationPitch=rowBytes And (fill<>0 Or sourcePitch=rowBytes)
+  rowBytes=rowBytes*rows : rows=1
+  sourcePitch=rowBytes : destinationPitch=rowBytes
+ EndIf
  deadline=start+timeoutUs
  While done<rows
   now=HwMicros()
@@ -136,5 +157,10 @@ Procedure.i ZentajiDmaRows(*q.ZentajiDmaTransfer,source.i,sourcePitch.i,destinat
   If ZentajiDmaWait(*q,deadline)<>1 : ProcedureReturn 0 : EndIf
   done=done+batch
  Wend
+ ; Record the contiguous destination only after the complete copy retires.
+ ; The next native launch invalidates this proof, even if that launch fails.
+ If fill=0 And destinationPitch=rowBytes
+  *q\copyBase=destination : *q\copyBytes=rowBytes*rows
+ EndIf
  ProcedureReturn 1
 EndProcedure

@@ -43,6 +43,15 @@ BODY=r''' Protected token.q,oldToken.q,aborted.q,p0.i,p1.i
  token=ZentajiGraphicsDisplayAcquireWrite()
  If token<=aborted Or ZentajiGraphicsDisplayWriteAddress(aborted)<>0 : ProcedureReturn 54 : EndIf
  If ZentajiGraphicsDisplayWriteBegin(oldToken,@avkZenDma)<>0 : ProcedureReturn 55 : EndIf
+ If writerPhase=2
+  If avkBackendGpuLeaseAcquire(#ANVIL_VK_GPU_LEASE_EXTERNAL)<>1 : ProcedureReturn 77 : EndIf
+  If ZentajiGraphicsDisplayWriteBegin(token,@avkZenDma)<>1 : ProcedureReturn 78 : EndIf
+  If ZentajiDmaRows(@avkZenDma,AnvilVkImageAddress(image),zgdPitch,p1+(zgdHeight-1)*zgdPitch,zgdPitch,zgdPitch,1,0,250000)<>1 : ProcedureReturn 79 : EndIf
+  If ZentajiGraphicsDisplayWriteRetire(token,@avkZenQueue)<>0 Or ZentajiGraphicsDisplayPresent(@avkZenQueue,1)<>0 : ProcedureReturn 82 : EndIf
+  report[21]=p0 : report[22]=p1 : report[23]=zgdWriter : report[24]=zgdLost
+  report[25]=avkZenDma\launches : report[27]=zgdSequence
+  ProcedureReturn 42
+ EndIf
  If writerPhase=1
   If avkBackendGpuLeaseAcquire(#ANVIL_VK_GPU_LEASE_EXTERNAL)<>1 : ProcedureReturn 72 : EndIf
   If ZentajiGraphicsDisplayWriteBegin(token,@avkZenDma)<>1 : ProcedureReturn 56 : EndIf
@@ -109,7 +118,7 @@ def main():
         ref=A.Asm();org,data=ref.assemble(Path(str(image)+'.asm').read_text(encoding='utf-8-sig'))
         assert image.read_bytes()==zexpack.header(org,org,data)+data
         wrapped,meta,_,_=B.pack(image.read_bytes(),zt/'zasm.exe',source_map=json.loads(Path(str(image)+'.zmap').read_text(encoding='utf-8-sig')))
-        for phase in (0,1):
+        for phase in (0,1,2):
             m=F.Fixture(ram_size=32<<20,cores=2,display_modes=[(33,17,60000)]);m.load_image(wrapped)
             struct.pack_into('<q',m.ram,ref.sym['GLOBAL_WRITERPHASE'],phase);m.write(td)
             output=run([zt/'zenemu.exe',td/'machine.txt','--max','30000000','--ram',td/'final.bin'])
@@ -122,7 +131,12 @@ def main():
             assert report[4]==0x3fc000 and report[8]==arena+4096,report
             assert ram[p0:p0+2244]==struct.pack('<I',0x803380B2)*561
             assert ram[p0+2244:p0+4096]==bytes(4096-2244)
-            if phase:
+            if phase == 2:
+                assert report[23:26]==(2,0,2) and report[27]==1,report
+                assert ram[p1:p1+2112]==bytes(2112)
+                assert ram[p1+2112:p1+2244]==struct.pack('<I',0x803380B2)*33
+                print('PASS a retired last-row-only DMA copy cannot publish a display plane',flush=True)
+            elif phase == 1:
                 assert report[23:29]==(2,1,1,1,1,-2),report
                 assert ram[p1:p1+4096]==bytes(4096)
                 print('PASS real DMA ownership loss: writer retained, stale/abort/present/release refused, shown plane unchanged',flush=True)

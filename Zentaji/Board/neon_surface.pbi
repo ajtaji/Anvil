@@ -122,7 +122,7 @@ Procedure.i ZentajiNeonSurfaceStartCapacities(maxQuads.i,maxVertexQuads.i)
  cfg\width=znsWidth : cfg\height=znsHeight : cfg\maxQuads=maxQuads
  If NeonVkLifecycleConfigureCapacities(@cfg,maxVertexQuads)<>#NEON_OK : ProcedureReturn znsFail(3) : EndIf
  If NeonVkPortCanvas(znsWidth,znsHeight,znsWidth,znsHeight)<>#NEON_OK : ProcedureReturn znsFail(4) : EndIf
- NeonVkChromeFenceProgressBind(@avkBackendFenceProgress())
+ NeonVkChromeFenceProgressBind(@avkZenListIndex)
  If NeonInit()<>#NEON_OK : ProcedureReturn znsFail(5) : EndIf
  znsState=2 : ProcedureReturn 1
 EndProcedure

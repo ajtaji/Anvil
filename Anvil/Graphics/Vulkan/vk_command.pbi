@@ -3742,7 +3742,7 @@ EndProcedure
 ; bounded timeout.
 ; Internal renderers can opt into a stall timeout for a bounded submission.
 ; Public vkWaitForFences callers keep a fixed deadline.
-Procedure.i avkWaitForFences(device.i, count.i, *handles, waitAll.i, timeoutNs.i, progressProbe.i)
+Procedure.i avkWaitForFences(device.i, count.i, *handles, waitAll.i, timeoutNs.i, progressAddress.i)
   Define d.i
   Define s.i
   Define i.i
@@ -3767,8 +3767,8 @@ Procedure.i avkWaitForFences(device.i, count.i, *handles, waitAll.i, timeoutNs.i
     timeoutUs = (timeoutNs + (#ANVIL_VK_NS_PER_US - 1)) / #ANVIL_VK_NS_PER_US
   EndIf
   t0 = avkBackendTicksUs()
-  If timeoutNs <= 0 : progressProbe = 0 : EndIf
-  If progressProbe <> 0 : progress = CallFunctionFast(progressProbe) : EndIf
+  If timeoutNs <= 0 : progressAddress = 0 : EndIf
+  If progressAddress <> 0 : progress = PeekI(progressAddress) : EndIf
   polls = 0
   While 1
     ; Count the fences that are signalled now, AFTER giving the device a
@@ -3795,8 +3795,8 @@ Procedure.i avkWaitForFences(device.i, count.i, *handles, waitAll.i, timeoutNs.i
     If polls >= #ANVIL_VK_WAIT_MAX_POLLS
       ProcedureReturn avkFault(#VK_TIMEOUT, "vkWaitForFences gave up after its bounded poll count without the fence being signalled (VkResult 2, VK_TIMEOUT); the wait is bounded twice so a backend whose clock never advances cannot hang the caller. Check that the device is still answering before waiting again.")
     EndIf
-    If progressProbe <> 0
-      completed = CallFunctionFast(progressProbe)
+    If progressAddress <> 0
+      completed = PeekI(progressAddress)
       If completed > progress
         progress = completed
         t0 = avkBackendTicksUs()

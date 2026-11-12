@@ -16,11 +16,12 @@ XIncludeFile "Zentaji/Board/dma_transfer.pbi"
 Global dma.ZentajiDmaTransfer,other.ZentajiDmaTransfer
 Global Dim report.q[32]
 Procedure.i Main(phase.i)
- Protected n.i,src.i=$200000,dst.i=$400000,scratch.i=$120000,old.i,rc.i
+ Protected n.i,src.i=$200000,dst.i=$400000,scratch.i=$120000,old.i,rc.i,capacity.i=4096
  PokeQ(#ZEN_IDLE_INTC+$120,3) : PokeQ(#ZEN_IDLE_INTC+$F008,2)
  If ZentajiPromptIdlePrepare(1000)<>1 : ProcedureReturn 1 : EndIf
  If phase=5 : PokeQ(#ZEN_DMA_CHANNEL+$10,73) : EndIf
- report[0]=ZentajiDmaBind(@dma,scratch,4096)
+ If phase=9 : capacity=2048 : EndIf
+ report[0]=ZentajiDmaBind(@dma,scratch,capacity)
  If phase=5
   report[1]=dma\error : report[2]=PeekQ(#ZEN_DMA_CHANNEL+$10)
   ProcedureReturn 42
@@ -67,12 +68,24 @@ Procedure.i Main(phase.i)
   report[9]=ZentajiDmaRows(@dma,$A1B2C3D4,0,dst+4096,36,28,100,1,250000)
  ElseIf phase=8
   report[8]=ZentajiDmaRows(@dma,src,36,src+17,36,17,100,0,250000)
+ ElseIf phase=9
+  report[8]=ZentajiDmaRows(@dma,src,2048,dst,2048,2048,512,0,250000)
+ ElseIf phase=10
+  report[8]=ZentajiDmaRows(@dma,$A1B2C3D4,0,dst,28,28,100,1,250000)
+ ElseIf phase=11
+  report[8]=ZentajiDmaRows(@dma,src+1,17,dst+3,17,17,100,0,250000)
+ ElseIf phase=12
+  report[8]=ZentajiDmaRows(@dma,src+4,28,dst+4,28,28,100,0,250000)
+ ElseIf phase=13
+  report[8]=ZentajiDmaRows(@dma,src+2,18,dst+2,18,18,100,0,250000)
  EndIf
  report[12]=dma\state : report[13]=dma\lost : report[14]=dma\error
  report[15]=dma\launches : report[16]=dma\sleeps : report[17]=dma\status
  report[18]=ZentajiDmaOwned(@dma)
  report[19]=PeekQ(#ZEN_DMA_CHANNEL+$30)
  report[20]=PeekQ(#ZEN_DMA_BASE+$10) : report[21]=PeekQ(#ZEN_DMA_BASE+$18)
+ report[28]=dma\mode : report[29]=dma\count
+ report[30]=dma\copyBase : report[31]=dma\copyBytes
  ProcedureReturn 42
 EndProcedure
 '''
@@ -101,7 +114,9 @@ def main():
     names = ['pitched-100-rows', 'fill-100-rows', 'timeout-late-completion',
              'later-descriptor-device-fault', 'foreign-idle-registers',
              'foreign-initial-registers', 'wrong-context', 'copy-then-fill-reuse',
-             'disjoint-rows-shared-allocation']
+             'disjoint-rows-shared-allocation', 'packed-atlas-copy',
+             'packed-fill', 'packed-unaligned-copy', 'packed-four-byte-copy',
+             'packed-two-byte-copy']
     with tempfile.TemporaryDirectory(prefix='zentaji-dma-') as tmp:
         td = a.keep.resolve() if a.keep else Path(tmp)
         td.mkdir(parents=True, exist_ok=True)
@@ -145,6 +160,24 @@ def main():
                 offset = 4096 if phase == 7 else 0
                 for row in range(100):
                     expected[offset+row*36:offset+row*36+28] = struct.pack('<I', 0xa1b2c3d4)*7
+            if phase >= 9:
+                mode, count, src_offset, dst_offset = {
+                    9: (0x300, 1 << 20, 0, 0),
+                    10: (0x201, 2800, 0, 0),
+                    11: (0, 1700, 1, 3),
+                    12: (0x200, 2800, 4, 4),
+                    13: (0x100, 1800, 2, 2),
+                }[phase]
+                payload = (struct.pack('<I', 0xa1b2c3d4) * (count // 4) if phase == 10
+                           else source_now[src_offset:src_offset+count])
+                expected[dst_offset:dst_offset+count] = payload
+                assert report[8] == 1 and report[12:15] == (1, 0, 0), (name, report)
+                assert report[15] == 1 and report[18:20] == (1, 0), (name, report)
+                assert report[28:30] == (mode, count), (name, report)
+                if phase == 10:
+                    assert report[31] == 0, (name, report)
+                else:
+                    assert report[30:32] == (0x400000+dst_offset, count), (name, report)
             if phase in (2, 3):
                 expected[:1 << 20] = source_now[:1 << 20]
                 assert report[8] == 1 and report[9] == -1, (name, report)

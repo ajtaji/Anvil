@@ -106,7 +106,7 @@ Procedure.i ZentajiGraphicsDisplayWriteRetire(token.q,*queue.ZentajiGraphicsQueu
  If token<1 Or token<>zgdWriteToken Or zgdWriter<>2 Or ZentajiGraphicsDisplayOwned()=0 : ProcedureReturn 0 : EndIf
  If *dma=0 Or *queue=0 : ProcedureReturn 0 : EndIf
  If *dma\state<>1 Or *dma\lost<>0 Or *dma\error<>0 Or *dma\launches<=zgdWriteLaunches Or ZentajiDmaOwned(*dma)=0 : ProcedureReturn 0 : EndIf
- If *dma\destination<>zgdBase+zgdWriteIndex*zgdSpan+zgdPitch*zgdHeight Or *dma\count<>zgdPitch Or *dma\mode<>0 : ProcedureReturn 0 : EndIf
+ If *dma\copyBase<>zgdBase+zgdWriteIndex*zgdSpan Or *dma\copyBytes<>zgdPitch*zgdHeight : ProcedureReturn 0 : EndIf
  If *queue\state<>1 Or *queue\error<>0 Or *queue\sequence<1 Or ZentajiGraphicsOwned(*queue)=0 : ProcedureReturn 0 : EndIf
  If PeekQ(*queue\fence)<>*queue\sequence : ProcedureReturn 0 : EndIf
  zgdWriter=3 : ProcedureReturn 1
