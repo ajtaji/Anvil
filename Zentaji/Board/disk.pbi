@@ -166,7 +166,7 @@ Procedure.i ZentajiDiskPoll()
  ProcedureReturn 1
 EndProcedure
 
-Procedure.i ZentajiDiskCommand(op.i,lba.i)
+Procedure.i zDiskCommandFlags(op.i,lba.i,flags.i)
  Protected at.i,n.i,start.q
  If zenDisk\state<>1 Or zenDisk\pending<>0 : ProcedureReturn ZentajiDiskFail(#ZEN_DISK_E_STATE) : EndIf
  If ZenCpuStatus()<>0 Or HwPromptIdleReady()=0 : ProcedureReturn ZentajiDiskFail(#ZEN_DISK_E_CONTEXT) : EndIf
@@ -177,7 +177,7 @@ Procedure.i ZentajiDiskCommand(op.i,lba.i)
  If zenDisk\tag=0 : zenDisk\tag=1 : EndIf
  at=zenDisk\sq+zenDisk\tail*32
  PokeQ(at,0) : PokeA(at,op)
- If op=2 : PokeA(at+1,1) : EndIf
+ PokeA(at+1,flags)
  If op<>3 : PokeL(at+4,1) : EndIf
  PokeQ(at+8,lba) : PokeQ(at+16,zenDisk\bounce) : PokeQ(at+24,zenDisk\tag)
  zenDisk\tail=(zenDisk\tail+1)&1 : zenDisk\pending=1
@@ -192,6 +192,10 @@ Procedure.i ZentajiDiskCommand(op.i,lba.i)
  ; The device has no cancel command. Keep the private DMA storage pinned.
  zenDisk\state=2
  ProcedureReturn ZentajiDiskFail(#ZEN_DISK_E_TIMEOUT)
+EndProcedure
+
+Procedure.i ZentajiDiskCommand(op.i,lba.i)
+ ProcedureReturn zDiskCommandFlags(op,lba,Bool(op=2))
 EndProcedure
 
 Procedure.i ZentajiDiskClose()
@@ -220,7 +224,7 @@ Procedure.i ZentajiDiskBuffer(address.i,bytes.i)
  ProcedureReturn 1
 EndProcedure
 
-Procedure.i ZentajiDiskRange(lba.i,count.i,buffer.i,write.i)
+Procedure.i zDiskRangeMode(lba.i,count.i,buffer.i,write.i,flags.i)
  Protected offset.i,n.i,i.i,block.i,bytes.i
  If zenDisk\state<>1 Or zenDisk\pending<>0 : ProcedureReturn ZentajiDiskFail(#ZEN_DISK_E_STATE) : EndIf
  If ZenCpuStatus()<>0 Or ZenCpuCoreId()<>zenDisk\owner Or HwPromptIdleReady()=0 : ProcedureReturn ZentajiDiskFail(#ZEN_DISK_E_CONTEXT) : EndIf
@@ -241,7 +245,7 @@ Procedure.i ZentajiDiskRange(lba.i,count.i,buffer.i,write.i)
    If write : PokeA(zenDisk\bounce+offset+i,PeekA(buffer+i)) : Else : PokeA(buffer+i,PeekA(zenDisk\bounce+offset+i)) : EndIf
   Next
   If write
-   If ZentajiDiskCommand(2,block)=0 : ProcedureReturn 0 : EndIf
+   If zDiskCommandFlags(2,block,flags)=0 : ProcedureReturn 0 : EndIf
   EndIf
   lba=lba+n : count=count-n : buffer=buffer+n*512
  Wend
@@ -249,10 +253,19 @@ Procedure.i ZentajiDiskRange(lba.i,count.i,buffer.i,write.i)
  ProcedureReturn 1
 EndProcedure
 
+Procedure.i ZentajiDiskRange(lba.i,count.i,buffer.i,write.i)
+ ProcedureReturn zDiskRangeMode(lba,count,buffer,write,Bool(write<>0))
+EndProcedure
+
 Procedure.i ZentajiDiskRead(lba.i,count.i,*buffer)
  ProcedureReturn ZentajiDiskRange(lba,count,*buffer,0)
 EndProcedure
 Procedure.i ZentajiDiskWrite(lba.i,count.i,*buffer)
  ProcedureReturn ZentajiDiskRange(lba,count,*buffer,1)
+EndProcedure
+; For a transaction that owns explicit barriers. Ordinary filesystem writes
+; keep FUA. A buffered completion is visible to reads and needs a flush for durability.
+Procedure.i ZentajiDiskWriteBuffered(lba.i,count.i,*buffer)
+ ProcedureReturn zDiskRangeMode(lba,count,*buffer,1,0)
 EndProcedure
 Procedure.i ZentajiDiskFlush() : ProcedureReturn ZentajiDiskCommand(3,0) : EndProcedure

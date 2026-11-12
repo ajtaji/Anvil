@@ -690,6 +690,43 @@ ROM must load Anvil, and Anvil must then reach the shared prompt and load
 applications. The built-in Forge must ultimately target Zentaji itself only.
 
 
+## Shared storage journal
+
+The shared redo journal in Anvil/Storage/journal.pbi stages up to 16 complete
+4 KiB home blocks. The format reserves two marker blocks followed by 16
+payload blocks. All addresses in the API are 512-byte sector numbers aligned
+to eight sectors. The caller supplies the volume bounds, reserved journal
+address and range reader, writer and flusher.
+
+Each marker starts with the eight-byte PMFJNL1 magic and NUL, a 32-bit entry
+count and a zero 32-bit field. Entries start at byte 16. Each has a 64-bit home
+sector number, a 32-bit CRC-32 of its payload and a zero 32-bit field. The
+marker ends with a CRC-32 of its first 4092 bytes. The integer fields are
+little-endian. A blank marker is all zeroes.
+
+Commit flushes the payload before publishing the two identical markers in
+separate write-and-flush steps. Home blocks become durable before either
+marker is cleared. Recovery validates all addresses and payload checksums
+before replaying. If neither marker is valid, an interrupted marker write
+beside a blank copy can be discarded. Conflicting records and damaged
+payloads refuse recovery without modifying the medium.
+
+The backend must preserve completed flushes through restart and confine
+partial writes to the addressed range. Zentaji's transaction writer uses
+ZentajiDiskWriteBuffered and explicit flushes. FAT32 and exFAT writes retain
+FUA. Read-only mounts can open a clean journal and require a writable medium
+if replay is pending.
+
+Run the native persistent-image checks with the existing Zentaji tools.
+
+```text
+python tools/zentaji_journal_check.py --compiler <Forge executable> --zen-tools <tools/zentaji directory>
+```
+
+The check restarts the emulator at commit and replay boundaries and injects
+torn block fixtures. Physical media power-cut behavior and the filesystem's
+volume, directory, extent and allocation layers remain open.
+
 ## Block storage and shared FAT32
 
 `Zentaji/Board/disk.pbi` supplies the existing filesystem range callbacks over
@@ -732,7 +769,7 @@ MCHECK on the latched queue producer core; partial host writes may have occurred
 Use exclusive ownership of the image. Explicit `disk-memory` bindings isolate
 writes for debugger snapshots/history. Recordings preserve initial disk bytes
 in separate sidecars and persistence outcomes; replay never writes source images.
-Linux execution and physical power-loss behavior remain unverified. The ROM now resets its empty owned queues after both boot READs
+Physical media power-loss behavior remains unverified. The ROM now resets its empty owned queues after both boot READs
 complete, then disables and clears their descriptors before entry. The driver can
 therefore acquire that same boot disk without treating disable as cancellation.
 
