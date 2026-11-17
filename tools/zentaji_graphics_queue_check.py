@@ -13,7 +13,7 @@ SOURCE=r'''XIncludeFile "Zentaji/Board/prompt_idle.pbi"
 XIncludeFile "Zentaji/Board/graphics_queue.pbi"
 Global queue.ZentajiGraphicsQueue,other.ZentajiGraphicsQueue
 Global Dim command.q[8]
-Global Dim report.q[32]
+Global Dim report.q[48]
 Procedure Blank()
  Protected n.i
  For n=0 To 7 : command[n]=0 : Next
@@ -26,9 +26,10 @@ Procedure DrainTime()
  For n=1 To 3 : HwPromptIdleWait() : Next
 EndProcedure
 Procedure.i Main(phase.i)
- Protected kind.i=15,base.i=#ZEN_GFX_3D,w.i=16,h.i=16,pitch.i=80,n.i,old.i,result.i
- If phase=1 : kind=14 : base=#ZEN_GFX_BLIT : EndIf
+ Protected kind.i=15,base.i=#ZEN_GFX_3D,w.i=16,h.i=16,pitch.i=80,n.i,old.i,result.i,config.i,mask.i,start.i,waited.i
+ If phase=1 Or phase=15 : kind=14 : base=#ZEN_GFX_BLIT : EndIf
  If phase=3 Or phase=4 Or phase=5 : w=512 : h=2048 : pitch=2048 : EndIf
+ If phase>=11 : w=256 : h=256 : pitch=1024 : EndIf
  PokeQ(#ZEN_IDLE_INTC+$120,3) : PokeQ(#ZEN_IDLE_INTC+$F008,2)
  If ZentajiPromptIdlePrepare(1000)<>1 : ProcedureReturn 1 : EndIf
  report[0]=ZentajiGraphicsBind(@queue,kind,$120000,$1000,$120000,512,$120008)
@@ -60,6 +61,7 @@ Procedure.i Main(phase.i)
   If kind=14
    command[0]=4 : PokeL(@command[0]+8,1) : PokeL(@command[0]+12,2)
    PokeL(@command[0]+16,7) : PokeL(@command[0]+20,5) : PokeL(@command[0]+24,$FF123456)
+   If phase=15 : PokeL(@command[0]+8,0) : PokeL(@command[0]+12,0) : PokeL(@command[0]+16,w) : PokeL(@command[0]+20,h) : EndIf
   Else
    command[0]=$105 : PokeL(@command[0]+8,$FF123456)
    If phase=2 Or phase=6 : PokeL(@command[0]+8,0) : EndIf
@@ -78,6 +80,26 @@ Procedure.i Main(phase.i)
  If ZentajiGraphicsSubmit(@queue)<>1 : ProcedureReturn 12 : EndIf
  ; The driver already copied every staging record; destroy the caller's copy.
  For n=0 To 7 : command[n]=$DEADBEEF : Next
+ If phase>=11
+  config=#ZEN_IDLE_INTC+$260 : mask=1<<11
+  If kind=15 : config=#ZEN_IDLE_INTC+$280 : mask=1<<12 : EndIf
+  If phase=12 : PokeQ(config,5) : PokeQ(config+8,2) : EndIf
+  If phase=13 : DrainTime() : EndIf
+  If phase=14 : old=ZenCpuSwapStatus(1) : EndIf
+  If phase=16 : PokeQ(#ZEN_IDLE_INTC+$F008,2|mask) : EndIf
+  If phase=17 : If ZentajiPromptIdleRelease()<>1 : ProcedureReturn 14 : EndIf : EndIf
+  report[32]=PeekQ(base+8)&1
+  waited=PeekQ($FFFF000000070158) : start=HwMicros()
+  ZentajiGraphicsIdleWait(@queue)
+  report[33]=HwMicros()-start : report[34]=PeekQ($FFFF000000070158)-waited
+  report[35]=PeekQ(base+8)&1 : report[36]=PeekQ(base+$20)
+  report[37]=PeekQ(config) : report[38]=PeekQ(config+8)
+  report[39]=PeekQ(#ZEN_IDLE_INTC+$F008) : report[40]=ZenCpuStatus()
+  report[41]=PeekQ(#ZEN_IDLE_TIMER+$10) : report[42]=PeekQ(#ZEN_IDLE_TIMER+$18)
+  report[43]=PeekQ(#ZEN_IDLE_TIMER)
+  If phase=14 : ZenCpuSwapStatus(old) : EndIf
+  If phase=17 : If ZentajiPromptIdlePrepare(1000)<>1 : ProcedureReturn 15 : EndIf : EndIf
+ EndIf
  If phase=3
   report[8]=ZentajiGraphicsWait(@queue,1) : report[9]=queue\error : report[10]=queue\state
   report[11]=ZentajiGraphicsBegin(@queue) : report[12]=ZentajiGraphicsRelease(@queue)
@@ -123,7 +145,7 @@ def shaders(A):
 def main():
     ap=argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--compiler');ap.add_argument('--zen-tools',type=Path,required=True)
-    ap.add_argument('--case',type=int,choices=range(11))
+    ap.add_argument('--case',type=int,choices=range(18),action='append')
     args=ap.parse_args();cc=resolve_compiler(args.compiler)
     sys.path.insert(0,str(args.zen_tools.resolve()))
     import zen_native_fixture as F
@@ -133,7 +155,8 @@ def main():
         p=subprocess.run([str(a) for a in argv],cwd=ROOT,env=dict(os.environ,PMF_ROOT=str(ROOT)),capture_output=True,text=True,encoding='utf-8',errors='replace',timeout=120)
         assert p.returncode==0,(p.returncode,p.stdout[-6000:],p.stderr)
         return p.stdout
-    names=['3d-clear','blitter-fill','3d-shader-draw','late-retirement','confirmed-abort','foreign-configuration','shader-fault','bounded-capacity','device-range-error','missing-fence','wrong-context']
+    names=['3d-clear','blitter-fill','3d-shader-draw','late-retirement','confirmed-abort','foreign-configuration','shader-fault','bounded-capacity','device-range-error','missing-fence','wrong-context',
+           'completion-wake','occupied-line-wait','already-completed-wait','wrong-context-wait','blitter-completion-wake','enabled-line-wait','unowned-timer-wait']
     with tempfile.TemporaryDirectory(prefix='zentaji-graphics-queue-') as tmp:
         td=Path(tmp);src=td/'probe.zentaji';image=td/'probe.zex'
         src.write_bytes(SOURCE.replace('\n','\r\n').encode('utf-8'))
@@ -141,7 +164,7 @@ def main():
         ref=A.Asm();org,body=ref.assemble(Path(str(image)+'.asm').read_text(encoding='utf-8-sig'))
         assert image.read_bytes()==zexpack.header(org,org,body)+body
         for phase,name in enumerate(names):
-            if args.case is not None and args.case!=phase:continue
+            if args.case is not None and phase not in args.case:continue
             m=F.Fixture(ram_size=8<<20,cores=2);m.load_image(image.read_bytes());c=m.cores[0]
             c.r[1]=phase;c.r[255]=0x7F0000
             for r in range(128,253):c.r[r]=0x10000+r*13
@@ -150,6 +173,7 @@ def main():
             vertices=struct.pack('<12f',-1,-1,.5,1,1,-1,.5,1,-1,1,.5,1)
             m.ram[0x101000:0x101000+len(vertices)]=vertices
             width,height,pitch=(512,2048,2048) if phase in (3,4,5) else (16,16,80)
+            if phase>=11:width,height,pitch=256,256,1024
             begin=0x200000;end=begin+pitch*height
             m.ram[begin-16:end+16]=b'\xA5'*(pitch*height+32)
             m.ram[0x11FFF0:0x121010]=b'\xA6'*0x1020
@@ -157,7 +181,7 @@ def main():
             native=run([F.EXE,td/'machine.txt','--max','2000000','--ram',td/'final.bin','--dump'])
             result=F.parse_result(native,(td/'final.bin').read_bytes())
             ram=result.ram;registers=result.registers[0]
-            report=struct.unpack_from('<32q',ram,ref.sym['GLOBAL_REPORT'])
+            report=struct.unpack_from('<48q',ram,ref.sym['GLOBAL_REPORT'])
             assert result.states==[3,0] and result.exit_code==42,(name,result.states,result.exit_code,report)
             assert registers[128:253]==kept and registers[255]==0x7F0000,name
             assert report[:8]==(0,)*8,(name,report)
@@ -177,6 +201,17 @@ def main():
             if phase==3:assert report[8:13]==(0,7,3,0,0),(name,report)
             if phase==7:assert report[22:24]==(0,6),(name,report)
             if phase==10:assert report[20:22]==(0,3),(name,report)
+            if phase>=11:
+                assert report[36]==0 and report[41:44]==(0,0,0),(name,'device/timer state was not restored',report)
+                assert report[37:41]==(5 if phase==12 else 0,2 if phase==12 else 0,
+                                      2|(1<<12) if phase==16 else 2,1 if phase==14 else 0),(name,'interrupt ownership changed',report)
+                if phase in (11,15):
+                    assert report[32]==1 and report[35]==0 and 0<report[33]<1000 and report[34]>0,(name,'completion did not wake before timer',report)
+                elif phase in (12,16):
+                    assert report[32]==1 and report[33]>=1000 and report[34]>0,(name,'occupied line did not use bounded timer',report)
+                else:
+                    assert report[34]==0,(name,'invalid/already-completed wait slept',report)
+                    if phase==13:assert report[32]==0,(name,report)
             expected=bytearray(b'\xA5'*(pitch*height))
             if phase not in (4,7,8):
                 for y in range(height):

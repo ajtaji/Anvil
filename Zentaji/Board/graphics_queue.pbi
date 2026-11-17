@@ -158,6 +158,30 @@ Procedure.i ZentajiGraphicsPoll(*q.ZentajiGraphicsQueue)
  ProcedureReturn 1
 EndProcedure
 
+; Borrow an otherwise unused completion line only for this bounded wait.
+; Delivery stays masked; WFI wakes on an enabled pending interrupt even with
+; IE=0. The latched DONE/ERROR reason closes the check-to-sleep race. Restore
+; all borrowed configuration before GraphicsOwned/GraphicsPoll inspect it.
+Procedure ZentajiGraphicsIdleWait(*q.ZentajiGraphicsQueue)
+ Protected line.i,config.i,enabled.q,mask.q,priority.i
+ If *q\state<>3 Or ZentajiGraphicsOwned(*q)=0 Or HwPromptIdleReady()=0 : ProcedureReturn : EndIf
+ If (PeekQ(*q\base+8)&1)=0 : ProcedureReturn : EndIf
+ line=11 : If *q\kind=15 : line=12 : EndIf
+ config=#ZEN_IDLE_INTC+$100+line*32 : mask=1<<line
+ enabled=PeekQ(#ZEN_IDLE_INTC+$F008)
+ priority=PeekQ(#ZEN_IDLE_INTC+$F010)+1
+ If PeekQ(config)<>0 Or PeekQ(config+8)<>0 Or (enabled&mask)<>0 Or priority>15
+  HwPromptIdleWait() : ProcedureReturn
+ EndIf
+ PokeQ(config,priority) : PokeQ(config+8,1<<*q\owner)
+ PokeQ(#ZEN_IDLE_INTC+$F008,enabled|mask) : PokeQ(*q\base+$20,3)
+ ; Completion can precede the enable or occur while the timer is armed.
+ ; Never acknowledge its reason here: retirement still checks the fence.
+ If (PeekQ(*q\base+8)&1)<>0 : HwPromptIdleWait() : EndIf
+ PokeQ(*q\base+$20,0) : PokeQ(#ZEN_IDLE_INTC+$F008,enabled)
+ PokeQ(config+8,0) : PokeQ(config,0)
+EndProcedure
+
 Procedure.i ZentajiGraphicsWait(*q.ZentajiGraphicsQueue,microseconds.i)
  Protected start.q,now.q,result.i,n.i
  If *q\state<>3 : ProcedureReturn ZentajiGraphicsFail(*q,#ZEN_GFX_E_STATE) : EndIf
@@ -172,7 +196,7 @@ Procedure.i ZentajiGraphicsWait(*q.ZentajiGraphicsQueue,microseconds.i)
   If now<start : ProcedureReturn ZentajiGraphicsFail(*q,#ZEN_GFX_E_CLOCK) : EndIf
   If now-start>=microseconds : ProcedureReturn ZentajiGraphicsFail(*q,#ZEN_GFX_E_TIMEOUT) : EndIf
   If HwPromptIdleReady()=0 : ProcedureReturn ZentajiGraphicsFail(*q,#ZEN_GFX_E_CONTEXT) : EndIf
-  HwPromptIdleWait()
+  ZentajiGraphicsIdleWait(*q)
  Next
  ProcedureReturn ZentajiGraphicsFail(*q,#ZEN_GFX_E_TIMEOUT)
 EndProcedure

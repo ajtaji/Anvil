@@ -117,6 +117,20 @@ qualified through actual ROM disk/host-file boot, storage, text and keyboard pat
 
 ## Native graphics bring-up
 
+The graphics queue waiter uses the device's completion/error interrupt to wake
+WFI promptly when its interrupt line is free. It borrows the line only during
+the wait, keeps interrupt delivery masked, and restores device enable, core
+enable, routing and priority before checking retirement. The existing prompt
+timer still bounds the wait. A line already owned by other code keeps its
+configuration and uses the bounded timer path. Completion reasons remain
+latched until the queue validates the fence and retires the command.
+
+`tools/zentaji_graphics_queue_check.py` covers eighteen native queue cases,
+including early completion, completed work, occupied or enabled interrupt lines,
+invalid CPU context, missing timer ownership, timeout, abort, fault and foreign
+queue quarantine. Its completion cases require an actual WFI wake before the
+timer deadline and verify exact restoration of borrowed interrupt state.
+
 The graphics components now reserve an immutable, page-aligned arena below the
 text reservation and supervisor stack. The memory HAL removes it, including
 alignment padding, from payload/staging admission while retaining a 4KB staging

@@ -283,7 +283,7 @@ Procedure.i avkZenPollOne()
  If avkZenPending=0 : ProcedureReturn 1 : EndIf
  result=ZentajiGraphicsPoll(@avkZenQueue)
  If result=0 And HwPromptIdleReady()<>0
-  HwPromptIdleWait()
+  ZentajiGraphicsIdleWait(@avkZenQueue)
   result=ZentajiGraphicsPoll(@avkZenQueue)
  EndIf
  If result<0
