@@ -218,6 +218,7 @@ EndProcedure
 def main():
     ap=argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--compiler');ap.add_argument('--zen-tools',type=Path,required=True)
+    ap.add_argument('--correctness-only',action='store_true',help='run native state/output cases; explicitly defer live CPU-usage measurement')
     a=ap.parse_args();cc=resolve_compiler(a.compiler);zt=a.zen_tools.resolve()
     sys.path.insert(0,str(zt))
     import zentaji_native as I
@@ -263,6 +264,9 @@ def main():
             match(m,native,scenario)
             assert c.r[128:253]==kept and c.v[32:]==vectors and c.r[255]==0xF0000
         print('PASS 25 actual console/input/editor/message-routing native state/RAM/output cases, including shared screen/aux byte/style fan-out, diversion exclusion, drop-newest overflow, refused-write exclusion, reset and lossless UART-to-model draining')
+        if a.correctness_only:
+            print('NOT RUN live console CPU-usage measurement (--correctness-only)')
+            return
         results=[]
         for scenario in (20,21):
             m=machine(scenario);assert not L.capture(m,str(td));rec=td/('recorded%d.txt'%scenario)

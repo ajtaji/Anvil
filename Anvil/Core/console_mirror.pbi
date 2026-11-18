@@ -286,3 +286,11 @@ Procedure uart_AuxPut(c.i)
     EndIf
   EndIf
 EndProcedure
+
+; Transport adapters call this once after accepting a byte. Message diversion
+; and refused writes belong before this call. The shared owner decides which
+; taps are enabled and retains the existing style, overflow and drain policy.
+Procedure ConsoleMirrorWrite(c.i)
+  If uart_mirrorOn <> 0 : uart_MirrorPut(c) : EndIf
+  If uart_auxOn <> 0 : uart_AuxPut(c) : EndIf
+EndProcedure

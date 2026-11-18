@@ -1412,6 +1412,35 @@
 ;    backends use it to choose the same atlas glyphs as native Neon.
 ;                 NeonBitmapFontBold(font)   1 for bold, 0 otherwise.
 ;
+;    The shared terminal grid asks its selected renderer for proportional
+;    positioning. The renderer uses the same face and pair spacing as drawing.
+;                 ScreenProportionalAdvance(previous,current)
+;                                        signed 16.16 pixel advance for current,
+;                                        including its pair adjustment after
+;                                        previous. Invalid previous means no
+;                                        pair; unsupported current returns 0.
+;
+;    The resident Neon service owns contexts, font epochs and target scopes.
+;    A board composition supplies only its checked display/Chrome adapter:
+;                 AvsSurfaceFlags()      supported NEON_SERVICE_* capability
+;                                        bits, not requested capabilities.
+;                 AvsSurfaceStart()      0 on success, negative service error
+;                                        on refusal; success publishes
+;                                        avsLogicalW/H in logical pixels.
+;                 AvsSurfacePresent()    0 on success, negative service error
+;                                        on refusal. Publishes optional
+;                                        avsCopyDma/Clean/PublishTicks.
+;                 AvsSurfacePresentError()
+;                                        board presentation failure code.
+;                 AvsSurfaceRetireReady()
+;                                        1 when target/device retirement may
+;                                        proceed, 0 to retain owned storage.
+;                 AvsSurfaceStop()       1 after checked Chrome retirement or
+;                                        reset, 0 on refusal. Shared close
+;                                        retires targets first, calls Stop,
+;                                        then releases font bytes. Failure
+;                                        preserves context/resource tokens.
+;
 ;    HwCon*    (#CAP_CONSOLE)  A PIXEL SURFACE ANVIL CAN HAND TO A
 ;              PAYLOAD. Not the monitor's own console - that is a terminal
 ;              grid and belongs to Anvil. This is the raw surface an

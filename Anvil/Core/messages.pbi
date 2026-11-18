@@ -75,6 +75,12 @@ Procedure.i msg_Secs()
   ProcedureReturn (now - gBootTicks) / hz
 EndProcedure
 
+; Public uptime reader for status displays; the message clock owns the epoch
+; and the invalid-frequency/backward-clock handling.
+Procedure.i MessagesUptimeSeconds()
+  ProcedureReturn msg_Secs()
+EndProcedure
+
 Procedure msg_AbsentLineHook(*text,length.i,number.i)
 EndProcedure
 Procedure msg_NotifyLine(*text,length.i,number.i)

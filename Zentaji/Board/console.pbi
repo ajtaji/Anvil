@@ -71,8 +71,7 @@ Procedure UartWrite(c.i)
   Else
     ; The shared model and auxiliary tap see accepted bytes exactly once.
     ; A diverted message or refused transport write never enters either ring.
-    If uart_mirrorOn<>0 : uart_MirrorPut(c) : EndIf
-    If uart_auxOn<>0 : uart_AuxPut(c) : EndIf
+    ConsoleMirrorWrite(c)
   EndIf
 EndProcedure
 

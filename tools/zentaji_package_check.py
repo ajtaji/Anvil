@@ -138,6 +138,8 @@ def check(archive, keep, signer, powershell):
                 assert expected in reply, (command, reply)
                 if command.startswith("echo "):
                     assert expected in reply.splitlines(), (command, reply)
+                if command in ("uptime", "up"):
+                    assert re.search(r"^uptime [0-9]+ boots \?\r?$", reply, re.M), (command, reply)
                 assert "!!" not in reply, (command, reply)
                 print(label + ": " + command + " PASS", flush=True)
             client.socket.sendall(b"halt\r")
@@ -157,7 +159,9 @@ def check(archive, keep, signer, powershell):
                                     halted=True))
 
     source = b"Procedure.q Main()\nProcedureReturn 42\nEndProcedure\n"
-    boot("first", [("forge print 2+2", "Forge result 4"),
+    boot("first", [("uptime", "boots ?"),
+                   ("up", "boots ?"),
+                   ("forge print 2+2", "Forge result 4"),
                    ("forge new", "pmf> "),
                    ("forge add Procedure.q Main()", "pmf> "),
                    ("forge add ProcedureReturn 42", "pmf> "),
