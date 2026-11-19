@@ -151,13 +151,11 @@ Procedure EthWhyNet()
   PrintNl()
 EndProcedure
 
-CompilerIf Not Defined(ANVIL_NET_NO_LEGACY_DIAGNOSTICS, #PB_Constant)
 Procedure EthWhyTftp()
   Print("   The transfer said: ")
   UartWriteStr(TftpErrorText())
   PrintNl()
 EndProcedure
-CompilerEndIf
 
 ; ----------------------------------------------------------------------
 ;  EthMacFetch - this board's own hardware address, from the firmware.

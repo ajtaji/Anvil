@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Compile/execute the TFTP transfer's route-and-preconditions gate.
 
-The gate extracts NetXferServer from Anvil/Core/netcfg.pbi and the transfer
-session block ending in EthStart from Anvil/Core/net_cmd.pbi, compiles those
+The gate extracts NetXferServer from Anvil/Core/net_tftp_server.pbi and the transfer
+session block ending in EthStart from Anvil/Core/net_tftp_cmd.pbi, compiles those
 exact procedures against explicit settings/route/hardware seams, and executes
 the emitted A64 through the shared interpreter.
 
@@ -35,8 +35,8 @@ from pmf_compiler import resolve_compiler
 
 
 ROOT = Path(__file__).resolve().parents[1]
-NETCFG = ROOT / "Anvil" / "Core" / "netcfg.pbi"
-NET_CMD = ROOT / "Anvil" / "Core" / "net_cmd.pbi"
+NETCFG = ROOT / "Anvil" / "Core" / "net_tftp_server.pbi"
+NET_CMD = ROOT / "Anvil" / "Core" / "net_tftp_cmd.pbi"
 FIXTURE = ROOT / "RaspberryPi4" / "Tests" / "net_xfer_route_emitted_gate.pi4"
 
 SERVER_MARKER = "; @@PRODUCTION_NET_XFER_SERVER@@"

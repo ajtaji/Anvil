@@ -114,7 +114,56 @@ def check_automation(client, transcript, container):
     return dict(payload_readback_bytes=len(container), multiblock_bytes=count)
 
 
-def check(archive, keep, signer, powershell, automation=False):
+def check_file_transfer(client, transcript, keep):
+    """Run against an independent TFTP server (pip install tftpy==0.8.7)."""
+    from concurrent.futures import ThreadPoolExecutor
+    import tftpy
+    from anvil_readback import parse_readback
+
+    def command(line):
+        reply = client.command(line).decode("ascii")
+        transcript.append(reply)
+        return reply
+
+    root = keep / "tftp-root"
+    root.mkdir()
+    # Two full blocks require a third, empty DATA packet to finish each direction.
+    payload = bytes((index * 53 + index // 256) & 255 for index in range(1024))
+    (root / "FROMHOST.BIN").write_bytes(payload)
+    (root / "EMPTY.BIN").write_bytes(b"")
+    server = tftpy.TftpServer(str(root))
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        worker = pool.submit(server.listen, "127.0.0.1", 69, 1)
+        try:
+            if not server.is_running.wait(3):
+                worker.result(timeout=1)
+                raise RuntimeError("The loopback TFTP server failed to start")
+            assert "Set net.server to 10.0.2.2" in command("settings set net.server 10.0.2.2")
+            fetched = command("get FROMHOST.BIN")
+            location = re.search(r"Fetched 1024 bytes into memory, filling ([0-9A-F]+)", fetched)
+            assert location, fetched
+            address = int(location[1], 16)
+            assert parse_readback(command(f"readback {address:X} 400"), address, 1024) == payload
+            assert "Saved" in command(f"save ROUND.BIN {address:X} 400")
+            assert "!!" not in command(f"fill.b {address:X} 00 400")
+            assert "Loaded 1024 bytes" in command(f"load ROUND.BIN {address:X}")
+            sent = command(f"put TOHOST.BIN {address:X} 400")
+            assert "Sent 1024 bytes" in sent, sent
+            assert (root / "TOHOST.BIN").read_bytes() == payload
+            for reply in (fetched, sent):
+                tid = re.search(r"The server answered from port (\d+)", reply)
+                assert tid and int(tid[1]) != 69, reply
+            assert "is EMPTY" in command("get EMPTY.BIN")
+            assert "server refused" in command("get MISSING.BIN")
+            assert "TRANSFER-DONE" in command("echo TRANSFER-DONE").splitlines()
+        finally:
+            server.stop(now=True)
+        worker.result(timeout=5)
+    print("PASS host-to-disk-to-host TFTP transfer, exact bytes, empty and missing files", flush=True)
+    return dict(bytes=len(payload), sha256=digest(root / "TOHOST.BIN"))
+
+
+def check(archive, keep, signer, powershell, automation=False, transfers=False):
     archive, keep, signer = (Path(p).resolve() for p in (archive, keep, signer))
     if keep.exists():
         raise ValueError("Choose a new evidence directory; existing disks must be preserved")
@@ -185,6 +234,8 @@ def check(archive, keep, signer, powershell, automation=False):
                     assert re.search(r"^uptime [0-9]+ boots \?\r?$", reply, re.M), (command, reply)
                 assert "!!" not in reply, (command, reply)
                 print(label + ": " + command + " PASS", flush=True)
+            if transfers and label == "first":
+                result["file_transfer"] = check_file_transfer(client, transcript, keep)
             if automation and label == "second":
                 result["automation"] = check_automation(client, transcript, container)
             client.socket.sendall(b"halt\r")
@@ -234,6 +285,10 @@ def check(archive, keep, signer, powershell, automation=False):
     assert disk_hash != digest(folder / "data-seed.img"), "The runtime disk did not change"
     with (folder / "data.img").open("rb") as disk:
         entries = read_entries(disk)
+        if transfers:
+            _, offset, size = entries["ROUND.BIN"]
+            disk.seek(offset)
+            assert disk.read(size) == (keep / "tftp-root" / "FROMHOST.BIN").read_bytes()
         _, offset, size = entries["SAVED.ZEN"]
         disk.seek(offset)
         assert disk.read(size) == source
@@ -276,6 +331,8 @@ def check(archive, keep, signer, powershell, automation=False):
     report = keep / "result.json"
     report.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
     evidence = [report, keep / "guest-built.pmf", keep / "live-screen.png", keep / "live.log"]
+    if transfers:
+        evidence.extend(keep / "tftp-root" / name for name in ("FROMHOST.BIN", "TOHOST.BIN"))
     if automation:
         evidence.append(keep / "guest-screenshot.png")
     for label in ("first", "second"):
@@ -293,8 +350,9 @@ def main():
     parser.add_argument("--sign-script", type=Path, required=True)
     parser.add_argument("--powershell", default="pwsh.exe")
     parser.add_argument("--automation", action="store_true", help="Exercise programs, readback and screenshot over UART")
+    parser.add_argument("--transfers", action="store_true", help="Check host file exchange over loopback TFTP (tftpy==0.8.7 and a free UDP port 69)")
     args = parser.parse_args()
-    print(json.dumps(check(args.archive, args.keep, args.sign_script, args.powershell, args.automation), indent=2))
+    print(json.dumps(check(args.archive, args.keep, args.sign_script, args.powershell, args.automation, args.transfers), indent=2))
 
 
 if __name__ == "__main__":

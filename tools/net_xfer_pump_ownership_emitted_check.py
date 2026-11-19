@@ -5,7 +5,7 @@ The fixture includes the real net/netif/tftp/link stack and has the
 production pumps spliced into it verbatim: NetServiceInput, netcon_PumpOne,
 NetConsolePump and NetConsoleCommandDone from Anvil/Core/netconsole.pbi,
 OutBreakByte/OutBreak from Anvil/Core/rxbreak.pbi, and NetXferSend/
-NetXferPump/NetXferRun from Anvil/Core/net_cmd.pbi. It then drives a whole
+NetXferPump/NetXferRun from Anvil/Core/net_tftp_cmd.pbi. It then drives a whole
 put and a whole get over a modelled interface, with the replies coming back
 to each of the two addresses the cable holds, from an ephemeral server port,
 with a lost acknowledgement, with duplicated acknowledgements, and with
@@ -53,7 +53,7 @@ from pmf_compiler import resolve_compiler
 ROOT = Path(__file__).resolve().parents[1]
 NETCONSOLE = ROOT / "Anvil" / "Core" / "netconsole.pbi"
 RXBREAK = ROOT / "Anvil" / "Core" / "rxbreak.pbi"
-NET_CMD = ROOT / "Anvil" / "Core" / "net_cmd.pbi"
+NET_CMD = ROOT / "Anvil" / "Core" / "net_tftp_cmd.pbi"
 TFTP = ROOT / "RaspberryPi4" / "Lib" / "tftp.pi4"
 FIXTURE = ROOT / "RaspberryPi4" / "Tests" / "net_xfer_pump_ownership_emitted_gate.pi4"
 

@@ -1,9 +1,9 @@
 EnableFloatingPoint
 ; Zentaji serial/storage monitor composition. The ROM loads the owned startup
 ; envelope; Main receives its validated table/source/context, never ARM registers.
-#ANVIL_BUILD = 49 ; pmf:build
+#ANVIL_BUILD = 50 ; pmf:build
 #ANVIL_BUILD_DATE = 20261119 ; pmf:builddate
-#ANVIL_BUILD_TIME = 171839 ; pmf:buildtime
+#ANVIL_BUILD_TIME = 174328 ; pmf:buildtime
 #CAP_TOUCH=0
 #CAP_PWM=0
 #CAP_NET=1
@@ -60,6 +60,8 @@ Procedure RunAt(address.i)
  PrintN("Raw entry is unavailable. Use boot with a PMF payload.")
 EndProcedure
 XIncludeFile "Anvil/Core/memcmd.pbi"
+XIncludeFile "Anvil/Core/net_tftp_server.pbi"
+XIncludeFile "Anvil/Core/net_tftp_cmd.pbi"
 XIncludeFile "Zentaji/Board/identity.pbi"
 XIncludeFile "Anvil/Core/flow_cmd.pbi"
 XIncludeFile "Anvil/Core/layout_cmd.pbi"
@@ -90,6 +92,8 @@ Procedure ZentajiShellHelp()
  PrintN("  memory/md, write/poke, fill/mw, copy/cp, compare/cmp, base, crc32/checksum")
  PrintN("  uptime/up, last run, reset/reboot")
  PrintN("  net, dhcp, ping <host>, dns <name>")
+ PrintN("  get <name> [hex address], put <name> <hex address> <hex length>")
+ PrintN("  settings set net.server <IPv4 address> selects the TFTP server")
  PrintN("  forge [command]       built-in Zentaji PureMetal compiler and editor")
  PrintN("  halt                 cleanly release storage and stop this monitor")
  PrintN("  programs, readback <hex address> <hex length>, screenshot/p")
@@ -156,6 +160,10 @@ Procedure.i HwCommandDispatch(c.i)
   CmdTime()
  ElseIf WordIs("net")<>0
   ZentajiNetworkStatus()
+ ElseIf WordIs("get")<>0
+  CmdGet()
+ ElseIf WordIs("put")<>0
+  CmdPut()
  ElseIf WordIs("dhcp")<>0
   CmdDhcp()
  ElseIf WordIs("ping")<>0

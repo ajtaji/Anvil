@@ -36,6 +36,7 @@ XIncludeFile "Anvil/Core/netif.pbi"
 XIncludeFile "Anvil/Network/dhcp.pbi"
 XIncludeFile "Anvil/Network/dns_codec.pbi"
 XIncludeFile "Anvil/Core/dhcpd.pbi"
+XIncludeFile "RaspberryPi4/Lib/tftp.pi4"
 #ANVIL_NET_NO_LEGACY_DIAGNOSTICS=1
 XIncludeFile "Anvil/Core/netfmt.pbi"
 XIncludeFile "Anvil/Network/link.pbi"
@@ -47,6 +48,12 @@ XIncludeFile "Anvil/Core/net_address.pbi"
 XIncludeFile "Anvil/Network/tcp.pbi"
 
 ; Compatibility accounting for the existing shared IPv4 commands.
+#ETH_SLICE_MS=200
+#ETH_RETRY_MS=2000
+#ETH_RETRIES=8
+#ETH_MAX_MS=600000
+#ETH_DOT_BLOCKS=64
+Global gEthSrv.i,gEthUdp.i,gEthSendFail.i
 #ETH_ARP_MS=500
 #ETH_ARP_TRIES=8
 Global Dim gEthPeer.a[6]
@@ -210,4 +217,8 @@ Procedure ZentajiNetworkStatus()
   NetDhcpSay(#HW_LINK_WIRED)
   HwLinkSayCounters()
  EndIf
+EndProcedure
+
+Procedure NetSayInterfaces()
+ ZentajiNetworkStatus()
 EndProcedure

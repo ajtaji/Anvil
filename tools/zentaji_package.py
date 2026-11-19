@@ -86,6 +86,20 @@ TRY
   dhcp
   dns localhost
 
+HOST FILE TRANSFERS
+Start a TFTP server on the host at 127.0.0.1, UDP port 69, with a directory
+containing your files. Enable uploads there if you want to use put. In Anvil:
+  settings set net.server 10.0.2.2
+  get INPUT.BIN
+The guest prints its destination address and byte count. Addresses and lengths
+in commands are hexadecimal. For example, for a 1024-byte file, substitute
+the printed address for ADDR:
+  save INPUT.BIN ADDR 400
+  load INPUT.BIN ADDR
+  put OUTPUT.BIN ADDR 400
+The server directory now contains OUTPUT.BIN. To keep the server selection
+across boots, type settings save.
+
 The resident Forge supports the integer PureMetal core; full language coverage
 and composed-desktop performance are still in development. This bundle does
 not claim completed performance acceptance.

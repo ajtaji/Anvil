@@ -272,6 +272,33 @@ Independent float32 wire records, all 33 application assertions and the vertex
 tail beyond 60000 vertices must match. The returning monitor must retire the
 particle allocations and restore its graphical prompt without Vulkan faults.
 
+@SECTION Transfer files between the host and Zentaji
+
+Run a TFTP server on the host, listening on 127.0.0.1 port 69. Set its
+directory to the files to exchange and enable uploads there to receive
+files from the guest. In the packaged machine, 10.0.2.2 reaches this host
+through the emulated Ethernet adapter. To use a server on another
+computer, substitute its reachable IPv4 address.
+
+@FRAG
+settings set net.server 10.0.2.2
+get INPUT.BIN
+@ENDFRAG
+
+Get prints the first guest RAM address in hex and the received length in
+decimal. To keep the file on the guest disk, use save with that address
+and the length converted to hex. For a 1024-byte file, replace ADDR below
+with the reported address. Load copies a guest file back into RAM. Put
+sends exactly the specified number of bytes to the server.
+
+@FRAG
+save INPUT.BIN ADDR 400
+load INPUT.BIN ADDR
+put OUTPUT.BIN ADDR 400
+@ENDFRAG
+
+Type settings save to keep the server address across boots.
+
 @SECTION Built-in PureMetal Forge
 
 Type `forge` at Anvil to enter the editor. Type EXIT to return to Anvil.
