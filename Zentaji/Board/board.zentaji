@@ -1,9 +1,9 @@
 EnableFloatingPoint
 ; Zentaji serial/storage monitor composition. The ROM loads the owned startup
 ; envelope; Main receives its validated table/source/context, never ARM registers.
-#ANVIL_BUILD = 48 ; pmf:build
-#ANVIL_BUILD_DATE = 20261117 ; pmf:builddate
-#ANVIL_BUILD_TIME = 180302 ; pmf:buildtime
+#ANVIL_BUILD = 49 ; pmf:build
+#ANVIL_BUILD_DATE = 20261119 ; pmf:builddate
+#ANVIL_BUILD_TIME = 171839 ; pmf:buildtime
 #CAP_TOUCH=0
 #CAP_PWM=0
 #CAP_NET=1
@@ -75,8 +75,11 @@ XIncludeFile "Zentaji/Board/text_service.pbi"
 XIncludeFile "Zentaji/Board/payload.pbi"
 XIncludeFile "Anvil/Core/pmfboot.pbi"
 XIncludeFile "Anvil/Core/bootfile_cmd.pbi"
+XIncludeFile "Anvil/Core/programs_cmd.pbi"
+XIncludeFile "Anvil/Core/readback.pbi"
 XIncludeFile "Anvil/Core/command_loop.pbi"
 XIncludeFile "Zentaji/Board/neon_console.pbi"
+XIncludeFile "Zentaji/Board/screenshot.pbi"
 XIncludeFile "Zentaji/Forge/shell.pbi"
 
 Procedure ZentajiShellHelp()
@@ -89,6 +92,7 @@ Procedure ZentajiShellHelp()
  PrintN("  net, dhcp, ping <host>, dns <name>")
  PrintN("  forge [command]       built-in Zentaji PureMetal compiler and editor")
  PrintN("  halt                 cleanly release storage and stop this monitor")
+ PrintN("  programs, readback <hex address> <hex length>, screenshot/p")
  PrintN("  boot <file> / mem <address>, boot status/ok/clear")
  PrintN("PMF service-table applications are supported; raw run is not available.")
 EndProcedure
@@ -160,6 +164,12 @@ Procedure.i HwCommandDispatch(c.i)
   CmdDns()
  ElseIf WordIs("force")<>0
   CmdForce()
+ ElseIf WordIs("programs")<>0
+  CmdPrograms()
+ ElseIf WordIs("readback")<>0
+  CmdReadback()
+ ElseIf WordIs("screenshot")<>0 Or LetterIs(112)<>0
+  CmdPic()
  ElseIf WordIs("boot")<>0
   CmdBoot()
  ElseIf WordIs("forge")<>0
@@ -191,7 +201,7 @@ Procedure.i HwCommandDispatch(c.i)
    zenShellStop=1
   EndIf
  Else
-  ProcedureReturn 0
+  ProcedureReturn ProgramsTryRun()
  EndIf
  ProcedureReturn 1
 EndProcedure

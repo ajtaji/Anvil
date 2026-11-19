@@ -73,7 +73,48 @@ def screen_check(path):
     return phase
 
 
-def check(archive, keep, signer, powershell):
+def check_screenshot(client, keep, transcript):
+    from pmfshot import decode, png
+
+    picture = client.command("screenshot").decode("ascii")
+    transcript.append(picture)
+    width, height, rows = decode(picture)
+    assert (width, height) == (1024, 768)
+    capture = keep / "guest-screenshot.png"
+    capture.write_bytes(png(width, height, rows))
+    return screen_check(capture)
+
+
+def check_automation(client, transcript, container):
+    from anvil_readback import parse_readback
+
+    def command(line):
+        reply = client.command(line).decode("ascii")
+        transcript.append(reply)
+        return reply
+
+    listing = command("programs")
+    assert re.search(r"^  SAVED +[0-9]+ bytes +1:/SAVED\.PMF\r?$", listing, re.M), listing
+    launched = command("sAvEd")
+    assert "Running 1:/SAVED.PMF" in launched and "r1 = $000000000000002A" in launched, launched
+    loaded = command("load SAVED.PMF")
+    match = re.search(r"Loaded ([0-9]+) bytes into memory, filling ([0-9A-F]+)", loaded)
+    assert match and int(match[1]) == len(container), loaded
+    address = int(match[2], 16)
+    reply = command(f"readback {address:X} {len(container):X}")
+    assert parse_readback(reply, address, len(container)) == container
+    # Cross the shared encoder's 720-byte block and exercise final padding.
+    count = 725
+    assert "!!" not in command(f"fill.b {address:X} A5 {count:X}")
+    reply = command(f"readback {address:X} {count:X}")
+    assert parse_readback(reply, address, count) == bytes([0xA5]) * count
+    assert "nothing was read" in command(f"readback {address:X} 0").lower()
+    assert "AUTOMATION-DONE" in command("echo AUTOMATION-DONE").splitlines()
+    print("PASS program discovery and launch, verified binary readback, guest screenshot and prompt", flush=True)
+    return dict(payload_readback_bytes=len(container), multiblock_bytes=count)
+
+
+def check(archive, keep, signer, powershell, automation=False):
     archive, keep, signer = (Path(p).resolve() for p in (archive, keep, signer))
     if keep.exists():
         raise ValueError("Choose a new evidence directory; existing disks must be preserved")
@@ -132,6 +173,8 @@ def check(archive, keep, signer, powershell):
             transcript.append(startup)
             assert "Zentaji boot ROM v1" in startup and "Type help for the available commands." in startup
             assert f"build {manifest['anvil_build']} " in startup
+            if automation and label == "second":
+                result["guest_sparkle_phase"] = check_screenshot(client, keep, transcript)
             for command, expected in commands:
                 reply = client.command(command).decode("utf-8")
                 transcript.append(reply)
@@ -142,8 +185,23 @@ def check(archive, keep, signer, powershell):
                     assert re.search(r"^uptime [0-9]+ boots \?\r?$", reply, re.M), (command, reply)
                 assert "!!" not in reply, (command, reply)
                 print(label + ": " + command + " PASS", flush=True)
+            if automation and label == "second":
+                result["automation"] = check_automation(client, transcript, container)
             client.socket.sendall(b"halt\r")
-            child.wait(45)
+            # Guest shutdown precedes the host's hex dump of the complete UART
+            # transcript. Keep the guest deadline independent of report size.
+            if automation and label == "second":
+                deadline = time.monotonic() + 45
+                while child.alive():
+                    if re.search(rb"(?m)^END steps=\d+ exit=0 powered=1 ",
+                                 (folder / "zentaji.log").read_bytes()):
+                        break
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("Anvil did not report a clean halt")
+                    time.sleep(0.2)
+                child.wait(300)
+            else:
+                child.wait(45)
         finally:
             if client:
                 client.close()
@@ -218,6 +276,8 @@ def check(archive, keep, signer, powershell):
     report = keep / "result.json"
     report.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
     evidence = [report, keep / "guest-built.pmf", keep / "live-screen.png", keep / "live.log"]
+    if automation:
+        evidence.append(keep / "guest-screenshot.png")
     for label in ("first", "second"):
         evidence += [keep / (label + "-" + suffix) for suffix in
                      ("launcher.log", "transcript.log", "zentaji.log", "zentaji-errors.log", "screen.png")]
@@ -232,8 +292,9 @@ def main():
     parser.add_argument("--keep", type=Path, required=True)
     parser.add_argument("--sign-script", type=Path, required=True)
     parser.add_argument("--powershell", default="pwsh.exe")
+    parser.add_argument("--automation", action="store_true", help="Exercise programs, readback and screenshot over UART")
     args = parser.parse_args()
-    print(json.dumps(check(args.archive, args.keep, args.sign_script, args.powershell), indent=2))
+    print(json.dumps(check(args.archive, args.keep, args.sign_script, args.powershell, args.automation), indent=2))
 
 
 if __name__ == "__main__":

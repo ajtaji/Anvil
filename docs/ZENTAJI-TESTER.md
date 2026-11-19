@@ -51,3 +51,35 @@ the saved payload. A separate resident-prompt capture verifies the exact shared
 header/logo before shutdown; a graceful `halt` deliberately disables scanout.
 The capture deadline is an observation bound, not a performance measurement.
 Logs, PNGs, the guest-built payload and results receive a verified catalog.
+
+## Automating program discovery, memory reads and screenshots
+
+On monitor builds with these commands, use the UART listener port printed in
+`zentaji.log`. A client can keep one connection open and wait for the
+`pmf> ` prompt after each command.
+
+* `programs` lists PMF containers. Type a listed name to boot it. Built-in
+  command names take precedence.
+* `readback <address> <length>` takes hexadecimal byte addresses and lengths.
+  Pass the returned text and expected address and count to
+  `tools/anvil_readback.py`'s `parse_readback` to verify the length and CRC-32.
+* `screenshot` (short form `p`) sends the displayed image over the console.
+  Feed its reply to `decode` and `png` in `tools/pmfshot.py`. The image uses
+  the current display dimensions. Ctrl-C aborts the transfer.
+
+For example, in Python with the package and Anvil's `tools` on the import path:
+
+```python
+from pathlib import Path
+from zen_console import Console
+from pmfshot import decode, png
+
+console = Console(port, timeout=90)
+try:
+    console.prompt()
+    print(console.command("programs").decode())
+    frame = decode(console.command("screenshot").decode())
+    Path("anvil.png").write_bytes(png(*frame))
+finally:
+    console.close()
+```
