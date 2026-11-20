@@ -30,7 +30,6 @@ XIncludeFile "Zentaji/Board/ethernet.pbi"
 #ANVIL_NET_IPV4_ONLY=1
 #ANVIL_LINK_SYNCHRONOUS=1
 #ANVIL_NET_NO_LINKLOCAL=1
-#ANVIL_NET_NO_LEGACY_UDP_HOOK=1
 XIncludeFile "Anvil/Network/net.pbi"
 XIncludeFile "Anvil/Core/netif.pbi"
 XIncludeFile "Anvil/Network/dhcp.pbi"
@@ -187,7 +186,7 @@ Procedure.i ZentajiNetworkService(operation.i)
   Case #APS_DHCP : NetDhcpTick()
   Case #APS_NTP : NtpServiceTick()
   Case #APS_NET_REARM : NetConsoleRearm()
-  Case #APS_HTTP : TcpTick()
+  Case #APS_HTTP : TcpTick() : HttpServerPoll()
  EndSelect
  ProcedureReturn 0
 EndProcedure

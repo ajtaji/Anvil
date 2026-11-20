@@ -1,9 +1,9 @@
 EnableFloatingPoint
 ; Zentaji serial/storage monitor composition. The ROM loads the owned startup
 ; envelope; Main receives its validated table/source/context, never ARM registers.
-#ANVIL_BUILD = 57 ; pmf:build
+#ANVIL_BUILD = 58 ; pmf:build
 #ANVIL_BUILD_DATE = 20261119 ; pmf:builddate
-#ANVIL_BUILD_TIME = 194642 ; pmf:buildtime
+#ANVIL_BUILD_TIME = 202534 ; pmf:buildtime
 #CAP_TOUCH=0
 #CAP_PWM=0
 #CAP_NET=1
@@ -50,7 +50,11 @@ XIncludeFile "Anvil/Core/fs_cmd.pbi"
 XIncludeFile "Anvil/Core/argfmt.pbi"
 XIncludeFile "Anvil/Core/settings_cmd.pbi"
 XIncludeFile "Zentaji/Board/network.pbi"
-XIncludeFile "Anvil/Core/net_tcp_cmd.pbi"
+XIncludeFile "Anvil/Applications/Forum/http_head.pbi"
+XIncludeFile "Anvil/Services/Http/transport_tcp.pbi"
+XIncludeFile "Anvil/Services/Http/server.pbi"
+XIncludeFile "Anvil/Core/tcp_cmd.pbi"
+XIncludeFile "Anvil/Services/Http/monitor.pbi"
 XIncludeFile "Anvil/Core/time_cmd.pbi"
 XIncludeFile "Anvil/Core/crc.pbi"
 Global gBase.i
@@ -93,6 +97,8 @@ XIncludeFile "Anvil/Crypto/t0vm.pbi"
 XIncludeFile "Anvil/Crypto/x509_blob.pbi"
 #X509_SIG_LINKED=1
 XIncludeFile "Anvil/Crypto/x509.pbi"
+XIncludeFile "Anvil/Crypto/tls13_record.pbi"
+XIncludeFile "Anvil/Crypto/tls13_hs.pbi"
 XIncludeFile "Anvil/Core/cryptotest_vectors.pbi"
 XIncludeFile "Anvil/Core/crypto_cmd.pbi"
 XIncludeFile "Anvil/Kernel/Zentaji/payload_contract.pbi"
@@ -100,6 +106,10 @@ XIncludeFile "Zentaji/Board/rtc_clock.pbi"
 XIncludeFile "Zentaji/Board/services.pbi"
 XIncludeFile "Anvil/Hal/abi_version.pbi"
 XIncludeFile "Anvil/Hal/abi.pbi"
+XIncludeFile "Anvil/Core/payload_net.pbi"
+XIncludeFile "Anvil/Core/tls_roots.pbi"
+XIncludeFile "Anvil/Core/tls_client.pbi"
+XIncludeFile "Anvil/Core/tls_cmd.pbi"
 XIncludeFile "Zentaji/Board/input.pbi"
 XIncludeFile "Zentaji/Board/text_service.pbi"
 XIncludeFile "Zentaji/Board/payload.pbi"
@@ -123,7 +133,7 @@ Procedure ZentajiShellHelp()
  PrintN("  memory/md, write/poke, fill/mw, copy/cp, compare/cmp, base, crc32/checksum")
  PrintN("  mm, nm, mtest, sha1sum, sha256sum, crypto, mmio, baud, vkstat, screen")
  PrintN("  uptime/up, last run, reset/reboot")
- PrintN("  net, dhcp, ping <host>, dns <name>")
+ PrintN("  net, dhcp, ping <host>, dns <name>, http, https, tls")
  PrintN("  info/board, clock, cache [status|sync], receive <hex address> <hex length> <crc32>, srecord/loads")
  PrintN("  tcp, wb <hex address> <hex length> <crc32>")
  PrintN("  get <name> [hex address], put <name> <hex address> <hex length>")
@@ -229,6 +239,12 @@ Procedure.i HwCommandDispatch(c.i)
   CmdTime()
  ElseIf WordIs("net")<>0
   ZentajiNetworkStatus()
+ ElseIf WordIs("http")<>0
+  CmdHttp()
+ ElseIf WordIs("https")<>0
+  CmdHttps()
+ ElseIf WordIs("tls")<>0
+  CmdTls()
  ElseIf WordIs("tcp")<>0
   CmdTcp()
  ElseIf WordIs("wb")<>0
@@ -344,6 +360,7 @@ Procedure.i Main(table.i,source.i,context.i)
   If RandomServiceBind(@HwEntropyAvailable,@HwEntropyRead)<>0 : ProcedureReturn 3 : EndIf
  EndIf
  ZentajiNetworkInit()
+ HttpServerInit()
  If zenMemoryGraphicsBase=0
   If AnvilPromptServicesBind(@ZentajiNetworkService)<>1 : ProcedureReturn 2 : EndIf
  EndIf

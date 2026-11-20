@@ -307,7 +307,9 @@ Procedure tlsc_AdvanceWork()
     EndIf
     tlsc_seeded = 1
   Else
-    DrbgAutoReseed()
+    If DrbgAutoReseed()<0
+      tlsc_Refuse(#SVC_EIO,"the hardware random generator could not reseed TLS") : ProcedureReturn
+    EndIf
   EndIf
     r=NetDialStart(@tlsc_dial[tlsc_slot],@tlsc_name[tlsc_slot*#TLSC_NAME_MAX],tlsc_port)
     If r<0 : tlsc_Refuse(r,"the connection selector could not start") : ProcedureReturn : EndIf
@@ -413,15 +415,15 @@ EndProcedure
 
  ; Optional cooperative driver installed by the target composition. The
 ; arithmetic implementation remains independent of scheduler/target details.
+Procedure tlsc_NoProfile() : EndProcedure
+Procedure tlsc_NoCloseNotification(handle.i) : EndProcedure
 Global *tlsc_advanceHook
 Global *tlsc_profileHook
 Global *tlsc_closeHook
 Procedure tlsc_AdvanceCurrent()
- If tlsc_advanceHook<>0
-  tlsc_advanceHook()
- Else
-  tlsc_AdvanceWork()
- EndIf
+ Protected *advance=@tlsc_AdvanceWork
+ If *tlsc_advanceHook<>0 : *advance=*tlsc_advanceHook : EndIf
+ advance()
 EndProcedure
 
 Procedure TlsClientAdvance()
@@ -654,7 +656,8 @@ EndProcedure
 
 ; Close: close_notify if established, then TCP; the handle is free at once.
 Procedure.i TlsClientClose(h.i)
-  If tlsc_closeHook<>0 : tlsc_closeHook(h) : EndIf
+  Protected *onClose=@tlsc_NoCloseNotification
+  If *tlsc_closeHook<>0 : *onClose=*tlsc_closeHook : onClose(h) : EndIf
   Define r.i
   Define i.i
   r = tlsc_Handle(h)
@@ -751,7 +754,8 @@ Procedure tlsc_ShowCurrent()
 EndProcedure
 
 Procedure TlsClientShow()
-  If tlsc_profileHook<>0 : tlsc_profileHook() : EndIf
+  Protected *profile=@tlsc_NoProfile
+  If *tlsc_profileHook<>0 : *profile=*tlsc_profileHook : profile() : EndIf
   If tlsc_advanceHook<>0
     PrintN("TLS scheduling: cooperative arithmetic")
   Else

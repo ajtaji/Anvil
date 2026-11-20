@@ -100,6 +100,8 @@ def main():
     parser.add_argument("--crypto", type=Path, metavar="COMPILER", help="Build a Zentaji entropy ABI probe and check the shared crypto vector suite")
     parser.add_argument("--readonly-disk", action="store_true",
                         help="Check native raw block reads and write refusal on a read-only disk")
+    parser.add_argument("--web", action="store_true",
+                        help="Check HTTP in both directions, verified TLS 1.3 and guest trust refusals")
     args = parser.parse_args()
     tools, output = args.zen_tools.resolve(), args.keep.resolve()
     sys.path.insert(0, str(tools))
@@ -127,8 +129,9 @@ def main():
                        cwd=ROOT, env=dict(os.environ, PMF_ROOT=str(ROOT)), check=True, timeout=120)
         probe = Path(str(probe_image) + ".pmf").read_bytes()
 
-    def boot(attached):
-        label = "nat" if attached else "disconnected"
+    def boot(attached, no_entropy=False):
+        label = "no-entropy" if no_entropy else ("nat" if attached else "disconnected")
+        live_entropy = attached and not no_entropy and (probe is not None or args.web)
         folder = output / label
         if args.sign_script and folder.exists() and any(folder.iterdir()):
             raise ValueError(f"Choose a fresh directory for signed fixture evidence: {folder}")
@@ -144,13 +147,20 @@ def main():
                 (seed / "main.zen").write_bytes(SOURCE)
                 if probe is not None:
                     (seed / "ENTROPY.PMF").write_bytes(probe)
+                if args.web:
+                    (seed / "ROOTS.PEM").write_bytes(web_root)
                 disk = Path(temporary) / "data.img"
                 build_image(disk, 2 << 20, seed)
                 disk_bytes = disk.read_bytes()
                 fixture.disks[0] = (disk_bytes, readonly)
         if attached:
-            if probe is not None:
+            if live_entropy:
                 fixture.directives.append("entropy host")
+            if args.web and not no_entropy:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as reservation:
+                    reservation.bind(("127.0.0.1", 0))
+                    http_port = reservation.getsockname()[1]
+                fixture.directives.append(f"forward tcp {http_port} 8080 127.0.0.1")
             with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as reserved:
                 reserved.bind(("127.0.0.1", 0))
                 port = reserved.getsockname()[1]
@@ -162,11 +172,11 @@ def main():
             inputs = [path for path in folder.iterdir() if path.is_file()]
             signatures("pwsh.exe", args.sign_script.resolve(), executables=[executable],
                        catalogs=[catalog(folder / "inputs.cat", inputs, True)])
-        run_mode = ["--fast"] if args.exchange or args.screenshot or args.crypto else []
-        budget = "300000000000" if args.crypto else ("4000000000" if args.screenshot else "2000000000")
+        run_mode = ["--fast"] if args.exchange or args.screenshot or args.crypto or args.web else []
+        budget = "300000000000" if args.crypto or args.web else ("4000000000" if args.screenshot else "2000000000")
         process = subprocess.Popen(
             [str(executable), str(config), *run_mode, "--headless", "--live", "--max", budget,
-             "--live-seconds", "1800" if args.crypto else "180", "--serial-listen", "0"],
+             "--live-seconds", "1800" if args.crypto or args.web else "180", "--serial-listen", "0"],
             cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, encoding="utf-8", errors="replace",
         )
@@ -209,14 +219,22 @@ def main():
                 assert parse_readback(reply, stage_addr, 512) == disk_bytes[:512]
                 result["readonly_sector_sha256"] = hashlib.sha256(disk_bytes[:512]).hexdigest()
             if probe is not None:
-                expected = 0xA1 if attached else 0xA0
+                expected = 0xA1 if live_entropy else 0xA0
                 command("boot ENTROPY.PMF", f"The payload returned, r1 = ${expected:016X}")
                 result["entropy_" + label] = expected
-                if attached:
+                if attached and not no_entropy:
                     vectors = check_crypto_vectors(client, folder / "crypto-vectors.log")
                     transcript.append(vectors)
                     result["crypto_vectors"] = 273
-            if attached:
+            if no_entropy:
+                command("dhcp", "Lease accepted")
+                command("settings set tls.roots 1:/ROOTS.PEM", "pmf> ")
+                command("tls reload", "1 roots registered")
+                with web_test_peer(web_body, keys / "good") as peer:
+                    text = command(f"https get https://localhost:{peer.server_port}/unseeded", "FAILED")
+                    assert "random generator" in text and not peer.requests
+                result["tls_without_entropy_refused"] = True
+            elif attached:
                 command("net", "Zentaji Ethernet is attached.")
                 lease = command("dhcp", "Lease accepted on Zentaji Ethernet")
                 for expected in ("10.0.2.15", "255.255.255.0", "10.0.2.2", "10.0.2.3"):
@@ -275,6 +293,8 @@ def main():
                     capture.write_bytes(png(width, height, rows))
                     result["udp_screenshot_phase"] = screen_check(capture)
                     transcript.append(client.prompt().decode("utf-8"))
+                if args.web:
+                    result["web"] = check_web_peers(command, http_port, keys, web_body)
                 command("echo UART-AFTER-UDP", "UART-AFTER-UDP")
             else:
                 command("net", "Zentaji Ethernet is disconnected.")
@@ -303,13 +323,27 @@ def main():
         assert re.search(r"^END steps=\d+ exit=0 powered=1 ", log, re.M), folder / "run.log"
         result[label] = True
 
-    boot(False)
-    boot(True)
+    if args.web:
+        from zentaji_web_peer import check_web_peers, web_test_identity, web_test_peer
+        with tempfile.TemporaryDirectory(prefix="zentaji-tls-") as private_keys:
+            keys = Path(private_keys)
+            web_root = web_test_identity(keys / "good", "localhost")
+            web_test_identity(keys / "untrusted", "localhost")
+            web_body = ("Zentaji peer " + os.urandom(16).hex()).encode("ascii")
+            boot(False)
+            boot(True, no_entropy=True)
+            boot(True)
+    else:
+        boot(False)
+        boot(True)
     (output / "result.json").write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
     if args.sign_script:
         from zentaji_package import signatures, catalog
         catalogs = []
-        for label in ("nat", "disconnected"):
+        labels = ["nat", "disconnected"]
+        if args.web:
+            labels.append("no-entropy")
+        for label in labels:
             folder = output / label
             evidence = [folder / "run.log", folder / "transcript.log"]
             if label == "nat" and args.screenshot:

@@ -165,6 +165,9 @@ Global Dim TlsTag.a[16]              ; tag scratch                 (public)
 Global TlsRecInnerType.i             ; recovered content type of the last record
 Global Tls13RecErr.i                 ; named reason for the last refusal
 ; Optional serialized decrypt driver; key/nonce spans are borrowed for the call.
+Procedure.i tlsrec_NoWorker(key.i,nonce.i,aad.i,aadBytes.i,src.i,bytes.i,dst.i,tag.i)
+  ProcedureReturn 0
+EndProcedure
 Global *TlsRecDecryptHook,*TlsRecEncryptHook
 Global TlsCipherInstalled.i          ; 0 none, 1 write key loaded, 2 read key
 
@@ -404,7 +407,9 @@ Procedure.i Tls13RecProtect(ctype.i, plain.i, plen.i, padlen.i, dst.i, dstmax.i)
   TlsRecUseWriteKey()
   TlsRecNonce(@secTlsWIv[0], TlsWSeqHi, TlsWSeqLo)
   If TlsRecEncryptHook<>0
-    protectedOk=TlsRecEncryptHook(@secTlsWKey[0],@TlsNonce[0],@TlsAad[0],#TLS_REC_HDR,dst+#TLS_REC_HDR,innerlen,dst+#TLS_REC_HDR,dst+#TLS_REC_HDR+innerlen)
+    Protected *encryptJob=@tlsrec_NoWorker
+    *encryptJob=*TlsRecEncryptHook
+    protectedOk=encryptJob(@secTlsWKey[0],@TlsNonce[0],@TlsAad[0],#TLS_REC_HDR,dst+#TLS_REC_HDR,innerlen,dst+#TLS_REC_HDR,dst+#TLS_REC_HDR+innerlen)
     Tls13RecInvalidateCipher()
     If protectedOk<>1 : Tls13RecErr=#TLSREC_ERR_CRYPTO : ProcedureReturn 0 : EndIf
   Else
@@ -471,7 +476,9 @@ Procedure.i Tls13RecUnprotect(rec.i, reclen.i)
   TlsRecNonce(@secTlsRIv[0], TlsRSeqHi, TlsRSeqLo)
   ; in-place: gcm hashes the ciphertext before it writes the plaintext
   If TlsRecDecryptHook<>0
-    ok=TlsRecDecryptHook(@secTlsRKey[0],@TlsNonce[0],@TlsAad[0],#TLS_REC_HDR,rec+#TLS_REC_HDR,innerlen,rec+#TLS_REC_HDR,rec+#TLS_REC_HDR+innerlen)
+    Protected *decryptJob=@tlsrec_NoWorker
+    *decryptJob=*TlsRecDecryptHook
+    ok=decryptJob(@secTlsRKey[0],@TlsNonce[0],@TlsAad[0],#TLS_REC_HDR,rec+#TLS_REC_HDR,innerlen,rec+#TLS_REC_HDR,rec+#TLS_REC_HDR+innerlen)
     Tls13RecInvalidateCipher()
   Else
   ok = GcmDecrypt(@TlsNonce[0], 12, @TlsAad[0], #TLS_REC_HDR, rec + #TLS_REC_HDR, innerlen, rec + #TLS_REC_HDR, rec + #TLS_REC_HDR + innerlen)

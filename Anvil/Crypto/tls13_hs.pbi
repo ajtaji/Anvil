@@ -661,6 +661,7 @@ EndProcedure
 
 ; Optional scheduler seam. A paused chunk owns no live SHA context: each
 ; chunk restores and snapshots the connection's transcript before yielding.
+XIncludeFile "Anvil/Crypto/progress.pbi"
 Global *Tls13PauseHook
 Procedure.i Tls13TranscriptAppend(addr.i,bytes.i)
   Define off.i,n.i
@@ -674,7 +675,7 @@ Procedure.i Tls13TranscriptAppend(addr.i,bytes.i)
   off=0
   While off<bytes
     If Tls13PauseHook<>0
-      If Tls13PauseHook()=0 : ProcedureReturn TlsFail(#TLS13_REFUSE_COOPERATIVE_STOP,#TLS_ALERT_INTERNAL_ERROR) : EndIf
+      If CryptoProgressCheck(*Tls13PauseHook)=0 : ProcedureReturn TlsFail(#TLS13_REFUSE_COOPERATIVE_STOP,#TLS_ALERT_INTERNAL_ERROR) : EndIf
     EndIf
     n=bytes-off : If n>512 : n=512 : EndIf
     Sha256Restore(@TlsTrSnap[0])
@@ -683,7 +684,7 @@ Procedure.i Tls13TranscriptAppend(addr.i,bytes.i)
     off=off+n
   Wend
   If Tls13PauseHook<>0
-    If Tls13PauseHook()=0 : ProcedureReturn TlsFail(#TLS13_REFUSE_COOPERATIVE_STOP,#TLS_ALERT_INTERNAL_ERROR) : EndIf
+    If CryptoProgressCheck(*Tls13PauseHook)=0 : ProcedureReturn TlsFail(#TLS13_REFUSE_COOPERATIVE_STOP,#TLS_ALERT_INTERNAL_ERROR) : EndIf
   EndIf
   ProcedureReturn 1
 EndProcedure
@@ -885,7 +886,7 @@ Global *Tls13SetupPauseHook
 Procedure.i Tls13SetupCheckpoint()
   If Tls13State=#TLS13_ST_FAILED : ProcedureReturn 0 : EndIf
   If Tls13SetupPauseHook<>0
-    If Tls13SetupPauseHook()=0 : ProcedureReturn TlsFail(#TLS13_REFUSE_COOPERATIVE_STOP,#TLS_ALERT_INTERNAL_ERROR) : EndIf
+    If CryptoProgressCheck(*Tls13SetupPauseHook)=0 : ProcedureReturn TlsFail(#TLS13_REFUSE_COOPERATIVE_STOP,#TLS_ALERT_INTERNAL_ERROR) : EndIf
   EndIf
   ProcedureReturn 1
 EndProcedure

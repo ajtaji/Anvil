@@ -1171,13 +1171,8 @@ EndProcedure
 
 ; copy-ee-rsa-pkey, copy-ee-ec-pkey, check-direct-trust,
 ; check-trust-anchor-CA, do-rsa-vrfy, do-ecdsa-vrfy.
+XIncludeFile "Anvil/Crypto/progress.pbi"
 Global *X509PauseHook
-Procedure.i x509_Continue() : ProcedureReturn 1 : EndProcedure
-Procedure.i x509_ContinueAfterPause()
-  Protected *resume=@x509_Continue
-  If *X509PauseHook<>0 : *resume=*X509PauseHook : EndIf
-  ProcedureReturn resume()
-EndProcedure
 Procedure XnKey(nid.i)
   Protected nlen.i
   Protected elen.i
@@ -1266,7 +1261,7 @@ Procedure XnKey(nid.i)
           EndIf
         EndIf
         If X509PauseHook<>0
-          If x509_ContinueAfterPause()=0 : xErr=#X509ERR_GUARD : ProcedureReturn : EndIf
+          If CryptoProgressCheck(*X509PauseHook)=0 : xErr=#X509ERR_GUARD : ProcedureReturn : EndIf
         EndIf
         u = u + 1
       Wend
@@ -1299,7 +1294,7 @@ Procedure XnKey(nid.i)
           EndIf
         EndIf
         If X509PauseHook<>0
-          If x509_ContinueAfterPause()=0 : xErr=#X509ERR_GUARD : ProcedureReturn : EndIf
+          If CryptoProgressCheck(*X509PauseHook)=0 : xErr=#X509ERR_GUARD : ProcedureReturn : EndIf
         EndIf
         u = u + 1
       Wend
@@ -1397,7 +1392,7 @@ Procedure.i X509RunOneCert()
   guard = 0
   Repeat
     If X509PauseHook<>0
-      If x509_ContinueAfterPause()=0 : xErr=#X509ERR_GUARD : ProcedureReturn 1 : EndIf
+      If CryptoProgressCheck(*X509PauseHook)=0 : xErr=#X509ERR_GUARD : ProcedureReturn 1 : EndIf
     EndIf
     st = T0Run()
     If st = #T0_NATIVE

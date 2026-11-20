@@ -382,6 +382,7 @@ EndProcedure
 ;  #TLSROOT_ERR_*. The previous store is replaced only by a load that
 ;  registered at least one root.
 ; ----------------------------------------------------------------------
+XIncludeFile "Anvil/Crypto/progress.pbi"
 Global *TlsRootsPauseHook
 Global tlsroot_loading.i
 Global tlsroot_prepareHandle.i
@@ -422,7 +423,7 @@ Procedure.i tlsroot_Open(path.i)
     If elapsed>tlsroot_prepareMax : tlsroot_prepareMax=elapsed : EndIf
     If rc<>0 : Break : EndIf
     If TlsRootsPauseHook<>0
-     If TlsRootsPauseHook()=0
+     If CryptoProgressCheck(*TlsRootsPauseHook)=0
       HwFilePrepareCancel(handle) : tlsroot_prepareHandle=0 : tlsroot_openCancelled=1
       ProcedureReturn tlsroot_OpenResult(0,span)
      EndIf
@@ -489,7 +490,7 @@ Procedure.i tlsroot_LoadWork(*path)
   ; Initial open can include mounting another volume. Honor the cooperative
   ; budget after closing that metadata handle, before opening the first read.
   If TlsRootsPauseHook<>0
-    If TlsRootsPauseHook()=0 : tlsroot_err=#TLSROOT_ERR_READ : ProcedureReturn tlsroot_err : EndIf
+    If CryptoProgressCheck(*TlsRootsPauseHook)=0 : tlsroot_err=#TLSROOT_ERR_READ : ProcedureReturn tlsroot_err : EndIf
   EndIf
   off = 0
   While off < size
@@ -516,7 +517,7 @@ Procedure.i tlsroot_LoadWork(*path)
     EndIf
     off = off + got
     If TlsRootsPauseHook<>0
-      If TlsRootsPauseHook()=0 : tlsroot_err=#TLSROOT_ERR_READ : ProcedureReturn tlsroot_err : EndIf
+      If CryptoProgressCheck(*TlsRootsPauseHook)=0 : tlsroot_err=#TLSROOT_ERR_READ : ProcedureReturn tlsroot_err : EndIf
     EndIf
   Wend
   tlsroot_bytes = size
@@ -536,7 +537,7 @@ Procedure.i tlsroot_LoadWork(*path)
     ; The file is already closed: suspending here cannot retain the shared
     ; storage handle while another service performs file I/O.
     If TlsRootsPauseHook<>0
-      If TlsRootsPauseHook()=0 : tlsroot_err=#TLSROOT_ERR_READ : ProcedureReturn tlsroot_err : EndIf
+      If CryptoProgressCheck(*TlsRootsPauseHook)=0 : tlsroot_err=#TLSROOT_ERR_READ : ProcedureReturn tlsroot_err : EndIf
     EndIf
     If tlsroot_PemIs(i, ?tlsroot_begin, 27, size) <> 0
       j = i + 27

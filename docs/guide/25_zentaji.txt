@@ -385,6 +385,35 @@ RAM per call. An unconfigured machine reports ENOCAP.
 Use crypto list to see the shared known-answer tests. Run crypto vectors
 to check every module, or crypto sha256 to check the digest alone.
 
+@SECTION HTTP and verified HTTPS
+
+After dhcp, fetch an HTTP response with http get URL. To serve Anvil's
+built-in page and health check, add a TCP forward to your test machine
+description before launching it.
+
+@FRAG
+forward tcp 18080 8080 127.0.0.1
+@ENDFRAG
+
+Run http serve 8080 at the guest prompt. The host can now read
+http://127.0.0.1:18080/health. Use http status to see the listener and
+http stop to close it.
+
+For HTTPS, place a trusted PEM CA bundle on the guest disk. Use the
+existing get and save commands to transfer it, then select its guest path.
+
+@FRAG
+settings set tls.roots 1:/ROOTS.PEM
+settings save
+tls reload
+https get https://example.com/
+@ENDFRAG
+
+tls roots reports the loaded trust anchors. HTTPS uses the host-backed
+entropy provider, the guest's trusted clock, and the server hostname when
+checking the peer certificate. The localhost test CA belongs to the
+disposable test disk. Supply your own trust bundle for the tester machine.
+
 @SECTION Raw disk sectors and instruction fences
 
 Use disk info or mmc info for the selected virtual disk's sector count.
