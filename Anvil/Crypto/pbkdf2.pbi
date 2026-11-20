@@ -290,6 +290,8 @@ Global pbkdf2StepOff.i = 0
 ; does not know what the callback services and never prints from it. Setting a
 ; callback returns the previous one so a caller can install it for exactly one
 ; operation and restore the prior owner afterwards.
+Procedure pbkdf2_NoProgress()
+EndProcedure
 Global *pbkdf2_progress = 0
 Procedure.i Pbkdf2SetProgress(*fn)
   Protected *old
@@ -608,7 +610,9 @@ Procedure.i Pbkdf2Sha1(pw.i, pwlen.i, salt.i, saltlen.i, iters.i, dst.i, dklen.i
       ; observe a half-updated digest. A caller must still avoid re-entering
       ; SHA/HMAC/PBKDF2 from the callback.
       If *pbkdf2_progress <> 0 And (j & 255) = 0
-        pbkdf2_progress()
+        Protected *notifyProgress=@pbkdf2_NoProgress
+        *notifyProgress=*pbkdf2_progress
+        notifyProgress()
       EndIf
     Wend
 

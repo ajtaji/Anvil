@@ -1,9 +1,9 @@
 EnableFloatingPoint
 ; Zentaji serial/storage monitor composition. The ROM loads the owned startup
 ; envelope; Main receives its validated table/source/context, never ARM registers.
-#ANVIL_BUILD = 55 ; pmf:build
+#ANVIL_BUILD = 56 ; pmf:build
 #ANVIL_BUILD_DATE = 20261119 ; pmf:builddate
-#ANVIL_BUILD_TIME = 190353 ; pmf:buildtime
+#ANVIL_BUILD_TIME = 192537 ; pmf:buildtime
 #CAP_TOUCH=0
 #CAP_PWM=0
 #CAP_NET=1
@@ -73,6 +73,29 @@ XIncludeFile "Anvil/Core/shotarm.pbi"
 XIncludeFile "Anvil/Crypto/sha1.pbi"
 XIncludeFile "Anvil/Core/sha256.pbi"
 XIncludeFile "Anvil/Core/hash_cmd.pbi"
+XIncludeFile "Zentaji/Board/entropy.pbi"
+XIncludeFile "Anvil/Crypto/sha512.pbi"
+XIncludeFile "Anvil/Crypto/hmacsha1.pbi"
+XIncludeFile "Anvil/Crypto/pbkdf2.pbi"
+XIncludeFile "Anvil/Crypto/aes.pbi"
+XIncludeFile "Anvil/Crypto/keywrap.pbi"
+XIncludeFile "Anvil/Crypto/hmac.pbi"
+XIncludeFile "Anvil/Crypto/hkdf.pbi"
+XIncludeFile "Anvil/Crypto/gcm.pbi"
+XIncludeFile "Anvil/Crypto/drbg.pbi"
+XIncludeFile "Anvil/Crypto/drbg_entropy.pbi"
+XIncludeFile "Anvil/Crypto/bignum.pbi"
+XIncludeFile "Anvil/Crypto/ec256.pbi"
+XIncludeFile "Anvil/Crypto/x25519.pbi"
+XIncludeFile "Anvil/Crypto/ecp.pbi"
+XIncludeFile "Anvil/Crypto/ecdsa.pbi"
+XIncludeFile "Anvil/Crypto/rsa.pbi"
+XIncludeFile "Anvil/Crypto/t0vm.pbi"
+XIncludeFile "Anvil/Crypto/x509_blob.pbi"
+#X509_SIG_LINKED=1
+XIncludeFile "Anvil/Crypto/x509.pbi"
+XIncludeFile "Anvil/Core/cryptotest_vectors.pbi"
+XIncludeFile "Anvil/Core/crypto_cmd.pbi"
 XIncludeFile "Anvil/Kernel/Zentaji/payload_contract.pbi"
 XIncludeFile "Zentaji/Board/rtc_clock.pbi"
 XIncludeFile "Zentaji/Board/services.pbi"
@@ -98,7 +121,7 @@ Procedure ZentajiShellHelp()
  PrintN("  mount, load, save, ls/dir, cat, mkdir, rmdir, rm/del, rename/mv")
  PrintN("  settings, printenv, setenv, saveenv, env, setexpr, time, force")
  PrintN("  memory/md, write/poke, fill/mw, copy/cp, compare/cmp, base, crc32/checksum")
- PrintN("  mm, nm, mtest, sha1sum, sha256sum, mmio, baud, vkstat, screen")
+ PrintN("  mm, nm, mtest, sha1sum, sha256sum, crypto, mmio, baud, vkstat, screen")
  PrintN("  uptime/up, last run, reset/reboot")
  PrintN("  net, dhcp, ping <host>, dns <name>")
  PrintN("  info/board, clock, receive <hex address> <hex length> <crc32>, srecord/loads")
@@ -174,6 +197,8 @@ Procedure.i HwCommandDispatch(c.i)
   CmdSha1sum()
  ElseIf WordIs("sha256sum")<>0
   CmdSha256sum()
+ ElseIf WordIs("crypto")<>0
+  CmdCrypto()
  ElseIf WordIs("base")<>0
   CmdBase()
  ElseIf WordIs("crc32")<>0 Or WordIs("checksum")<>0
@@ -311,6 +336,9 @@ Procedure.i Main(table.i,source.i,context.i)
  EndIf
  If TimeBoot()=0 : UartWriteStr(TimeBootErrorText()) : PrintNl() : EndIf
  If ZentajiClockSeed()=0 : PrintN("RTC time is unavailable; the software clock keeps its existing source.") : EndIf
+ If HwEntropyAvailable()<>0
+  If RandomServiceBind(@HwEntropyAvailable,@HwEntropyRead)<>0 : ProcedureReturn 3 : EndIf
+ EndIf
  ZentajiNetworkInit()
  If zenMemoryGraphicsBase=0
   If AnvilPromptServicesBind(@ZentajiNetworkService)<>1 : ProcedureReturn 2 : EndIf

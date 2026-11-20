@@ -498,8 +498,7 @@ EndProcedure
 ;  must equal the resulting modulus length. e is a big-endian byte string.
 ; ----------------------------------------------------------------------
 Global *RsaPublicHook
-Procedure.i RsaPublic(x.i, xlen.i, nPtr.i, nLen.i, ePtr.i, eLen.i)
-  If RsaPublicHook<>0 : ProcedureReturn RsaPublicHook(x,xlen,nPtr,nLen,ePtr,eLen) : EndIf
+Procedure.i RsaPublicSync(x.i, xlen.i, nPtr.i, nLen.i, ePtr.i, eLen.i)
   Protected r.i
   Protected m0i.i
   While nLen > 0 And (PeekA(nPtr) & 255) = 0
@@ -520,6 +519,12 @@ Procedure.i RsaPublic(x.i, xlen.i, nPtr.i, nLen.i, ePtr.i, eLen.i)
   BnModpow(@RsaA, ePtr, eLen, @RsaM, m0i, @RsaT1, @RsaT2)
   BnEncode(x, xlen, @RsaA)
   ProcedureReturn r
+EndProcedure
+
+Procedure.i RsaPublic(x.i, xlen.i, nPtr.i, nLen.i, ePtr.i, eLen.i)
+  Protected *operation=@RsaPublicSync
+  If *RsaPublicHook<>0 : *operation=*RsaPublicHook : EndIf
+  ProcedureReturn operation(x,xlen,nPtr,nLen,ePtr,eLen)
 EndProcedure
 
 ; ----------------------------------------------------------------------

@@ -2864,6 +2864,10 @@ EndProcedure
  ; ABI1.10 fills the reserved entropy slots. Providers remain board-owned.
 Procedure.i SvcRandom(dst.i,n.i)
   Define rc.i
+  If randomServiceBound<>0
+    If dst<=0 Or n<1 Or n>#RANDOM_SERVICE_MAX Or dst>$7FFFFFFFFFFFFFFF-n : ProcedureReturn #SVC_EARG : EndIf
+    If InPayload(dst,dst+n-1)=0 : ProcedureReturn #SVC_EARG : EndIf
+  EndIf
   rc=RandomServiceBytes(dst,n)
   If rc<0 : gSvcDetail="random bytes unavailable, invalid request, or entropy provider failure" : EndIf
   ProcedureReturn rc

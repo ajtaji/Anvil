@@ -68,9 +68,7 @@
 ;
 ;  SHAPE 2 - PeekL SIGN-EXTENDS.
 ;      NOT PRESENT.  Words come in through PeekU and bytes through
-;      PeekA.  The only PeekB is the `Read.b` DataSection walk in
-;      XReadWords, whose bytes are masked with `& 255` before use - so
-;      even a sign-extended read of $FF cannot escape it.
+;      PeekA, including the low and high bytes in XReadWords.
 ;
 ;  SHAPE 3 - `<<` DOES NOT DISCARD AT BIT 31.
 ;      NOT PRESENT.  Every shift here is an array index, a byte
@@ -141,16 +139,16 @@ Global Dim XWG.a[32]                  ; working point copy (big-endian after swa
 Global Dim SecK.a[32]                 ; clamped scalar, big-endian
 
 ; ----------------------------------------------------------------------
-;  Read n 16-bit words from the Data cursor as low/high byte pairs.
+;  Read n 16-bit words from the labeled table as low/high byte pairs.
 ; ----------------------------------------------------------------------
-Procedure XReadWords(dst.i, n.i)
+Procedure XReadWords(src.i, dst.i, n.i)
   Protected i.i
   Protected lo.i
   Protected hi.i
   i = 0
   While i < n
-    Read.b lo
-    Read.b hi
+    lo = PeekA(src + (i << 1))
+    hi = PeekA(src + (i << 1) + 1)
     PokeW(dst + (i << 1), ((lo & 255) | ((hi & 255) << 8)) & $FFFF)
     i = i + 1
   Wend
@@ -232,8 +230,7 @@ EndProcedure
 ;  All buffers are 32-byte little-endian per RFC 7748. Returns 1.
 ; ----------------------------------------------------------------------
 Global *X25519ComputeHook
-Procedure.i X25519(out.i, secScalar.i, point.i)
-  If X25519ComputeHook<>0 : ProcedureReturn X25519ComputeHook(out,secScalar,point) : EndIf
+Procedure.i X25519Sync(out.i, secScalar.i, point.i)
   Protected i.i
   Protected j.i
   Protected secSwap.i
@@ -359,16 +356,19 @@ Procedure.i X25519(out.i, secScalar.i, point.i)
   ProcedureReturn 1
 EndProcedure
 
+Procedure.i X25519(out.i, secScalar.i, point.i)
+  Protected *operation=@X25519Sync
+  If *X25519ComputeHook<>0 : *operation=*X25519ComputeHook : EndIf
+  ProcedureReturn operation(out,secScalar,point)
+EndProcedure
+
 ; ----------------------------------------------------------------------
 ;  X25519Init - load the field constants once, before X25519().
 ; ----------------------------------------------------------------------
 Procedure X25519Init()
-  Restore XDataP
-  XReadWords(@XConstP, 18)
-  Restore XDataR2
-  XReadWords(@XConstR2, 18)
-  Restore XDataA24
-  XReadWords(@XConstA24, 18)
+  XReadWords(?XDataP, @XConstP, 18)
+  XReadWords(?XDataR2, @XConstR2, 18)
+  XReadWords(?XDataA24, @XConstA24, 18)
 EndProcedure
 
 ; ----------------------------------------------------------------------

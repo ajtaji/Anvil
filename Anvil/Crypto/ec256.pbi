@@ -74,8 +74,7 @@
 ;
 ;  SHAPE 2 - PeekL SIGN-EXTENDS.
 ;      NOT PRESENT.  Words come in through PeekU and bytes through
-;      PeekA; there is no PeekL and no PeekB outside the `Read.b`
-;      DataSection walk, which masks every byte with `& 255`.
+;      PeekA, including the low and high bytes in EcReadWords.
 ;
 ;  SHAPE 3 - `<<` DOES NOT DISCARD AT BIT 31.
 ;      NOT PRESENT.  The only shifts here build 16-bit opcodes (at most
@@ -226,28 +225,28 @@ Procedure Emit(arr.i, op.i)
 EndProcedure
 
 ; ----------------------------------------------------------------------
-;  Read n 16-bit words from the Data cursor as low/high byte pairs into a
+;  Read n 16-bit words from the labeled table as low/high byte pairs into a
 ;  word array (longhand, width-explicit; avoids any wide-Read stepping).
 ; ----------------------------------------------------------------------
-Procedure EcReadWords(dst.i, n.i)
+Procedure EcReadWords(src.i, dst.i, n.i)
   Protected i.i
   Protected lo.i
   Protected hi.i
   i = 0
   While i < n
-    Read.b lo
-    Read.b hi
+    lo = PeekA(src + (i << 1))
+    hi = PeekA(src + (i << 1) + 1)
     PokeW(dst + (i << 1), ((lo & 255) | ((hi & 255) << 8)) & $FFFF)
     i = i + 1
   Wend
 EndProcedure
 
-Procedure EcReadBytes(dst.i, n.i)
+Procedure EcReadBytes(src.i, dst.i, n.i)
   Protected i.i
   Protected bb.i
   i = 0
   While i < n
-    Read.b bb
+    bb = PeekA(src + i)
     PokeB(dst + i, bb & 255)
     i = i + 1
   Wend
@@ -502,14 +501,10 @@ EndProcedure
 ; ----------------------------------------------------------------------
 Procedure EcInit()
   ; Curve constants (limb form, word 0 + 18 limbs).
-  Restore EcDataP
-  EcReadWords(@EcConstP, #EC_WORDS - 1)
-  Restore EcDataR2
-  EcReadWords(@EcConstR2, #EC_WORDS - 1)
-  Restore EcDataB
-  EcReadWords(@EcConstB, #EC_WORDS - 1)
-  Restore EcDataGen
-  EcReadBytes(@EcGen, 65)
+  EcReadWords(?EcDataP, @EcConstP, #EC_WORDS - 1)
+  EcReadWords(?EcDataR2, @EcConstR2, #EC_WORDS - 1)
+  EcReadWords(?EcDataB, @EcConstB, #EC_WORDS - 1)
+  EcReadBytes(?EcDataGen, @EcGen, 65)
 
   ; Inversion exponent p-2 (big-endian, 32 bytes).
   BnEncode(@EcExp, 32, @EcConstP)

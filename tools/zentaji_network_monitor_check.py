@@ -20,6 +20,30 @@ ROOT = Path(__file__).resolve().parents[1]
 SOURCE = b"Procedure.q Main()\n  ProcedureReturn 42\nEndProcedure\n"
 
 
+def check_crypto_vectors(client, log):
+    """Keep the last guest output even if a long-running vector fails to return."""
+    deadline = time.monotonic() + 1750
+    client.socket.sendall(b"crypto vectors\r")
+    reply = bytearray()
+    with log.open("xb", buffering=0) as evidence:
+        while not reply.endswith(b"\npmf> "):
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise TimeoutError(f"The crypto vector run did not return to the prompt. See {log}")
+            client.socket.settimeout(left)
+            part = client.socket.recv(65536)
+            if not part:
+                raise ConnectionError(f"The crypto vector run lost its UART. See {log}")
+            evidence.write(part)
+            reply.extend(part)
+            if len(reply) > 16 << 20:
+                raise ValueError(f"The crypto vector transcript exceeded 16 MiB. See {log}")
+    text = reply.decode("ascii")
+    assert "crypto: 273 of 273 vectors PASS" in text, text[-4000:]
+    assert "forged GCM tags REFUSED" in text and "negatives REFUSED" in text, text[-4000:]
+    return text
+
+
 def check_exchange(command, client, port, folder):
     from unittest.mock import patch
     from anvil import read_map
@@ -73,6 +97,7 @@ def main():
     parser.add_argument("--exchange", action="store_true", help="Exercise block upload and TCP send/receive")
     parser.add_argument("--sign-script", type=Path, help="Sign the generated input catalogs before running the native machine")
     parser.add_argument("--screenshot", action="store_true", help="Retrieve and verify the live header using the shared UDP screenshot tool")
+    parser.add_argument("--crypto", type=Path, metavar="COMPILER", help="Build a Zentaji entropy ABI probe and check the shared crypto vector suite")
     args = parser.parse_args()
     tools, output = args.zen_tools.resolve(), args.keep.resolve()
     sys.path.insert(0, str(tools))
@@ -86,6 +111,20 @@ def main():
     executable = tools / ("zenwin.exe" if os.name == "nt" else "zenwin")
     result = {"image_sha256": digest}
 
+    probe = None
+    if args.crypto:
+        output.mkdir(parents=True, exist_ok=True)
+        probe_image = output / "entropy-probe.zex"
+        stage = (json.loads(Path(str(image) + ".boot.json").read_text())["image_end"] + 4095) & -4096
+        if args.sign_script:
+            from zentaji_package import signatures
+            signatures("pwsh.exe", args.sign_script.resolve(), executables=[args.crypto.resolve()])
+        subprocess.run([str(args.crypto.resolve()), "--compile", str(ROOT / "Zentaji/Tests/entropy_service.zentaji"),
+                        "--entry-returns", "--wants-services", "--load-addr", hex(stage + 8),
+                        "--stack-addr", hex(stage + 0x200000), "-o", str(probe_image)],
+                       cwd=ROOT, env=dict(os.environ, PMF_ROOT=str(ROOT)), check=True, timeout=120)
+        probe = Path(str(probe_image) + ".pmf").read_bytes()
+
     def boot(attached):
         label = "nat" if attached else "disconnected"
         folder = output / label
@@ -95,14 +134,19 @@ def main():
                           hostfiles=[["anvil.zex", bytearray(raw), False]],
                           display_modes=[(1024, 768, 60000)])
         fixture.net_attached = attached
-        if attached:
+        if attached or probe is not None:
             with tempfile.TemporaryDirectory(prefix="zentaji-net-") as temporary:
                 seed = Path(temporary) / "source"
                 seed.mkdir()
                 (seed / "main.zen").write_bytes(SOURCE)
+                if probe is not None:
+                    (seed / "ENTROPY.PMF").write_bytes(probe)
                 disk = Path(temporary) / "data.img"
                 build_image(disk, 2 << 20, seed)
                 fixture.disks[0] = (disk.read_bytes(), False)
+        if attached:
+            if probe is not None:
+                fixture.directives.append("entropy host")
             with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as reserved:
                 reserved.bind(("127.0.0.1", 0))
                 port = reserved.getsockname()[1]
@@ -114,10 +158,11 @@ def main():
             inputs = [path for path in folder.iterdir() if path.is_file()]
             signatures("pwsh.exe", args.sign_script.resolve(), executables=[executable],
                        catalogs=[catalog(folder / "inputs.cat", inputs, True)])
-        run_mode = ["--fast"] if args.exchange or args.screenshot else []
+        run_mode = ["--fast"] if args.exchange or args.screenshot or args.crypto else []
+        budget = "300000000000" if args.crypto else ("4000000000" if args.screenshot else "2000000000")
         process = subprocess.Popen(
-            [str(executable), str(config), *run_mode, "--headless", "--live", "--max", "4000000000" if args.screenshot else "2000000000",
-             "--live-seconds", "180", "--serial-listen", "0"],
+            [str(executable), str(config), *run_mode, "--headless", "--live", "--max", budget,
+             "--live-seconds", "1800" if args.crypto else "180", "--serial-listen", "0"],
             cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, encoding="utf-8", errors="replace",
         )
@@ -148,6 +193,14 @@ def main():
                 assert expected in reply, (text, reply)
                 return reply
 
+            if probe is not None:
+                expected = 0xA1 if attached else 0xA0
+                command("boot ENTROPY.PMF", f"The payload returned, r1 = ${expected:016X}")
+                result["entropy_" + label] = expected
+                if attached:
+                    vectors = check_crypto_vectors(client, folder / "crypto-vectors.log")
+                    transcript.append(vectors)
+                    result["crypto_vectors"] = 273
             if attached:
                 command("net", "Zentaji Ethernet is attached.")
                 lease = command("dhcp", "Lease accepted on Zentaji Ethernet")
@@ -246,6 +299,8 @@ def main():
             evidence = [folder / "run.log", folder / "transcript.log"]
             if label == "nat" and args.screenshot:
                 evidence.append(folder / "pr.png")
+            if label == "nat" and args.crypto:
+                evidence.append(folder / "crypto-vectors.log")
             catalogs.append(catalog(folder / (label + ".cat"), evidence, True))
         catalogs.append(catalog(output / "results.cat", [output / "result.json"], True))
         signatures("pwsh.exe", args.sign_script.resolve(), catalogs=catalogs)

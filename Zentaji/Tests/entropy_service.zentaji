@@ -1,0 +1,24 @@
+XIncludeFile "Anvil/Network/web_random.pbi"
+Global Dim entropyFirst.a[49]
+Global Dim entropySecond.a[49]
+
+Procedure.i Main(services.i)
+ Protected rc.i,i.i,different.i
+ If WebRandomBind(services)<>0 : ProcedureReturn $E0 : EndIf
+ rc=WebRandomReady()
+ If rc=-101
+  If WebRandomBytes(@entropyFirst[1],47)<>-101 : ProcedureReturn $E1 : EndIf
+  ProcedureReturn $A0
+ EndIf
+ If rc<>1 : ProcedureReturn $E2 : EndIf
+ entropyFirst[0]=$A5 : entropyFirst[48]=$5A
+ entropySecond[0]=$3C : entropySecond[48]=$C3
+ If WebRandomBytes(@entropyFirst[1],47)<>47 Or WebRandomBytes(@entropySecond[1],47)<>47 : ProcedureReturn $E3 : EndIf
+ If entropyFirst[0]<>$A5 Or entropyFirst[48]<>$5A Or entropySecond[0]<>$3C Or entropySecond[48]<>$C3 : ProcedureReturn $E4 : EndIf
+ For i=1 To 47
+  If entropyFirst[i]<>entropySecond[i] : different=1 : EndIf
+  entropyFirst[i]=0 : entropySecond[i]=0
+ Next
+ If different=0 : ProcedureReturn $E5 : EndIf
+ ProcedureReturn $A1
+EndProcedure

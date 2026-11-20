@@ -187,10 +187,7 @@
 ;        anyway.  It changes WHICH line refuses them, not the verdict
 ;        and not EcdsaLastErr.  Recorded, with the argument, in the
 ;        gate's table.
-;      The one non-PeekA read is `Read.b bb` in EcdsaReadBytes, walking
-;      the curve-order DataSection; the byte is masked `& 255` at the
-;      PokeB it feeds, and PokeB truncates to eight bits regardless, so
-;      the width of the read cannot escape that statement.
+;      EcdsaReadBytes reads the curve-order table with unsigned PeekA.
 ;
 ;  SHAPE 3 - `<<` DOES NOT DISCARD AT BIT 31.
 ;      NOT PRESENT, AND THE DER WALK IS WHY.  The dangerous site in any
@@ -364,14 +361,14 @@ Global EcdsaReady.i                   ; 0 until EcdsaInit has run
 Global EcdsaLastErr.i                 ; why the last call answered as it did
 
 ; ----------------------------------------------------------------------
-;  Read n bytes from the Data cursor LONGHAND (one explicit .b per byte).
+;  Read n bytes from the labeled table LONGHAND (one explicit .b per byte).
 ; ----------------------------------------------------------------------
-Procedure EcdsaReadBytes(dst.i, n.i)
+Procedure EcdsaReadBytes(src.i, dst.i, n.i)
   Protected i.i
   Protected bb.i
   i = 0
   While i < n
-    Read.b bb
+    bb = PeekA(src + i)
     PokeB(dst + i, bb & 255)
     i = i + 1
   Wend
@@ -392,8 +389,7 @@ Procedure EcdsaInit()
     BnSw(@EcdsaN, i, 0)
     i = i + 1
   Wend
-  Restore EcdsaDataOrder
-  EcdsaReadBytes(@EcdsaOrder, 32)
+  EcdsaReadBytes(?EcdsaDataOrder, @EcdsaOrder, 32)
   BnDecode(@EcdsaN, @EcdsaOrder, 32)
   EcdsaN0i = BnNinv15(BnGw(@EcdsaN, 1))
   i = 0
@@ -890,8 +886,7 @@ EndProcedure
 ;  still -1.
 ; ----------------------------------------------------------------------
 Global *EcdsaVerifyHook
-Procedure.i EcdsaVrfy(curve.i, hashAddr.i, hashLen.i, qAddr.i, qLen.i, sigAddr.i, sigLen.i)
-  If EcdsaVerifyHook<>0 : ProcedureReturn EcdsaVerifyHook(curve,hashAddr,hashLen,qAddr,qLen,sigAddr,sigLen) : EndIf
+Procedure.i EcdsaVrfySync(curve.i, hashAddr.i, hashLen.i, qAddr.i, qLen.i, sigAddr.i, sigLen.i)
   Protected i.i
   Protected rawLen.i
   Protected r.i
@@ -919,6 +914,12 @@ Procedure.i EcdsaVrfy(curve.i, hashAddr.i, hashLen.i, qAddr.i, qLen.i, sigAddr.i
   r = EcpVrfyRaw(curve, hashAddr, hashLen, qAddr, qLen, @EcdsaRsig, rawLen)
   EcdsaLastErr = EcpLastErr
   ProcedureReturn r
+EndProcedure
+
+Procedure.i EcdsaVrfy(curve.i, hashAddr.i, hashLen.i, qAddr.i, qLen.i, sigAddr.i, sigLen.i)
+  Protected *operation=@EcdsaVrfySync
+  If *EcdsaVerifyHook<>0 : *operation=*EcdsaVerifyHook : EndIf
+  ProcedureReturn operation(curve,hashAddr,hashLen,qAddr,qLen,sigAddr,sigLen)
 EndProcedure
 
 ; ----------------------------------------------------------------------

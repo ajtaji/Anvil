@@ -1,7 +1,7 @@
 ; SPDX-License-Identifier: MIT
 ; Optional ABI1.10 entropy binding for web nonces and frame masks.
 ; Does not change the ABI1.6 transport requirements for older callers.
-Global *webRandomReadyFn,*webRandomBytesFn
+Global webRandomReadyFn.i,webRandomBytesFn.i
 Global webRandomBound.i
 Procedure.i WebRandomBind(table.i)
   webRandomBound=0 : webRandomReadyFn=0 : webRandomBytesFn=0
@@ -15,9 +15,9 @@ Procedure.i WebRandomBind(table.i)
 EndProcedure
 Procedure.i WebRandomReady()
   If webRandomBound=0 : ProcedureReturn -109 : EndIf
-  ProcedureReturn webRandomReadyFn()
+  ProcedureReturn CallFunctionFast(webRandomReadyFn)
 EndProcedure
 Procedure.i WebRandomBytes(dst.i,n.i)
   If webRandomBound=0 : ProcedureReturn -109 : EndIf
-  ProcedureReturn webRandomBytesFn(dst,n)
+  ProcedureReturn CallFunctionFast(webRandomBytesFn,dst,n)
 EndProcedure

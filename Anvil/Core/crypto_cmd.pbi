@@ -2075,7 +2075,7 @@ Procedure CryptoSpeedRun(n.i)
   PrintN("Throughput on this part, over a buffer of")
   Print("  ")
   PrintDec(n)
-  Print(" bytes, CNTPCT_EL0 at ")
+  Print(" bytes, hardware timer at ")
   PrintDec(hz)
   PrintN(" Hz.")
   PrintN("  These are the numbers the desktop model cannot produce - it has no")
@@ -2315,9 +2315,9 @@ EndProcedure
 ; ----------------------------------------------------------------------
 Procedure CryHeader()
   PrintN("crypto - known-answer self-test, on this board, on the vectors the")
-  PrintN("         desktop gates use. module / id / verdict / CNTPCT_EL0 ticks.")
+  PrintN("         desktop gates use. module / id / verdict / hardware timer ticks.")
   If cryTicksOk = 0
-    PrintN("         THE TICK COLUMN IS A DASH: CNTPCT_EL0 is not advancing, so")
+    PrintN("         THE TICK COLUMN IS A DASH: the hardware timer is not advancing, so")
     PrintN("         nothing here is timed. The verdicts are unaffected.")
   EndIf
   PrintN("")
