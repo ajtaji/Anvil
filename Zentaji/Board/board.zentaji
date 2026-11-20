@@ -1,9 +1,9 @@
 EnableFloatingPoint
 ; Zentaji serial/storage monitor composition. The ROM loads the owned startup
 ; envelope; Main receives its validated table/source/context, never ARM registers.
-#ANVIL_BUILD = 53 ; pmf:build
+#ANVIL_BUILD = 54 ; pmf:build
 #ANVIL_BUILD_DATE = 20261119 ; pmf:builddate
-#ANVIL_BUILD_TIME = 182832 ; pmf:buildtime
+#ANVIL_BUILD_TIME = 184535 ; pmf:buildtime
 #CAP_TOUCH=0
 #CAP_PWM=0
 #CAP_NET=1
@@ -88,6 +88,7 @@ XIncludeFile "Anvil/Core/readback.pbi"
 XIncludeFile "Anvil/Core/command_loop.pbi"
 XIncludeFile "Zentaji/Board/neon_console.pbi"
 XIncludeFile "Zentaji/Board/screenshot.pbi"
+XIncludeFile "Zentaji/Board/machine_diagnostics.pbi"
 XIncludeFile "Zentaji/Forge/shell.pbi"
 
 Procedure ZentajiShellHelp()
@@ -96,7 +97,7 @@ Procedure ZentajiShellHelp()
  PrintN("  mount, load, save, ls/dir, cat, mkdir, rmdir, rm/del, rename/mv")
  PrintN("  settings, printenv, setenv, saveenv, env, setexpr, time, force")
  PrintN("  memory/md, write/poke, fill/mw, copy/cp, compare/cmp, base, crc32/checksum")
- PrintN("  mm, nm, mtest, sha1sum, sha256sum")
+ PrintN("  mm, nm, mtest, sha1sum, sha256sum, mmio, baud, vkstat")
  PrintN("  uptime/up, last run, reset/reboot")
  PrintN("  net, dhcp, ping <host>, dns <name>")
  PrintN("  info/board, clock, receive <hex address> <hex length> <crc32>, srecord/loads")
@@ -133,6 +134,12 @@ Procedure.i HwCommandDispatch(c.i)
   CmdVersion()
  ElseIf WordIs("info")<>0 Or WordIs("board")<>0 Or LetterIs(105)<>0
   ZentajiCmdInfo()
+ ElseIf WordIs("mmio")<>0
+  ZentajiCmdMmio()
+ ElseIf WordIs("baud")<>0
+  ZentajiCmdBaud()
+ ElseIf WordIs("vkstat")<>0
+  ZentajiCmdVkStat()
  ElseIf WordIs("clock")<>0 Or LetterIs(99)<>0
   ZentajiCmdClock()
  ElseIf WordIs("receive")<>0 Or LetterIs(98)<>0

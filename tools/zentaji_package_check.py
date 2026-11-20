@@ -114,6 +114,54 @@ def check_automation(client, transcript, container):
     return dict(payload_readback_bytes=len(container), multiblock_bytes=count)
 
 
+def check_machine_diagnostics(client, transcript):
+    def command(line):
+        reply = client.command(line).decode("ascii")
+        transcript.append(reply)
+        return reply
+
+    table = command("mmio FFFF000000010018")
+    assert "FFFF000000010018: 0000000010000000" in table, table
+    uart = command("mmio FFFF000000100000 2")
+    assert "FFFF000000100000: 0000000000010011" in uart, uart
+    assert "FFFF000000100008: " in uart, uart
+    for bad, refusal in (("1", "eight-byte-aligned"), ("100000", "outside a fitted device"),
+                         ("FFFF00000010FFF8 2", "outside a fitted device"),
+                         ("FFFF000000100000 41", "count"), ("FFFF000000100000 1junk", "count")):
+        assert refusal in command("mmio " + bad)
+
+    old = int(re.search(r"UART0 baud: (\d+)", command("baud"))[1])
+    rate = 1500000 if old != 1500000 else 3000000
+
+    def confirm(value):
+        client.socket.sendall(f"baud {value}\r\r".encode("ascii"))
+        reply = client.prompt().decode("ascii")
+        transcript.append(reply)
+        assert f"UART0 baud kept: {value}" in reply, reply
+
+    confirm(rate)
+    assert f"FFFF000000100060: {rate:016X}" in command("mmio FFFF000000100060")
+    assert f"UART0 baud restored: {rate}" in command(f"baud {old}")
+    assert f"UART0 baud: {rate} " in command("baud")
+    confirm(old)
+    assert "!!" in command("baud 15")
+    assert f"UART0 baud: {old} " in command("baud")
+    # A plain payload gives up the scanout lease. The new lease starts its
+    # count at zero, and the first returned prompt can precede the GPU latch.
+    deadline = time.monotonic() + 30
+    while True:
+        reply = command("vkstat")
+        assert "Display: 1024x768, buffers: " in reply and "error: 0, lost: 0" in reply, reply
+        assert int(re.search(r"Native Vulkan queue sequence: (\d+)", reply)[1]) > 0, reply
+        presents = int(re.search(r"Completed presents: (\d+)", reply)[1])
+        if presents:
+            break
+        if time.monotonic() >= deadline:
+            raise AssertionError("The returned monitor never latched a frame: " + reply)
+        time.sleep(0.5)
+    return dict(confirmed_baud=rate, restored_baud=old, completed_presents=presents)
+
+
 def check_serial_loaders(client, transcript):
     from anvil_readback import parse_readback
     import zlib
@@ -253,7 +301,7 @@ def check_file_transfer(client, transcript, keep):
     return dict(bytes=len(payload), sha256=digest(root / "TOHOST.BIN"))
 
 
-def check(archive, keep, signer, powershell, automation=False, transfers=False, memory=False, loaders=False):
+def check(archive, keep, signer, powershell, automation=False, transfers=False, memory=False, loaders=False, diagnostics=False):
     archive, keep, signer = (Path(p).resolve() for p in (archive, keep, signer))
     if keep.exists():
         raise ValueError("Choose a new evidence directory; existing disks must be preserved")
@@ -326,6 +374,8 @@ def check(archive, keep, signer, powershell, automation=False, transfers=False, 
                 print(label + ": " + command + " PASS", flush=True)
             if transfers and label == "first":
                 result["file_transfer"] = check_file_transfer(client, transcript, keep)
+            if diagnostics and label == "second":
+                result["machine_diagnostics"] = check_machine_diagnostics(client, transcript)
             if loaders and label == "second":
                 result["serial_loaders"] = check_serial_loaders(client, transcript)
             if memory and label == "second":
@@ -446,9 +496,10 @@ def main():
     parser.add_argument("--automation", action="store_true", help="Exercise programs, readback and screenshot over UART")
     parser.add_argument("--transfers", action="store_true", help="Check host file exchange over loopback TFTP (tftpy==0.8.7 and a free UDP port 69)")
     parser.add_argument("--memory", action="store_true", help="Check interactive memory edits, range testing and hashes on Zentaji")
+    parser.add_argument("--diagnostics", action="store_true", help="Check native UART baud, register inspection and GPU presentation status")
     parser.add_argument("--loaders", action="store_true", help="Check serial block and S-record loading, board identity and timer frequency")
     args = parser.parse_args()
-    print(json.dumps(check(args.archive, args.keep, args.sign_script, args.powershell, args.automation, args.transfers, args.memory, args.loaders), indent=2))
+    print(json.dumps(check(args.archive, args.keep, args.sign_script, args.powershell, args.automation, args.transfers, args.memory, args.loaders, args.diagnostics), indent=2))
 
 
 if __name__ == "__main__":
