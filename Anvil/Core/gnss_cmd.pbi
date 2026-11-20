@@ -62,8 +62,8 @@ Procedure GnssCmdCounts()
   PrintN("")
 EndProcedure
 
-Procedure.i GnssCmdOpen(src.i)
-  If GnssSource() = src
+Procedure.i GnssCmdOpen(src.i,reconnect.i)
+  If GnssSource() = src And reconnect=0
     ProcedureReturn 1
   EndIf
   If GnssOpen(src) = 0
@@ -132,7 +132,7 @@ Procedure.i GnssCmdDecTo(v.i, *dst)
 EndProcedure
 
 Procedure GnssCmdNetwork()
-  Define i.i, c.i, ip.i, port.i, hl.i
+  Define i.i, c.i, ip.i, port.i, hl.i, reconnect.i
   Define Dim host.a[128]
   Define Dim txt.a[32]
   SkipSpace()
@@ -164,6 +164,7 @@ Procedure GnssCmdNetwork()
         ProcedureReturn                              ; ResolveName said why
       EndIf
     EndIf
+    reconnect=Bool(ip<>GnssNetIp() Or port<>GnssNetPort())
     ; the dotted quad, as the setting stores it
     i = 0
     For c = 3 To 0 Step -1
@@ -183,17 +184,21 @@ Procedure GnssCmdNetwork()
       PrintN("!! the settings could not be saved to the stick; the network source is set until the next reset.")
     EndIf
   EndIf
-  GnssCmdOpen(#GNSS_SRC_NETWORK)
+  GnssCmdOpen(#GNSS_SRC_NETWORK,reconnect)
 EndProcedure
 
 Procedure CmdGnss()
   Define s.i
   SkipSpace()
   If gLine[gPos] = 0
-    If GnssCmdOpen(#GNSS_SRC_USB) <> 0
+    If GnssCmdOpen(GnssPreferredSource(),0) <> 0
       GnssCmdWatch(2, 0)
     EndIf
-    PrintN("Type gnss watch [seconds], gnss raw [seconds] or gnss source usb | bluetooth | ble | network.")
+    If UsbSerialAvailable()<>0
+      PrintN("Type gnss watch [seconds], gnss raw [seconds] or gnss source usb | bluetooth | ble | network.")
+    Else
+      PrintN("Type gnss source network <host>[:<port>], gnss watch [seconds] or gnss raw [seconds].")
+    EndIf
     ProcedureReturn
   EndIf
   gWordAt = gPos
@@ -210,7 +215,7 @@ Procedure CmdGnss()
       EndIf
     EndIf
     If GnssSource() = #GNSS_SRC_NONE
-      If GnssCmdOpen(#GNSS_SRC_USB) = 0
+      If GnssCmdOpen(GnssPreferredSource(),0) = 0
         ProcedureReturn
       EndIf
     EndIf
@@ -219,12 +224,11 @@ Procedure CmdGnss()
     SkipSpace()
     gWordAt = gPos : SkipWord() : gWordLen = gPos - gWordAt
     If WordIs("usb") <> 0
-      SettingsSet("gnss.source", "usb") : SettingsSave()
-      GnssCmdOpen(#GNSS_SRC_USB)
+      If GnssCmdOpen(#GNSS_SRC_USB,0)<>0 : SettingsSet("gnss.source", "usb") : SettingsSave() : EndIf
     ElseIf WordIs("bluetooth") <> 0
-      GnssCmdOpen(#GNSS_SRC_BLUETOOTH)
+      GnssCmdOpen(#GNSS_SRC_BLUETOOTH,0)
     ElseIf WordIs("ble") <> 0
-      GnssCmdOpen(#GNSS_SRC_BLE)
+      GnssCmdOpen(#GNSS_SRC_BLE,0)
     ElseIf WordIs("network") <> 0
       GnssCmdNetwork()
     Else

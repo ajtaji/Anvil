@@ -13,41 +13,4 @@
 ;  There is no PPS input wired on this board, so HwGnssPpsTicks() is -1.
 ; ======================================================================
 
-; The source set at the prompt (the setting gnss.source: usb, the default, or network); see gnss_cmd.pbi.
-Procedure.i HwGnssUp()
-  Define *p
-  If GnssSource() <> #GNSS_SRC_NONE
-    ProcedureReturn 1
-  EndIf
-  *p = SettingsGet("gnss.source")
-  If *p <> 0
-    If PeekA(*p) = 110 And PeekA(*p + 1) = 101 And PeekA(*p + 2) = 116            ; "net..."
-      ProcedureReturn GnssOpen(#GNSS_SRC_NETWORK)
-    EndIf
-  EndIf
-  ProcedureReturn GnssOpen(#GNSS_SRC_USB)
-EndProcedure
-
-Procedure.i HwGnssPoll()
-  ProcedureReturn GnssPump()
-EndProcedure
-
-Procedure.i HwGnssFix(*fix)
-  ProcedureReturn GnssFix(*fix)
-EndProcedure
-
-Procedure.i HwGnssAgeMs()
-  ProcedureReturn GnssAgeMs()
-EndProcedure
-
-Procedure.i HwGnssPpsTicks()
-  ProcedureReturn -1
-EndProcedure
-
-Procedure.i HwGnssSatsUsed()
-  ProcedureReturn GnssSatsUsed()
-EndProcedure
-
-Procedure.i HwGnssErrText()
-  ProcedureReturn GnssWhy()
-EndProcedure
+XIncludeFile "Anvil/Services/gnss_hal.pbi"

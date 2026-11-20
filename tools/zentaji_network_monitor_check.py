@@ -90,6 +90,87 @@ def check_exchange(command, client, port, folder):
             "tcp_sent": len(incoming), "tcp_received": 11}
 
 
+def seed_mouse_motion(fixture):
+    # The native input device consumes display pixels and reports wheel markers.
+    # Repeat to admit a session at any phase of the scripted hand movement.
+    for cycle in range(40):
+        tick = cycle * 125_000_000
+        for offset, wheel in ([(0, 1)] + [(i, 0) for i in range(1, 17)] +
+                              [(16, 2)] + [(i, 0) for i in range(15, -1, -1)] + [(0, 3)]):
+            tick += 250000
+            fixture.input_feed(tick, "mouse", 300 + offset, 200 - offset, 0, wheel)
+
+
+def check_mouse(command):
+    command("mouse", "100%")
+    reports = {}
+    for percent in (100, 150, 50):
+        command(f"mouse {percent}", f"now {percent}%")
+        reply = command("boot MOUSE.PMF", "The payload returned, r1 =")
+        word = int(re.search(r"r1 = \$([0-9A-F]{16})", reply)[1], 16)
+        x, y = word >> 48, (word >> 32) & 65535
+        extent = 16 * percent // 100
+        # At half gain exactly eight of sixteen single-pixel movements advance
+        # on each leg. The payload also requires the final position to match.
+        moves = min(16, extent)
+        expected = bytes([128 + extent, 128 - extent, moves, moves])
+        assert (word & 0xffffffff).to_bytes(4, "big") == expected, (percent, reply)
+        assert (x, y) == (300, 200), (percent,x,y)
+        reports[str(percent)] = dict(start=[x, y], delta=[extent, -extent], moves=moves)
+    command("mouse 9", "now 10%")
+    command("mouse 1001", "now 1000%")
+    command("mouse nope", "Nothing")
+    command("mouse", "1000%")
+    command("mouse 100", "now 100%")
+    return reports
+
+
+def check_gnss(command):
+    from concurrent.futures import ThreadPoolExecutor
+    from gnss_read_check import SENTENCE
+
+    def send_fix(server, payload, release, gpsd=False):
+        server.settimeout(15)
+        with server.accept()[0] as peer:
+            if gpsd:
+                expected = b'?WATCH={"enable":true,"nmea":true}\n'
+                request = bytearray()
+                peer.settimeout(15)
+                while len(request)<len(expected):
+                    chunk=peer.recv(len(expected)-len(request))
+                    if not chunk:
+                        raise ConnectionError("GNSS client closed before its gpsd WATCH")
+                    request.extend(chunk)
+                assert request==expected,request
+            # Split the checksum from its sentence across writes.
+            peer.sendall(payload[:-4])
+            peer.sendall(payload[-4:])
+            release.wait(30)
+
+    # Two independent receivers also test changing ports while a source is open.
+    with socket.create_server(("127.0.0.1",0)) as first, socket.create_server(("127.0.0.1",2947)) as second:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            released = threading.Event()
+            try:
+                sent = pool.submit(send_fix, first, SENTENCE.replace(b"*47", b"*00") + SENTENCE, released)
+                command(f"gnss source network 10.0.2.2:{first.getsockname()[1]}", "GNSS source: network")
+                fix = command("gnss watch 2", "3D fix  48.1173000, 11.5166667")
+                assert "alt 545 m" in fix and "sats 8" in fix and "12:35:19 UTC" in fix, fix
+                assert "1 good frames, 1 bad" in fix, fix
+                command("gnss source usb", "no USB serial receiver transport")
+                command("boot GNSS.PMF", "$00000000474E5353")
+                sent2 = pool.submit(send_fix, second, SENTENCE, released, True)
+                command(f"gnss source network 10.0.2.2:{second.getsockname()[1]}", "GNSS source: network")
+                raw = command("gnss raw 2", SENTENCE.decode("ascii").strip())
+                assert "1 good frames, 0 bad" in raw, raw
+            finally:
+                released.set()
+            sent.result(timeout=5)
+            sent2.result(timeout=5)
+    return dict(latitude_e7=481173000, longitude_e7=115166667, altitude_mm=545400,
+                satellites=8, bad_checksums=1, receiver_ports=2, gpsd_watch=True, service_return="474E5353")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--zen-tools", type=Path, required=True)
@@ -100,6 +181,9 @@ def main():
     parser.add_argument("--crypto", type=Path, metavar="COMPILER", help="Build a Zentaji entropy ABI probe and check the shared crypto vector suite")
     parser.add_argument("--readonly-disk", action="store_true",
                         help="Check native raw block reads and write refusal on a read-only disk")
+    parser.add_argument("--gnss", type=Path, metavar="COMPILER", help="Check network NMEA and the shared payload fix ABI")
+    parser.add_argument("--mouse", type=Path, metavar="COMPILER",
+                        help="Check native pointer movement through a separately compiled input client")
     parser.add_argument("--kept-shot", type=Path, metavar="COMPILER",
                         help="Capture a returning Neon payload over UART and acknowledged UDP")
     parser.add_argument("--cores", action="store_true", help="Exercise native secondary core launch, results and ownership")
@@ -136,6 +220,9 @@ def main():
     probe = compile_probe(args.crypto, "Zentaji/Tests/entropy_service.zentaji", "entropy-probe.zex") if args.crypto else None
     shot_probe = compile_probe(args.kept_shot, "Zentaji/Tests/kept_frame.zentaji", "kept-frame.zex") if args.kept_shot else None
 
+    gnss_probe = compile_probe(args.gnss, "Zentaji/Tests/gnss_service.zentaji", "gnss-service.zex") if args.gnss else None
+    mouse_probe = compile_probe(args.mouse, "Zentaji/Tests/mouse_motion.zentaji", "mouse-motion.zex") if args.mouse else None
+
     def boot(attached, no_entropy=False):
         label = "no-entropy" if no_entropy else ("nat" if attached else "disconnected")
         live_entropy = attached and not no_entropy and (probe is not None or args.web)
@@ -150,13 +237,20 @@ def main():
                           display_modes=[(1024, 768, 60000)])
         fixture.net_attached = attached
         readonly = args.readonly_disk and not attached
-        if attached or probe is not None or readonly:
+        mouse_case = mouse_probe is not None and not attached
+        if mouse_case:
+            seed_mouse_motion(fixture)
+        if attached or probe is not None or readonly or mouse_case:
             with tempfile.TemporaryDirectory(prefix="zentaji-net-") as temporary:
                 seed = Path(temporary) / "source"
                 seed.mkdir()
                 (seed / "main.zen").write_bytes(SOURCE)
                 if probe is not None:
                     (seed / "ENTROPY.PMF").write_bytes(probe)
+                if gnss_probe is not None:
+                    (seed / "GNSS.PMF").write_bytes(gnss_probe)
+                if mouse_case:
+                    (seed / "MOUSE.PMF").write_bytes(mouse_probe)
                 if shot_probe is not None:
                     (seed / "FRAME.PMF").write_bytes(shot_probe)
                 if args.web:
@@ -196,8 +290,10 @@ def main():
             inputs = [path for path in folder.iterdir() if path.is_file()]
             signatures("pwsh.exe", args.sign_script.resolve(), executables=[executable],
                        catalogs=[catalog(folder / "inputs.cat", inputs, True)])
-        run_mode = ["--fast"] if args.exchange or args.screenshot or args.crypto or args.web else []
+        run_mode = ["--fast"] if mouse_case or args.exchange or args.screenshot or args.crypto or args.web else []
         budget = "300000000000" if args.crypto or args.web else ("4000000000" if args.screenshot else "2000000000")
+        if mouse_case:
+            budget = "30000000000"
         process = subprocess.Popen(
             [str(executable), str(config), *run_mode, "--headless", "--live", "--max", budget,
              "--live-seconds", "1800" if args.crypto or args.web else "180", "--serial-listen", "0"],
@@ -231,6 +327,8 @@ def main():
                 assert expected in reply, (text, reply)
                 return reply
 
+            if mouse_case:
+                result["mouse"] = check_mouse(command)
             if args.cores:
                 command("coretest run extra", "coretest takes exactly")
                 command("coretest status", f"coretest fitted={cores} owned=0")
@@ -418,6 +516,8 @@ def main():
                     assert parse_shot_header(command("shot status","not armed"))["seq"] == 2
                     result["kept"] = dict(sequence=2, return_register=header["x0"], bytes=header["bytes"],
                                           rgb_sha256=hashlib.sha256(b"".join(rows)).hexdigest())
+                if gnss_probe is not None:
+                    result["gnss"] = check_gnss(command)
                 if args.web:
                     result["web"] = check_web_peers(command, http_port, keys, web_body)
                 command("echo UART-AFTER-UDP", "UART-AFTER-UDP")
@@ -427,7 +527,19 @@ def main():
                 command("echo UART-AFTER-NO-LINK", "UART-AFTER-NO-LINK")
 
             client.socket.sendall(b"halt\r")
-            assert process.wait(timeout=30) == 0
+            stop_reply = bytearray()
+            stop_deadline = time.monotonic() + 30
+            while b"Anvil stopped." not in stop_reply:
+                client.socket.settimeout(max(0.1, stop_deadline - time.monotonic()))
+                chunk = client.socket.recv(4096)
+                if not chunk:
+                    break
+                stop_reply.extend(chunk)
+                if b"\npmf> " in stop_reply or time.monotonic() >= stop_deadline:
+                    break
+            transcript.append(stop_reply.decode("utf-8", errors="replace"))
+            assert b"Anvil stopped." in stop_reply, stop_reply
+            assert process.wait(timeout=90 if mouse_case else 30) == 0
         except ConnectionError:
             try:
                 process.wait(timeout=3)

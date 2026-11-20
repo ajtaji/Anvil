@@ -1,0 +1,51 @@
+; Read ordinary slot-39 application events. The host supplies three wheel
+; markers around two 16-count diagonal drags and checks the returned metrics.
+XIncludeFile "Anvil/Hal/input_service_client.pbi"
+Procedure.q Main(services.i)
+ Protected evt.NativeInputEvent,rc.i,n.i,phase.i,aligned.i,firstX.i,firstY.i
+ Protected peakX.i,peakY.i,lastX.i,lastY.i,outX.i,outY.i,backX.i,backY.i,answer.q
+ If AnvilInputBind(services,#NUI_MOUSE)<>0 : ProcedureReturn $BAD01 : EndIf
+ If AnvilInputOpen()<>0 : ProcedureReturn $BAD02 : EndIf
+ For n=1 To 3000000
+  rc=AnvilInputPoll(@evt)
+  If rc<0 : ProcedureReturn $BAD03 : EndIf
+  If rc=1 And evt\source=#NUI_SOURCE_MOUSE
+   If evt\kind=#NUI_WHEEL
+    ; Open may land mid-drag. Reopen at the end marker so both the physical
+    ; baseline and the provider's signed fractions start at a known point.
+    If aligned=0
+     If evt\value=3
+      If AnvilInputClose()<>0 Or AnvilInputOpen()<>0 : ProcedureReturn $BAD07 : EndIf
+      aligned=1
+     EndIf
+    ElseIf evt\value=1
+     firstX=evt\x : firstY=evt\y : lastX=firstX : lastY=firstY : phase=1
+     outX=0 : outY=0 : backX=0 : backY=0
+    ElseIf evt\value=2 And phase=1
+     peakX=evt\x : peakY=evt\y : phase=2
+    ElseIf evt\value=3 And phase=2
+     If evt\x<>firstX Or evt\y<>firstY : ProcedureReturn $BAD04 : EndIf
+     If outX<>outY Or backX<>backY : ProcedureReturn $BAD08 : EndIf
+     answer=(firstX<<48) | (firstY<<32) | ((128+peakX-firstX)<<24) | ((128+peakY-firstY)<<16) | (outX<<8) | backX
+     If AnvilInputClose()<>0 : ProcedureReturn $BAD05 : EndIf
+     ProcedureReturn answer
+    EndIf
+   EndIf
+   If evt\kind=#NUI_POINTER
+    ; The two native axis registers are independent. Count each axis even
+    ; when its two coordinates were reported in consecutive events.
+    If phase=1
+     If evt\x<lastX Or evt\y>lastY : ProcedureReturn $BAD09 : EndIf
+     If evt\x<>lastX : outX=outX+1 : EndIf
+     If evt\y<>lastY : outY=outY+1 : EndIf
+    ElseIf phase=2
+     If evt\x>lastX Or evt\y<lastY : ProcedureReturn $BAD0A : EndIf
+     If evt\x<>lastX : backX=backX+1 : EndIf
+     If evt\y<>lastY : backY=backY+1 : EndIf
+    EndIf
+    lastX=evt\x : lastY=evt\y
+   EndIf
+  EndIf
+ Next
+ ProcedureReturn $BAD06
+EndProcedure

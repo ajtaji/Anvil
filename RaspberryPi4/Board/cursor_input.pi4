@@ -874,6 +874,8 @@ EndProcedure
 
 
 Global gPtrWheel.i
+XIncludeFile "Anvil/Core/mouse_cmd.pbi"
+
 Procedure MouseTick()
   Define n.i
   ; No screen, no cursor - and no point paying for the poll.
@@ -949,12 +951,8 @@ Procedure MouseTick()
   ; out whole pixels (÷100) and carry the rest, so 100 is exactly 1:1
   ; and the leftover of a slow drag is never rounded away. The subtract
   ; carries the sign whichever way the mouse moved.
-  gCurAx = gCurAx + rawDx * gMousePct
-  gCurAy = gCurAy + rawDy * gMousePct
-  stepX = gCurAx / 100
-  stepY = gCurAy / 100
-  gCurAx = gCurAx - stepX * 100
-  gCurAy = gCurAy - stepY * 100
+  stepX = AnvilMouseStep(rawDx,@gCurAx)
+  stepY = AnvilMouseStep(rawDy,@gCurAy)
   If stepX = 0 And stepY = 0
     ProcedureReturn
   EndIf
@@ -1200,32 +1198,5 @@ EndProcedure
 ;  finger cannot pin the cursor in a corner or freeze it in place.
 ; ----------------------------------------------------------------------
 Procedure CmdMouse()
-  Define v.i
-  SkipSpace()
-  If gLine[gPos] = 0
-    Print("mouse sensitivity is ")
-    PrintDec(gMousePct)
-    PrintN("% of 1:1 (100 = raw counts, 200 = twice as fast).")
-    If gMouseOk = 0
-      PrintN("No mouse is attached yet; the setting still takes effect when one is.")
-    EndIf
-    PrintN("Type mouse <percent> to change it, e.g. mouse 200.")
-    ProcedureReturn
-  EndIf
-  v = ParseDec()
-  If gParseOk = 0
-    PrintN("!! mouse wants a whole number of percent, e.g. mouse 150. Nothing")
-    PrintN("   was changed.")
-    ProcedureReturn
-  EndIf
-  If v < 10
-    v = 10
-  EndIf
-  If v > 1000
-    v = 1000
-  EndIf
-  gMousePct = v
-  Print("mouse sensitivity is now ")
-  PrintDec(gMousePct)
-  PrintN("% of 1:1.")
+  AnvilCmdMouse(gMouseOk)
 EndProcedure

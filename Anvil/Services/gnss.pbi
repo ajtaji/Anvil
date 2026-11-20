@@ -749,7 +749,7 @@ EndProcedure
 #GNSS_NET_RETRY_US = 3000000
 #GNSS_NET_ARP_US = 200000
 Global gnss_netIp.i, gnss_netPort.i, gnss_netSock.i = -1, gnss_netState.i, gnss_netTryUs.i, gnss_netConnects.i, gnss_netLastErr.i
-Global Dim gnss_netWatch.a[48]
+#GNSS_GPSD_WATCH_BYTES=35
 DataSection
   gnss_netWatchBytes:
   Data.a 63, 87, 65, 84, 67, 72, 61, 123, 34, 101, 110, 97, 98, 108, 101, 34, 58, 116, 114, 117, 101, 44, 34, 110, 109, 101, 97, 34, 58, 116, 114, 117, 101, 125, 10
@@ -788,9 +788,11 @@ Procedure.i gnss_NetSettings()
 EndProcedure
 
 Procedure gnss_NetClose()
+  Protected previous.i
   If gnss_netSock >= 0
-    TcpUse(gnss_netSock)
+    previous=TcpCurrent() : TcpUse(gnss_netSock)
     If TcpState() <> #TCP_CLOSED : TcpClose() : EndIf
+    TcpUse(previous)
   EndIf
   gnss_netSock = -1 : gnss_netState = 0
 EndProcedure
@@ -803,7 +805,7 @@ Procedure.i GnssNetConnects() : ProcedureReturn gnss_netConnects : EndProcedure
 Procedure.i GnssNetLastError() : ProcedureReturn gnss_netLastErr : EndProcedure
 
 Procedure.i gnss_NetRead(*dst, max.i)
-  Define now.i, s.i, rc.i, k.i, i.i, n.i, t.i
+  Define now.i, s.i, rc.i, k.i
   now = HwMicros()
   TcpPoll(1)                                         ; the stack moves on: frames in, timers, what is queued out
   If gnss_netSock >= 0
@@ -812,9 +814,7 @@ Procedure.i gnss_NetRead(*dst, max.i)
       If gnss_netState <> 2
         gnss_netState = 2 : gnss_netConnects = gnss_netConnects + 1
         If gnss_netPort = 2947                       ; gpsd: ask for its NMEA
-          Restore gnss_netWatchBytes
-          For n = 0 To 34 : Read.a t : gnss_netWatch[n] = t : Next
-          TcpSend(@gnss_netWatch[0], 35)
+          TcpSend(?gnss_netWatchBytes,#GNSS_GPSD_WATCH_BYTES)
         EndIf
       EndIf
       ProcedureReturn TcpRead(*dst, max)
@@ -858,6 +858,7 @@ EndProcedure
 ; ---------------------------------------------------------------- the sources
 ; The bytes waiting at the open source, up to max, into *dst; -1 if it is not up.
 Procedure.i gnss_SrcRead(*dst, max.i)
+  Protected previous.i,count.i
   Select gnss_src
     Case #GNSS_SRC_USB
       ProcedureReturn UsbSerialRead(*dst, max)
@@ -866,7 +867,8 @@ Procedure.i gnss_SrcRead(*dst, max.i)
     Case #GNSS_SRC_BLE
       ProcedureReturn -1                                      ; PLACEHOLDER: the Nordic UART service
     Case #GNSS_SRC_NETWORK
-      ProcedureReturn gnss_NetRead(*dst, max)
+      previous=TcpCurrent() : count=gnss_NetRead(*dst,max) : TcpUse(previous)
+      ProcedureReturn count
   EndSelect
   ProcedureReturn -1
 EndProcedure
@@ -908,6 +910,7 @@ Procedure.i GnssWhy()
     Case 11 : ProcedureReturn "Bluetooth LE (the GNSS Bridge Nordic UART service) is a placeholder: not built yet"
     Case 12 : ProcedureReturn "no network source is set: type gnss source network <host>[:<port>] at the prompt"
     Case 13 : ProcedureReturn "there is no such source"
+    Case 14 : ProcedureReturn "this board has no USB serial receiver transport"
   EndSelect
   ProcedureReturn "an unknown reason"
 EndProcedure
@@ -915,6 +918,10 @@ EndProcedure
 ; Opens a source. 1, or 0 with GnssWhy().
 Procedure.i GnssOpen(src.i)
   Define i.i
+  ; Refusing an absent transport must leave the working receiver open.
+  If src=#GNSS_SRC_USB And UsbSerialAvailable()=0 : gnss_why=14 : ProcedureReturn 0 : EndIf
+  If src=#GNSS_SRC_BLUETOOTH : gnss_why=10 : ProcedureReturn 0 : EndIf
+  If src=#GNSS_SRC_BLE : gnss_why=11 : ProcedureReturn 0 : EndIf
   gnss_NetClose()                                   ; a connection of an earlier source is let go
   gnss_src = #GNSS_SRC_NONE : gnss_why = 0
   GnfReset(0) : GnfReset(1)
@@ -933,8 +940,6 @@ Procedure.i GnssOpen(src.i)
       gnss_bauds[4] = 19200 : gnss_bauds[5] = 4800 : gnss_bauds[6] = 230400 : gnss_bauds[7] = 460800
       gnss_baudAt = 0 : gnss_baudUs = HwMicros()
       If UsbSerialNeedsBaud() <> 0 : UsbSerialSetBaud(gnss_bauds[0]) : EndIf
-    Case #GNSS_SRC_BLUETOOTH : gnss_why = 10 : ProcedureReturn 0
-    Case #GNSS_SRC_BLE       : gnss_why = 11 : ProcedureReturn 0
     Case #GNSS_SRC_NETWORK
       If gnss_NetSettings() = 0
         gnss_why = 12

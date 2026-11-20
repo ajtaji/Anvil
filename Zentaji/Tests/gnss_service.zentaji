@@ -1,0 +1,30 @@
+; Read the receiver through the published Anvil GNSS service group.
+XIncludeFile "Anvil/Services/usb_serial.pbi"
+; Exercise the optional transport dispatch contract separately from the network
+; receiver that supplies the actual fix. This provider owns no USB hardware.
+Procedure.i ProbeTransport(op.i,argument.i,count.i)
+ If op=#USB_SERIAL_WRITE And count=3 And PeekA(argument)=65 : ProcedureReturn count : EndIf
+ ProcedureReturn -1
+EndProcedure
+Procedure.q Main(table.i)
+ Protected fn.i,quality.i
+ Dim fix.q[8]
+ If table=0 Or PeekL(table)<>$53564E41 Or PeekL(table+12)<163 : ProcedureReturn $BAD01 : EndIf
+ If UsbSerialAvailable()<>0 Or UsbSerialError()<>1 Or UsbSerialRead(@fix[0],8)<>-1 : ProcedureReturn $BAD09 : EndIf
+ UsbSerialBind(@ProbeTransport)
+ If UsbSerialAvailable()<>1 Or UsbSerialWrite("ABC",3)<>3 : ProcedureReturn $BAD0A : EndIf
+ UsbSerialBind(0)
+ If UsbSerialAvailable()<>0 Or UsbSerialFind()<>0 : ProcedureReturn $BAD0B : EndIf
+ fn=PeekI(table+16+156*8)
+ If CallFunctionFast(fn)<>0 : ProcedureReturn $BAD02 : EndIf
+ fn=PeekI(table+16+158*8) : quality=CallFunctionFast(fn,@fix[0])
+ If quality<>2 Or PeekL(@fix[0])<>2 : ProcedureReturn $BAD03 : EndIf
+ If PeekL(@fix[0]+4)<>481173000 Or PeekL(@fix[0]+8)<>115166667 : ProcedureReturn $BAD04 : EndIf
+ If PeekL(@fix[0]+12)<>545400 Or PeekL(@fix[0]+28)<>8 : ProcedureReturn $BAD05 : EndIf
+ If PeekL(@fix[0]+36)<>45319000 Or PeekL(@fix[0]+44)<>4 Or PeekL(@fix[0]+60)<>3 : ProcedureReturn $BAD06 : EndIf
+ fn=PeekI(table+16+160*8)
+ If CallFunctionFast(fn)<>-1 : ProcedureReturn $BAD07 : EndIf
+ fn=PeekI(table+16+161*8)
+ If CallFunctionFast(fn)<>8 : ProcedureReturn $BAD08 : EndIf
+ ProcedureReturn $474E5353
+EndProcedure

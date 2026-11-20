@@ -13,11 +13,20 @@ Global Dim ziNamed.a[256]
 Global ziMouseBlocked.i,ziMouseButtons.i,ziMouseX.i,ziMouseY.i
 Global ziOwned.i,ziEpoch.i,ziCaps.i,ziWidth.i,ziHeight.i,ziResize.i
 Global ziPromptAdmitted.i
+Global gMousePct.i=100
+Global ziRawX.i,ziRawY.i,ziCarryX.i,ziCarryY.i
+XIncludeFile "Anvil/Core/mouse_cmd.pbi"
 
 Procedure.i ZentajiInputHardwareOwned()
  If ziInstalled=0 : ProcedureReturn 1 : EndIf
  If (PeekQ(#ZEN_INPUT)&$FFFF)<>11 Or PeekQ(#ZEN_INPUT+$10)<>0 Or PeekQ(#ZEN_INPUT+$20)<>0 Or PeekQ(#ZEN_INPUT+$B0)<>0 : ProcedureReturn 0 : EndIf
  ProcedureReturn 1
+EndProcedure
+
+Procedure.i ZiMouseClamp(position.i,extent.i)
+ If position<0 : ProcedureReturn 0 : EndIf
+ If position>=extent : ProcedureReturn extent-1 : EndIf
+ ProcedureReturn position
 EndProcedure
 
 Procedure.i ZentajiInputFence()
@@ -46,9 +55,9 @@ Procedure.i ZentajiInputFence()
  ziMouseBlocked=PeekQ(#ZEN_INPUT+$90)&7 : ziMouseButtons=0
  ziMouseX=PeekQ(#ZEN_INPUT+$80) : ziMouseY=PeekQ(#ZEN_INPUT+$88)
  If ziOwned<>0 And (ziCaps & #NUI_MOUSE)<>0
-  If ziMouseX<0 : ziMouseX=0 : ElseIf ziMouseX>=ziWidth : ziMouseX=ziWidth-1 : EndIf
-  If ziMouseY<0 : ziMouseY=0 : ElseIf ziMouseY>=ziHeight : ziMouseY=ziHeight-1 : EndIf
+  ziMouseX=ZiMouseClamp(ziMouseX,ziWidth) : ziMouseY=ZiMouseClamp(ziMouseY,ziHeight)
  EndIf
+ ziRawX=ziMouseX : ziRawY=ziMouseY : ziCarryX=0 : ziCarryY=0
  ignored=PeekQ(#ZEN_INPUT+$98) : ignored=PeekQ(#ZEN_INPUT+$A0) : ignored=PeekQ(#ZEN_INPUT+$A8)
  ; Acknowledge only keyboard/mouse reasons; gamepads/rumble are unclaimed.
  PokeQ(#ZEN_INPUT+8,1) : PokeQ(#ZEN_INPUT+$18,3)
@@ -120,11 +129,20 @@ Procedure ZentajiInputKeys()
 EndProcedure
 
 Procedure ZentajiInputMouse()
- Protected x.i,y.i,buttons.i,state.i,wheel.i,ignored.i
+ Protected x.i,y.i,rawX.i,rawY.i,buttons.i,state.i,wheel.i,ignored.i
  If ziOwned=0 Or (ziCaps & #NUI_MOUSE)=0 Or ziGeneration<>InputFocusGeneration() Or ziFencing<>0 : ProcedureReturn : EndIf
- x=PeekQ(#ZEN_INPUT+$80) : y=PeekQ(#ZEN_INPUT+$88)
- If x<0 : x=0 : ElseIf x>=ziWidth : x=ziWidth-1 : EndIf
- If y<0 : y=0 : ElseIf y>=ziHeight : y=ziHeight-1 : EndIf
+ ; Clamp the native display coordinates before subtracting. At 100 percent
+ ; application coordinates stay aligned with the visible host pointer.
+ rawX=ZiMouseClamp(PeekQ(#ZEN_INPUT+$80),ziWidth)
+ rawY=ZiMouseClamp(PeekQ(#ZEN_INPUT+$88),ziHeight)
+ x=rawX : y=rawY
+ If gMousePct<>100
+  x=ziMouseX+AnvilMouseStep(rawX-ziRawX,@ziCarryX)
+  y=ziMouseY+AnvilMouseStep(rawY-ziRawY,@ziCarryY)
+  If x<0 Or x>=ziWidth : x=ZiMouseClamp(x,ziWidth) : ziCarryX=0 : EndIf
+  If y<0 Or y>=ziHeight : y=ZiMouseClamp(y,ziHeight) : ziCarryY=0 : EndIf
+ EndIf
+ ziRawX=rawX : ziRawY=rawY
  buttons=PeekQ(#ZEN_INPUT+$90)&7
  ziMouseBlocked=ziMouseBlocked & buttons : buttons=buttons & (7-ziMouseBlocked)
  If x<>ziMouseX Or y<>ziMouseY Or buttons<>ziMouseButtons

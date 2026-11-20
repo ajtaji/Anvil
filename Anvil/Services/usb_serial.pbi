@@ -15,57 +15,58 @@
 #USB_SERIAL_VID=9
 #USB_SERIAL_PID=10
 #USB_SERIAL_SLOT=11
-Global *usbserialProvider=0
+Procedure.i usbserial_Unbound(operation.i,argument.i,count.i)
+  Select operation
+    Case #USB_SERIAL_KIND_TEXT : ProcedureReturn "unavailable"
+    Case #USB_SERIAL_ERROR : ProcedureReturn 1
+    Case #USB_SERIAL_READ,#USB_SERIAL_WRITE : ProcedureReturn -1
+  EndSelect
+  ProcedureReturn 0
+EndProcedure
+
+Global usbserialProvider.i=@usbserial_Unbound
 
 Procedure UsbSerialBind(*provider)
-  *usbserialProvider=*provider
+  If *provider=0 : usbserialProvider=@usbserial_Unbound : Else : usbserialProvider=*provider : EndIf
 EndProcedure
 
 Procedure.i UsbSerialAvailable()
-  ProcedureReturn Bool(*usbserialProvider<>0)
+  ProcedureReturn Bool(usbserialProvider<>@usbserial_Unbound)
 EndProcedure
 
 Procedure.i UsbSerialKind()
-  If *usbserialProvider=0 : ProcedureReturn 0 : EndIf
   ProcedureReturn usbserialProvider(#USB_SERIAL_KIND,0,0)
 EndProcedure
 Procedure.i UsbSerialKindText(kind.i)
-  If *usbserialProvider=0 : ProcedureReturn "unavailable" : EndIf
   ProcedureReturn usbserialProvider(#USB_SERIAL_KIND_TEXT,kind,0)
 EndProcedure
 Procedure.i UsbSerialNeedsBaud()
-  If *usbserialProvider=0 : ProcedureReturn 0 : EndIf
   ProcedureReturn usbserialProvider(#USB_SERIAL_NEEDS_BAUD,0,0)
 EndProcedure
 Procedure.i UsbSerialSetBaud(baud.i)
-  If *usbserialProvider=0 Or baud<=0 : ProcedureReturn 0 : EndIf
+  If baud<=0 : ProcedureReturn 0 : EndIf
   ProcedureReturn usbserialProvider(#USB_SERIAL_SET_BAUD,baud,0)
 EndProcedure
 Procedure.i UsbSerialError()
-  If *usbserialProvider=0 : ProcedureReturn 1 : EndIf
   ProcedureReturn usbserialProvider(#USB_SERIAL_ERROR,0,0)
 EndProcedure
 Procedure.i UsbSerialFind()
-  If *usbserialProvider=0 : ProcedureReturn 0 : EndIf
   ProcedureReturn usbserialProvider(#USB_SERIAL_FIND,0,0)
 EndProcedure
 Procedure.i UsbSerialRead(*dst,capacity.i)
-  If *usbserialProvider=0 Or *dst=0 Or capacity<=0 : ProcedureReturn -1 : EndIf
+  If *dst=0 Or capacity<=0 : ProcedureReturn -1 : EndIf
   ProcedureReturn usbserialProvider(#USB_SERIAL_READ,*dst,capacity)
 EndProcedure
 Procedure.i UsbSerialWrite(*src,count.i)
-  If *usbserialProvider=0 Or *src=0 Or count<=0 : ProcedureReturn -1 : EndIf
+  If *src=0 Or count<=0 : ProcedureReturn -1 : EndIf
   ProcedureReturn usbserialProvider(#USB_SERIAL_WRITE,*src,count)
 EndProcedure
 Procedure.i UsbSerialVid()
-  If *usbserialProvider=0 : ProcedureReturn 0 : EndIf
   ProcedureReturn usbserialProvider(#USB_SERIAL_VID,0,0)
 EndProcedure
 Procedure.i UsbSerialPid()
-  If *usbserialProvider=0 : ProcedureReturn 0 : EndIf
   ProcedureReturn usbserialProvider(#USB_SERIAL_PID,0,0)
 EndProcedure
 Procedure.i UsbSerialSlot()
-  If *usbserialProvider=0 : ProcedureReturn 0 : EndIf
   ProcedureReturn usbserialProvider(#USB_SERIAL_SLOT,0,0)
 EndProcedure
