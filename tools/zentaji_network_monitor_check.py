@@ -100,6 +100,8 @@ def main():
     parser.add_argument("--crypto", type=Path, metavar="COMPILER", help="Build a Zentaji entropy ABI probe and check the shared crypto vector suite")
     parser.add_argument("--readonly-disk", action="store_true",
                         help="Check native raw block reads and write refusal on a read-only disk")
+    parser.add_argument("--kept-shot", type=Path, metavar="COMPILER",
+                        help="Capture a returning Neon payload over UART and acknowledged UDP")
     parser.add_argument("--cores", action="store_true", help="Exercise native secondary core launch, results and ownership")
     parser.add_argument("--trail", action="store_true",
                         help="Check the boot trail through two ROM resets and preserve foreign NVRAM")
@@ -118,19 +120,21 @@ def main():
     executable = tools / ("zenwin.exe" if os.name == "nt" else "zenwin")
     result = {"image_sha256": digest}
 
-    probe = None
-    if args.crypto:
+    def compile_probe(compiler, source, name):
         output.mkdir(parents=True, exist_ok=True)
-        probe_image = output / "entropy-probe.zex"
+        probe_image = output / name
         stage = (json.loads(Path(str(image) + ".boot.json").read_text())["image_end"] + 4095) & -4096
         if args.sign_script:
             from zentaji_package import signatures
-            signatures("pwsh.exe", args.sign_script.resolve(), executables=[args.crypto.resolve()])
-        subprocess.run([str(args.crypto.resolve()), "--compile", str(ROOT / "Zentaji/Tests/entropy_service.zentaji"),
+            signatures("pwsh.exe", args.sign_script.resolve(), executables=[compiler.resolve()])
+        subprocess.run([str(compiler.resolve()), "--compile", str(ROOT / source),
                         "--entry-returns", "--wants-services", "--load-addr", hex(stage + 8),
                         "--stack-addr", hex(stage + 0x200000), "-o", str(probe_image)],
                        cwd=ROOT, env=dict(os.environ, PMF_ROOT=str(ROOT)), check=True, timeout=120)
-        probe = Path(str(probe_image) + ".pmf").read_bytes()
+        return Path(str(probe_image) + ".pmf").read_bytes()
+
+    probe = compile_probe(args.crypto, "Zentaji/Tests/entropy_service.zentaji", "entropy-probe.zex") if args.crypto else None
+    shot_probe = compile_probe(args.kept_shot, "Zentaji/Tests/kept_frame.zentaji", "kept-frame.zex") if args.kept_shot else None
 
     def boot(attached, no_entropy=False):
         label = "no-entropy" if no_entropy else ("nat" if attached else "disconnected")
@@ -153,6 +157,8 @@ def main():
                 (seed / "main.zen").write_bytes(SOURCE)
                 if probe is not None:
                     (seed / "ENTROPY.PMF").write_bytes(probe)
+                if shot_probe is not None:
+                    (seed / "FRAME.PMF").write_bytes(shot_probe)
                 if args.web:
                     (seed / "ROOTS.PEM").write_bytes(web_root)
                 disk = Path(temporary) / "data.img"
@@ -377,6 +383,41 @@ def main():
                     capture.write_bytes(png(width, height, rows))
                     result["udp_screenshot_phase"] = screen_check(capture)
                     transcript.append(client.prompt().decode("utf-8"))
+                if args.kept_shot:
+                    from unittest.mock import patch
+                    from board_run import parse_shot_header
+                    from pmfshot import decode, png
+                    import pmfshot_wifi
+
+                    command("shot status","holds no picture")
+                    command("shot now","picture number 1")
+                    command("shot arm","ONE run")
+                    command("boot FRAME.PMF","$123456780000002A")
+                    status = command("shot status","not armed")
+                    assert parse_shot_header(status)["seq"] == 2, status
+                    command("boot answer.pmf","$000000000000002A")
+                    text = command("shot","END ")
+                    header = parse_shot_header(text)
+                    assert header and header["seq"] == 2 and header["who"] == 1
+                    assert header["src_name"] == "zentaji" and header["tier_name"] == "vulkan"
+                    assert header["x0"] == 0x123456780000002A
+                    w,h,rows = decode(text)
+                    assert (w,h) == (1024,768) and header["bytes"] == 4*w*h
+                    green, red = bytes((0,255,0)),bytes((255,0,0))
+                    normal = green*w
+                    marked = green*128 + red*128 + green*(w-256)
+                    for y,row in enumerate(rows):
+                        assert row == (marked if 96<=y<160 else normal), f"kept frame mismatch in row {y}"
+                    (folder/"kept.png").write_bytes(png(w,h,rows))
+                    with patch.object(pmfshot_wifi,"PORT",port):
+                        other,udp_rows=pmfshot_wifi.grab_kept_reliable("127.0.0.1",timeout=90)
+                    assert udp_rows==rows and all(header[k]==v for k,v in other.items()), other
+                    transcript.append(client.prompt().decode("ascii"))
+                    command("shot arm","ONE run")
+                    command("boot answer.pmf","No new picture")
+                    assert parse_shot_header(command("shot status","not armed"))["seq"] == 2
+                    result["kept"] = dict(sequence=2, return_register=header["x0"], bytes=header["bytes"],
+                                          rgb_sha256=hashlib.sha256(b"".join(rows)).hexdigest())
                 if args.web:
                     result["web"] = check_web_peers(command, http_port, keys, web_body)
                 command("echo UART-AFTER-UDP", "UART-AFTER-UDP")
@@ -432,6 +473,8 @@ def main():
             evidence = [folder / "run.log", folder / "transcript.log"]
             if label == "nat" and args.screenshot:
                 evidence.append(folder / "pr.png")
+            if label == "nat" and args.kept_shot:
+                evidence.append(folder / "kept.png")
             if label == "nat" and args.crypto:
                 evidence.append(folder / "crypto-vectors.log")
             catalogs.append(catalog(folder / (label + ".cat"), evidence, True))

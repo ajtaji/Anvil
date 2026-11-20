@@ -487,6 +487,22 @@ are bound to that window. Compile from source again if a monitor build or
 machine configuration moves the window. The full PureMetal language and
 the immediate graphics and sound commands remain unfinished.
 
+@SECTION Keeping a payload frame
+
+Use `shot arm` before booting a program that draws with Anvil's resident
+Neon Vulkan service. When the program returns, Anvil copies its last
+presented frame with native DMA before repainting the console. The arm
+lasts for one run. A program that presents no resident frame leaves the
+previous capture in place. Use `shot status` to check its sequence number.
+
+`shot` sends the kept picture and its return-register header over serial.
+`sr` sends the same picture with acknowledgements and a CRC over the UDP
+console. The Pi 4 uses this same protocol for its kept HDMI and DSI frames.
+The wire field named x0 contains r1 on Zentaji. Source and tier
+code 3 identify the native Zentaji display and Vulkan renderer. `shot now`
+keeps the current console display. The capture buffer uses protected
+graphics memory on demand, up to 4,194,304 pixels.
+
 @SECTION Testing secondary CPU cores
 
 Type `coretest run` to send sixteen rounds of challenges to every fitted

@@ -1,9 +1,9 @@
 EnableFloatingPoint
 ; Zentaji serial/storage monitor composition. The ROM loads the owned startup
 ; envelope; Main receives its validated table/source/context, never ARM registers.
-#ANVIL_BUILD = 60 ; pmf:build
+#ANVIL_BUILD = 62 ; pmf:build
 #ANVIL_BUILD_DATE = 20261119 ; pmf:builddate
-#ANVIL_BUILD_TIME = 205752 ; pmf:buildtime
+#ANVIL_BUILD_TIME = 212417 ; pmf:buildtime
 #CAP_TOUCH=0
 #CAP_PWM=0
 #CAP_NET=1
@@ -73,6 +73,9 @@ XIncludeFile "Anvil/Core/flow_cmd.pbi"
 XIncludeFile "Zentaji/Board/monitor_info.pbi"
 XIncludeFile "Anvil/Core/layout_cmd.pbi"
 XIncludeFile "Anvil/Core/shotarm.pbi"
+#ANVIL_ZENTAJI_KEPT_SHOT=1
+Global zkWatch.i,zkPresented.i
+XIncludeFile "Anvil/Core/kept_shot_fields.pbi"
 XIncludeFile "Anvil/Crypto/sha1.pbi"
 XIncludeFile "Anvil/Core/sha256.pbi"
 XIncludeFile "Anvil/Core/hash_cmd.pbi"
@@ -126,6 +129,8 @@ XIncludeFile "Anvil/Core/readback.pbi"
 XIncludeFile "Anvil/Core/command_loop.pbi"
 XIncludeFile "Zentaji/Board/neon_console.pbi"
 XIncludeFile "Zentaji/Board/screenshot.pbi"
+XIncludeFile "Anvil/Core/kept_shot_cmd.pbi"
+XIncludeFile "Zentaji/Board/kept_shot.pbi"
 XIncludeFile "Zentaji/Board/machine_diagnostics.pbi"
 XIncludeFile "Zentaji/Forge/shell.pbi"
 
@@ -145,7 +150,7 @@ Procedure ZentajiShellHelp()
  PrintN("  settings set net.server <IPv4 address> selects the TFTP server")
  PrintN("  forge [command]       built-in Zentaji PureMetal compiler and editor")
  PrintN("  halt                 cleanly release storage and stop this monitor")
- PrintN("  programs, readback <hex address> <hex length>, screenshot/p, pr")
+ PrintN("  programs, readback <hex address> <hex length>, screenshot/p, pr, shot [arm|disarm|now|status], sr")
  PrintN("  autoboot file <name>, autoboot status/clear")
  PrintN("  boot <file> / mem <address>, boot status/ok/clear")
  PrintN("PMF service-table applications are supported; raw run is not available.")
@@ -182,6 +187,10 @@ Procedure.i HwCommandDispatch(c.i)
   ZentajiCmdBaud()
  ElseIf WordIs("screen")<>0
   ZentajiCmdScreen()
+ ElseIf WordIs("shot")<>0
+  CmdShot()
+ ElseIf WordIs("sr")<>0
+  ZentajiCmdShotR()
  ElseIf WordIs("vkstat")<>0
   ZentajiCmdVkStat()
  ElseIf WordIs("autoboot")<>0

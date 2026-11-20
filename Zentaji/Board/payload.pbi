@@ -81,6 +81,9 @@ EndProcedure
 
 Procedure.i HwPayloadRun(entry.i,argument.i,stack.i,stackBytes.i)
  Protected hadStorage.i,entered.i,code.i,services.i,startUs.q,endUs.q
+ CompilerIf Defined(ANVIL_ZENTAJI_KEPT_SHOT,#PB_Constant)
+ Protected captureReady.i
+ CompilerEndIf
  CompilerIf Defined(ANVIL_ZENTAJI_NET, #PB_Constant)
  Protected hadEthernet.i
  CompilerEndIf
@@ -104,11 +107,13 @@ Procedure.i HwPayloadRun(entry.i,argument.i,stack.i,stackBytes.i)
   PrintN("!! native input ownership is not ready; nothing was entered.")
   ProcedureReturn 0
  EndIf
+ CompilerIf Not Defined(ANVIL_ZENTAJI_KEPT_SHOT,#PB_Constant)
  If ShotArmed()<>0
   ShotTakeArm()
   PrintN("!! this Zentaji monitor has no frame-capture provider; nothing was entered.")
   ProcedureReturn 0
  EndIf
+ CompilerEndIf
  CompilerIf Defined(ANVIL_ZENTAJI_CORE_TEST,#PB_Constant)
  If ZentajiCoreRelease()=0
   PrintN("!! A secondary changed ownership. Core diagnostics must be resolved before payload entry.")
@@ -150,9 +155,15 @@ Procedure.i HwPayloadRun(entry.i,argument.i,stack.i,stackBytes.i)
  EndIf
  gGoAddr=entry
  startUs=HwMicros()
+ CompilerIf Defined(ANVIL_ZENTAJI_KEPT_SHOT,#PB_Constant)
+ ZentajiKeptBegin()
+ CompilerEndIf
  entered=ZentajiPayloadEnter(zenMemoryContext,entry,argument,stack,stackBytes)
  endUs=HwMicros()
  code=ZentajiPayloadLastError() : gGoRc=ZentajiPayloadReturnValue()
+ CompilerIf Defined(ANVIL_ZENTAJI_KEPT_SHOT,#PB_Constant)
+ captureReady=ZentajiKeptReturn(entered,gGoRc)
+ CompilerEndIf
  ; The CPU boundary has restored owned SP/vectors/FP state with IE masked.
  ; Do not overwrite foreign live hardware to make recovery appear successful.
  If ZentajiInputPayload(0,services)=0 : ZentajiPayloadRecoveryFailed($5B06,"Payload return failed (0x5B06): native input ownership changed. Release mouse capture and device interrupts before returning.") : EndIf
@@ -190,6 +201,9 @@ Procedure.i HwPayloadRun(entry.i,argument.i,stack.i,stackBytes.i)
  EndIf
  CompilerEndIf
  If zenPayloadGraphicsUp()<>1 : ZentajiPayloadRecoveryFailed($5B07,"Payload return failed (0x5B07): graphics ownership could not be restored.") : EndIf
+ CompilerIf Defined(ANVIL_ZENTAJI_KEPT_SHOT,#PB_Constant)
+ If captureReady=0 : PrintN("!! No new picture: capture was unavailable on this return.") : EndIf
+ CompilerEndIf
  If entered=0
   Print("!! the Zentaji CPU entry refused the payload, code ") : PrintDec(code) : PrintN(".")
  Else

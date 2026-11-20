@@ -96,9 +96,10 @@ def parse_kept_header(data):
             0 < ph <= MAX_SHOT_BYTES // pitch and
             pitch * ph <= head["bytes"] <= MAX_SHOT_BYTES):
         raise ReliableShotError("sr capture geometry exceeds the byte bound")
-    if head["bpp"] != 4 or head["src"] not in (1, 2) or head["who"] not in (0, 1):
+    if head["bpp"] != 4 or head["src"] not in (1, 2, 3) or head["who"] not in (0, 1):
         raise ReliableShotError("sr capture format is invalid")
-    if head["tier"] not in (0, 1, 2):
+    tiers = (3,) if head["src"] == 3 else (0, 1, 2)
+    if head["tier"] not in tiers:
         raise ReliableShotError("sr capture tier is invalid")
     head["x0"] = head.pop("x0_lo") | (head.pop("x0_hi") << 32)
     head.pop("magic")

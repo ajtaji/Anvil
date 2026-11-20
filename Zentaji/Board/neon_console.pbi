@@ -378,6 +378,9 @@ Procedure.i AvsSurfacePresent()
  Protected started.i
  started=Ticks()
  If ZentajiNeonSurfacePresent()<>1 : ProcedureReturn #NEON_SERVICE_ERR_PROVIDER : EndIf
+ CompilerIf Defined(ANVIL_ZENTAJI_KEPT_SHOT,#PB_Constant)
+ If zkWatch<>0 : zkPresented=1 : EndIf
+ CompilerEndIf
  avsCopyDmaTicks=0 : avsCopyCleanTicks=0 : avsCopyPublishTicks=Ticks()-started
  ProcedureReturn 0
 EndProcedure
@@ -386,6 +389,9 @@ Procedure.i ZentajiNeonConsoleStop()
  If zngUp=0 : ProcedureReturn 1 : EndIf
  If zngSuspended<>0 Or zngPainting<>0 : ProcedureReturn 0 : EndIf
  If zngDrainFrame()<>1 : ProcedureReturn 0 : EndIf
+ CompilerIf Defined(ANVIL_ZENTAJI_KEPT_SHOT,#PB_Constant)
+ ZentajiKeptRelease()
+ CompilerEndIf
  If ZentajiNeonSurfaceStop()<>1 : ProcedureReturn 0 : EndIf
  If zngDmaDown()<>1 Or ZentajiGraphicsRelease(@avkZenQueue)<>1 : ProcedureReturn 0 : EndIf
  ConNoRenderer() : UartMirrorSetDrain(0) : UartMirror(0)

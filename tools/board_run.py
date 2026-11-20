@@ -298,8 +298,8 @@ SHOT_RE = re.compile(
 SHOT_FIELDS = ("seq", "w", "h", "pitch", "rot", "tier", "x0",
                "panel_w", "panel_h", "bpp", "src", "who", "bytes")
 
-TIER_NAMES = {0: "cpu", 1: "dma", 2: "v3d"}
-SRC_NAMES = {0: "none", 1: "hdmi", 2: "dsi"}
+TIER_NAMES = {0: "cpu", 1: "dma", 2: "v3d", 3: "vulkan"}
+SRC_NAMES = {0: "none", 1: "hdmi", 2: "dsi", 3: "zentaji"}
 WHO_NAMES = {0: "the payload asked for it", 1: "the monitor took it on return"}
 
 # The line RunAt prints on the way back. Sixteen digits, because x0 is a

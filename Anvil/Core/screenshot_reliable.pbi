@@ -63,7 +63,8 @@ Procedure picr_PushRun(cnt.i, px.i)
   EndIf
 EndProcedure
 
-Procedure AnvilScreenshotReliable(fb.i,w.i,h.i,pitch.i,rot.i,panelW.i,panelH.i)
+Procedure AnvilScreenshotReliableSend(fb.i,w.i,h.i,pitch.i,rot.i,panelW.i,panelH.i,metadata.i)
+  Define headerBytes.i=16,word.i
   Define x.i
   Define y.i
   Define px.i
@@ -119,7 +120,11 @@ Procedure AnvilScreenshotReliable(fb.i,w.i,h.i,pitch.i,rot.i,panelW.i,panelH.i)
   PokeL(@gPicrBuf[8], h)
   PokeL(@gPicrBuf[12], runs1)
   PokeL(@gPicrBuf[16], 8)
-  If picr_SendWait(#PICR_TAG_HDR, 16) = 0
+  If metadata<>0
+    For word=0 To 13 : PokeL(@gPicrBuf[20+word*4],PeekL(metadata+word*4)) : Next
+    headerBytes=72
+  EndIf
+  If picr_SendWait(#PICR_TAG_HDR, headerBytes) = 0
     gPicrOk = 0
   EndIf
 
@@ -201,4 +206,8 @@ Procedure AnvilScreenshotReliable(fb.i,w.i,h.i,pitch.i,rot.i,panelW.i,panelH.i)
     PrintDec(gPicrOff)
     PrintN(" bytes), every datagram acknowledged, CRC32 checked host-side.")
   EndIf
+EndProcedure
+
+Procedure AnvilScreenshotReliable(fb.i,w.i,h.i,pitch.i,rot.i,panelW.i,panelH.i)
+  AnvilScreenshotReliableSend(fb,w,h,pitch,rot,panelW,panelH,0)
 EndProcedure
