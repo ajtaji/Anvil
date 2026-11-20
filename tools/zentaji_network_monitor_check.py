@@ -193,7 +193,11 @@ def main():
                         help="Check the boot trail through two ROM resets and preserve foreign NVRAM")
     parser.add_argument("--web", action="store_true",
                         help="Check HTTP in both directions, verified TLS 1.3 and guest trust refusals")
+    parser.add_argument("--payload-net", type=Path, metavar="COMPILER",
+                        help="Run a returning PMF against independent TCP and TLS peers")
     args = parser.parse_args()
+    if args.payload_net:
+        args.web = True
     tools, output = args.zen_tools.resolve(), args.keep.resolve()
     sys.path.insert(0, str(tools))
     from zen_console import Console
@@ -225,6 +229,9 @@ def main():
     gnss_probe = compile_probe(args.gnss, "Zentaji/Tests/gnss_service.zentaji", "gnss-service.zex") if args.gnss else None
     mouse_probe = compile_probe(args.mouse, "Zentaji/Tests/mouse_motion.zentaji", "mouse-motion.zex") if args.mouse else None
 
+    net_probe = compile_probe(args.payload_net, "Zentaji/Tests/payload_network.zentaji",
+                              "payload-network.zex") if args.payload_net else None
+
     def boot(attached, no_entropy=False):
         label = "no-entropy" if no_entropy else ("nat" if attached else "disconnected")
         live_entropy = attached and not no_entropy and (probe is not None or args.web)
@@ -242,11 +249,13 @@ def main():
         mouse_case = mouse_probe is not None and not attached
         if mouse_case:
             seed_mouse_motion(fixture)
-        if attached or probe is not None or readonly or mouse_case:
+        if attached or probe is not None or readonly or mouse_case or net_probe is not None:
             with tempfile.TemporaryDirectory(prefix="zentaji-net-") as temporary:
                 seed = Path(temporary) / "source"
                 seed.mkdir()
                 (seed / "main.zen").write_bytes(SOURCE)
+                if net_probe is not None:
+                    (seed / "PAYNET.PMF").write_bytes(net_probe)
                 if probe is not None:
                     (seed / "ENTROPY.PMF").write_bytes(probe)
                 if args.font and attached and not no_entropy:
@@ -535,6 +544,9 @@ def main():
                                           rgb_sha256=hashlib.sha256(b"".join(rows)).hexdigest())
                 if gnss_probe is not None:
                     result["gnss"] = check_gnss(command)
+                if net_probe is not None:
+                    from zentaji_web_peer import check_payload_peers
+                    result["payload_network"] = check_payload_peers(command, keys)
                 if args.web:
                     result["web"] = check_web_peers(command, http_port, keys, web_body)
                 command("echo UART-AFTER-UDP", "UART-AFTER-UDP")
@@ -547,6 +559,9 @@ def main():
             else:
                 command("net", "Zentaji Ethernet is disconnected.")
                 command("dhcp", "the machine description has no net attachment")
+                if net_probe is not None:
+                    command("boot PAYNET.PMF", "The payload returned, r1 = $000000004E4F4C4B")
+                    result["payload_no_link"] = True
                 command("echo UART-AFTER-NO-LINK", "UART-AFTER-NO-LINK")
 
             client.socket.sendall(b"halt\r")

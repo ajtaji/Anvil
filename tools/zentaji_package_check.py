@@ -59,7 +59,11 @@ def screen_check(path):
     from PIL import Image
     frame = Image.open(path).convert("RGBA")
     assert frame.size == (1024, 768), frame.size
-    raw = frame.tobytes("raw", "BGRA")
+    return screen_check_bgra(frame.tobytes("raw", "BGRA"))
+
+
+def screen_check_bgra(raw):
+    assert len(raw) == 1024 * 768 * 4
     for phase in range(8):
         try:
             assert_logo(raw, 1024, phase)

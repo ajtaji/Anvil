@@ -213,6 +213,11 @@ Procedure.i HwPayloadRun(entry.i,argument.i,stack.i,stackBytes.i)
   If ZentajiEthernetOpen()=0 : ZentajiPayloadRecoveryFailed($5B08,"Payload return failed (0x5B08): Ethernet ownership could not be restored.") : EndIf
  EndIf
  CompilerEndIf
+ CompilerIf Defined(ANVIL_PAYLOAD_NET,#PB_Constant)
+ CompilerIf #ANVIL_PAYLOAD_NET=1
+ If services<>0 : PayNetPayloadReturned() : EndIf
+ CompilerEndIf
+ CompilerEndIf
  If zenPayloadGraphicsUp()<>1 : ZentajiPayloadRecoveryFailed($5B07,"Payload return failed (0x5B07): graphics ownership could not be restored.") : EndIf
  CompilerIf Defined(ANVIL_ZENTAJI_KEPT_SHOT,#PB_Constant)
  If captureReady=0 : PrintN("!! No new picture: capture was unavailable on this return.") : EndIf

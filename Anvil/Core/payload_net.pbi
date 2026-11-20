@@ -1354,7 +1354,11 @@ Procedure.i PayNetUp()
       ProcedureReturn #SVC_EAGAIN
     EndIf
   Next
-  gSvcDetail = "no network link is up: join a Wi-Fi network at the monitor prompt before starting the payload (the wired port is stopped while a payload runs); a radio that drops re-associates by itself while the network service slot is called"
+  CompilerIf Defined(ANVIL_ZENTAJI_NET,#PB_Constant)
+    gSvcDetail = "no configured Ethernet link: attach net to the machine and run dhcp at the Anvil prompt before starting the program"
+  CompilerElse
+    gSvcDetail = "no network link is up: join a Wi-Fi network at the monitor prompt before starting the payload (the wired port is stopped while a payload runs); a radio that drops re-associates by itself while the network service slot is called"
+  CompilerEndIf
   ProcedureReturn #SVC_ESTATE
 EndProcedure
 

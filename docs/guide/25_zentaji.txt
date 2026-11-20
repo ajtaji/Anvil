@@ -664,3 +664,22 @@ touchscreen verification is pending.
 The current ROM device table includes no GPIO header, SPI or I2C bus,
 temperature sensor or fan controller. The Pi commands for those devices
 require a guest peripheral that implements their operations.
+
+Networking from a running program
+
+In Anvil, type dhcp before booting a PMF that requests services. While the
+program runs, Anvil keeps the native Ethernet rings and lease. Through the
+service table, use slots 72-75 for link readiness, link kind, IPv4 address
+and DNS. Slots 76-79 open, send, receive and close TCP. Poll connection
+state with slot 86 and call SvcNetService (slot 85) to advance the stack.
+An IPv4 service program uses the same table layout as on the Pi.
+
+TLS uses slots 80-83 and 87. It requires live entropy, trusted time and a
+root store for the peer. Connection, handshake and receive are asynchronous.
+Anvil releases outstanding payload TCP and TLS handles when a program
+returns. A subsequent program must open its own connection. With Ethernet
+disconnected, SvcNetUp reports SVC_ESTATE and the link and address are zero.
+
+The Linux x86-64 tester ZIP includes its own native emulator, Anvil image
+and seed disk. Extract it in WSL Ubuntu and run ./start-zentaji.sh.
+Use ./start-zentaji.sh --headless for a loopback UART automation session.

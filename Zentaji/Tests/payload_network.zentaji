@@ -1,0 +1,96 @@
+; Guest ABI probe. The host supplies a fresh port and four binary response
+; bytes on each run. P leaves the TCP handle open for return-time cleanup.
+; T exercises authenticated TLS, and R expects a TLS handshake refusal.
+XIncludeFile "Anvil/Hal/service_errors.pbi"
+XIncludeFile "Zentaji/Board/clock.pbi"
+Global Dim netOption.a[32]
+Global Dim netReceive.a[127]
+Global netTable.i
+
+Procedure.i NetSlot(slot.i)
+ ProcedureReturn PeekI(netTable+16+slot*8)
+EndProcedure
+
+Procedure.q Main(table.i)
+ Protected fn.i,pump.i,handle.i,state.i,send.i,receive.i,close.i,poll.i
+ Protected rc.i,ip.i,port.i,mode.i,settingBytes.i,request.i,requestBytes.i,sent.i
+ Protected i.i,j.i,ch.i,ready.i,body.i,bytes.i,tail.q,value.q,deadline.q
+ If table=0 Or PeekL(table)<>$53564E41 Or PeekL(table+12)<=92 : ProcedureReturn $BAD00 : EndIf
+ netTable=table
+ pump=NetSlot(85)
+ If CallFunctionFast(pump,-1)<>#SVC_EARG : ProcedureReturn $BAD01 : EndIf
+ fn=NetSlot(72) : rc=CallFunctionFast(fn)
+ If rc=#SVC_ESTATE
+  fn=NetSlot(73) : If CallFunctionFast(fn)<>0 : ProcedureReturn $BAD02 : EndIf
+  fn=NetSlot(74) : If CallFunctionFast(fn)<>0 : ProcedureReturn $BAD03 : EndIf
+  ProcedureReturn $4E4F4C4B
+ EndIf
+ If rc<>0 : ProcedureReturn $BAD04 : EndIf
+ fn=NetSlot(73) : If CallFunctionFast(fn)<>1 : ProcedureReturn $BAD05 : EndIf
+ fn=NetSlot(74) : If CallFunctionFast(fn)<>$0A00020F : ProcedureReturn $BAD06 : EndIf
+ fn=NetSlot(86) : If CallFunctionFast(fn,1)<>#SVC_EARG : ProcedureReturn $BAD07 : EndIf
+ fn=NetSlot(64) : settingBytes=CallFunctionFast(fn,"test.network",@netOption[0],32)
+ If settingBytes<2 Or settingBytes>6 : ProcedureReturn $BAD08 : EndIf
+ mode=netOption[0] : If mode<>80 And mode<>84 And mode<>82 : ProcedureReturn $BAD09 : EndIf
+ For i=1 To settingBytes-1
+  ch=netOption[i] : If ch<48 Or ch>57 : ProcedureReturn $BAD0A : EndIf
+  port=port*10+ch-48
+ Next
+ deadline=Ticks()+TickHz()*25
+ fn=NetSlot(75)
+ Repeat
+  ip=CallFunctionFast(fn,"localhost")
+  If ip<>#SVC_EAGAIN : Break : EndIf
+  rc=CallFunctionFast(pump,2)
+ Until Ticks()>=deadline
+ If ip<>$0A000202 : ProcedureReturn $BAD0B : EndIf
+ If mode=80
+  fn=NetSlot(76) : handle=CallFunctionFast(fn,ip,port)
+  poll=NetSlot(86) : ready=2 : send=NetSlot(77) : receive=NetSlot(78)
+ Else
+  fn=NetSlot(80) : handle=CallFunctionFast(fn,"localhost",port)
+  poll=NetSlot(87) : ready=4 : send=NetSlot(81) : receive=NetSlot(82) : close=NetSlot(83)
+ EndIf
+ If handle<=0 : ProcedureReturn $BAD0C : EndIf
+ Repeat
+  rc=CallFunctionFast(pump,2) : state=CallFunctionFast(poll,handle)
+  If state<0 Or state=ready : Break : EndIf
+ Until Ticks()>=deadline
+ If mode=82 And state<0 : ProcedureReturn $52454655 : EndIf
+ If state<>ready Or mode=82 : ProcedureReturn $BAD0D : EndIf
+ request=?payloadRequest : requestBytes=?payloadRequestEnd-?payloadRequest
+ Repeat
+  rc=CallFunctionFast(send,handle,request+sent,requestBytes-sent)
+  If rc<0 And rc<>#SVC_EAGAIN : ProcedureReturn $BAD0E : EndIf
+  If rc>0 : sent=sent+rc : EndIf
+  rc=CallFunctionFast(pump,2)
+ Until sent=requestBytes Or Ticks()>=deadline
+ If sent<>requestBytes : ProcedureReturn $BAD0F : EndIf
+ Repeat
+  rc=CallFunctionFast(pump,2)
+  rc=CallFunctionFast(receive,handle,@netReceive[0],127)
+  If rc<0 And rc<>#SVC_EAGAIN : ProcedureReturn $BAD10 : EndIf
+  For j=0 To rc-1
+   ch=netReceive[j]&255
+   If body
+    value=(value<<8)|ch : bytes=bytes+1
+   Else
+    tail=((tail<<8)|ch)&$FFFFFFFF
+    If tail=$0D0A0D0A : body=1 : EndIf
+   EndIf
+  Next
+ Until bytes>=4 Or Ticks()>=deadline
+ If bytes<>4 : ProcedureReturn $BAD11 : EndIf
+ If mode=84
+  If CallFunctionFast(close,handle)<>0 : ProcedureReturn $BAD12 : EndIf
+ EndIf
+ ProcedureReturn $4E45540000000000|value
+EndProcedure
+
+DataSection
+ payloadRequest:
+  Data.a 71,69,84,32,47,112,97,121,108,111,97,100,32,72,84,84,80,47,49,46,49,13,10
+  Data.a 72,111,115,116,58,32,108,111,99,97,108,104,111,115,116,13,10
+  Data.a 67,111,110,110,101,99,116,105,111,110,58,32,99,108,111,115,101,13,10,13,10
+ payloadRequestEnd:
+EndDataSection

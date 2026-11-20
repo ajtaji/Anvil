@@ -143,3 +143,26 @@ def check_web_peers(command, forwarded_port, keys, body):
     return dict(http_client=True,http_health_bytes=len(health),tls_version="TLSv1.3",
                 trusted_reply_sha256=hashlib.sha256(body).hexdigest(),
                 untrusted_issuer_refused=True,wrong_hostname_refused=True)
+
+
+def check_payload_peers(command, keys):
+    import secrets
+
+    command("settings set tls.roots 1:/ROOTS.PEM", "pmf> ")
+    command("tls reload", "1 roots registered")
+    result = {}
+    for mode, label, certificate in (("P", "tcp", None), ("T", "tls", keys / "good"),
+                                     ("R", "untrusted", keys / "untrusted"), ("P", "tcp_again", None)):
+        body = secrets.token_bytes(4)
+        with web_test_peer(body, certificate) as server:
+            command(f"settings set test.network {mode}{server.server_port}", "Set test.network")
+            expected = "0000000052454655" if mode == "R" else "4E455400" + body.hex().upper()
+            command("boot PAYNET.PMF", "The payload returned, r1 = $" + expected)
+            if mode == "R":
+                assert not server.requests
+                result[label] = "refused before sending application data"
+            else:
+                protocol = "TLSv1.3" if certificate else "HTTP"
+                assert server.requests == [("/payload", "localhost", protocol)], server.requests
+                result[label] = {"peer_protocol": protocol, "body_hex": body.hex()}
+    return result
