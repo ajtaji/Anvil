@@ -1,9 +1,9 @@
 EnableFloatingPoint
 ; Zentaji serial/storage monitor composition. The ROM loads the owned startup
 ; envelope; Main receives its validated table/source/context, never ARM registers.
-#ANVIL_BUILD = 52 ; pmf:build
+#ANVIL_BUILD = 53 ; pmf:build
 #ANVIL_BUILD_DATE = 20261119 ; pmf:builddate
-#ANVIL_BUILD_TIME = 181238 ; pmf:buildtime
+#ANVIL_BUILD_TIME = 182832 ; pmf:buildtime
 #CAP_TOUCH=0
 #CAP_PWM=0
 #CAP_NET=1
@@ -50,6 +50,7 @@ XIncludeFile "Anvil/Core/fs_cmd.pbi"
 XIncludeFile "Anvil/Core/argfmt.pbi"
 XIncludeFile "Anvil/Core/settings_cmd.pbi"
 XIncludeFile "Zentaji/Board/network.pbi"
+XIncludeFile "Anvil/Core/net_tcp_cmd.pbi"
 XIncludeFile "Anvil/Core/time_cmd.pbi"
 XIncludeFile "Anvil/Core/crc.pbi"
 Global gBase.i
@@ -99,6 +100,7 @@ Procedure ZentajiShellHelp()
  PrintN("  uptime/up, last run, reset/reboot")
  PrintN("  net, dhcp, ping <host>, dns <name>")
  PrintN("  info/board, clock, receive <hex address> <hex length> <crc32>, srecord/loads")
+ PrintN("  tcp, wb <hex address> <hex length> <crc32>")
  PrintN("  get <name> [hex address], put <name> <hex address> <hex length>")
  PrintN("  settings set net.server <IPv4 address> selects the TFTP server")
  PrintN("  forge [command]       built-in Zentaji PureMetal compiler and editor")
@@ -185,6 +187,10 @@ Procedure.i HwCommandDispatch(c.i)
   CmdTime()
  ElseIf WordIs("net")<>0
   ZentajiNetworkStatus()
+ ElseIf WordIs("tcp")<>0
+  CmdTcp()
+ ElseIf WordIs("wb")<>0
+  CmdWirelessBlock()
  ElseIf WordIs("get")<>0
   CmdGet()
  ElseIf WordIs("put")<>0

@@ -313,6 +313,31 @@ put OUTPUT.BIN ADDR 400
 
 Type settings save to keep the server address across boots.
 
+For an outgoing TCP connection, start a TCP listener on the host. Type
+tcp connect 10.0.2.2 PORT with its decimal port. Use tcp status to check
+for ESTABLISHED, tcp send TEXT to send a line including CRLF, tcp recv
+COUNT to read up to COUNT bytes, and tcp close to close the connection.
+
+For a host-initiated network block upload, make a copy of the machine
+description with a loopback UDP forward. In a freshly extracted tester
+folder, run these PowerShell commands once. The copy uses its own disk.
+
+@FRAG
+Copy-Item data-seed.img transfer.img
+$spec = (Get-Content machine.txt).Replace('data.img','transfer.img')
+$spec | Set-Content -Encoding ascii transfer.txt
+Add-Content -Encoding ascii transfer.txt 'forward udp 5555 5555 127.0.0.1'
+.\zenwin.exe transfer.txt --fast --window-size 1024x768 --serial-listen 0
+@ENDFRAG
+
+Acquire a lease with dhcp. From the host, run the shared uploader in
+receive-only mode to stage the file in guest RAM. Use readback over UART
+to retrieve the staged bytes or save them to a guest file.
+
+@FRAG
+python tools/anvil_wifi_update.py --receive-only 127.0.0.1 INPUT.BIN
+@ENDFRAG
+
 @SECTION Verify and edit guest memory
 
 Use the start address and byte count printed by load or get. Both numeric
