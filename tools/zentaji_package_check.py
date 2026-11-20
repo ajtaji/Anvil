@@ -130,6 +130,9 @@ def check_machine_diagnostics(client, transcript):
                          ("FFFF000000100000 41", "count"), ("FFFF000000100000 1junk", "count")):
         assert refusal in command("mmio " + bad)
 
+    capability = command("mmio FFFF000000090060")
+    assert "FFFF000000090060: 0000000000000001" in capability, capability
+
     old = int(re.search(r"UART0 baud: (\d+)", command("baud"))[1])
     rate = 1500000 if old != 1500000 else 3000000
 
@@ -159,7 +162,14 @@ def check_machine_diagnostics(client, transcript):
         if time.monotonic() >= deadline:
             raise AssertionError("The returned monitor never latched a frame: " + reply)
         time.sleep(0.5)
-    return dict(confirmed_baud=rate, restored_baud=old, completed_presents=presents)
+    assert "Screen on: 1024x768 native Vulkan" in command("screen status")
+    assert "Screen off." in command("screen off")
+    assert "FFFF0000000C0010: 0000000000000000" in command("mmio FFFF0000000C0010")
+    assert "Screen off: " in command("screen")
+    assert "!!" in command("screenshot")
+    assert "Screen on." in command("screen on")
+    assert "FFFF0000000C0010: 0000000000000001" in command("mmio FFFF0000000C0010")
+    return dict(screen_power_cycle=True, confirmed_baud=rate, restored_baud=old, completed_presents=presents)
 
 
 def check_serial_loaders(client, transcript):
@@ -301,7 +311,7 @@ def check_file_transfer(client, transcript, keep):
     return dict(bytes=len(payload), sha256=digest(root / "TOHOST.BIN"))
 
 
-def check(archive, keep, signer, powershell, automation=False, transfers=False, memory=False, loaders=False, diagnostics=False):
+def check(archive, keep, signer, powershell, automation=False, transfers=False, memory=False, loaders=False, diagnostics=False, autoboot=False):
     archive, keep, signer = (Path(p).resolve() for p in (archive, keep, signer))
     if keep.exists():
         raise ValueError("Choose a new evidence directory; existing disks must be preserved")
@@ -360,6 +370,10 @@ def check(archive, keep, signer, powershell, automation=False, transfers=False, 
             transcript.append(startup)
             assert "Zentaji boot ROM v1" in startup and "Type help for the available commands." in startup
             assert f"build {manifest['anvil_build']} " in startup
+            if label == "autostart":
+                assert "Booting SAVED.PMF in " in startup and "The payload returned, r1 = $000000000000002A" in startup, startup
+            elif label == "cleared":
+                assert "Booting SAVED.PMF" not in startup and "The payload returned" not in startup, startup
             if automation and label == "second":
                 result["guest_sparkle_phase"] = check_screenshot(client, keep, transcript)
             for command, expected in commands:
@@ -382,6 +396,15 @@ def check(archive, keep, signer, powershell, automation=False, transfers=False, 
                 result["memory"] = check_memory_commands(client, transcript, container)
             if automation and label == "second":
                 result["automation"] = check_automation(client, transcript, container)
+            if label == "arm":
+                for line, expected in (("autoboot file ABSENT.PMF", "could not be opened"),
+                                       ("autoboot file SAVED.ZEN", "too short")):
+                    reply = client.command(line).decode("ascii")
+                    transcript.append(reply)
+                    assert expected in reply, reply
+                status = client.command("autoboot status").decode("ascii")
+                transcript.append(status)
+                assert "SAVED.PMF" in status, status
             client.socket.sendall(b"halt\r")
             # Guest shutdown precedes the host's hex dump of the complete UART
             # transcript. Keep the guest deadline independent of report size.
@@ -470,8 +493,19 @@ def check(archive, keep, signer, powershell, automation=False, transfers=False, 
     result["live_header_logo"] = True
     result["live_sparkle_phase"] = screen_check(keep / "live-screen.png")
     assert digest(folder / "data.img") == disk_hash
+    if autoboot:
+        def sign_boot_disk(label):
+            signatures(powershell, signer, catalogs=[catalog(keep / (label + "-input.cat"), [folder / "data.img"], True)])
+        sign_boot_disk("arm")
+        boot("arm", [("autoboot file SAVED.PMF", "Autoboot target saved: SAVED.PMF"),
+                     ("autoboot status", "SAVED.PMF")])
+        sign_boot_disk("autostart")
+        boot("autostart", [("autoboot clear", "The boot target is cleared")])
+        sign_boot_disk("cleared")
+        boot("cleared", [("echo AUTOBOOT-CLEARED", "AUTOBOOT-CLEARED")])
+        result["file_autoboot"] = dict(file="SAVED.PMF", return_value=42, cleared=True)
     result.update(persistent_source=True, persistent_payload_return=42,
-                  immutable_package_valid=True, disk_sha256=disk_hash)
+                  immutable_package_valid=True, disk_sha256=digest(folder / "data.img"))
     report = keep / "result.json"
     report.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
     evidence = [report, keep / "guest-built.pmf", keep / "live-screen.png", keep / "live.log"]
@@ -479,7 +513,7 @@ def check(archive, keep, signer, powershell, automation=False, transfers=False, 
         evidence.extend(keep / "tftp-root" / name for name in ("FROMHOST.BIN", "TOHOST.BIN"))
     if automation:
         evidence.append(keep / "guest-screenshot.png")
-    for label in ("first", "second"):
+    for label in [item["label"] for item in result["boots"]]:
         evidence += [keep / (label + "-" + suffix) for suffix in
                      ("launcher.log", "transcript.log", "zentaji.log", "zentaji-errors.log", "screen.png")]
     signatures(powershell, signer, catalogs=[catalog(keep / "results.cat", evidence, True)])
@@ -496,10 +530,11 @@ def main():
     parser.add_argument("--automation", action="store_true", help="Exercise programs, readback and screenshot over UART")
     parser.add_argument("--transfers", action="store_true", help="Check host file exchange over loopback TFTP (tftpy==0.8.7 and a free UDP port 69)")
     parser.add_argument("--memory", action="store_true", help="Check interactive memory edits, range testing and hashes on Zentaji")
+    parser.add_argument("--autoboot", action="store_true", help="Select a file, cold-boot it, and clear the persistent boot selection")
     parser.add_argument("--diagnostics", action="store_true", help="Check native UART baud, register inspection and GPU presentation status")
     parser.add_argument("--loaders", action="store_true", help="Check serial block and S-record loading, board identity and timer frequency")
     args = parser.parse_args()
-    print(json.dumps(check(args.archive, args.keep, args.sign_script, args.powershell, args.automation, args.transfers, args.memory, args.loaders, args.diagnostics), indent=2))
+    print(json.dumps(check(args.archive, args.keep, args.sign_script, args.powershell, args.automation, args.transfers, args.memory, args.loaders, args.diagnostics, args.autoboot), indent=2))
 
 
 if __name__ == "__main__":

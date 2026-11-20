@@ -37,6 +37,7 @@ Global zngUp.i,zngFault.i,zngLineHeight.i,zngSuspended.i
 Global zngFont.NeonVkPortFontRef
 #ZNG_CONSOLE_TOP=128
 Global zngBanner.NeonVkBannerArgs
+Global zngBlanked.i
 Global zngPresented.i,zngPainting.i,zngCursorRow.i=-1,zngCursorPen.i
 Global zngClockSecond.i=-2,zngClockDirty.i
 Global zngGlintPhase.i=-1,zngGlintTime.q,zngGlintDirty.i
@@ -178,7 +179,7 @@ EndProcedure
 Procedure zngPaint()
  Protected row.i,col.i,count.i,style.i,x.f,y.f,r.f,g.f,b.f,cursor.i,pen.i
  Protected full.i,moved.i,rows.i,py.i,clock.i,glint.i
- If zngUp=0 Or zngSuspended<>0 Or zngFault<>0 Or zngPainting<>0 Or NeonVkChromeFramePending()<>0 : ProcedureReturn : EndIf
+ If zngUp=0 Or zngBlanked<>0 Or zngSuspended<>0 Or zngFault<>0 Or zngPainting<>0 Or NeonVkChromeFramePending()<>0 : ProcedureReturn : EndIf
  If zngClockPoll()<>1 : zngFault=10 : ProcedureReturn : EndIf
  zngGlintPoll()
  zngPainting=1
@@ -270,7 +271,7 @@ Procedure.i ZentajiNeonConsoleStart()
 EndProcedure
 Procedure.i ZentajiNeonConsolePump()
  Protected resized.i,cols.i,rows.i,retired.i
- If zngUp=0 Or zngSuspended<>0 : ProcedureReturn 1 : EndIf
+ If zngUp=0 Or zngBlanked<>0 Or zngSuspended<>0 : ProcedureReturn 1 : EndIf
  If zngPainting<>0 : ProcedureReturn 1 : EndIf
  If zngFault<>0 : ProcedureReturn 0 : EndIf
  retired=zngRetireFrame()
@@ -321,6 +322,9 @@ Procedure.i ZentajiNeonConsoleResume()
   ; it here before the console can submit work or reuse a payload font cache.
   If GraphicsServiceLeave()<>0 : ProcedureReturn 0 : EndIf
   If ZentajiGraphicsDisplayOwned()<>1 Or znsState<>2 : ProcedureReturn 0 : EndIf
+  If zngBlanked<>0
+   If ZentajiGraphicsDisplayBlank()<>1 : ProcedureReturn 0 : EndIf
+  EndIf
   zngSuspended=0 : ConSetRenderer(@zngPaint) : ConGridMarkAll()
   ProcedureReturn ZentajiNeonConsolePump()
  EndIf

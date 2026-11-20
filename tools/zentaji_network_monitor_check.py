@@ -72,6 +72,7 @@ def main():
     parser.add_argument("--keep", type=Path, required=True)
     parser.add_argument("--exchange", action="store_true", help="Exercise block upload and TCP send/receive")
     parser.add_argument("--sign-script", type=Path, help="Sign the generated input catalogs before running the native machine")
+    parser.add_argument("--screenshot", action="store_true", help="Retrieve and verify the live header using the shared UDP screenshot tool")
     args = parser.parse_args()
     tools, output = args.zen_tools.resolve(), args.keep.resolve()
     sys.path.insert(0, str(tools))
@@ -113,9 +114,9 @@ def main():
             inputs = [path for path in folder.iterdir() if path.is_file()]
             signatures("pwsh.exe", args.sign_script.resolve(), executables=[executable],
                        catalogs=[catalog(folder / "inputs.cat", inputs, True)])
-        run_mode = ["--fast"] if args.exchange else []
+        run_mode = ["--fast"] if args.exchange or args.screenshot else []
         process = subprocess.Popen(
-            [str(executable), str(config), *run_mode, "--headless", "--live", "--max", "2000000000",
+            [str(executable), str(config), *run_mode, "--headless", "--live", "--max", "4000000000" if args.screenshot else "2000000000",
              "--live-seconds", "180", "--serial-listen", "0"],
             cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, encoding="utf-8", errors="replace",
@@ -192,6 +193,20 @@ def main():
                 # The network command's prompt is mirrored over serial too.
                 if not args.exchange:
                     client.prompt()
+                if args.screenshot:
+                    from unittest.mock import patch
+                    from pmfshot import png
+                    from zentaji_package_check import screen_check
+                    import pmfshot_wifi
+                    with patch.object(pmfshot_wifi, "PORT", port):
+                        frame = pmfshot_wifi.grab_reliable("127.0.0.1", timeout=90)
+                    assert frame is not None, "No CRC-verified UDP screenshot"
+                    width, height, rows = frame
+                    assert (width, height) == (1024, 768)
+                    capture = folder / "pr.png"
+                    capture.write_bytes(png(width, height, rows))
+                    result["udp_screenshot_phase"] = screen_check(capture)
+                    transcript.append(client.prompt().decode("utf-8"))
                 command("echo UART-AFTER-UDP", "UART-AFTER-UDP")
             else:
                 command("net", "Zentaji Ethernet is disconnected.")
@@ -229,6 +244,8 @@ def main():
         for label in ("nat", "disconnected"):
             folder = output / label
             evidence = [folder / "run.log", folder / "transcript.log"]
+            if label == "nat" and args.screenshot:
+                evidence.append(folder / "pr.png")
             catalogs.append(catalog(folder / (label + ".cat"), evidence, True))
         catalogs.append(catalog(output / "results.cat", [output / "result.json"], True))
         signatures("pwsh.exe", args.sign_script.resolve(), catalogs=catalogs)

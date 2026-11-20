@@ -26,6 +26,7 @@ display 1024 768 60000
 hostfile 0 anvil.zex anvil.zex
 disk 0 0 data.img
 net
+entropy host
 bootsource 0 0
 """
 

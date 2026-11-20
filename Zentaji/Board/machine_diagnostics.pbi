@@ -63,6 +63,38 @@ Procedure ZentajiCmdBaud()
  Print("UART0 baud restored: ") : PrintDec(old) : PrintNl()
 EndProcedure
 
+Procedure ZentajiCmdScreen()
+ Protected on.i
+ SkipSpace() : gWordAt=gPos : SkipWord() : gWordLen=gPos-gWordAt : SkipSpace()
+ If zngUp=0 : PrintN("!! this configuration has no active graphical console.") : ProcedureReturn : EndIf
+ If gLine[gPos]<>0 : PrintN("Use screen status, screen off or screen on.") : ProcedureReturn : EndIf
+ If gWordLen=0 Or WordIs("status")<>0
+  If zngBlanked<>0 : Print("Screen off: ") : Else : Print("Screen on: ") : EndIf
+  PrintDec(zgdWidth) : Print("x") : PrintDec(zgdHeight) : PrintN(" native Vulkan") : ProcedureReturn
+ EndIf
+ on=Bool(WordIs("on")<>0 Or WordIs("vulkan")<>0)
+ If on=0 And WordIs("off")=0 : PrintN("Use screen status, screen off or screen on.") : ProcedureReturn : EndIf
+ If on<>0
+  If zngBlanked<>0
+   zngBlanked=0 : zngPresented=0 : ConGridMarkAll()
+   If ZentajiNeonConsolePump()<>1 : PrintN("!! the native display resize could not complete.") : ProcedureReturn : EndIf
+   If NeonVkChromeFramePending()=0 And zngPresented=0 : zngPaint() : EndIf
+   If zngDrainFrame()<>1 Or zgdEnabled=0
+    PrintN("!! the native display could not present the console.") : ProcedureReturn
+   EndIf
+  EndIf
+  PrintN("Screen on.")
+ Else
+  If zngBlanked=0
+   If zngDrainFrame()<>1 Or ZentajiGraphicsDisplayBlank()<>1
+    PrintN("!! the native display could not be blanked.") : ProcedureReturn
+   EndIf
+   zngBlanked=1 : zngPresented=0
+  EndIf
+  PrintN("Screen off.")
+ EndIf
+EndProcedure
+
 Procedure ZentajiCmdVkStat()
  SkipSpace()
  If gLine[gPos]<>0 : PrintN("!! vkstat takes no arguments.") : ProcedureReturn : EndIf

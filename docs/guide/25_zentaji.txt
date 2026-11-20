@@ -293,6 +293,16 @@ size and buffer count, and completed presents since the monitor acquired
 the display. After a payload returns, the first prompt can precede the
 first completed frame.
 
+screen status reports the active dimensions. Use screen off to blank the
+native display and screen on to redraw the console. UART commands continue
+to work with the display off.
+
+autoboot file SAVED.PMF selects a PMF on the guest disk for the next
+startup. The monitor checks its header and placement before saving the
+selection. Each boot verifies the image hash before entering the payload.
+Use autoboot status to inspect the selection and autoboot clear to remove
+it. The package still starts through the Zentaji boot ROM and Anvil.
+
 receive ADDR LENGTH CRC32 accepts a binary stream over the UART. Give the
 address, byte count and CRC32 in hexadecimal. Wait for the rdy line before
 sending the bytes. The monitor prints ok after the checksum matches.
@@ -352,6 +362,21 @@ to retrieve the staged bytes or save them to a guest file.
 @FRAG
 python tools/anvil_wifi_update.py --receive-only 127.0.0.1 INPUT.BIN
 @ENDFRAG
+
+With the same loopback forward, the host screenshot tool requests pr. It
+acknowledges each UDP block and checks the complete run stream's CRC32
+before writing a PNG of the displayed frame.
+
+@FRAG
+python tools/pmfshot_wifi.py 127.0.0.1 anvil.png
+@ENDFRAG
+
+@SECTION Live host entropy
+
+The tester machine requests host cryptographic entropy with the machine
+directive entropy host. Run mmio FFFF000000090060 to inspect its status.
+A value of 1 means the host provider is available. Offline and recorded
+sessions report 0. The original seeded random device stays reproducible.
 
 @SECTION Verify and edit guest memory
 

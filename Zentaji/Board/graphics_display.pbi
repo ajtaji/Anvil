@@ -143,6 +143,12 @@ Procedure.i ZentajiGraphicsDisplayCopyWrite(token.q,*dma.ZentajiDmaTransfer,sour
  ProcedureReturn 1
 EndProcedure
 
+Procedure.i ZentajiGraphicsDisplayBlank()
+ If zgdPending<>0 Or zgdWriter<>0 Or ZentajiGraphicsDisplayOwned()<>1 : ProcedureReturn 0 : EndIf
+ PokeQ(#ZEN_GFX_DISPLAY+$10,0) : zgdEnabled=0
+ ProcedureReturn ZentajiGraphicsDisplayOwned()
+EndProcedure
+
 Procedure.i ZentajiGraphicsDisplayPresent(*queue.ZentajiGraphicsQueue,index.i)
  If index<0 Or index>=zgdBuffers Or zgdPending<>0 Or ZentajiGraphicsDisplayOwned()=0 : ProcedureReturn 0 : EndIf
  If zgdManaged<>0 And (zgdWriter<>3 Or index<>zgdWriteIndex) : ProcedureReturn 0 : EndIf
