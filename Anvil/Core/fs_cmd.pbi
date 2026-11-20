@@ -193,6 +193,7 @@ Procedure CmdFat()
     ProcedureReturn
   EndIf
 
+  gHaveEntry=0 : gFail=1
   got = HwFileReadAt(0, a, n)
   HwFileClose()
 
@@ -225,12 +226,15 @@ Procedure CmdFat()
     PrintN("   run will not jump into it by accident.")
     ProcedureReturn
   EndIf
-  gEntry = a
-  gHaveEntry = 1
+  RememberContiguousLoad(a,got)
+  CompilerIf Defined(ANVIL_ZENTAJI_KERNEL_BOOT, #PB_Constant)
+  PrintN("  Use boot mem for a PMF, booti for a kernel ZEX, or bootm for a boot-disk image.")
+  CompilerElse
   Print("  Its entry point is ")
   PutAddr(a)
   PrintN(", which is where run will jump if you")
   PrintN("  type run with no address of your own.")
+  CompilerEndIf
 EndProcedure
 
 ; ======================================================================

@@ -1,0 +1,22 @@
+; Compile once as a service client and once as a plain returning PMF. The
+; plain program sleeps indefinitely. The service client renews a one-second
+; watchdog between two 650 ms waits and returns to the live Anvil prompt.
+XIncludeFile "Zentaji/Board/clock.pbi"
+Procedure GuardWait(ticks.q)
+ Protected prior.q=PeekQ(#ZEN_IDLE_TIMER),deadline.q=Ticks()+ticks
+ PokeQ(#ZEN_IDLE_TIMER,deadline) : PokeQ(#ZEN_IDLE_TIMER+16,3)
+ While Ticks()<deadline : ZenCpuWait() : Wend
+ PokeQ(#ZEN_IDLE_TIMER+16,0) : PokeQ(#ZEN_IDLE_TIMER+24,1) : PokeQ(#ZEN_IDLE_TIMER,prior)
+EndProcedure
+Procedure.q Main(table.i)
+ Protected pet.i,delay.q
+ If table=0
+  Repeat : ZenCpuWait() : ForEver
+ EndIf
+ If PeekL(table)<>$53564E41 Or PeekL(table+12)<7 : ProcedureReturn $BAD1 : EndIf
+ pet=PeekQ(table+16+6*8) : If pet=0 : ProcedureReturn $BAD2 : EndIf
+ If PeekQ(#ZEN_IDLE_TIMER+16)<>0 Or PeekQ(#ZEN_IDLE_TIMER+24)<>0 : ProcedureReturn $BAD3 : EndIf
+ delay=TickHz()*65/100
+ GuardWait(delay) : CallFunctionFast(pet) : GuardWait(delay)
+ ProcedureReturn $50455431
+EndProcedure

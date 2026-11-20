@@ -120,6 +120,13 @@ Procedure.i HwPayloadRun(entry.i,argument.i,stack.i,stackBytes.i)
   ProcedureReturn 0
  EndIf
  CompilerEndIf
+ CompilerIf Defined(ANVIL_ZENTAJI_DEADMAN,#PB_Constant)
+ Protected guard.i
+ If zenDeadSeconds>0
+  guard=ZentajiDeadFree()
+  If guard=0 : PrintN("!! deadman needs a free secondary timer and watchdog. Nothing was entered.") : ProcedureReturn 0 : EndIf
+ EndIf
+ CompilerEndIf
  hadStorage=zenStorageAcquired
  If services=0
  If ZentajiStorageDown()=0
@@ -158,7 +165,13 @@ Procedure.i HwPayloadRun(entry.i,argument.i,stack.i,stackBytes.i)
  CompilerIf Defined(ANVIL_ZENTAJI_KEPT_SHOT,#PB_Constant)
  ZentajiKeptBegin()
  CompilerEndIf
+ CompilerIf Defined(ANVIL_ZENTAJI_DEADMAN,#PB_Constant)
+ ZentajiDeadBegin(guard)
+ CompilerEndIf
  entered=ZentajiPayloadEnter(zenMemoryContext,entry,argument,stack,stackBytes)
+ CompilerIf Defined(ANVIL_ZENTAJI_DEADMAN,#PB_Constant)
+ If ZentajiDeadEnd()<>1 : ZentajiPayloadRecoveryFailed($5B0D,"The payload changed the deadman core lease.") : EndIf
+ CompilerEndIf
  endUs=HwMicros()
  code=ZentajiPayloadLastError() : gGoRc=ZentajiPayloadReturnValue()
  CompilerIf Defined(ANVIL_ZENTAJI_KEPT_SHOT,#PB_Constant)

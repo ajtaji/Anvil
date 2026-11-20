@@ -594,3 +594,29 @@ checks the interrupt claim, then executes a tagged breakpoint. Both return
 through ERET. The command reports the observed causes, tag and interrupt
 count and restores the timer, interrupt mask and original vectors. It runs
 only when requested at the prompt.
+
+Starting a Zentaji supervisor kernel
+
+From the Anvil prompt, load KERNEL.ZEX and then type booti. For a Zentaji
+boot-disk image, load BOOT.IMG and type bootm. The disk format has a
+4 KiB header block followed by the kernel body. Either command accepts a
+hexadecimal staging address when the image was moved to a different part
+of payload RAM. get also records the address and length of a complete file.
+
+Anvil checks the image header, entry, RAM extents and body CRC-32 before
+releasing its devices. The kernel can replace Anvil itself. It receives
+the ROM device table in r1 and the original boot source in r2, with the
+image's stack or the ROM default stack. A successful handoff is one way.
+Reset the machine to start Anvil again. Use boot for returning PMF programs.
+
+Guarding a payload with the watchdog
+
+deadman 5 arms the next PMF run for five seconds. A returning payload
+cancels the guard. A running program can call the shared watchdog-pet
+service to renew its interval. If the deadline expires, the machine
+watchdog resets the board and the boot ROM starts Anvil again. Type
+deadman to see the setting and whether the last reset was a watchdog reset.
+deadman off cancels an unused setting. The maximum interval is 15 seconds.
+
+The guard sleeps on a spare core's private timer. A single-core machine,
+or one whose secondary cores or timers are busy, refuses the guarded run.

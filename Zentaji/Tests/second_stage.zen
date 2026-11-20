@@ -1,0 +1,38 @@
+; A second-stage kernel checks its initial register contract before using
+; any register as scratch. r3..r254 should start clear.
+.org KERNEL_BASE
+kernel_entry:
+  BNEI r3,0,bad_register
+  BNEI r27,0,bad_register
+  BNEI r128,0,bad_register
+  BNEI r254,0,bad_register
+  LIQ r4,$FFFF000000010000
+  BNE r1,r4,bad_register
+  LD8U r4,[r1+35]
+  BNE r2,r4,bad_register
+  MFCR r4,STATUS
+  BNEI r4,0,bad_register
+  MFCR r4,EVEC
+  LIQ r5,$FFFF00000000F000
+  BNE r4,r5,bad_register
+  LIQ r5,KERNEL_STACK
+  BNE r255,r5,bad_register
+  MFCR r4,COREID
+  BNEI r4,0,bad_register
+  LIQ r4,kernel_marker
+  LD64 r5,[r4]
+  LIQ r6,$21FE004300BEAD73
+  BNE r5,r6,bad_register
+  LIQ r4,kernel_bss
+  LD64 r5,[r4]
+  BNEI r5,0,bad_register
+  LD64 r5,[r4+56]
+  BNEI r5,0,bad_register
+  LI r1,$4B424F54
+  HALT r1
+bad_register:
+  LI r1,$BAD
+  HALT r1
+kernel_marker:
+  .word $21FE004300BEAD73
+kernel_bss:

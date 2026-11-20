@@ -6,6 +6,9 @@ Procedure.i HwMmuState() : ProcedureReturn 0 : EndProcedure
 ; No dynamic module arena/provider is admitted by this composition.
 Procedure.i HwSeamCore(id.i) : ProcedureReturn 0 : EndProcedure
 Procedure HwPet()
+ CompilerIf Defined(ANVIL_ZENTAJI_DEADMAN,#PB_Constant)
+ If zenDeadCore<>0 : ZentajiDeadPet() : ProcedureReturn : EndIf
+ CompilerEndIf
  ; Only feed an actually enabled watchdog; never enable it as a side effect.
  If (PeekQ(#ZEN_IDLE_TIMERS+$800)&1)<>0 : PokeQ(#ZEN_IDLE_TIMERS+$810,$FEEDD06E) : EndIf
 EndProcedure

@@ -846,6 +846,71 @@ zen_diag_trap:
   OR r1,r24,r0
   JR r254
 
+; One-way kernel handoff after the board releases its devices. r1 points to
+; six validated words, r2 is the bottom of the monitor's 64 KiB stack. Copy
+; the position-independent last stage there before overwriting any old code.
+anvil_kernel_enter:
+  ADDI r16,r2,4096
+  BGEU r16,r255,anvil_kernel_stack_busy
+  LD64 r20,[r1]
+  LD64 r21,[r1+8]
+  LD64 r22,[r1+16]
+  LD64 r23,[r1+24]
+  LD64 r24,[r1+32]
+  LD64 r25,[r1+40]
+  OR r26,r2,r0
+  ADDI r27,r2,2048
+  OR r18,r27,r0
+  LI r19,256
+  MSET r18,r0,r19,3
+  OR r18,r26,r0
+  LIQ r16,anvil_kernel_copy
+  LIQ r19,anvil_kernel_copy_end
+  SUB r19,r19,r16
+  MCPY r18,r16,r19
+  LIQ r16,$FFFF00000000F000
+  MTCR r0,r16,EVEC
+  FENCE.full
+  FENCE.IFENCE
+  JR r26
+anvil_kernel_stack_busy:
+  LI r1,$5B0B
+  HALT r1
+
+; Only relative branches or architectural constants below this point.
+; The 2 KiB zero table above this relocated code clears all scratch GPRs.
+anvil_kernel_copy:
+  ADD r28,r21,r22
+  BEQ r20,r21,anvil_kernel_bss
+  BLTU r21,r20,anvil_kernel_forward
+  ADD r29,r20,r22
+  BGEU r21,r29,anvil_kernel_forward
+  OR r21,r28,r0
+  OR r20,r29,r0
+  MCPY r21,r20,r22,1
+  JMP anvil_kernel_bss
+anvil_kernel_forward:
+  MCPY r21,r20,r22
+anvil_kernel_bss:
+  MSET r28,r0,r23,0
+  FENCE.full
+  FENCE.IFENCE
+  MTCR r0,r24,EPC
+  MTCR r0,r0,ESTATUS
+  MTCR r0,r0,ECAUSE
+  MTCR r0,r0,EWORD
+  MTCR r0,r0,EINFO
+  MTCR r0,r0,FPCR
+  MTCR r0,r0,FPSR
+  MTCR r0,r0,SCRATCH0
+  MTCR r0,r0,SCRATCH1
+  LIQ r1,$FFFF000000010000
+  LD8U r2,[r1+35]
+  OR r255,r25,r0
+  LDM r3-r254,[r27]
+  ERET
+anvil_kernel_copy_end:
+
 .align 64
 anvil_zen_payload_save:
   .org anvil_zen_payload_save+3160
@@ -853,6 +918,7 @@ anvil_zen_payload_save:
   ; Optional supervisor diagnostic descriptor immediately before the v2 context.
   ; Its magic and address are in monitor-owned memory. Existing v2 users read
   ; only their original 128 bytes; older images have no such descriptor.
+  .word $31544F4F424E455A,anvil_kernel_enter
   .word $31474149444E455A,anvil_diag_enter
 anvil_zen_context:
   ; magic, version, size; device table/source/RAM/loader SP/stack bottom/top;

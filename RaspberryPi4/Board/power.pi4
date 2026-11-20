@@ -165,25 +165,16 @@ Procedure CmdReset()
   SafetyToFirmware()
 EndProcedure
 
+XIncludeFile "Anvil/Core/deadman_arg.pbi"
 Procedure CmdDeadman()
-  Define n.i
-
-  ; "deadman off", for symmetry with "screen off". Same reasoning: the
-  ; word has to be taken before ParseDec, which cannot see it.
-  SkipSpace()
-  gWordAt = gPos
-  SkipWord()
-  gWordLen = gPos - gWordAt
-  If WordIs("off") <> 0
+  Define n.i=DeadmanArgument()
+  If n = #DEADMAN_OFF
     gDead = 0
     PrintN("The deadman watchdog is off. A payload that hangs will now hang the")
     PrintN("board with it, and getting out of that means a reset or the mains.")
     ProcedureReturn
   EndIf
-  gPos = gWordAt
-
-  n = ParseDec()
-  If gParseOk = 0 And gWordLen > 0
+  If n = #DEADMAN_BAD_WORD
     ; A WORD THIS COMMAND DOES NOT KNOW. It used to fall through to the
     ; report below, so "deadman of" - one letter short of "off" - printed
     ; the current setting and looked as though it had disarmed the thing.
@@ -200,7 +191,7 @@ Procedure CmdDeadman()
     PrintN("  deadman off        disarm it")
     ProcedureReturn
   EndIf
-  If gParseOk = 0
+  If n = #DEADMAN_REPORT
     ; Bare deadman - report, do not change. A command that silently
     ; disarms the safety net when you mistype it is worse than no net.
     If gDead > 0

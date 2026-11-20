@@ -562,6 +562,7 @@ Procedure CmdGet()
   EndIf
 
   If NetXferRun(XferKind()) = 0
+    If TftpBytes()>0 : gFail=1 : gHaveEntry=0 : EndIf
     PrintN("The transfer did not complete.")
     EthWhyTftp()
     EthSayServer()
@@ -570,6 +571,7 @@ Procedure CmdGet()
   EndIf
 
   If TftpComplete() <> 1
+    If TftpBytes()>0 : gFail=1 : gHaveEntry=0 : EndIf
     PrintN("!! the transfer ended without completing, so what is in memory is part")
     PrintN("   of a file and NOT a file. Do not run it.")
     EthWhyTftp()
@@ -602,11 +604,10 @@ Procedure CmdGet()
   PutAddr(a + TftpBytes() - 1)
   PrintN(".")
   EthTally()
+  RememberContiguousLoad(a,TftpBytes())
   CompilerIf Defined(ANVIL_ZENTAJI_NET, #PB_Constant)
   PrintN("  Use save to keep the file, or boot mem with its address for a PMF payload.")
   CompilerElse
-  gEntry = a
-  gHaveEntry = 1
   Print("  Its entry point is ")
   PutAddr(a)
   PrintN(", which is where run will jump if you")

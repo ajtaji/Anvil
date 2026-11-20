@@ -150,6 +150,12 @@ Global gHiHi.i                 ;            highest address written
 Global gEntry.i                ;            entry point
 Global gHaveEntry.i
 
+Procedure RememberContiguousLoad(address.i,bytes.i)
+  gLoLo=address : gHiHi=address+bytes-1
+  gEntry=address : gHaveEntry=1
+  gRecs=1 : gBytes=bytes : gBad=0 : gFail=0
+EndProcedure
+
 Global gGoAddr.i               ; entry selected for a validated payload
 Global gGoRc.i                 ; full-width result returned to the monitor
 
