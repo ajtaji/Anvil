@@ -100,6 +100,8 @@ def main():
     parser.add_argument("--crypto", type=Path, metavar="COMPILER", help="Build a Zentaji entropy ABI probe and check the shared crypto vector suite")
     parser.add_argument("--readonly-disk", action="store_true",
                         help="Check native raw block reads and write refusal on a read-only disk")
+    parser.add_argument("--trail", action="store_true",
+                        help="Check the boot trail through two ROM resets and preserve foreign NVRAM")
     parser.add_argument("--web", action="store_true",
                         help="Check HTTP in both directions, verified TLS 1.3 and guest trust refusals")
     args = parser.parse_args()
@@ -165,8 +167,18 @@ def main():
                 reserved.bind(("127.0.0.1", 0))
                 port = reserved.getsockname()[1]
             fixture.directives.append(f"forward udp {port} 5555 127.0.0.1")
+        if args.trail:
+            # A different owner uses the low half. In the attached case it also
+            # holds a byte in the proposed trail region.
+            nvram = bytearray(256)
+            nvram[:128] = bytes(range(128))
+            if attached:
+                nvram[248] = 0xAD
+            fixture.directives.append("nvram rtc.bin")
         fixture.power_on(0, 0)
         config = fixture.write(folder)
+        if args.trail:
+            (folder / "rtc.bin").write_bytes(nvram)
         if args.sign_script:
             from zentaji_package import signatures, catalog
             inputs = [path for path in folder.iterdir() if path.is_file()]
@@ -207,6 +219,40 @@ def main():
                 assert expected in reply, (text, reply)
                 return reply
 
+            if args.trail:
+                def rtc_bytes(addr, count):
+                    reply = command(f"mmio {addr:X} {count:X}", "pmf> ")
+                    values = re.findall(r"(?m)^([0-9A-F]{16}): ([0-9A-F]{16})\r?$", reply)
+                    assert [int(a,16) for a,_ in values] == list(range(addr,addr+8*count,8))
+                    return b"".join(int(v,16).to_bytes(8,"little") for _,v in values)
+
+                if attached:
+                    command("trail", "NVRAM trail area is occupied")
+                    assert rtc_bytes(0xFFFF000000060100,32) == nvram
+                    result["trail_foreign_preserved"] = True
+                else:
+                    def entries(text, which):
+                        rows = re.findall(rf"(?m)^TRAIL {which} ([0-9A-F]{{4}}) (\d+) ms  (.+?)\r?$", text)
+                        return [(int(code,16),int(ms),name) for code,ms,name in rows]
+
+                    previous = []
+                    for generation in (1,2,3):
+                        if generation > 1:
+                            command("reset", "Zentaji boot ROM v1")
+                        reply = command("trail", f"This boot (boot {generation}), TRAIL 0")
+                        rows = entries(reply,0)
+                        assert [e[0] for e in rows] == list(range(0x5A01,0x5A08)), reply
+                        times = [e[1] for e in rows]
+                        assert times == sorted(times) and times[-1] > times[0], times
+                        assert rows[-1][2] == "Monitor ready"
+                        assert entries(reply,1) == previous
+                        if previous:
+                            assert f"The previous boot (boot {generation-1}) FINISHED" in reply
+                        else:
+                            assert "no record of a previous boot" in reply
+                        previous = rows
+                    assert rtc_bytes(0xFFFF000000060100,16) == nvram[:128]
+                    result["trail_reset_generations"] = 3
             if readonly:
                 from anvil import read_map
                 from anvil_readback import parse_readback
