@@ -114,6 +114,61 @@ def check_automation(client, transcript, container):
     return dict(payload_readback_bytes=len(container), multiblock_bytes=count)
 
 
+def check_serial_loaders(client, transcript):
+    from anvil_readback import parse_readback
+    import zlib
+
+    def command(line):
+        reply = client.command(line).decode("ascii")
+        transcript.append(reply)
+        return reply
+
+    def transfer(line, ready, payload):
+        client.socket.sendall(line.encode("ascii") + b"\r")
+        first = bytearray()
+        deadline = time.monotonic() + client.timeout
+        while ready not in first:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(f"Timed out waiting for {ready!r}")
+            client.socket.settimeout(remaining)
+            packet = client.socket.recv(4096)
+            if not packet:
+                raise ConnectionError("UART closed before transfer")
+            first.extend(packet)
+            if first.endswith(b"pmf> "):
+                raise AssertionError(first.decode("ascii"))
+        client.socket.sendall(payload)
+        reply = (first + client.prompt()).decode("ascii")
+        transcript.append(reply)
+        return reply
+
+    info = command("board")
+    for text in ("RAM bytes: 268435456", "CPU cores: 2", "Current core: 0", "Boot source: host file"):
+        assert text in info, info
+    assert "Nominal machine clock: 100000000 Hz" in command("clock")
+    assert "read-only" in command("clock 48000000")
+    loaded = command("load SAVED.PMF")
+    address = int(re.search(r"filling ([0-9A-F]+)", loaded)[1], 16)
+    data = bytes((i * 79) & 255 for i in range(1031))
+    header = f"receive {address:X} {len(data):X} {zlib.crc32(data):08X}"
+    reply = transfer(header, b"rdy\r\n", data)
+    assert "Received all 1031 bytes" in reply and "ok" in reply.splitlines(), reply
+    assert parse_readback(command(f"readback {address:X} {len(data):X}"), address, len(data)) == data
+
+    def record(kind, target, data):
+        raw = bytes([len(data) + 5]) + target.to_bytes(4, "big") + data
+        return f"S{kind}{raw.hex()}{(~sum(raw)) & 255:02x}".upper().encode()
+
+    fragment = b"ANVIL\0UART\xff"
+    # S7 terminates immediately. No trailing newline should be offered as a command.
+    stream = record(3, address, fragment) + b"\r\n" + record(7, address, b"")
+    reply = transfer("loads", b"abandons it.\r\n", stream)
+    assert f"{len(fragment)} bytes in all" in reply and "!!" not in reply, reply
+    assert parse_readback(command(f"readback {address:X} {len(fragment):X}"), address, len(fragment)) == fragment
+    return dict(block_bytes=len(data), srecord_bytes=len(fragment))
+
+
 def check_memory_commands(client, transcript, container):
     import hashlib
     from anvil_readback import parse_readback
@@ -198,7 +253,7 @@ def check_file_transfer(client, transcript, keep):
     return dict(bytes=len(payload), sha256=digest(root / "TOHOST.BIN"))
 
 
-def check(archive, keep, signer, powershell, automation=False, transfers=False, memory=False):
+def check(archive, keep, signer, powershell, automation=False, transfers=False, memory=False, loaders=False):
     archive, keep, signer = (Path(p).resolve() for p in (archive, keep, signer))
     if keep.exists():
         raise ValueError("Choose a new evidence directory; existing disks must be preserved")
@@ -271,6 +326,8 @@ def check(archive, keep, signer, powershell, automation=False, transfers=False, 
                 print(label + ": " + command + " PASS", flush=True)
             if transfers and label == "first":
                 result["file_transfer"] = check_file_transfer(client, transcript, keep)
+            if loaders and label == "second":
+                result["serial_loaders"] = check_serial_loaders(client, transcript)
             if memory and label == "second":
                 result["memory"] = check_memory_commands(client, transcript, container)
             if automation and label == "second":
@@ -389,8 +446,9 @@ def main():
     parser.add_argument("--automation", action="store_true", help="Exercise programs, readback and screenshot over UART")
     parser.add_argument("--transfers", action="store_true", help="Check host file exchange over loopback TFTP (tftpy==0.8.7 and a free UDP port 69)")
     parser.add_argument("--memory", action="store_true", help="Check interactive memory edits, range testing and hashes on Zentaji")
+    parser.add_argument("--loaders", action="store_true", help="Check serial block and S-record loading, board identity and timer frequency")
     args = parser.parse_args()
-    print(json.dumps(check(args.archive, args.keep, args.sign_script, args.powershell, args.automation, args.transfers, args.memory), indent=2))
+    print(json.dumps(check(args.archive, args.keep, args.sign_script, args.powershell, args.automation, args.transfers, args.memory, args.loaders), indent=2))
 
 
 if __name__ == "__main__":

@@ -1,9 +1,9 @@
 EnableFloatingPoint
 ; Zentaji serial/storage monitor composition. The ROM loads the owned startup
 ; envelope; Main receives its validated table/source/context, never ARM registers.
-#ANVIL_BUILD = 51 ; pmf:build
+#ANVIL_BUILD = 52 ; pmf:build
 #ANVIL_BUILD_DATE = 20261119 ; pmf:builddate
-#ANVIL_BUILD_TIME = 175942 ; pmf:buildtime
+#ANVIL_BUILD_TIME = 181238 ; pmf:buildtime
 #CAP_TOUCH=0
 #CAP_PWM=0
 #CAP_NET=1
@@ -32,6 +32,7 @@ Global zenShellStop.i, zenShellReset.i
 #ZEN_MONITOR_POWER = $FFFF000000020000
 XIncludeFile "Anvil/Core/messages.pbi"
 XIncludeFile "Anvil/Core/parse.pbi"
+#ANVIL_UART_RX_WAIT=1
 XIncludeFile "Anvil/Core/rxbreak.pbi"
 XIncludeFile "Anvil/Hal/hal.pbi"
 XIncludeFile "Anvil/Hal/seams.pbi"
@@ -60,10 +61,12 @@ Procedure RunAt(address.i)
  PrintN("Raw entry is unavailable. Use boot with a PMF payload.")
 EndProcedure
 XIncludeFile "Anvil/Core/memcmd.pbi"
+XIncludeFile "Anvil/Core/xfer.pbi"
 XIncludeFile "Anvil/Core/net_tftp_server.pbi"
 XIncludeFile "Anvil/Core/net_tftp_cmd.pbi"
 XIncludeFile "Zentaji/Board/identity.pbi"
 XIncludeFile "Anvil/Core/flow_cmd.pbi"
+XIncludeFile "Zentaji/Board/monitor_info.pbi"
 XIncludeFile "Anvil/Core/layout_cmd.pbi"
 XIncludeFile "Anvil/Core/shotarm.pbi"
 XIncludeFile "Anvil/Crypto/sha1.pbi"
@@ -95,6 +98,7 @@ Procedure ZentajiShellHelp()
  PrintN("  mm, nm, mtest, sha1sum, sha256sum")
  PrintN("  uptime/up, last run, reset/reboot")
  PrintN("  net, dhcp, ping <host>, dns <name>")
+ PrintN("  info/board, clock, receive <hex address> <hex length> <crc32>, srecord/loads")
  PrintN("  get <name> [hex address], put <name> <hex address> <hex length>")
  PrintN("  settings set net.server <IPv4 address> selects the TFTP server")
  PrintN("  forge [command]       built-in Zentaji PureMetal compiler and editor")
@@ -125,6 +129,14 @@ Procedure.i HwCommandDispatch(c.i)
   ZentajiShellHelp()
  ElseIf WordIs("version")<>0 Or WordIs("ver")<>0
   CmdVersion()
+ ElseIf WordIs("info")<>0 Or WordIs("board")<>0 Or LetterIs(105)<>0
+  ZentajiCmdInfo()
+ ElseIf WordIs("clock")<>0 Or LetterIs(99)<>0
+  ZentajiCmdClock()
+ ElseIf WordIs("receive")<>0 Or LetterIs(98)<>0
+  CmdBlock()
+ ElseIf WordIs("srecord")<>0 Or WordIs("loads")<>0 Or LetterIs(108)<>0
+  SrecLoad()
  ElseIf WordIs("map")<>0
   CmdMap()
  ElseIf WordIs("memory")<>0 Or WordIs("dump")<>0 Or WordIs("md")<>0 Or LetterIs(109)<>0

@@ -61,6 +61,10 @@ Procedure.i RxByte()
     If (Ticks() - t0) > timeout
       ProcedureReturn -1
     EndIf
+    CompilerIf Defined(ANVIL_UART_RX_WAIT, #PB_Constant)
+      ; Wait for the board timer or RX without consuming a protocol byte.
+      If HwPromptIdleReady() <> 0 : HwPromptIdleWait() : EndIf
+    CompilerEndIf
   ForEver
 EndProcedure
 
