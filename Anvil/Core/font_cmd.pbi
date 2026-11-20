@@ -128,6 +128,16 @@ EndProcedure
 
 ; Boards with a fixed-cell display may narrow the shared command's size
 ; range without changing the parser or other boards' default behavior.
+; A TrueType-only display may validate a proposed face and pixel height
+; against its actual glyph atlas before selection or settings changes.
+Procedure.i anvil_font_AnyDisplay(slot.i,pixels.i)
+  ProcedureReturn 1
+EndProcedure
+Global anvil_font_checkDisplay.i=@anvil_font_AnyDisplay
+Procedure.i AnvilFontDisplayAccept(slot.i,pixels.i)
+  ProcedureReturn anvil_font_checkDisplay(slot,pixels)
+EndProcedure
+
 Procedure.i AnvilFontPixelLimitSet(limit.i)
   If limit<1 Or limit>512 : ProcedureReturn 0 : EndIf
   anvil_font_pixel_limit=limit
@@ -146,7 +156,7 @@ Procedure.i AnvilFontSettingsBootApply()
   *value = SettingsGet("font.size")
   If *value <> 0
     pixelHeight = PmfDecOf(*value, 16)
-    If pixelHeight<1 Or pixelHeight>anvil_font_pixel_limit Or AnvilTrueTypeSetPixelHeight(pixelHeight) = 0
+    If pixelHeight<1 Or pixelHeight>anvil_font_pixel_limit Or AnvilFontDisplayAccept(AnvilTrueTypeSlotSelected(),pixelHeight)=0 Or AnvilTrueTypeSetPixelHeight(pixelHeight) = 0
       AnvilTrueTypeSetPixelHeight(16)
       If anvil_font_pixel_limit<16
         AnvilTrueTypeSetPixelHeight(anvil_font_pixel_limit)
@@ -167,7 +177,7 @@ Procedure.i AnvilFontSettingsBootApply()
   pathBytes = SettingsLength("font.default")
   If pathBytes > 0 And pathBytes < #ANVIL_FONT_PATH_BYTES
     If anvil_font_LoadFile(0, *value, pathBytes) <> 0
-      If AnvilTrueTypeSlotSelect(0) <> 0
+      If AnvilFontDisplayAccept(0,AnvilTrueTypePixelHeight())<>0 And AnvilTrueTypeSlotSelect(0) <> 0
         AnvilTrueTypeSetDefaultSlot(0)
         Print("default TrueType font loaded from ") : UartWriteStr(*value) : PrintNl()
         ProcedureReturn 1
@@ -250,6 +260,7 @@ Procedure anvil_font_Info()
   Else
     PrintN("  no font selected")
   EndIf
+  If selected=#ANVIL_TTS_BOOT_SLOT : PrintN("  selected font: embedded TrueType") : EndIf
   Print("  text size ") : PrintDec(AnvilTrueTypePixelHeight()) : PrintN(" pixels")
   defaultSlot = AnvilTrueTypeDefaultSlot()
   *defaultPath = SettingsGet("font.default")
@@ -265,10 +276,10 @@ Procedure anvil_font_Info()
     PrintNl()
   ElseIf *defaultPath <> 0
     Print("  default font unavailable: ") : UartWriteStr(*defaultPath)
-    PrintN("; built-in bitmap fallback active")
+    If anvil_font_checkDisplay<>@anvil_font_AnyDisplay : PrintN("; embedded TrueType fallback active") : Else : PrintN("; built-in bitmap fallback active") : EndIf
   Else
     Print("  default slot ") : PrintDec(defaultSlot)
-    PrintN(" is not loaded; built-in bitmap fallback active")
+    If anvil_font_checkDisplay<>@anvil_font_AnyDisplay : PrintN(" is not loaded; embedded TrueType fallback active") : Else : PrintN(" is not loaded; built-in bitmap fallback active") : EndIf
   EndIf
 EndProcedure
 
@@ -318,8 +329,12 @@ Procedure anvil_font_Size()
   If gLine[gPos] <> 0
     PrintN("!! font size must be one decimal value from 1 through 512") : ProcedureReturn
   EndIf
-  If pixelHeight<1 Or pixelHeight>anvil_font_pixel_limit Or AnvilTrueTypeSetPixelHeight(pixelHeight) = 0
+  If pixelHeight<1 Or pixelHeight>anvil_font_pixel_limit
     Print("!! font size must be one decimal value from 1 through ") : PrintDec(anvil_font_pixel_limit) : PrintN(" on this board") : ProcedureReturn
+  EndIf
+  If AnvilFontDisplayAccept(AnvilTrueTypeSlotSelected(),pixelHeight)=0 Or AnvilTrueTypeSetPixelHeight(pixelHeight)=0
+    PrintN("!! the selected face at that size does not fit the display; the current size is unchanged")
+    ProcedureReturn
   EndIf
   PmfPutDec(pixelHeight, @gNumBuf[0])
   If SettingsSet("font.size", @gNumBuf[0]) = 0
@@ -329,11 +344,43 @@ Procedure anvil_font_Size()
   EndIf
 EndProcedure
 
+Procedure.i anvil_font_EmbeddedChoice(saveDefault.i)
+  If anvil_font_checkDisplay=@anvil_font_AnyDisplay : ProcedureReturn 0 : EndIf
+  If WordIs("bitmap")<>0
+    PrintN("This console uses TrueType. Choose embedded or a loaded slot.")
+    ProcedureReturn 1
+  EndIf
+  If WordIs("embedded")=0 : ProcedureReturn 0 : EndIf
+  SkipSpace()
+  If gLine[gPos]<>0
+    PrintN("!! embedded takes no arguments")
+    ProcedureReturn 1
+  EndIf
+  If AnvilFontDisplayAccept(#ANVIL_TTS_BOOT_SLOT,AnvilTrueTypePixelHeight())=0 Or AnvilTrueTypeSlotSelect(#ANVIL_TTS_BOOT_SLOT)=0
+    PrintN("!! the embedded face could not be selected at this size")
+    ProcedureReturn 1
+  EndIf
+  If saveDefault<>0
+    If SettingsHas("font.default")<>0
+      If SettingsRemove("font.default")=0
+        PrintN("!! embedded font selected, but the saved default could not be cleared")
+        ProcedureReturn 1
+      EndIf
+    EndIf
+    AnvilTrueTypeSetDefaultSlot(#ANVIL_TTS_BOOT_SLOT)
+    PrintN("embedded TrueType is the default; type settings save to persist it")
+  Else
+    PrintN("embedded TrueType font selected")
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
 Procedure anvil_font_Default()
   Protected slot.i
   Protected start.i
   Protected pathBytes.i
   SkipSpace() : start = gPos : gWordAt = gPos : SkipWord() : gWordLen = gPos - gWordAt
+  If anvil_font_EmbeddedChoice(1)<>0 : ProcedureReturn : EndIf
   If WordIs("bitmap") <> 0
     SkipSpace()
     If gLine[gPos] <> 0
@@ -350,7 +397,8 @@ Procedure anvil_font_Default()
   gPos = start : slot = anvil_font_ParseSlot()
   SkipSpace()
   If slot < 0 Or gLine[gPos] <> 0
-    PrintN("!! usage: font default <loaded slot 0..3|bitmap>") : ProcedureReturn
+    If anvil_font_checkDisplay<>@anvil_font_AnyDisplay : PrintN("!! usage: font default <loaded slot 0..3|embedded>") : Else : PrintN("!! usage: font default <loaded slot 0..3|bitmap>") : EndIf
+    ProcedureReturn
   EndIf
   If AnvilTrueTypeSlotBytes(slot) = 0 Or anvil_font_SlotPath(slot) = 0
     PrintN("!! that font slot has no loaded path to use as the default") : ProcedureReturn
@@ -361,7 +409,7 @@ Procedure anvil_font_Default()
     PrintN("!! the selected slot path is invalid")
     ProcedureReturn
   EndIf
-  If AnvilTrueTypeSlotSelect(slot) = 0
+  If AnvilFontDisplayAccept(slot,AnvilTrueTypePixelHeight())=0 Or AnvilTrueTypeSlotSelect(slot) = 0
     PrintN("!! that font slot could not be selected; default unchanged")
     ProcedureReturn
   EndIf
@@ -415,6 +463,7 @@ Procedure anvil_font_Select()
   gWordAt = gPos
   SkipWord()
   gWordLen = gPos - gWordAt
+  If anvil_font_EmbeddedChoice(0)<>0 : ProcedureReturn : EndIf
   If WordIs("bitmap") <> 0
     SkipSpace()
     If gLine[gPos] <> 0
@@ -434,7 +483,7 @@ Procedure anvil_font_Select()
     PrintN("!! usage: font select <loaded slot 0..3>")
     ProcedureReturn
   EndIf
-  If AnvilTrueTypeSlotSelect(slot) = 0
+  If AnvilFontDisplayAccept(slot,AnvilTrueTypePixelHeight())=0 Or AnvilTrueTypeSlotSelect(slot) = 0
     Print("!! font slot ") : PrintDec(slot) : PrintN(" could not be selected; prior font was restored")
     ProcedureReturn
   EndIf
@@ -468,11 +517,19 @@ Procedure anvil_font_Unload()
   Print("font slot ") : PrintDec(slot) : PrintN(" unloaded")
 EndProcedure
 
+Procedure anvil_font_Usage()
+  If anvil_font_checkDisplay<>@anvil_font_AnyDisplay
+    PrintN("usage: font info | load <slot 0..3> <path> | default <slot|embedded> | size <pixels> | select <slot|embedded> | unload <slot>")
+  Else
+    Print("usage: font info | load <slot 0..3> <path> | default <slot|bitmap> | size <pixels 1..") : PrintDec(anvil_font_pixel_limit) : Print("> | select <slot|bitmap> | unload <slot>") : PrintNl()
+  EndIf
+EndProcedure
+
 Procedure CmdFont()
   AnvilTrueTypeSlotsInit()
   SkipSpace()
   If gLine[gPos] = 0
-    Print("usage: font info | load <slot 0..3> <path> | default <slot|bitmap> | size <pixels 1..") : PrintDec(anvil_font_pixel_limit) : Print("> | select <slot|bitmap> | unload <slot>") : PrintNl()
+    anvil_font_Usage()
     ProcedureReturn
   EndIf
   gWordAt = gPos
@@ -496,6 +553,6 @@ Procedure CmdFont()
   ElseIf WordIs("default") <> 0
     anvil_font_Default()
   Else
-    Print("usage: font info | load <slot 0..3> <path> | default <slot|bitmap> | size <pixels 1..") : PrintDec(anvil_font_pixel_limit) : Print("> | select <slot|bitmap> | unload <slot>") : PrintNl()
+    anvil_font_Usage()
   EndIf
 EndProcedure

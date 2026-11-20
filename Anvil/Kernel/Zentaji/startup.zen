@@ -629,10 +629,231 @@ zen_payload_bad_protection:
 LI r16,$5A02
 HALT r16
 
+
+; Private supervisor diagnostic vectors. Only core 0 may install this table.
+; The monitor checks ownership and prepares the one-shot timer interrupt.
+; All other causes jump to their ordinary vector by a fixed assembler branch.
+.align 4096
+anvil_diag_vectors:
+.org anvil_diag_vectors+0
+  JMP anvil_zen_vectors+0
+.org anvil_diag_vectors+64
+  JMP anvil_zen_vectors+64
+.org anvil_diag_vectors+128
+  JMP anvil_zen_vectors+128
+.org anvil_diag_vectors+192
+  JMP anvil_zen_vectors+192
+.org anvil_diag_vectors+256
+  JMP anvil_zen_vectors+256
+.org anvil_diag_vectors+320
+  JMP anvil_zen_vectors+320
+.org anvil_diag_vectors+384
+  JMP anvil_zen_vectors+384
+.org anvil_diag_vectors+448
+  JMP anvil_zen_vectors+448
+.org anvil_diag_vectors+512
+  JMP anvil_zen_vectors+512
+.org anvil_diag_vectors+576
+  JMP anvil_zen_vectors+576
+.org anvil_diag_vectors+640
+  JMP anvil_zen_vectors+640
+.org anvil_diag_vectors+704
+  JMP anvil_diag_brk
+.org anvil_diag_vectors+768
+  JMP anvil_zen_vectors+768
+.org anvil_diag_vectors+832
+  JMP anvil_zen_vectors+832
+.org anvil_diag_vectors+896
+  JMP anvil_zen_vectors+896
+.org anvil_diag_vectors+960
+  JMP anvil_zen_vectors+960
+.org anvil_diag_vectors+1024
+  JMP anvil_zen_vectors+1024
+.org anvil_diag_vectors+1088
+  JMP anvil_zen_vectors+1088
+.org anvil_diag_vectors+1152
+  JMP anvil_zen_vectors+1152
+.org anvil_diag_vectors+1216
+  JMP anvil_zen_vectors+1216
+.org anvil_diag_vectors+1280
+  JMP anvil_zen_vectors+1280
+.org anvil_diag_vectors+1344
+  JMP anvil_zen_vectors+1344
+.org anvil_diag_vectors+1408
+  JMP anvil_zen_vectors+1408
+.org anvil_diag_vectors+1472
+  JMP anvil_zen_vectors+1472
+.org anvil_diag_vectors+1536
+  JMP anvil_zen_vectors+1536
+.org anvil_diag_vectors+1600
+  JMP anvil_zen_vectors+1600
+.org anvil_diag_vectors+1664
+  JMP anvil_zen_vectors+1664
+.org anvil_diag_vectors+1728
+  JMP anvil_zen_vectors+1728
+.org anvil_diag_vectors+1792
+  JMP anvil_zen_vectors+1792
+.org anvil_diag_vectors+1856
+  JMP anvil_zen_vectors+1856
+.org anvil_diag_vectors+1920
+  JMP anvil_zen_vectors+1920
+.org anvil_diag_vectors+1984
+  JMP anvil_zen_vectors+1984
+.org anvil_diag_vectors+2048
+  JMP anvil_zen_vectors+2048
+.org anvil_diag_vectors+2112
+  JMP anvil_diag_timer
+.org anvil_diag_vectors+2176
+  JMP anvil_zen_vectors+2176
+.org anvil_diag_vectors+2240
+  JMP anvil_zen_vectors+2240
+.org anvil_diag_vectors+2304
+  JMP anvil_zen_vectors+2304
+.org anvil_diag_vectors+2368
+  JMP anvil_zen_vectors+2368
+.org anvil_diag_vectors+2432
+  JMP anvil_zen_vectors+2432
+.org anvil_diag_vectors+2496
+  JMP anvil_zen_vectors+2496
+.org anvil_diag_vectors+2560
+  JMP anvil_zen_vectors+2560
+.org anvil_diag_vectors+2624
+  JMP anvil_zen_vectors+2624
+.org anvil_diag_vectors+2688
+  JMP anvil_zen_vectors+2688
+.org anvil_diag_vectors+2752
+  JMP anvil_zen_vectors+2752
+.org anvil_diag_vectors+2816
+  JMP anvil_zen_vectors+2816
+.org anvil_diag_vectors+2880
+  JMP anvil_zen_vectors+2880
+.org anvil_diag_vectors+2944
+  JMP anvil_zen_vectors+2944
+.org anvil_diag_vectors+3008
+  JMP anvil_zen_vectors+3008
+.org anvil_diag_vectors+3072
+  JMP anvil_zen_vectors+3072
+.org anvil_diag_vectors+3136
+  JMP anvil_zen_vectors+3136
+.org anvil_diag_vectors+3200
+  JMP anvil_zen_vectors+3200
+.org anvil_diag_vectors+3264
+  JMP anvil_zen_vectors+3264
+.org anvil_diag_vectors+3328
+  JMP anvil_zen_vectors+3328
+.org anvil_diag_vectors+3392
+  JMP anvil_zen_vectors+3392
+.org anvil_diag_vectors+3456
+  JMP anvil_zen_vectors+3456
+.org anvil_diag_vectors+3520
+  JMP anvil_zen_vectors+3520
+.org anvil_diag_vectors+3584
+  JMP anvil_zen_vectors+3584
+.org anvil_diag_vectors+3648
+  JMP anvil_zen_vectors+3648
+.org anvil_diag_vectors+3712
+  JMP anvil_zen_vectors+3712
+.org anvil_diag_vectors+3776
+  JMP anvil_zen_vectors+3776
+.org anvil_diag_vectors+3840
+  JMP anvil_zen_vectors+3840
+.org anvil_diag_vectors+3904
+  JMP anvil_zen_vectors+3904
+.org anvil_diag_vectors+3968
+  JMP anvil_zen_vectors+3968
+.org anvil_diag_vectors+4032
+  JMP anvil_zen_vectors+4032
+
+.org anvil_diag_vectors+4096
+anvil_diag_timer:
+  MFCR r70,ECAUSE
+  ST64 r70,[r3]
+  MFCR r70,EINFO
+  ST64 r70,[r3+8]
+  LD64 r70,[r21+$18]
+  ST64 r70,[r3+16]
+  LD64 r70,[r20+$18]
+  ST64 r70,[r3+24]
+  ST64 r0,[r20+$10]
+  LI r70,1
+  ST64 r70,[r20+$18]
+  ST64 r0,[r21+$20]
+  ADDI r24,r24,1
+  ERET
+
+anvil_diag_brk:
+  MFCR r70,EPC
+  BNE r70,r26,zen_diag_unexpected
+  MFCR r71,ECAUSE
+  ST64 r71,[r3+32]
+  MFCR r71,EINFO
+  ST64 r71,[r3+40]
+  MFCR r71,EWORD
+  ST64 r71,[r3+48]
+  ADDI r70,r70,8
+  MTCR r0,r70,EPC
+  ERET
+zen_diag_unexpected:
+  ADDI r17,r22,704
+  JR r17
+
+; r1=period (ticks), r2=seven writable result words. Returns timer IRQ count.
+anvil_diag_enter:
+  OR r3,r2,r0
+  OR r2,r1,r0
+  LIQ r1,anvil_diag_vectors
+  MFCR r22,EVEC
+  MFCR r40,ECAUSE
+  MFCR r41,EPC
+  MFCR r42,ESTATUS
+  MFCR r43,EINFO
+  MFCR r44,EWORD
+  LIQ r20,$FFFF00000005F000
+  LIQ r21,$FFFF00000004F000
+  LD64 r23,[r20]
+  LI r24,0
+  LI r27,1
+  LIQ r26,zen_diag_trap
+  LD64 r45,[r21+8]
+  LI r28,2
+  ST64 r28,[r21+8]
+  MTCR r0,r1,EVEC
+  MFCR r25,TIME
+  ADD r25,r25,r2
+  ST64 r25,[r20]
+  LI r28,3
+  ST64 r28,[r20+$10]
+  ADD r25,r25,r2
+  MTCR.SET r0,r27,STATUS
+zen_diag_poll:
+  BNEI r24,0,zen_diag_done
+  MFCR r28,TIME
+  BLTU r28,r25,zen_diag_poll
+zen_diag_done:
+  MTCR.CLEAR r0,r27,STATUS
+  ST64 r0,[r20+$10]
+  ST64 r27,[r20+$18]
+  ST64 r23,[r20]
+zen_diag_trap:
+  BRK $5A454E
+  MTCR r0,r22,EVEC
+  ST64 r45,[r21+8]
+  MTCR r0,r40,ECAUSE
+  MTCR r0,r41,EPC
+  MTCR r0,r42,ESTATUS
+  MTCR r0,r43,EINFO
+  MTCR r0,r44,EWORD
+  OR r1,r24,r0
+  JR r254
+
 .align 64
 anvil_zen_payload_save:
   .org anvil_zen_payload_save+3160
 .align 16
+  ; Optional supervisor diagnostic descriptor immediately before the v2 context.
+  ; Its magic and address are in monitor-owned memory. Existing v2 users read
+  ; only their original 128 bytes; older images have no such descriptor.
+  .word $31474149444E455A,anvil_diag_enter
 anvil_zen_context:
   ; magic, version, size; device table/source/RAM/loader SP/stack bottom/top;
   ; vectors, compiled entry, saved STATUS, image extent, stack size, call boundary.

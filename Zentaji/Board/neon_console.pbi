@@ -31,10 +31,12 @@ XIncludeFile "Anvil/Core/build_identity.pbi"
 XIncludeFile "Anvil/Graphics/Vulkan/neon_vk_banner.pbi"
 XIncludeFile "Anvil/Graphics/banner_glint.pbi"
 XIncludeFile "Anvil/Core/font_cmd.pbi"
+XIncludeFile "Anvil/Core/font_boot_embedded.pbi"
 XIncludeFile "Anvil/Graphics/Vulkan/neon_vk_resident_state.pbi"
 
 Global zngUp.i,zngFault.i,zngLineHeight.i,zngSuspended.i
 Global zngFont.NeonVkPortFontRef
+Global Dim zngPrintable.a[96]
 #ZNG_CONSOLE_TOP=128
 Global zngBanner.NeonVkBannerArgs
 Global zngBlanked.i
@@ -117,6 +119,7 @@ Procedure.i zngBannerPrepare()
  zngBanner\platformText="bare-metal monitor   -   Zentaji   -   Zentaji64"
  zngBanner\buildText=AnvilBuildLabel(#ANVIL_BUILD,#ANVIL_BUILD_DATE,#ANVIL_BUILD_TIME)
  zngBanner\clockText=@zngClockText[0]
+ If NeonVkChromeFontSelect(#ANVIL_TTS_BOOT_SLOT,AnvilTrueTypeSlotGeneration(#ANVIL_TTS_BOOT_SLOT),#NEON_FONT_SMALL,16)<>0 : ProcedureReturn 0 : EndIf
  If NeonVkChromeFontHeightSet(#NEON_FONT_BOLD,48)<>0 : ProcedureReturn 0 : EndIf
  If NeonVkChromeFontHeightSet(#NEON_FONT_SMALL,16)<>0 : ProcedureReturn 0 : EndIf
  If NeonVkChromeWarmTrueTypeText(48,"PureMetal Forge")<0 : ProcedureReturn 0 : EndIf
@@ -199,7 +202,7 @@ Procedure zngPaint()
  If full<>0
   If zngBannerPrepare()<>1 : zngFault=8 : zngPainting=0 : ProcedureReturn : EndIf
  ElseIf clock<>0
-  If NeonVkChromeFontHeightSet(#NEON_FONT_SMALL,16)<>0 : zngFault=8 : zngPainting=0 : ProcedureReturn : EndIf
+  If NeonVkChromeFontSelect(#ANVIL_TTS_BOOT_SLOT,AnvilTrueTypeSlotGeneration(#ANVIL_TTS_BOOT_SLOT),#NEON_FONT_SMALL,16)<>0 : zngFault=8 : zngPainting=0 : ProcedureReturn : EndIf
   If NeonVkChromeWarmTrueTypeText(16,@zngClockText[0])<0 : zngFault=8 : zngPainting=0 : ProcedureReturn : EndIf
  EndIf
  If full=0 And rows=0 And clock=0 And glint=0 : ConGridClearDirty() : zngPainting=0 : ProcedureReturn : EndIf
@@ -216,6 +219,7 @@ Procedure zngPaint()
    If NeonVkBannerClockRender(@zngBanner,1)<>0 : zngFault=9 : zngPainting=0 : ProcedureReturn : EndIf
   EndIf
  EndIf
+ If nvpFontActivate(@zngFont)<>0 : zngFault=4 : zngPainting=0 : ProcedureReturn : EndIf
  For row=0 To ConGridRows()-1
   If zngRows[row]<>0
    py=#ZNG_CONSOLE_TOP+row*zngLineHeight
@@ -246,16 +250,72 @@ Procedure zngPaint()
  ConGridClearDirty()
  zngPainting=0
 EndProcedure
+; Preflight both the header and every printable console glyph while the renderer
+; is idle. A refused size can never strand the prompt with a full atlas.
+Procedure.i zngFontFits(slot.i,pixels.i)
+ Protected candidate.NeonVkPortFontRef,priorSlot.i,priorHeight.i,rc.i,height.i
+ If zngPainting=0 Or zngSuspended<>0 Or zngUp=0 : ProcedureReturn 0 : EndIf
+ If slot=zngFont\slot And pixels=zngFont\pixelHeight And AnvilTrueTypeSlotGeneration(slot)=zngFont\generation : ProcedureReturn 1 : EndIf
+ If NeonVkPortFontBind(@candidate,slot,#NEON_FONT_UI,pixels)<>0 : ProcedureReturn 0 : EndIf
+ priorSlot=AnvilTrueTypeSlotSelected() : priorHeight=AnvilTrueTypePixelHeight()
+ If NeonVkChromeTTCacheReset()<>0 : ProcedureReturn 0 : EndIf
+ zngPresented=0
+ If zngBannerPrepare()<>0
+  If NeonVkChromeWarmTrueTypeText(16,@zngPrintable[0])>=0
+   height=NeonVkPortFontLineHeight(@candidate)
+   If height>0 And height<=znsHeight-#ZNG_CONSOLE_TOP-8
+    rc=Bool(NeonVkPortFontWarm(@candidate,@zngPrintable[0])=0)
+   EndIf
+  EndIf
+ EndIf
+ If rc=0 : NeonVkChromeTTCacheReset() : EndIf
+ If priorSlot>=0 : AnvilTrueTypeSlotSelect(priorSlot) : Else : AnvilTrueTypeSlotDeselect() : EndIf
+ AnvilTrueTypeSetPixelHeight(priorHeight)
+ ProcedureReturn rc
+EndProcedure
+
+; Shared font commands and banner drawing both use the shared font parser.
+; Defer model draining while a command is selecting or unloading a face.
+Procedure.i ZentajiConsoleFont(boot.i)
+ Protected slot.i,pixels.i,height.i
+ If zngUp=0
+  If boot=0 : PrintN("TrueType font selection needs the native graphics console.") : EndIf
+  ProcedureReturn 1
+ EndIf
+ If zngDrainFrame()<>1 : ProcedureReturn 0 : EndIf
+ zngPainting=1 : UartMirrorSetDrain(0)
+ If nvpFontActivate(@zngFont)<>0 : ProcedureReturn 0 : EndIf
+ AnvilTrueTypeSetPixelHeight(zngFont\pixelHeight)
+ If boot<>0 : AnvilFontSettingsBootApply() : Else : CmdFont() : EndIf
+ pixels=AnvilTrueTypePixelHeight() : slot=AnvilTrueTypeSlotSelected()
+ If slot<0
+  slot=AnvilTrueTypeDefaultSlot()
+  If AnvilTrueTypeSlotBytes(slot)=0 : slot=#ANVIL_TTS_BOOT_SLOT : EndIf
+  If zngFontFits(slot,pixels)=0 : slot=#ANVIL_TTS_BOOT_SLOT : pixels=16 : EndIf
+ EndIf
+ If slot<>zngFont\slot Or pixels<>zngFont\pixelHeight Or AnvilTrueTypeSlotGeneration(slot)<>zngFont\generation
+  If NeonVkPortFontBind(@zngFont,slot,#NEON_FONT_UI,pixels)<>0 : ProcedureReturn 0 : EndIf
+  height=NeonVkPortFontLineHeight(@zngFont)
+  If height<1 : ProcedureReturn 0 : EndIf
+  zngLineHeight=height
+  ConGridResize((znsWidth-16)/4,(znsHeight-#ZNG_CONSOLE_TOP-8)/height)
+  zngPresented=0 : zngCursorRow=-1 : ConGridMarkAll()
+ EndIf
+ If nvpFontActivate(@zngFont)<>0 : ProcedureReturn 0 : EndIf
+ AnvilTrueTypeSetPixelHeight(pixels)
+ UartMirrorSetDrain(@ConMirrorDrain) : zngPainting=0 : ConMirrorDrain()
+ ProcedureReturn 1
+EndProcedure
+
 Procedure.i ZentajiNeonConsoleStart()
- Protected cols.i,rows.i
+ Protected cols.i,rows.i,i.i
  If zngUp<>0 Or zenMemoryGraphicsBase=0 : ProcedureReturn 0 : EndIf
  neon_texSrc=@zngAtlas[0] : neon_glyphUV=@zngUV[0]
  If NeonBitmapFontBind(@zngBitmap[0],8,16,32,126)<>1 : ProcedureReturn 0 : EndIf
  NeonFontDefaults()
  zngClear[0]=GraphicsF32ByteBits(6) : zngClear[1]=GraphicsF32ByteBits(9)
  zngClear[2]=GraphicsF32ByteBits(14) : zngClear[3]=GraphicsF32ByteBits(255)
- If AnvilTrueTypeSlotLoad(#ANVIL_TTS_BOOT_SLOT,?anvilBootTtf,#ANVIL_BOOT_TTF_BYTES)<>1 : ProcedureReturn 0 : EndIf
- If AnvilTrueTypeSlotSelect(#ANVIL_TTS_BOOT_SLOT)<>1 : ProcedureReturn 0 : EndIf
+ If AnvilFontBootEmbeddedInit()<>1 : ProcedureReturn 0 : EndIf
  If NeonVkPortFontBind(@zngFont,#ANVIL_TTS_BOOT_SLOT,#NEON_FONT_UI,16)<>0 : ProcedureReturn 0 : EndIf
  If NeonVkChromeLogoSource(?anvilPix,#ANVIL_PIC_W,#ANVIL_PIC_H)<>0 : ProcedureReturn 0 : EndIf
  If ZentajiNeonSurfaceStartCapacities(#NEON_VK_CHROME_MAX_QUADS,#CON_CELLS+1)<>1 : ProcedureReturn 0 : EndIf
@@ -267,6 +327,8 @@ Procedure.i ZentajiNeonConsoleStart()
  If rows>#CON_MAXROWS : rows=#CON_MAXROWS : EndIf
  ConGridInit(cols,rows) : ConGridProportionalSet(znsWidth-16,1)
  ConSetRenderer(@zngPaint) : UartMirrorSetDrain(@ConMirrorDrain) : UartMirror(1)
+ For i=0 To 94 : zngPrintable[i]=32+i : Next
+ anvil_font_checkDisplay=@zngFontFits
  zngUp=1 : ProcedureReturn 1
 EndProcedure
 Procedure.i ZentajiNeonConsolePump()

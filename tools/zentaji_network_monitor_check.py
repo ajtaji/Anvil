@@ -181,6 +181,8 @@ def main():
     parser.add_argument("--crypto", type=Path, metavar="COMPILER", help="Build a Zentaji entropy ABI probe and check the shared crypto vector suite")
     parser.add_argument("--readonly-disk", action="store_true",
                         help="Check native raw block reads and write refusal on a read-only disk")
+    parser.add_argument("--display", action="store_true", help="Check native connector registers and every GPU test-pattern pixel")
+    parser.add_argument("--font", action="store_true", help="Check live TrueType glyph metrics and saved monitor face")
     parser.add_argument("--gnss", type=Path, metavar="COMPILER", help="Check network NMEA and the shared payload fix ABI")
     parser.add_argument("--mouse", type=Path, metavar="COMPILER",
                         help="Check native pointer movement through a separately compiled input client")
@@ -247,6 +249,10 @@ def main():
                 (seed / "main.zen").write_bytes(SOURCE)
                 if probe is not None:
                     (seed / "ENTROPY.PMF").write_bytes(probe)
+                if args.font and attached and not no_entropy:
+                    font_source = ROOT/"RaspberryPi3/Data/fonts/CourierPrime-Regular.ttf"
+                    (seed/"MONO.TTF").write_bytes(font_source.read_bytes())
+                    (seed/"BAD.TTF").write_bytes(b"not a font")
                 if gnss_probe is not None:
                     (seed / "GNSS.PMF").write_bytes(gnss_probe)
                 if mouse_case:
@@ -290,8 +296,10 @@ def main():
             inputs = [path for path in folder.iterdir() if path.is_file()]
             signatures("pwsh.exe", args.sign_script.resolve(), executables=[executable],
                        catalogs=[catalog(folder / "inputs.cat", inputs, True)])
-        run_mode = ["--fast"] if mouse_case or args.exchange or args.screenshot or args.crypto or args.web else []
+        run_mode = ["--fast"] if mouse_case or args.exchange or args.screenshot or args.crypto or args.web or args.font or args.display else []
         budget = "300000000000" if args.crypto or args.web else ("4000000000" if args.screenshot else "2000000000")
+        if attached and (args.font or args.display):
+            budget = "300000000000"
         if mouse_case:
             budget = "30000000000"
         process = subprocess.Popen(
@@ -329,6 +337,15 @@ def main():
 
             if mouse_case:
                 result["mouse"] = check_mouse(command)
+            if args.cores and not attached:
+                command("supertest excess", "supertest takes no arguments")
+                mask = command("mmio FFFF00000004F008 2", "0000000000000202")
+                for alias in ("supertest", "el3test"):
+                    outcome = command(alias, "supertest PASS.")
+                    assert "IRQ cause=33 line=1 claim=1 fired=1 count=1" in outcome, outcome
+                    assert "BRK cause=11 tag=005A454E" in outcome, outcome
+                assert command("mmio FFFF00000004F008 2", "pmf> ") == mask
+                result["supervisor"] = dict(timer_irq=33, breakpoint=11, tag=0x5A454E, repeated=True)
             if args.cores:
                 command("coretest run extra", "coretest takes exactly")
                 command("coretest status", f"coretest fitted={cores} owned=0")
@@ -521,6 +538,12 @@ def main():
                 if args.web:
                     result["web"] = check_web_peers(command, http_port, keys, web_body)
                 command("echo UART-AFTER-UDP", "UART-AFTER-UDP")
+                if args.display:
+                    from zentaji_display_monitor_check import check_display
+                    result["display"] = check_display(command,client,port,folder)
+                if args.font:
+                    from zentaji_font_monitor_check import check_fonts
+                    result["font"] = check_fonts(command,client,port,folder)
             else:
                 command("net", "Zentaji Ethernet is disconnected.")
                 command("dhcp", "the machine description has no net attachment")
@@ -585,6 +608,10 @@ def main():
             evidence = [folder / "run.log", folder / "transcript.log"]
             if label == "nat" and args.screenshot:
                 evidence.append(folder / "pr.png")
+            if label == "nat" and args.display:
+                evidence.append(folder/"display-bars.png")
+            if label == "nat" and args.font:
+                evidence.extend([folder/"font-mono16.png", folder/"font-mono24.png"])
             if label == "nat" and args.kept_shot:
                 evidence.append(folder / "kept.png")
             if label == "nat" and args.crypto:

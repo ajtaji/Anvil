@@ -557,3 +557,40 @@ network and saves its endpoint. The default TCP port is 10110. Use gnss
 watch 5 to see decoded fixes or gnss raw 5 to inspect incoming sentences.
 A host-side NMEA bridge is reachable at 10.0.2.2 through native NAT.
 Programs use Anvil's shared GNSS service slots for the same decoded fixes.
+
+TrueType monitor fonts
+
+The console starts with embedded DejaVu Sans Bold. Use font info to see the
+selected face, pixel size and the four file slots. For example, after
+copying MONO.TTF to the guest data disk, type font load 1 MONO.TTF, font
+select 1, then font size 24. The window's grid and cursor use that face's
+real advances and line height. The Anvil header retains its original face.
+
+font default 1 records the selected file path. Type settings save to keep
+the choice and size across boots. font select embedded immediately selects
+the built-in TrueType face. font default embedded clears the file selection
+for the next boot. font unload 1 releases the file slot. A face and size
+must fit the current display and glyph atlas before they become active.
+
+Native display diagnostics
+
+display (also accepted as dsi for Pi monitor scripts) reports the native
+window connector's current mode, dimensions, refresh in millihertz, pixel
+format, byte stride, output enable and vertical blank count. display id
+reads the device ID. display snapshot shows the initial registers Anvil
+read before acquiring the display. display up and display off use the
+same output owner as screen on and screen off.
+
+display pattern presents eight full-intensity colour bars for a second
+at the current window size, then restores the Anvil header and prompt.
+Use shot or sr to retrieve the retained pattern after the prompt returns.
+Pi DSI rails, lanes and panel-register writes require a DSI host.
+
+Supervisor interrupt test
+
+supertest (also el3test) temporarily installs a private supervisor vector
+table on the primary core. It takes one interrupt from the core timer,
+checks the interrupt claim, then executes a tagged breakpoint. Both return
+through ERET. The command reports the observed causes, tag and interrupt
+count and restores the timer, interrupt mask and original vectors. It runs
+only when requested at the prompt.

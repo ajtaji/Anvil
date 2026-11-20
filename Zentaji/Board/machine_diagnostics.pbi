@@ -74,6 +74,10 @@ Procedure ZentajiCmdScreen()
  EndIf
  on=Bool(WordIs("on")<>0 Or WordIs("vulkan")<>0)
  If on=0 And WordIs("off")=0 : PrintN("Use screen status, screen off or screen on.") : ProcedureReturn : EndIf
+ ZentajiScreenSet(on)
+EndProcedure
+
+Procedure ZentajiScreenSet(on.i)
  If on<>0
   If zngBlanked<>0
    zngBlanked=0 : zngPresented=0 : ConGridMarkAll()
