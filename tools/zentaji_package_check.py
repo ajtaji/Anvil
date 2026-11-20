@@ -357,12 +357,13 @@ def check(archive, keep, signer, powershell, automation=False, transfers=False, 
     folder = keep / "Relocated O'Brien & tester"
     folder.mkdir(parents=True)
     with zipfile.ZipFile(archive) as zipped:
-        expected = set(FILES) | {"package.cat"}
+        files = (*FILES, "machine-radios.txt") if "machine-radios.txt" in zipped.namelist() else FILES
+        expected = set(files) | {"package.cat"}
         assert len(zipped.namelist()) == len(expected) and set(zipped.namelist()) == expected
-        for name in (*FILES, "package.cat"):
+        for name in (*files, "package.cat"):
             with zipped.open(name) as src, (folder / name).open("xb") as dst:
                 shutil.copyfileobj(src, dst)
-    immutable = [folder / name for name in FILES]
+    immutable = [folder / name for name in files]
 
     def verify():
         signatures(powershell, signer, executables=[folder / "zenwin.exe"],
@@ -384,7 +385,10 @@ def check(archive, keep, signer, powershell, automation=False, transfers=False, 
         # the launcher's process exit, not EOF on a pipe the emulator may own.
         launch_log = keep / (label + "-launcher.log")
         with launch_log.open("wb") as output:
-            run = subprocess.run(["cmd.exe", "/d", "/c", "Start-Zentaji.cmd", "--headless"],
+            switches = ["--headless"]
+            if label == "second" and "machine-radios.txt" in files:
+                switches.append("--radios")
+            run = subprocess.run(["cmd.exe", "/d", "/c", "Start-Zentaji.cmd", *switches],
                                  cwd=folder, stdout=output, stderr=subprocess.STDOUT,
                                  timeout=30, creationflags=0x08000000)
         assert run.returncode == 0, launch_log.read_text(errors="replace")
@@ -430,6 +434,16 @@ def check(archive, keep, signer, powershell, automation=False, transfers=False, 
                     assert re.search(r"^uptime [0-9]+ boots \?\r?$", reply, re.M), (command, reply)
                 assert "!!" not in reply, (command, reply)
                 print(label + ": " + command + " PASS", flush=True)
+            if "machine-radios.txt" in files and label in ("first", "second"):
+                reply = client.command("bt pair 00:00:00:00:00:00").decode("ascii")
+                transcript.append(reply)
+                limit = time.monotonic() + 20
+                while "operation pending." in reply and time.monotonic() < limit:
+                    reply = client.command("bt result").decode("ascii")
+                    transcript.append(reply)
+                expected = "requires radios manage" if label == "first" else "Bluetooth request failed (Windows"
+                assert expected in reply, reply
+                result.setdefault("radio_launch_modes", []).append(label)
             if transfers and label == "first":
                 result["file_transfer"] = check_file_transfer(client, transcript, keep)
             if diagnostics and label == "second":

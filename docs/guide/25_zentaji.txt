@@ -640,12 +640,26 @@ container hash before matching a device or calling an entry point.
 
 Pi peripheral commands and the Zentaji machine
 
-Zentaji exposes Ethernet to Anvil. Use net and dhcp even when the host
-laptop connects over Wi-Fi. Wireless scanning, pairing Bluetooth devices
-and enumerating a physical USB bus are host operations. The guest receives
-keyboard, mouse and gamepad events through its native input device. The
-pointer supplies one position in window pixels. The machine has no touch
-contact list or touchscreen calibration.
+Zentaji carries application traffic through Ethernet and NAT. On a live
+Windows machine, radios host in the machine description also exposes the
+host radios. wifi status shows the selected adapter. wifi scan requests an
+over-the-air scan and shows signal strength. wifi profiles lists saved
+Windows profiles. bt status identifies the first available Classic radio.
+bt devices lists known devices. bt scan runs a Classic inquiry and includes
+remembered devices, with paired and connected flags where available.
+
+In the tester package launch Start-Zentaji.cmd --radios for guest control.
+Custom machine descriptions can use radios manage. The commands are
+wifi join <saved Windows profile> and bt pair
+AA:BB:CC:DD:EE:FF. These act on the host. Scan before pairing a new Classic
+device and confirm Windows pairing prompts. The current connection or bond
+is checked before Anvil reports success. Use wifi result or bt result when
+an operation is pending. The radio control window is absent in deterministic
+and recorded sessions. Windows location settings may restrict Wi-Fi scans.
+
+Keyboard, mouse and gamepads use the native input device. A host-connected
+USB HID touchscreen is a candidate for native multi-contact input. Physical
+touchscreen verification is pending.
 
 The current ROM device table includes no GPIO header, SPI or I2C bus,
 temperature sensor or fan controller. The Pi commands for those devices

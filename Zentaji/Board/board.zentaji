@@ -1,9 +1,9 @@
 EnableFloatingPoint
 ; Zentaji serial/storage monitor composition. The ROM loads the owned startup
 ; envelope; Main receives its validated table/source/context, never ARM registers.
-#ANVIL_BUILD = 66 ; pmf:build
-#ANVIL_BUILD_DATE = 20261119 ; pmf:builddate
-#ANVIL_BUILD_TIME = 224157 ; pmf:buildtime
+#ANVIL_BUILD = 67 ; pmf:build
+#ANVIL_BUILD_DATE = 20261120 ; pmf:builddate
+#ANVIL_BUILD_TIME = 064559 ; pmf:buildtime
 #CAP_TOUCH=0
 #CAP_PWM=0
 #CAP_NET=1
@@ -53,6 +53,8 @@ XIncludeFile "Anvil/Core/fs_cmd.pbi"
 XIncludeFile "Anvil/Core/argfmt.pbi"
 XIncludeFile "Anvil/Core/settings_cmd.pbi"
 XIncludeFile "Zentaji/Board/network.pbi"
+XIncludeFile "Zentaji/Board/host_radio.pbi"
+XIncludeFile "Anvil/Core/host_radio_cmd.pbi"
 XIncludeFile "Anvil/Applications/Forum/http_head.pbi"
 XIncludeFile "Anvil/Services/Http/transport_tcp.pbi"
 XIncludeFile "Anvil/Services/Http/server.pbi"
@@ -174,7 +176,7 @@ Procedure ZentajiShellHelp()
  PrintN("  memory/md, write/poke, fill/mw, copy/cp, compare/cmp, base, crc32/checksum")
  PrintN("  mm, nm, mtest, sha1sum, sha256sum, crypto, mmio, baud, vkstat, screen, display/dsi, font, mouse [percent]")
  PrintN("  uptime/up, trail, supertest/el3test, coretest [run|status|stop], last run, reset/reboot")
- PrintN("  net, dhcp, ping <host>, dns <name>, http, https, tls, gnss")
+ PrintN("  net, dhcp, ping <host>, dns <name>, http, https, tls, gnss, wifi, bt")
  PrintN("  info/board, clock, cache [status|sync], receive <hex address> <hex length> <crc32>, srecord/loads")
  PrintN("  tcp, wb <hex address> <hex length> <crc32>")
  PrintN("  get <name> [hex address], put <name> <hex address> <hex length>")
@@ -312,6 +314,8 @@ Procedure.i HwCommandDispatch(c.i)
   CmdSetexpr()
  ElseIf WordIs("time")<>0
   CmdTime()
+ ElseIf WordIs("wifi")<>0 Or WordIs("bt")<>0
+  AnvilCmdHostRadio(WordIs("bt"))
  ElseIf WordIs("net")<>0
   ZentajiNetworkStatus()
  ElseIf WordIs("http")<>0

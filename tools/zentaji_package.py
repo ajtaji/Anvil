@@ -35,8 +35,8 @@ bootsource 0 0
 # The headless option runs the same configuration for package acceptance.
 LAUNCH_PS = """$ErrorActionPreference='Stop';
 $p=$env:ZENTAJI_PACKAGE;
-$mode=[string]$env:ZENTAJI_MODE;
-if ($mode -notin @('', '--headless')) { throw 'Use Start-Zentaji.cmd [--headless]' };
+$modes=@([string]$env:ZENTAJI_MODE,[string]$env:ZENTAJI_RADIO);
+foreach ($option in $modes) { if ($option -notin @('', '--headless','--radios')) { throw 'Use Start-Zentaji.cmd [--headless] [--radios]' } };
 $m=Get-Content -LiteralPath (Join-Path $p 'manifest.json') -Raw | ConvertFrom-Json;
 $sha=[Security.Cryptography.SHA256]::Create();
 try {
@@ -48,15 +48,20 @@ try {
 } finally { $sha.Dispose() };
 $disk=Join-Path $p 'data.img';
 if (-not [IO.File]::Exists($disk)) { [IO.File]::Copy((Join-Path $p 'data-seed.img'),$disk,$false) };
-$a=@('machine.txt','--fast','--window-size','1024x768','--serial-listen','0');
-if ($mode -eq '--headless') {
+$machine='machine.txt';
+if ($modes -contains '--radios') {
+  if ('machine-radios.txt' -notin $m.files.name) { throw 'This package has no managed radio configuration' };
+  $machine='machine-radios.txt'
+};
+$a=@($machine,'--fast','--window-size','1024x768','--serial-listen','0');
+if ($modes -contains '--headless') {
   $a+=@('--headless','--live','--live-seconds','300','--max','4000000000','--screenshot','screen.png')
 };
 $child=Start-Process -FilePath (Join-Path $p 'zenwin.exe') -WorkingDirectory $p -ArgumentList $a -WindowStyle Hidden -RedirectStandardOutput (Join-Path $p 'zentaji.log') -RedirectStandardError (Join-Path $p 'zentaji-errors.log') -PassThru;
 [IO.File]::WriteAllText((Join-Path $p 'zentaji.pid'),[string]$child.Id);
 """
 LAUNCHER = ('@echo off\nsetlocal\nset "ZENTAJI_PACKAGE=%~dp0"\n'
-            'set "ZENTAJI_MODE=%~1"\n'
+            'set "ZENTAJI_MODE=%~1"\nset "ZENTAJI_RADIO=%~2"\n'
             'powershell.exe -NoProfile -Command "' +
             " ".join(row.strip() for row in LAUNCH_PS.splitlines()) +
             '"\nexit /b %errorlevel%\n')
@@ -86,6 +91,15 @@ TRY
   net
   dhcp
   dns localhost
+  wifi status
+  bt devices
+
+HOST RADIOS
+The normal launcher enables radio discovery on supported live Windows builds.
+Run Start-Zentaji.cmd --radios to enable Windows profile joins and Bluetooth
+Classic pairing using the signed managed-radio configuration. Use wifi profiles and wifi join <profile>, or
+bt scan and bt pair AA:BB:CC:DD:EE:FF. Use wifi result or bt result to check
+an operation that is still running. Windows may request physical confirmation.
 
 HOST FILE TRANSFERS
 Start a TFTP server on the host at 127.0.0.1, UDP port 69, with a directory
@@ -195,6 +209,7 @@ def package(image, zen_tools, output, archive, sign_script, powershell="pwsh.exe
         raise ValueError("The counted image does not fit this Zentaji profile")
     build = None
     has_modules = False
+    has_radios = False
     for source in mapping["sources"]:
         path = Path(source["path"]).resolve()
         if not path.is_relative_to(ROOT):
@@ -202,6 +217,8 @@ def package(image, zen_tools, output, archive, sign_script, powershell="pwsh.exe
         raw = path.read_bytes().replace(b"\r", b"")
         if hashlib.sha256(raw).hexdigest() != source["sha256"]:
             raise ValueError(f"Anvil source changed since its counted build: {path}")
+        if path == ROOT / "Zentaji/Board/host_radio.pbi":
+            has_radios = True
         if path == ROOT / "Zentaji/Board/module_devices.pbi":
             has_modules = True
         if path == ROOT / "Zentaji/Board/board.zentaji":
@@ -226,23 +243,30 @@ def package(image, zen_tools, output, archive, sign_script, powershell="pwsh.exe
             build_image(output / "data-seed.img",64 << 20,seed)
     else:
         build_image(output / "data-seed.img",64 << 20)
-    for name, text in (("machine.txt", MACHINE), ("Start-Zentaji.cmd", LAUNCHER),
+    machine = MACHINE
+    files = FILES
+    if has_radios:
+        machine = MACHINE.replace("entropy host\n", "entropy host\nradios host\n")
+        managed = machine.replace("radios host\n", "radios manage\n")
+        (output / "machine-radios.txt").write_text(managed, encoding="utf-8", newline="\r\n")
+        files = (*FILES, "machine-radios.txt")
+    for name, text in (("machine.txt", machine), ("Start-Zentaji.cmd", LAUNCHER),
                        ("START-HERE.txt", INSTRUCTIONS)):
         (output / name).write_text(text, encoding="utf-8", newline="\r\n")
     manifest = dict(schema=1, anvil_build=build, architecture="Zentaji",
                     ram_bytes=256 << 20, cores=2, initial_window=[1024, 768],
                     boot="machine ROM selects bundled Anvil host file",
                     files=[dict(name=name, sha256=digest(output / name))
-                           for name in FILES if name != "manifest.json"],
+                           for name in files if name != "manifest.json"],
                     mutable_files=["data.img", "zentaji.log", "zentaji-errors.log",
                                    "zentaji.pid", "screen.png"])
     if has_modules:
         manifest["seed_modules"] = ["AUXUART.MOD"]
     (output / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
     signatures(powershell, sign_script, executables=[output / "zenwin.exe"], catalogs=[
-        catalog(output / "package.cat", [output / name for name in FILES], True)])
+        catalog(output / "package.cat", [output / name for name in files], True)])
     with zipfile.ZipFile(archive, "x", zipfile.ZIP_DEFLATED, compresslevel=6) as zipped:
-        for name in (*FILES, "package.cat"):
+        for name in (*files, "package.cat"):
             zipped.write(output / name, name)
     archive_catalog = Path(str(archive) + ".cat")
     try:
