@@ -100,6 +100,7 @@ def main():
     parser.add_argument("--crypto", type=Path, metavar="COMPILER", help="Build a Zentaji entropy ABI probe and check the shared crypto vector suite")
     parser.add_argument("--readonly-disk", action="store_true",
                         help="Check native raw block reads and write refusal on a read-only disk")
+    parser.add_argument("--cores", action="store_true", help="Exercise native secondary core launch, results and ownership")
     parser.add_argument("--trail", action="store_true",
                         help="Check the boot trail through two ROM resets and preserve foreign NVRAM")
     parser.add_argument("--web", action="store_true",
@@ -137,7 +138,10 @@ def main():
         folder = output / label
         if args.sign_script and folder.exists() and any(folder.iterdir()):
             raise ValueError(f"Choose a fresh directory for signed fixture evidence: {folder}")
-        fixture = Fixture(ram_size=128 << 20, cores=2,
+        cores = 2
+        if args.cores:
+            cores = 1 if not attached else (2 if no_entropy else 4)
+        fixture = Fixture(ram_size=128 << 20, cores=cores,
                           hostfiles=[["anvil.zex", bytearray(raw), False]],
                           display_modes=[(1024, 768, 60000)])
         fixture.net_attached = attached
@@ -176,6 +180,8 @@ def main():
                 nvram[248] = 0xAD
             fixture.directives.append("nvram rtc.bin")
         fixture.power_on(0, 0)
+        if args.cores and no_entropy:
+            fixture.cores[1].state = "HALTED"
         config = fixture.write(folder)
         if args.trail:
             (folder / "rtc.bin").write_bytes(nvram)
@@ -219,6 +225,35 @@ def main():
                 assert expected in reply, (text, reply)
                 return reply
 
+            if args.cores:
+                command("coretest run extra", "coretest takes exactly")
+                command("coretest status", f"coretest fitted={cores} owned=0")
+                if cores == 1:
+                    command("coretest run", "needs a fitted secondary core")
+                    result["coretest_single_refused"] = True
+                elif no_entropy:
+                    before = command("mmio FFFF000000030140 7", "FFFF000000030140: 0000000000000003")
+                    command("coretest run", "occupied or staged secondary")
+                    command("coretest stop", "owned=0")
+                    assert command("mmio FFFF000000030140 7", "pmf> ") == before
+                    result["coretest_foreign_preserved"] = True
+                else:
+                    def check_cores(round_no):
+                        text = command("coretest run", f"16 challenge rounds on {cores-1} secondary")
+                        rows = re.findall(r"core=(\d+) state=(\d+) argument=([0-9A-F]{16}) exit=([0-9A-F]{16})", text)
+                        assert len(rows) == cores - 1, text
+                        for expected_core,(core,state,argument,response) in enumerate(rows,1):
+                            arg = round_no * 257 + expected_core * 17
+                            assert (int(core),int(state),int(argument,16),int(response,16)) == (expected_core,3,arg,arg*3+expected_core)
+                    check_cores(16)
+                    command("coretest stop", "owned=0")
+                    for core in range(1,cores):
+                        address = 0xFFFF000000030100 + core * 64
+                        words = re.findall(r"(?m)^[0-9A-F]{16}: ([0-9A-F]{16})\r?$",command(f"mmio {address:X} 7", "pmf> "))
+                        assert words == ["0"*16]*7, words
+                    check_cores(32)
+                    result["coretest_challenge_rounds"] = 32
+                    result["coretest_secondaries"] = cores-1
             if args.trail:
                 def rtc_bytes(addr, count):
                     reply = command(f"mmio {addr:X} {count:X}", "pmf> ")
@@ -308,6 +343,9 @@ def main():
                 command("forge compile answer.pmf", "Forge wrote")
                 command("boot answer.pmf", "The payload returned, r1 = $000000000000002A")
                 command("dns localhost", "localhost resolves to 10.0.2.2")
+                if args.cores:
+                    command("coretest", f"coretest fitted={cores} owned=0")
+                    result["coretest_released_on_payload"] = True
 
                 with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as peer:
                     peer.settimeout(20)

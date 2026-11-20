@@ -109,6 +109,12 @@ Procedure.i HwPayloadRun(entry.i,argument.i,stack.i,stackBytes.i)
   PrintN("!! this Zentaji monitor has no frame-capture provider; nothing was entered.")
   ProcedureReturn 0
  EndIf
+ CompilerIf Defined(ANVIL_ZENTAJI_CORE_TEST,#PB_Constant)
+ If ZentajiCoreRelease()=0
+  PrintN("!! A secondary changed ownership. Core diagnostics must be resolved before payload entry.")
+  ProcedureReturn 0
+ EndIf
+ CompilerEndIf
  hadStorage=zenStorageAcquired
  If services=0
  If ZentajiStorageDown()=0

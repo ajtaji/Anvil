@@ -2344,6 +2344,7 @@ XIncludeFile "Anvil/Core/programs_cmd.pbi"
 ; can see the ownership boundary. This reporting half uses the console's real
 ; PrintDec routine already included above; it defines no private formatter.
 XIncludeFile "RaspberryPi4/Board/core_accept_cmd.pi4"
+XIncludeFile "Anvil/Core/coretest_cmd.pbi"
 ; fan - the temperature, the curve and the pulse width. Core, chip-free;
 ; it gates on #CAP_PWM through RequireCap (Anvil/Hal/hal.pbi), drives the
 ; pin through the HwPwm* seam and reads the part through HwTemp*. It comes
@@ -2980,26 +2981,7 @@ Procedure.i HwCommandDispatch(c.i)
     ; A bare word is read-only status. `run` owns cores 1..3 until restart;
     ; `stop` parks them permanently and still retains that ownership.
     ElseIf WordIs("coretest") <> 0
-      SkipSpace()
-      gWordAt = gPos
-      SkipWord()
-      gWordLen = gPos - gWordAt
-      If gWordLen = 0
-        CmdCoreAcceptStatus()
-      Else
-        SkipSpace()
-        If gLine[gPos] <> 0
-          PrintN("? coretest takes exactly run, stop, status, or no argument.")
-        ElseIf WordIs("run") <> 0
-          CmdCoreAcceptRun()
-        ElseIf WordIs("stop") <> 0
-          CmdCoreAcceptStop()
-        ElseIf WordIs("status") <> 0
-          CmdCoreAcceptStatus()
-        Else
-          PrintN("? coretest takes run, stop, status, or no argument.")
-        EndIf
-      EndIf
+      CmdCoreTest()
 
     ElseIf WordIs("deadman") <> 0 Or LetterIs(100) <> 0   ; d
       CmdDeadman()
