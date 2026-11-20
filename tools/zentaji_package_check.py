@@ -114,6 +114,41 @@ def check_automation(client, transcript, container):
     return dict(payload_readback_bytes=len(container), multiblock_bytes=count)
 
 
+def check_memory_commands(client, transcript, container):
+    import hashlib
+    from anvil_readback import parse_readback
+
+    def command(line):
+        reply = client.command(line).decode("ascii")
+        transcript.append(reply)
+        return reply
+
+    loaded = command("load SAVED.PMF")
+    address = int(re.search(r"filling ([0-9A-F]+)", loaded)[1], 16)
+    for name, algorithm in (("sha1sum", hashlib.sha1), ("sha256sum", hashlib.sha256)):
+        reply = command(f"{name} {address:X} {len(container):X}")
+        assert f"The {name} is {algorithm(container).hexdigest()}" in reply, reply
+
+    # These two commands own the input line until the operator explicitly quits.
+    for name, values, expected in (("mm", ("3C", "4D"), b"\x3c\x4d"),
+                                    ("nm", ("7A", "A5"), b"\xa5\x4d")):
+        client.socket.sendall(("\r".join([f"{name}.b {address:X}", *values, "q"]) + "\r").encode("ascii"))
+        reply = client.prompt().decode("ascii")
+        transcript.append(reply)
+        assert "Left interactive modify." in reply, reply
+        assert parse_readback(command(f"readback {address:X} 2"), address, 2) == expected
+
+    assert "!!" not in command(f"fill.b {address+32:X} CC 8")
+    reply = command(f"mtest {address:X} {address+31:X} 12345678 1")
+    assert "mtest passed: 1 iteration over 8 words, no errors found." in reply, reply
+    after = parse_readback(command(f"readback {address:X} 20"), address, 32)
+    assert after == bytes.fromhex("78563412") * 8
+    assert parse_readback(command(f"readback {address+32:X} 8"), address+32, 8) == bytes([0xCC]) * 8
+    assert "Nothing was tested" in command(f"mtest {address:X} {address-1:X}")
+    return dict(sha1=hashlib.sha1(container).hexdigest(), sha256=hashlib.sha256(container).hexdigest(),
+                mtest_words=8, interactive_modes=["mm.b", "nm.b"])
+
+
 def check_file_transfer(client, transcript, keep):
     """Run against an independent TFTP server (pip install tftpy==0.8.7)."""
     from concurrent.futures import ThreadPoolExecutor
@@ -163,7 +198,7 @@ def check_file_transfer(client, transcript, keep):
     return dict(bytes=len(payload), sha256=digest(root / "TOHOST.BIN"))
 
 
-def check(archive, keep, signer, powershell, automation=False, transfers=False):
+def check(archive, keep, signer, powershell, automation=False, transfers=False, memory=False):
     archive, keep, signer = (Path(p).resolve() for p in (archive, keep, signer))
     if keep.exists():
         raise ValueError("Choose a new evidence directory; existing disks must be preserved")
@@ -236,6 +271,8 @@ def check(archive, keep, signer, powershell, automation=False, transfers=False):
                 print(label + ": " + command + " PASS", flush=True)
             if transfers and label == "first":
                 result["file_transfer"] = check_file_transfer(client, transcript, keep)
+            if memory and label == "second":
+                result["memory"] = check_memory_commands(client, transcript, container)
             if automation and label == "second":
                 result["automation"] = check_automation(client, transcript, container)
             client.socket.sendall(b"halt\r")
@@ -351,8 +388,9 @@ def main():
     parser.add_argument("--powershell", default="pwsh.exe")
     parser.add_argument("--automation", action="store_true", help="Exercise programs, readback and screenshot over UART")
     parser.add_argument("--transfers", action="store_true", help="Check host file exchange over loopback TFTP (tftpy==0.8.7 and a free UDP port 69)")
+    parser.add_argument("--memory", action="store_true", help="Check interactive memory edits, range testing and hashes on Zentaji")
     args = parser.parse_args()
-    print(json.dumps(check(args.archive, args.keep, args.sign_script, args.powershell, args.automation, args.transfers), indent=2))
+    print(json.dumps(check(args.archive, args.keep, args.sign_script, args.powershell, args.automation, args.transfers, args.memory), indent=2))
 
 
 if __name__ == "__main__":

@@ -1,9 +1,9 @@
 EnableFloatingPoint
 ; Zentaji serial/storage monitor composition. The ROM loads the owned startup
 ; envelope; Main receives its validated table/source/context, never ARM registers.
-#ANVIL_BUILD = 50 ; pmf:build
+#ANVIL_BUILD = 51 ; pmf:build
 #ANVIL_BUILD_DATE = 20261119 ; pmf:builddate
-#ANVIL_BUILD_TIME = 174328 ; pmf:buildtime
+#ANVIL_BUILD_TIME = 175942 ; pmf:buildtime
 #CAP_TOUCH=0
 #CAP_PWM=0
 #CAP_NET=1
@@ -66,7 +66,9 @@ XIncludeFile "Zentaji/Board/identity.pbi"
 XIncludeFile "Anvil/Core/flow_cmd.pbi"
 XIncludeFile "Anvil/Core/layout_cmd.pbi"
 XIncludeFile "Anvil/Core/shotarm.pbi"
+XIncludeFile "Anvil/Crypto/sha1.pbi"
 XIncludeFile "Anvil/Core/sha256.pbi"
+XIncludeFile "Anvil/Core/hash_cmd.pbi"
 XIncludeFile "Anvil/Kernel/Zentaji/payload_contract.pbi"
 XIncludeFile "Zentaji/Board/rtc_clock.pbi"
 XIncludeFile "Zentaji/Board/services.pbi"
@@ -90,6 +92,7 @@ Procedure ZentajiShellHelp()
  PrintN("  mount, load, save, ls/dir, cat, mkdir, rmdir, rm/del, rename/mv")
  PrintN("  settings, printenv, setenv, saveenv, env, setexpr, time, force")
  PrintN("  memory/md, write/poke, fill/mw, copy/cp, compare/cmp, base, crc32/checksum")
+ PrintN("  mm, nm, mtest, sha1sum, sha256sum")
  PrintN("  uptime/up, last run, reset/reboot")
  PrintN("  net, dhcp, ping <host>, dns <name>")
  PrintN("  get <name> [hex address], put <name> <hex address> <hex length>")
@@ -134,6 +137,16 @@ Procedure.i HwCommandDispatch(c.i)
   CmdCopy()
  ElseIf WordIs("compare")<>0 Or WordIs("cmp")<>0
   CmdCompare()
+ ElseIf WordIs("mm")<>0
+  CmdMm()
+ ElseIf WordIs("nm")<>0
+  CmdNm()
+ ElseIf WordIs("mtest")<>0
+  CmdMtest()
+ ElseIf WordIs("sha1sum")<>0
+  CmdSha1sum()
+ ElseIf WordIs("sha256sum")<>0
+  CmdSha256sum()
  ElseIf WordIs("base")<>0
   CmdBase()
  ElseIf WordIs("crc32")<>0 Or WordIs("checksum")<>0
