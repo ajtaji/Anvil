@@ -311,7 +311,43 @@ def check_file_transfer(client, transcript, keep):
     return dict(bytes=len(payload), sha256=digest(root / "TOHOST.BIN"))
 
 
-def check(archive, keep, signer, powershell, automation=False, transfers=False, memory=False, loaders=False, diagnostics=False, autoboot=False):
+def check_raw_blocks(client, transcript, lba, initial):
+    from anvil import read_map
+    from anvil_readback import parse_readback
+
+    def command(line):
+        reply = client.command(line).decode("ascii")
+        transcript.append(reply)
+        return reply
+
+    stage = read_map(command("map")).stage
+    assert "native virtual disk" in command("disk info")
+    amount = len(initial)
+    assert amount == 1024
+    assert "1024 bytes read" in command(f"mmc read {lba:X} {stage:X} 2")
+    assert parse_readback(command(f"readback {stage:X} 400"), stage, amount) == initial
+    assert "Filled" in command(f"fill.b {stage:X} A5 400")
+    assert "1024 bytes written" in command(f"mmc write {lba:X} {stage:X} 2")
+    assert "payload window" in command(f"mmc read {lba:X} 0 2")
+    assert "SAVED.ZEN" in command("ls")
+
+    def fence_count():
+        reply = command("mmio FFFF000000070170")
+        return int(re.search(r"FFFF000000070170: ([0-9A-F]{16})", reply)[1], 16)
+
+    first_count = fence_count()
+    assert "Core 0 data and instruction fences completed" in command("cache sync")
+    assert fence_count() == first_count + 1
+    assert "no data-cache enable switch" in command("cache off")
+    assert fence_count() == first_count + 1
+    assert "r1 = $000000000000002A" in command("boot SAVED.PMF")
+    for line in ("forge new", "forge add Procedure.q Main()", "forge add ProcedureReturn 43",
+                 "forge add EndProcedure", "forge compile NEW.PMF"):
+        assert "!!" not in command(line)
+    assert "r1 = $000000000000002B" in command("boot NEW.PMF")
+
+
+def check(archive, keep, signer, powershell, automation=False, transfers=False, memory=False, loaders=False, diagnostics=False, autoboot=False, blocks=False):
     archive, keep, signer = (Path(p).resolve() for p in (archive, keep, signer))
     if keep.exists():
         raise ValueError("Choose a new evidence directory; existing disks must be preserved")
@@ -396,6 +432,8 @@ def check(archive, keep, signer, powershell, automation=False, transfers=False, 
                 result["memory"] = check_memory_commands(client, transcript, container)
             if automation and label == "second":
                 result["automation"] = check_automation(client, transcript, container)
+            if label == "blocks":
+                check_raw_blocks(client, transcript, block_start, block_pattern)
             if label == "arm":
                 for line, expected in (("autoboot file ABSENT.PMF", "could not be opened"),
                                        ("autoboot file SAVED.ZEN", "too short")):
@@ -504,6 +542,23 @@ def check(archive, keep, signer, powershell, automation=False, transfers=False, 
         sign_boot_disk("cleared")
         boot("cleared", [("echo AUTOBOOT-CLEARED", "AUTOBOOT-CLEARED")])
         result["file_autoboot"] = dict(file="SAVED.PMF", return_value=42, cleared=True)
+    if blocks:
+        disk = folder / "data.img"
+        tail = bytes((i * 37 + i // 256) & 255 for i in range(8192))
+        size = disk.stat().st_size
+        assert size % 4096 == 0
+        with disk.open("ab") as target:
+            target.write(tail)
+        # Two sectors cross a native 4 KiB boundary outside the filesystem.
+        block_start = size // 512 + 7
+        block_pattern = tail[3584:4608]
+        signatures(powershell, signer, catalogs=[catalog(keep / "blocks-input.cat", [disk], True)])
+        boot("blocks", [])
+        with disk.open("rb") as target:
+            target.seek(size)
+            assert target.read() == tail[:3584] + bytes([0xA5]) * 1024 + tail[4608:]
+        result["raw_blocks"] = dict(first_sector=block_start, independent_bytes=1024,
+                                    adjacent_sectors_preserved=True, filesystem_remounted=True)
     result.update(persistent_source=True, persistent_payload_return=42,
                   immutable_package_valid=True, disk_sha256=digest(folder / "data.img"))
     report = keep / "result.json"
@@ -531,10 +586,11 @@ def main():
     parser.add_argument("--transfers", action="store_true", help="Check host file exchange over loopback TFTP (tftpy==0.8.7 and a free UDP port 69)")
     parser.add_argument("--memory", action="store_true", help="Check interactive memory edits, range testing and hashes on Zentaji")
     parser.add_argument("--autoboot", action="store_true", help="Select a file, cold-boot it, and clear the persistent boot selection")
+    parser.add_argument("--blocks", action="store_true", help="Verify raw writes independently on an extended disposable disk")
     parser.add_argument("--diagnostics", action="store_true", help="Check native UART baud, register inspection and GPU presentation status")
     parser.add_argument("--loaders", action="store_true", help="Check serial block and S-record loading, board identity and timer frequency")
     args = parser.parse_args()
-    print(json.dumps(check(args.archive, args.keep, args.sign_script, args.powershell, args.automation, args.transfers, args.memory, args.loaders, args.diagnostics, args.autoboot), indent=2))
+    print(json.dumps(check(args.archive, args.keep, args.sign_script, args.powershell, args.automation, args.transfers, args.memory, args.loaders, args.diagnostics, args.autoboot, args.blocks), indent=2))
 
 
 if __name__ == "__main__":

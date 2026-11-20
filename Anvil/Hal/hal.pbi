@@ -2183,6 +2183,7 @@
 ; reader of raw blocks is byte- versus block-addressing, so that is what
 ; the vocabulary carries; the backend maps its silicon's CCS/OCR onto it.
 #HW_MMC_UNKNOWN = 0          ; not identified yet, or no card
+#HW_MMC_VIRTUAL = 3          ; native sector-addressed virtual disk
 #HW_MMC_SDSC    = 1          ; standard capacity, byte addressed
 #HW_MMC_SDHC    = 2          ; high/extended capacity (SDHC/SDXC), block addressed
 

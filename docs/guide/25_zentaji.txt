@@ -385,6 +385,28 @@ RAM per call. An unconfigured machine reports ENOCAP.
 Use crypto list to see the shared known-answer tests. Run crypto vectors
 to check every module, or crypto sha256 to check the digest alone.
 
+@SECTION Raw disk sectors and instruction fences
+
+Use disk info or mmc info for the selected virtual disk's sector count.
+Read or write one or more 512-byte sectors with a buffer in the payload
+window. The sector number, address and optional count are hexadecimal.
+
+@FRAG
+disk read SECTOR ADDR COUNT
+disk write SECTOR ADDR COUNT
+@ENDFRAG
+
+Raw writes replace the sectors you name, including any filesystem data
+there. Anvil flushes and unmounts a mounted volume before raw access and
+remounts it afterward. A changed partition or damaged filesystem can make
+that remount fail. The underlying media can also be attached read-only.
+
+Use cache status for core 0's instruction-fence counter. Run cache sync
+after editing guest instructions on that core. It orders data writes and
+makes subsequent instruction fetches see them. Anvil performs this step
+automatically before entering a payload. Zentaji has coherent data RAM
+and a per-core instruction fence.
+
 @SECTION Verify and edit guest memory
 
 Use the start address and byte count printed by load or get. Both numeric

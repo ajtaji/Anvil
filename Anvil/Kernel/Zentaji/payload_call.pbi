@@ -19,6 +19,7 @@
 ; The standalone startup.zen trampoline owns the assembly mechanism and saved
 ; state; the version2 context publishes its address. No naked-leaf call rule is
 ; bypassed. Version1 has no call boundary and reports unavailable.
+XIncludeFile "Anvil/Kernel/Zentaji/code_sync.pbi"
 #ZEN_PAYLOAD_E_CONTEXT=1
 #ZEN_PAYLOAD_E_ACTIVE=2
 #ZEN_PAYLOAD_E_ENTRY=3
@@ -80,6 +81,7 @@ Procedure.i ZentajiPayloadEnter(context.i,entry.i,argument.i,stack.i,stackBytes.
  If PeekQ(context+8)<>2 : ProcedureReturn ZentajiPayloadFail(#ZEN_PAYLOAD_E_UNAVAILABLE) : EndIf
  *zenPayloadCaller=PeekQ(context+#ZEN_BOOT_PAYLOAD_CALL)
  zenPayloadActive=1
+ ZentajiCodeSync()
  zenPayloadResult=CallFunctionFast(zenPayloadCaller,entry,argument,stack)
  *zenPayloadCaller=@ZentajiPayloadUnavailable
  zenPayloadActive=0 : zenPayloadError=0

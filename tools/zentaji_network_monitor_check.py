@@ -98,6 +98,8 @@ def main():
     parser.add_argument("--sign-script", type=Path, help="Sign the generated input catalogs before running the native machine")
     parser.add_argument("--screenshot", action="store_true", help="Retrieve and verify the live header using the shared UDP screenshot tool")
     parser.add_argument("--crypto", type=Path, metavar="COMPILER", help="Build a Zentaji entropy ABI probe and check the shared crypto vector suite")
+    parser.add_argument("--readonly-disk", action="store_true",
+                        help="Check native raw block reads and write refusal on a read-only disk")
     args = parser.parse_args()
     tools, output = args.zen_tools.resolve(), args.keep.resolve()
     sys.path.insert(0, str(tools))
@@ -134,7 +136,8 @@ def main():
                           hostfiles=[["anvil.zex", bytearray(raw), False]],
                           display_modes=[(1024, 768, 60000)])
         fixture.net_attached = attached
-        if attached or probe is not None:
+        readonly = args.readonly_disk and not attached
+        if attached or probe is not None or readonly:
             with tempfile.TemporaryDirectory(prefix="zentaji-net-") as temporary:
                 seed = Path(temporary) / "source"
                 seed.mkdir()
@@ -143,7 +146,8 @@ def main():
                     (seed / "ENTROPY.PMF").write_bytes(probe)
                 disk = Path(temporary) / "data.img"
                 build_image(disk, 2 << 20, seed)
-                fixture.disks[0] = (disk.read_bytes(), False)
+                disk_bytes = disk.read_bytes()
+                fixture.disks[0] = (disk_bytes, readonly)
         if attached:
             if probe is not None:
                 fixture.directives.append("entropy host")
@@ -193,6 +197,17 @@ def main():
                 assert expected in reply, (text, reply)
                 return reply
 
+            if readonly:
+                from anvil import read_map
+                from anvil_readback import parse_readback
+
+                stage_addr = read_map(command("map", "stage a file at")).stage
+                command("disk info", "native virtual disk")
+                command(f"disk write 0 {stage_addr:X}", "read-only. No blocks were written")
+                command(f"mmc read 0 {stage_addr:X}", "512 bytes read")
+                reply = command(f"readback {stage_addr:X} 200", "readback end")
+                assert parse_readback(reply, stage_addr, 512) == disk_bytes[:512]
+                result["readonly_sector_sha256"] = hashlib.sha256(disk_bytes[:512]).hexdigest()
             if probe is not None:
                 expected = 0xA1 if attached else 0xA0
                 command("boot ENTROPY.PMF", f"The payload returned, r1 = ${expected:016X}")

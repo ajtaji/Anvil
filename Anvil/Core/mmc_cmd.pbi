@@ -46,7 +46,9 @@
 ;  PutMmcType - the card class as a word, from the #HW_MMC_* code.
 ; ----------------------------------------------------------------------
 Procedure PutMmcType(t.i)
-  If t = #HW_MMC_SDHC
+  If t = #HW_MMC_VIRTUAL
+    Print("native virtual disk, sector addressed")
+  ElseIf t = #HW_MMC_SDHC
     Print("SDHC/SDXC, high capacity, block addressed")
   ElseIf t = #HW_MMC_SDSC
     Print("SDSC, standard capacity, byte addressed")
@@ -63,6 +65,9 @@ EndProcedure
 Procedure.i MmcBringUp()
   If HwMmcInfo() <> 0
     ProcedureReturn 1
+  EndIf
+  If HwMmcType()=#HW_MMC_VIRTUAL
+    UartWriteStr(HwMmcErrorText()) : PrintNl() : ProcedureReturn 0
   EndIf
   PrintN("!! no SD card came up, so nothing on it can be read or written. On")
   PrintN("   this board the card-detect line is not trustworthy, so the only")
@@ -232,6 +237,11 @@ EndProcedure
 ;  refusal printed) if it is not. bytes is the whole transfer length.
 ; ----------------------------------------------------------------------
 Procedure.i MmcGuardRam(addr.i, bytes.i)
+  If HwMmcType()=#HW_MMC_VIRTUAL
+    If addr<0 Or bytes<1 Or addr>$7FFFFFFFFFFFFFFF-bytes Or InPayload(addr,addr+bytes-1)=0
+      PrintN("!! Raw block transfers require a buffer inside the payload window.") : ProcedureReturn 0
+    EndIf
+  EndIf
   If HitsMonitor(addr, addr + bytes - 1) <> 0
     Print("!! that RAM range runs into the monitor itself, which lives at ")
     PutAddr(gMonHitLo)
@@ -321,6 +331,9 @@ Procedure MmcWrite()
   Define addr.i
 
   If HwMmcCanWrite() = 0
+    If HwMmcType()=#HW_MMC_VIRTUAL
+      PrintN("!! This virtual disk is read-only. No blocks were written.") : ProcedureReturn
+    EndIf
     PrintN("!! writing to the card is not available on this board. The card")
     PrintN("   controller here can be read but this build has no write path for")
     PrintN("   it, so mmc write does nothing rather than pretend. mmc read and")
