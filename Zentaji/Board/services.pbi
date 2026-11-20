@@ -4,7 +4,9 @@ Procedure.i HwBoardName() : ProcedureReturn "Zentaji" : EndProcedure
 ; No address translation or instruction/data cache is implemented by this CPU.
 Procedure.i HwMmuState() : ProcedureReturn 0 : EndProcedure
 ; No dynamic module arena/provider is admitted by this composition.
+CompilerIf Not Defined(ANVIL_ZENTAJI_MODULES,#PB_Constant)
 Procedure.i HwSeamCore(id.i) : ProcedureReturn 0 : EndProcedure
+CompilerEndIf
 Procedure HwPet()
  CompilerIf Defined(ANVIL_ZENTAJI_DEADMAN,#PB_Constant)
  If zenDeadCore<>0 : ZentajiDeadPet() : ProcedureReturn : EndIf
@@ -23,6 +25,8 @@ EndProcedure
 
 ; No module loader/registry is installed here. A fill is unavailable and a
 ; lookup/availability question returns no function/provider, never a fake one.
+CompilerIf Not Defined(ANVIL_ZENTAJI_MODULES,#PB_Constant)
 Procedure.i HwPayloadModuleHas(seam.i) : ProcedureReturn 0 : EndProcedure
 Procedure.i HwPayloadModuleFill(seam.i,index.i,fn.i) : ProcedureReturn #SVC_ENOSYS : EndProcedure
 Procedure.i HwPayloadModuleFn(seam.i,index.i) : ProcedureReturn 0 : EndProcedure
+CompilerEndIf

@@ -171,3 +171,9 @@
 ; Prompt idle, selected per architecture/board. The complete bounded-wait
 ; and context-preservation contract lives in Anvil/Hal/prompt_idle.pbi.
 ; HwPromptIdleReady() / HwPromptIdleWait() / HwPromptBoardService()
+
+
+; Optional auxiliary UART module. Function 0 takes the UART group slot
+; (0 count, 1 open, 2 read, 3 write, 4 overrun, 5 close), zero-based port,
+; buffer address or baud, and length. Its result is the public slot result.
+#SEAM_UART_DISPATCH=0

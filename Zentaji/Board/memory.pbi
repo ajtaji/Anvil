@@ -17,6 +17,24 @@ Global zenMemoryAddrWhy.i
 Global zenMemoryTextBase.i,zenMemoryTextBytes.i,zenMemoryTextTried.i
 Global zenMemoryGraphicsBase.i,zenMemoryGraphicsBytes.i,zenMemoryGraphicsTried.i
 
+Global zenModuleStage.i,zenModuleArena.i
+#ZEN_MOD_STAGE_BYTES=$100000
+#ZEN_MOD_ARENA_BYTES=$100000
+Procedure.i HwModArenaRegion()
+ If zenModuleArena=0 : ProcedureReturn -1 : EndIf
+ ProcedureReturn 3+Bool(zenMemoryTextBase<>0)+Bool(zenMemoryGraphicsBase<>0)
+EndProcedure
+Procedure.i HwModArenaBase() : ProcedureReturn zenModuleArena : EndProcedure
+Procedure.i HwModArenaBytes()
+ If zenModuleArena<>0 : ProcedureReturn #ZEN_MOD_ARENA_BYTES : EndIf
+ ProcedureReturn 0
+EndProcedure
+Procedure.i HwModStageAddr() : ProcedureReturn zenModuleStage : EndProcedure
+Procedure.i HwModStageBytes()
+ If zenModuleStage<>0 : ProcedureReturn #ZEN_MOD_STAGE_BYTES : EndIf
+ ProcedureReturn 0
+EndProcedure
+
 Procedure.i ZentajiMemoryBind(context.i)
  Protected last.i,nextPage.i,bottom.i
  If ZentajiBootContextValid(context)<>1 : ProcedureReturn 0 : EndIf
@@ -39,9 +57,13 @@ Procedure.i HwMonBytes() : ProcedureReturn zenMemoryLast-zenMemoryFirst : EndPro
 Procedure.i HwMonStack() : ProcedureReturn zenMemoryStackTop : EndProcedure
 Procedure.i HwMonRegions()
  If zenMemoryContext=0 : ProcedureReturn 0 : EndIf
- ProcedureReturn 3+Bool(zenMemoryTextBase<>0)+Bool(zenMemoryGraphicsBase<>0)
+ ProcedureReturn 3+Bool(zenMemoryTextBase<>0)+Bool(zenMemoryGraphicsBase<>0)+2*Bool(zenModuleArena<>0)
 EndProcedure
 Procedure.i HwMonRegionLo(index.i)
+ If zenModuleArena<>0
+  If index=HwModArenaRegion() : ProcedureReturn zenModuleArena : EndIf
+  If index=HwModArenaRegion()+1 : ProcedureReturn zenModuleStage : EndIf
+ EndIf
  Select index
   Case 0 : ProcedureReturn 0
   Case 1 : ProcedureReturn zenMemoryStackBottom
@@ -55,6 +77,10 @@ Procedure.i HwMonRegionLo(index.i)
  ProcedureReturn -1
 EndProcedure
 Procedure.i HwMonRegionHi(index.i)
+ If zenModuleArena<>0
+  If index=HwModArenaRegion() : ProcedureReturn zenModuleArena+#ZEN_MOD_ARENA_BYTES-1 : EndIf
+  If index=HwModArenaRegion()+1 : ProcedureReturn zenModuleStage+#ZEN_MOD_STAGE_BYTES-1 : EndIf
+ EndIf
  Select index
   Case 0 : ProcedureReturn zenMemoryPayload-1
   Case 1 : ProcedureReturn zenMemoryStackTop-1
@@ -67,6 +93,10 @@ Procedure.i HwMonRegionHi(index.i)
  ProcedureReturn -1
 EndProcedure
 Procedure HwMonRegionSay(index.i)
+ If zenModuleArena<>0
+  If index=HwModArenaRegion() : Print("native driver modules") : ProcedureReturn : EndIf
+  If index=HwModArenaRegion()+1 : Print("driver module file staging") : ProcedureReturn : EndIf
+ EndIf
  Select index
   Case 0 : Print("monitor image, data, vectors and low reserved RAM")
   Case 1 : Print("Anvil supervisor stack")
@@ -90,6 +120,7 @@ Procedure.i HwPayLo(index.i)
 EndProcedure
 Procedure.i HwPayHi(index.i)
  If zenMemoryContext=0 Or index<>0 : ProcedureReturn -1 : EndIf
+ If zenModuleStage<>0 : ProcedureReturn zenModuleStage-1 : EndIf
  If zenMemoryGraphicsBase<>0 : ProcedureReturn zenMemoryGraphicsBase-1 : EndIf
  If zenMemoryTextBase<>0 : ProcedureReturn zenMemoryTextBase-1 : EndIf
  ProcedureReturn zenMemoryStackBottom-1
@@ -168,3 +199,12 @@ EndProcedure
 Procedure.i HwAddrReason() : ProcedureReturn zenMemoryAddrWhy : EndProcedure
 Procedure.i HwAddrBlockLo() : ProcedureReturn zenMemoryAddrLo : EndProcedure
 Procedure.i HwAddrBlockHi() : ProcedureReturn zenMemoryAddrHi : EndProcedure
+
+; Seal both disjoint ranges before the first payload or storage command.
+; Small machines keep their payload window and report that no arena fits.
+Procedure ZentajiMemoryModulesInit()
+ Protected endAt.i=(HwPayHi(0)+1)&-4096
+ If zenMemoryContext=0 Or zenModuleStage<>0 : ProcedureReturn : EndIf
+ If endAt-zenMemoryPayload<#ZEN_MOD_STAGE_BYTES+#ZEN_MOD_ARENA_BYTES+$400000 : ProcedureReturn : EndIf
+ zenModuleArena=endAt-#ZEN_MOD_ARENA_BYTES : zenModuleStage=zenModuleArena-#ZEN_MOD_STAGE_BYTES
+EndProcedure

@@ -620,3 +620,33 @@ deadman off cancels an unused setting. The maximum interval is 15 seconds.
 
 The guard sleeps on a spare core's private timer. A single-core machine,
 or one whose secondary cores or timers are busy, refuses the guarded run.
+
+Native driver modules
+
+mod devices lists the native devices available to a loadable driver. On a
+machine with a spare UART, mod load AUXUART.MOD claims serial port 1.
+mod info AUXUART.MOD shows the live record. Programs look up UART seam
+function 0 through Anvil's SvcSeamGet slot, then open auxiliary port 0.
+Look up the dispatch function again after a module unload or detach.
+mod unload AUXUART.MOD releases the driver. UART0 stays with the monitor.
+The optional module is on the tester package's seed disk. On an existing
+writable disk, use get and save to install the file. A MODULES.TXT manifest
+can load it on subsequent boots using Anvil's shared module discovery.
+
+The native module architecture is 2. Entries cover whole, eight-byte
+instructions. Position-independent code can use an empty relocation
+table, and ABS64 can relocate a native data pointer. Anvil verifies the
+container hash before matching a device or calling an entry point.
+
+Pi peripheral commands and the Zentaji machine
+
+Zentaji exposes Ethernet to Anvil. Use net and dhcp even when the host
+laptop connects over Wi-Fi. Wireless scanning, pairing Bluetooth devices
+and enumerating a physical USB bus are host operations. The guest receives
+keyboard, mouse and gamepad events through its native input device. The
+pointer supplies one position in window pixels. The machine has no touch
+contact list or touchscreen calibration.
+
+The current ROM device table includes no GPIO header, SPI or I2C bus,
+temperature sensor or fan controller. The Pi commands for those devices
+require a guest peripheral that implements their operations.

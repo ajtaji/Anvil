@@ -43,6 +43,7 @@ def main():
     parser.add_argument("--keep", type=Path, required=True)
     parser.add_argument("--compiler", type=Path, required=True, help="Installed Forge for the two Zentaji payload fixtures")
     parser.add_argument("--get",action="store_true",help="Stage the host-file kernel through a real TFTP peer on loopback UDP port 69")
+    parser.add_argument("--modules",action="store_true",help="Exercise native module admission, hardware calls, unload and manifest discovery")
     args = parser.parse_args()
     native = args.zen_tools.resolve()
     sys.path.insert(0, str(native))
@@ -101,12 +102,17 @@ def main():
         (files/"SHORT.BIN").write_bytes(prefix+payload[:-8])
         for name,pmf in payloads.items():
             (files/name).write_bytes(pmf)
+        if args.modules:
+            from zentaji_module_monitor_check import seed_modules,check_modules
+            seed_modules(files,assembler,compiler,stage,manifest=not disk_image)
         disk=folder/"data.img"
         build_image(disk,2<<20,files)
         guest=Fixture(ram_size=128<<20,cores=2 if disk_image else 1,display_modes=[(1024,768,60000)],
                       hostfiles=[["anvil.zex",raw,False]],disks={0:(disk.read_bytes(),False)})
         guest.power_on(0,0)
         guest.net_attached=args.get and not disk_image
+        if args.modules:
+            guest.serial_feed(1,b"Z!")
         config=guest.write(folder/"native")
         signatures("pwsh.exe",args.sign_script,catalogs=[catalog(config.parent/"inputs.cat",list(config.parent.iterdir()),True)])
         log=folder/"run.log"
@@ -135,6 +141,8 @@ def main():
                     serial.flush()
                     assert expected.encode() in reply, (line,reply)
                     return reply.decode("ascii")
+                if args.modules:
+                    check_modules(command,manifest=not disk_image)
                 command("deadman","Deadman is off.")
                 command("deadman 999","Maximum monitor deadman interval is 15 seconds.")
                 command("deadman 1 extra","setting was preserved")
@@ -185,6 +193,10 @@ def main():
         assert re.search(r"^END steps=\d+ exit=4B424F54 ",text,re.M), log
         uart=bytes.fromhex(re.search(r"^SERIAL0 ([0-9A-Fa-f]+)$",text,re.M)[1])
         assert b"Starting the Zentaji supervisor kernel." in uart and b"pmf> " not in uart.split(b"Starting the Zentaji supervisor kernel.")[-1]
+        if args.modules:
+            aux=re.search(r"^SERIAL1 ([0-9A-Fa-f]+)$",text,re.M)
+            assert aux and bytes.fromhex(aux[1])==b"AUX1:Z!", log
+            result.setdefault("modules",{})[cmd]=dict(manifest=not disk_image,uart1_hex=aux[1],released=True)
         result["kernels"][cmd]=dict(load_address=address,exit="4B424F54",checked_refusals=7)
         evidence=args.keep/(cmd+".cat")
         signatures("pwsh.exe",args.sign_script,catalogs=[catalog(evidence,[log,transcript,config.parent/"inputs.cat"],True)])

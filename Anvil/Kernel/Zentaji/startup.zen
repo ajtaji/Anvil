@@ -911,6 +911,16 @@ anvil_kernel_bss:
   ERET
 anvil_kernel_copy_end:
 
+; Checked PMFMOD entry, followed using the module's own return link.
+; The caller has verified its lease, alignment and complete entry instruction.
+anvil_module_call:
+  OR r16,r1,r0
+  OR r1,r2,r0
+  OR r2,r3,r0
+  OR r3,r4,r0
+  OR r4,r5,r0
+  JR r16
+
 .align 64
 anvil_zen_payload_save:
   .org anvil_zen_payload_save+3160
@@ -918,6 +928,7 @@ anvil_zen_payload_save:
   ; Optional supervisor diagnostic descriptor immediately before the v2 context.
   ; Its magic and address are in monitor-owned memory. Existing v2 users read
   ; only their original 128 bytes; older images have no such descriptor.
+  .word $3130444F4D4E455A,anvil_module_call
   .word $31544F4F424E455A,anvil_kernel_enter
   .word $31474149444E455A,anvil_diag_enter
 anvil_zen_context:

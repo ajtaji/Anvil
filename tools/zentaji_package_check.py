@@ -406,6 +406,14 @@ def check(archive, keep, signer, powershell, automation=False, transfers=False, 
             transcript.append(startup)
             assert "Zentaji boot ROM v1" in startup and "Type help for the available commands." in startup
             assert f"build {manifest['anvil_build']} " in startup
+            if label == "first" and "AUXUART.MOD" in manifest.get("seed_modules", []):
+                for line, expected in (("mod devices", "FFFF000000110000"),
+                                       ("mod load AUXUART.MOD", "bound to Zentaji serial port 1"),
+                                       ("mod info AUXUART.MOD", "ACTIVE")):
+                    reply = client.command(line).decode("ascii")
+                    transcript.append(reply)
+                    assert expected in reply, (line, reply)
+                result["stock_uart_module"] = "AUXUART.MOD"
             if label == "autostart":
                 assert "Booting SAVED.PMF in " in startup and "The payload returned, r1 = $000000000000002A" in startup, startup
             elif label == "cleared":

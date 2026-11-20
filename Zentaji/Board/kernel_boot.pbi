@@ -67,6 +67,7 @@ Procedure ZentajiCmdKernelBoot(diskImage.i)
   PrintN("!! the kernel handoff address is outside the supervisor startup.") : ProcedureReturn
  EndIf
  If ZentajiKernelOwnsMachine()=0 : ProcedureReturn : EndIf
+ If ZentajiModulesDown()=0 : ProcedureReturn : EndIf
  If ZentajiStorageDown()=0 : UartWriteStr(ZentajiStorageErrorText()) : PrintNl() : ProcedureReturn : EndIf
  zenKernelPlan[0]=body : zenKernelPlan[1]=load : zenKernelPlan[2]=bytes
  zenKernelPlan[3]=bss : zenKernelPlan[4]=entry : zenKernelPlan[5]=stack

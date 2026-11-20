@@ -194,6 +194,7 @@ def package(image, zen_tools, output, archive, sign_script, powershell="pwsh.exe
     if metadata["architecture"] != "Zentaji" or metadata["minimum_ram_bytes"] > 256 << 20:
         raise ValueError("The counted image does not fit this Zentaji profile")
     build = None
+    has_modules = False
     for source in mapping["sources"]:
         path = Path(source["path"]).resolve()
         if not path.is_relative_to(ROOT):
@@ -201,6 +202,8 @@ def package(image, zen_tools, output, archive, sign_script, powershell="pwsh.exe
         raw = path.read_bytes().replace(b"\r", b"")
         if hashlib.sha256(raw).hexdigest() != source["sha256"]:
             raise ValueError(f"Anvil source changed since its counted build: {path}")
+        if path == ROOT / "Zentaji/Board/module_devices.pbi":
+            has_modules = True
         if path == ROOT / "Zentaji/Board/board.zentaji":
             match = re.search(rb"^#ANVIL_BUILD\s*=\s*(\d+)\s*;", raw, re.M)
             if match:
@@ -213,7 +216,16 @@ def package(image, zen_tools, output, archive, sign_script, powershell="pwsh.exe
     shutil.copyfile(exe, output / "zenwin.exe")
     shutil.copyfile(image, output / "anvil.zex")
     shutil.copyfile(client, output / "zen_console.py")
-    build_image(output / "data-seed.img", 64 << 20)
+    if has_modules:
+        from zentaji_uart_module import build_module
+        assembler = zen_tools / "zasm.exe"
+        signatures(powershell, sign_script, executables=[assembler])
+        with tempfile.TemporaryDirectory(prefix="zentaji-drivers-") as temporary:
+            seed=Path(temporary)
+            (seed/"AUXUART.MOD").write_bytes(build_module(assembler))
+            build_image(output / "data-seed.img",64 << 20,seed)
+    else:
+        build_image(output / "data-seed.img",64 << 20)
     for name, text in (("machine.txt", MACHINE), ("Start-Zentaji.cmd", LAUNCHER),
                        ("START-HERE.txt", INSTRUCTIONS)):
         (output / name).write_text(text, encoding="utf-8", newline="\r\n")
@@ -224,6 +236,8 @@ def package(image, zen_tools, output, archive, sign_script, powershell="pwsh.exe
                            for name in FILES if name != "manifest.json"],
                     mutable_files=["data.img", "zentaji.log", "zentaji-errors.log",
                                    "zentaji.pid", "screen.png"])
+    if has_modules:
+        manifest["seed_modules"] = ["AUXUART.MOD"]
     (output / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
     signatures(powershell, sign_script, executables=[output / "zenwin.exe"], catalogs=[
         catalog(output / "package.cat", [output / name for name in FILES], True)])

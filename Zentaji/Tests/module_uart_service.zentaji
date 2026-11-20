@@ -1,0 +1,27 @@
+; Look up the loaded driver through Anvil's published module service.
+; The real machine receives two test bytes on UART1.
+XIncludeFile "Zentaji/Board/clock.pbi"
+XIncludeFile "Anvil/Hal/seams.pbi"
+Global Dim probeBytes.a[4]
+Procedure.q Main(table.i)
+ Protected lookup.i,driver.i,rc.i,deadline.q
+ If table=0 Or PeekL(table)<>$53564E41 Or PeekL(table+12)<=#SVC_SEAM_SLOT_GET : ProcedureReturn $BAD0 : EndIf
+ lookup=PeekQ(table+#SVC_SEAM_HDR_BYTES+#SVC_SEAM_SLOT_GET*8)
+ driver=CallFunctionFast(lookup,#SVCCAP_UART,#SEAM_UART_DISPATCH)
+ If driver=0 : ProcedureReturn $A0 : EndIf
+ If CallFunctionFast(driver,0,0,0,0)<>1 Or CallFunctionFast(driver,1,1,0,0)<>-102 : ProcedureReturn $BAD2 : EndIf
+ If CallFunctionFast(driver,1,0,0,0)<>0 Or CallFunctionFast(driver,1,0,0,0)<>-103 : ProcedureReturn $BAD3 : EndIf
+ probeBytes[0]=$AA : probeBytes[3]=$55
+ If CallFunctionFast(driver,2,0,@probeBytes[1],2)<>2 : ProcedureReturn $BAD4 : EndIf
+ If probeBytes[0]<>$AA Or probeBytes[1]<>90 Or probeBytes[2]<>33 Or probeBytes[3]<>$55 : ProcedureReturn $BAD5 : EndIf
+ If CallFunctionFast(driver,2,0,@probeBytes[1],2)<>0 Or CallFunctionFast(driver,4,0,0,0)<>0 : ProcedureReturn $BAD6 : EndIf
+ If CallFunctionFast(driver,3,0,"AUX1:",5)<>5 Or CallFunctionFast(driver,3,0,@probeBytes[1],2)<>2 : ProcedureReturn $BAD7 : EndIf
+ deadline=Ticks()+TickHz()
+ Repeat
+  rc=CallFunctionFast(driver,5,0,0,0)
+  If rc=0 : Break : EndIf
+  If rc<>-103 Or Ticks()>=deadline : ProcedureReturn $BAD8 : EndIf
+ ForEver
+ If CallFunctionFast(driver,2,0,@probeBytes[1],2)<>-108 : ProcedureReturn $BAD8 : EndIf
+ ProcedureReturn $55415254
+EndProcedure

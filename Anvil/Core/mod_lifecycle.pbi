@@ -361,7 +361,11 @@ Procedure.i ModActivate(rec.i)
   ; and silicon that does not answer is exactly the case a probe is for.
   *fn = gModRecProbe[rec]
   If *fn <> 0
+    CompilerIf Defined(ANVIL_ZENTAJI_MODULES,#PB_Constant)
+    r = HwModuleLifecycleCall(rec,fn,services,token)
+    CompilerElse
     r = fn(services, token)
+    CompilerEndIf
     If r <= 0
       ModSeamAllowClear(rec)
       gModRecState[rec] = #MOD_STATE_FAILED
@@ -379,7 +383,11 @@ Procedure.i ModActivate(rec.i)
   EndIf
   gModRecInitCalls[rec] = gModRecInitCalls[rec] + 1
   ModSeamFillOpen(rec)
+  CompilerIf Defined(ANVIL_ZENTAJI_MODULES,#PB_Constant)
+  r = HwModuleLifecycleCall(rec,fn,services,token)
+  CompilerElse
   r = fn(services, token)
+  CompilerEndIf
   fills = ModSeamFillClose()
   gModRecInitResult[rec] = r
 
@@ -468,7 +476,11 @@ Procedure.i ModUnload(rec.i)
 
   *fn = gModRecQuiesce[rec]
   If *fn <> 0 And gModRecState[rec] = #MOD_STATE_ACTIVE
+    CompilerIf Defined(ANVIL_ZENTAJI_MODULES,#PB_Constant)
+    r = HwModuleLifecycleCall(rec,fn,SvcTableAddr(),gModRecToken[rec])
+    CompilerElse
     r = fn(SvcTableAddr(), gModRecToken[rec])
+    CompilerEndIf
     If r <> 0
       ProcedureReturn ModFail(#MOD_ERR_QUIESCE, rec, r)
     EndIf
@@ -819,7 +831,7 @@ Procedure ModSayRefusal()
       Print("was built for architecture ")
       PrintDec(gModErrorValue)
       Print(" and this Anvil runs ")
-      PrintDec(#PMFMOD_ARCH_AARCH64)
+      PrintDec(#MOD_TARGET_ARCH)
       Print(".")
       PrintNl()
       Print("   Nothing was loaded.")

@@ -230,6 +230,9 @@ Procedure.i ModSeamFill(sid.i, index.i, fn.i)
   If fn = 0
     ProcedureReturn ModSeamFail(#MOD_ERR_NOSERVICE, sid, index)
   EndIf
+  CompilerIf Defined(ANVIL_ZENTAJI_MODULES,#PB_Constant)
+  If HwModuleEntryOk(gSeamFillOwner,fn)=0 : ProcedureReturn ModSeamFail(#MOD_ERR_NOSERVICE,sid,index) : EndIf
+  CompilerEndIf
   If gSeamAllow[sid] <> gSeamFillOwner
     ProcedureReturn ModSeamFail(#MOD_ERR_SEAM_UNDECLARED, sid, gSeamFillOwner)
   EndIf
@@ -365,6 +368,9 @@ Procedure.i ModSeamBind(sid.i, saySelf.i, detach.i)
   If saySelf = 0 Or detach = 0
     ProcedureReturn ModSeamFail(#MOD_ERR_STATE, sid, 0)
   EndIf
+  CompilerIf Defined(ANVIL_ZENTAJI_MODULES,#PB_Constant)
+  If HwModuleBindingOk(saySelf)=0 Or HwModuleBindingOk(detach)=0 : ProcedureReturn ModSeamFail(#MOD_ERR_STATE,sid,0) : EndIf
+  CompilerEndIf
   i = 0
   While i < #MOD_BIND_MAX
     If gBindSeam[i] = #MOD_SEAM_NONE
@@ -417,7 +423,11 @@ Procedure ModSeamSayBinders(sid.i)
       EndIf
       *say = gBindSay[i]
       If *say <> 0
+        CompilerIf Defined(ANVIL_ZENTAJI_MODULES,#PB_Constant)
+        HwModuleNotify(say)
+        CompilerElse
         say()
+        CompilerEndIf
       Else
         Print("an owner that did not name itself")
       EndIf
@@ -459,7 +469,11 @@ Procedure.i ModSeamDetachAll(sid.i)
     If gBindSeam[i] = sid
       *fn = gBindDetach[i]
       If *fn <> 0
+        CompilerIf Defined(ANVIL_ZENTAJI_MODULES,#PB_Constant)
+        HwModuleNotify(fn)
+        CompilerElse
         fn()
+        CompilerEndIf
       EndIf
     EndIf
     i = i + 1

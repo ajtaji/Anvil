@@ -36,6 +36,11 @@ Global gModInitOffset.i
 Global gModRelocCount.i
 Global gModRelocOffset.i
 Global gModAlign.i
+CompilerIf Defined(ANVIL_NATIVE_MODULE_ARCH,#PB_Constant)
+#MOD_TARGET_ARCH=#ANVIL_NATIVE_MODULE_ARCH
+CompilerElse
+#MOD_TARGET_ARCH=#PMFMOD_ARCH_AARCH64
+CompilerEndIf
 Global gModArchitecture.i
 Global gModMatchCount.i
 Global gModMatchOffset.i
@@ -118,6 +123,9 @@ Procedure.i ModEntryOffsetOk(offset.i, optional.i)
   If optional <> 0 And offset = 0
     ProcedureReturn 1
   EndIf
+  CompilerIf Defined(ANVIL_NATIVE_MODULE_ARCH,#PB_Constant)
+  If offset<0 Or offset>gModImageBytes-8 Or (offset&7)<>0 : ProcedureReturn 0 : EndIf
+  CompilerEndIf
   If offset < 0 Or offset >= gModImageBytes Or (offset & 3) <> 0
     ProcedureReturn 0
   EndIf
@@ -230,6 +238,10 @@ Procedure.i ModRelocSiteOk(p.i, index.i)
   reserved = ModRd16(r + #PMFMOD_REL_OFF_RESERVED)
   addend = ModRd64(r + #PMFMOD_REL_OFF_ADDEND)
 
+  CompilerIf Defined(ANVIL_NATIVE_MODULE_ARCH,#PB_Constant)
+  ; A zero relocation count is the canonical position-independent form.
+  If kind<>#MREL_ABS64 : ProcedureReturn ModFail(#MOD_ERR_RELKIND,index,kind) : EndIf
+  CompilerEndIf
   If kind < #MREL_ADRP_PAGE Or kind > #MREL_CALL26
     ProcedureReturn ModFail(#MOD_ERR_RELKIND, index, kind)
   EndIf
@@ -392,7 +404,7 @@ Procedure.i ModPreflight(p.i, bytes.i, abiMajor.i, abiMinor.i)
     ProcedureReturn ModFail(#MOD_ERR_HEADER, -1, gModFlags)
   EndIf
   gModArchitecture = ModRd32(p + #PMFMOD_OFF_ARCH)
-  If gModArchitecture <> #PMFMOD_ARCH_AARCH64
+  If gModArchitecture <> #MOD_TARGET_ARCH
     ProcedureReturn ModFail(#MOD_ERR_ARCH, -1, gModArchitecture)
   EndIf
   gModAlign = ModRd32(p + #PMFMOD_OFF_ALIGN)

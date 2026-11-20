@@ -1,0 +1,122 @@
+; Native Anvil auxiliary UART module. The five words are build-time offsets
+; and one relocated dispatch pointer. All other references are PC-relative.
+  .org 0
+  .word uart_init,uart_probe,uart_quiesce,uart_dispatch
+uart_entry:
+  .word 0
+uart_state:
+  .word 0,0,0,0
+uart_probe:
+  LD64 r16,[r2]
+  LI r17,$01010011
+  BNE r16,r17,uart_bad_device
+  LI r1,1
+  JR r254
+uart_bad_device:
+  LI r1,-101
+  JR r254
+uart_init:
+  LAPC r16,uart_state
+  ST64 r2,[r16]
+  LD64 r18,[r1+128]
+  LAPC r17,uart_entry
+  LD64 r3,[r17]
+  LI r1,11
+  LI r2,0
+  ; tail-call SvcSeamFill with the original return link.
+  JR r18
+uart_quiesce:
+  LAPC r16,uart_state
+  LD64 r17,[r16+8]
+  BEQI r17,0,uart_ok
+  LD64 r18,[r16]
+  JMP uart_close
+uart_dispatch:
+  BEQI r1,0,uart_count
+  BNEI r2,0,uart_arg
+  LAPC r16,uart_state
+  LD64 r18,[r16]
+  LD64 r17,[r16+8]
+  BEQI r1,1,uart_open
+  BEQI r17,0,uart_closed
+  BEQI r1,5,uart_close
+  BEQI r1,4,uart_overrun
+  BLT r4,r0,uart_arg
+  BEQI r4,0,uart_ok
+  BEQI r3,0,uart_arg
+  LI r19,0
+  BEQI r1,3,uart_tx
+  BNEI r1,2,uart_arg
+uart_rx:
+  LD64 r20,[r18+$48]
+  BLT r20,r0,uart_bytes
+  ST8 r20,[r3]
+  ADDI r3,r3,1
+  ADDI r19,r19,1
+  BLTU r19,r4,uart_rx
+  JMP uart_bytes
+uart_tx:
+  LD64 r20,[r18+$58]
+  BEQI r20,0,uart_bytes
+  LD8U r20,[r3]
+  ST64 r20,[r18+$40]
+  ADDI r3,r3,1
+  ADDI r19,r19,1
+  BLTU r19,r4,uart_tx
+uart_bytes:
+  OR r1,r19,r0
+  JR r254
+uart_count:
+  LI r1,1
+  JR r254
+uart_overrun:
+  LD64 r20,[r18+8]
+  LI r19,8
+  AND r20,r20,r19
+  BEQI r20,0,uart_ok
+  LI r1,1
+  JR r254
+uart_open:
+  BNEI r17,0,uart_busy
+  BLT r3,r0,uart_arg
+  LIQ r19,$FFFF000000050048
+  LD64 r19,[r19]
+  BLTU r19,r3,uart_arg
+  LD64 r20,[r18+8]
+  LI r19,48
+  AND r20,r20,r19
+  BNEI r20,0,uart_busy
+  LD64 r20,[r18+$20]
+  BNEI r20,0,uart_busy
+  LD64 r20,[r18+$58]
+  LI r19,4096
+  BNE r20,r19,uart_busy
+  LD64 r20,[r18+$60]
+  ST64 r20,[r16+16]
+  ST64 r3,[r18+$60]
+  ST64 r3,[r16+24]
+  LI r17,1
+  ST64 r17,[r16+8]
+uart_ok:
+  LI r1,0
+  JR r254
+uart_close:
+  LD64 r20,[r18+$58]
+  LI r19,4096
+  BNE r20,r19,uart_busy
+  LD64 r20,[r18+$60]
+  LD64 r19,[r16+24]
+  BNE r19,r20,uart_busy
+  LD64 r20,[r16+16]
+  ST64 r20,[r18+$60]
+  ST64 r0,[r16+8]
+  JMP uart_ok
+uart_closed:
+  LI r1,-108
+  JR r254
+uart_busy:
+  LI r1,-103
+  JR r254
+uart_arg:
+  LI r1,-102
+  JR r254
