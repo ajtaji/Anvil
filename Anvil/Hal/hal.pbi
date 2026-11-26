@@ -1884,7 +1884,7 @@
 ;              for exactly that.
 ;    HwPayload* (NO CAPABILITY)  THE BOARD'S HALF OF ENTERING A PAYLOAD.
 ;              Anvil/Kernel/payload_call.pbi's PayloadCall() keeps the
-;              entry contract (x0 the table, x1..x7 zero, the monitor's
+;              entry contract (x0 the table, x1..x3 the heap window or zero, x4..x7 zero, the monitor's
 ;              sp and DAIF back afterwards) on every board that includes
 ;              it; what it cannot know is whether this board owns the
 ;              exception vectors a payload may have replaced.

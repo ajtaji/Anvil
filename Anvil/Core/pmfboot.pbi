@@ -1048,6 +1048,9 @@ Procedure.i PmfEnter()
   If gPmfVersion=#PMF_VERSION_V2
     stack=gPmfStack : stackBytes=HwPmfInitialStackBytes()
   EndIf
+  ; The heap window is chosen by where the payload's variables are
+  ; (ABI 1.17; RunAt hands it over in x1..x3).
+  If gPmfBssLen > 0 : gGoHeapAt = gPmfBssBase : Else : gGoHeapAt = gPmfLoad : EndIf
   entered=HwPayloadRun(gPmfEntry, entryArgument, stack, stackBytes)
   If (gPmfFlags & #PMF_FLAG_WANTS_SERVICES) <> 0
     ; GPU targets retire this scope before their platform bus-master recovery.

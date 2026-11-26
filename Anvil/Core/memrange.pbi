@@ -84,6 +84,44 @@ Procedure.i PayloadTop(a.i)
   ProcedureReturn 0
 EndProcedure
 
+; ----------------------------------------------------------------------
+;  PayloadHeapWindow(a) - THE HEAP A PAYLOAD IS HANDED (ABI 1.17).
+;
+;  The compiler's memory library takes the payload's heap from a window
+;  its loader hands over at entry (x1 first byte, x2 one past the last, x3
+;  the key "PMFHEAP1"), and cuts the payload's own image, variables and
+;  stack out of it itself. The window handed over is the payload window
+;  that holds address `a` - the container's BSS - narrowed to the piece
+;  around `a` that no monitor region touches (a firmware framebuffer can
+;  sit inside a window; the board's region list names it). That memory is
+;  the payload's for its whole run: the monitor's services and DMA write
+;  only their own regions. An `a` in no window, or on a monitor region,
+;  hands over nothing: x3 is 0 and the payload uses its own bare window.
+;  Sets gGoHeapLo / gGoHeapHi / gGoHeapKey; answers 1 when a window is set.
+; ----------------------------------------------------------------------
+Procedure.i PayloadHeapWindow(a.i)
+  Define i.i, n.i, lo.i, hi.i, rlo.i, rhi.i
+  gGoHeapLo = 0 : gGoHeapHi = 0 : gGoHeapKey = 0
+  hi = PayloadTop(a)
+  If hi = 0 : ProcedureReturn 0 : EndIf
+  lo = 0
+  n = HwPayWindows()
+  For i = 0 To n - 1
+    If a >= HwPayLo(i) And a <= HwPayHi(i) : lo = HwPayLo(i) : EndIf
+  Next
+  n = HwMonRegions()
+  For i = 0 To n - 1
+    rlo = HwMonRegionLo(i) : rhi = HwMonRegionHi(i)
+    If rlo <= rhi And rlo <= hi And rhi >= lo
+      If a >= rlo And a <= rhi : ProcedureReturn 0 : EndIf
+      If rhi < a And rhi + 1 > lo : lo = rhi + 1 : EndIf
+      If rlo > a And rlo - 1 < hi : hi = rlo - 1 : EndIf
+    EndIf
+  Next
+  gGoHeapLo = lo : gGoHeapHi = hi + 1 : gGoHeapKey = #PAY_HEAP_KEY
+  ProcedureReturn 1
+EndProcedure
+
 ; WHICH REGION THE LAST HitsMonitor() CALL MATCHED. Valid ONLY on the
 ; instruction after a call that returned non-zero; meaningless otherwise,
 ; and deliberately not initialised to anything that would look sensible

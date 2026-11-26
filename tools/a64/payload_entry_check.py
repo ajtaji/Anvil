@@ -421,8 +421,15 @@ def gate_board(cc: str, target: str, override: dict, work: pathlib.Path) -> list
     got = [struct.unpack("<Q", m.peek(symbols(probe)["global_gr%d" % i], 8))[0] for i in range(8)]
     check(got[0] == table, "%s: the probe was entered with x0 = the table (%#x)" % (target, table),
           notes)
-    check(all(v == 0 for v in got[1:]),
-          "%s: the probe was entered with x1..x7 = 0 (poisoned before RunAt)" % target, notes)
+    # ABI 1.17: x1..x3 are the heap window RunAt chose (zero on a board
+    # that hands over none); x4..x7 are zero.
+    heap = [peek64("global_ggoheaplo"), peek64("global_ggoheaphi"), peek64("global_ggoheapkey")]
+    check(got[1:4] == heap and heap[2] in (0, 0x3150414548464D50) and
+          (heap[2] != 0 or heap[:2] == [0, 0]) and (heap[2] == 0 or heap[0] < heap[1]),
+          "%s: the probe was entered with x1..x3 = the heap window %s (got %s)"
+          % (target, [hex(v) for v in heap], [hex(v) for v in got[1:4]]), notes)
+    check(all(v == 0 for v in got[4:]),
+          "%s: the probe was entered with x4..x7 = 0 (poisoned before RunAt)" % target, notes)
     check(rc == 0x5A00 + board_id,
           "%s: gGoRc = $5A00 + SvcBoardId() = %#x, the payload's own answer through the real slot"
           % (target, 0x5A00 + board_id), notes)

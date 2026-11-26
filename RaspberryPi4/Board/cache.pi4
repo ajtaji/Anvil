@@ -445,9 +445,18 @@ Procedure CallAddr()
     ; x9 already holds the entry address and x10/x11 are the monitor's
     ; scratch above; neither is part of the contract, and both are
     ; caller-saved in this backend's convention.
-    movz x1, #0
-    movz x2, #0
-    movz x3, #0
+    ; ABI 1.17 (2026-11-26): x1..x3 are the heap window - first byte, one
+    ; past the last, and the key "PMFHEAP1" - or all three zero when
+    ; RunAt chose none (PayloadHeapWindow). x4..x7 are still zero.
+    adrp x10, global_ggoheaplo
+    add  x10, x10, #:lo12:global_ggoheaplo
+    ldr  x1, [x10]
+    adrp x10, global_ggoheaphi
+    add  x10, x10, #:lo12:global_ggoheaphi
+    ldr  x2, [x10]
+    adrp x10, global_ggoheapkey
+    add  x10, x10, #:lo12:global_ggoheapkey
+    ldr  x3, [x10]
     movz x4, #0
     movz x5, #0
     movz x6, #0
@@ -560,6 +569,14 @@ Procedure RunAt(a.i)
   EndIf
   gGoAddr = a
   gGoRc = 0
+  ; The heap window, chosen by the container's BSS when the loader named it
+  ; and by the entry address otherwise (ABI 1.17, PayloadHeapWindow).
+  If gGoHeapAt <> 0
+    PayloadHeapWindow(gGoHeapAt)
+  Else
+    PayloadHeapWindow(a)
+  EndIf
+  gGoHeapAt = 0
   ; x0 IS CLEARED HERE AND SET BY THE CALLER AFTERWARDS, in that order.
   ;
   ; Every entry path that is not a wants-services container - `run`,

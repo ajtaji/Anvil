@@ -312,8 +312,14 @@ def check_case(a64, image: Path, case: Case, mutant: str = "", guards=False) -> 
     def payload(inner):
         if get("gGoAddr") != PAYLOAD_ENTRY or inner.x[0] != SERVICE_ARGUMENT:
             raise AssertionError("payload entry/service argument changed")
-        if any(inner.x[index] != 0 for index in range(1, 8)):
-            raise AssertionError("payload x1..x7 were not cleared by real CallAddr")
+        # ABI 1.17: x1..x3 are the heap window RunAt chose (or all zero);
+        # x4..x7 are zero.
+        if [inner.x[1], inner.x[2], inner.x[3]] != [get("gGoHeapLo"), get("gGoHeapHi"), get("gGoHeapKey")]:
+            raise AssertionError("payload x1..x3 are not the heap window real RunAt chose")
+        if inner.x[3] not in (0, 0x3150414548464D50) or (inner.x[3] == 0 and (inner.x[1] or inner.x[2])):
+            raise AssertionError("payload x3 is neither 0 nor the PMFHEAP1 key, or x1/x2 are set without it")
+        if any(inner.x[index] != 0 for index in range(4, 8)):
+            raise AssertionError("payload x4..x7 were not cleared by real CallAddr")
         events.append("payload")
         put("genet_started", 1)  # Returning code left the controller active.
         for address in GENET_WORDS:

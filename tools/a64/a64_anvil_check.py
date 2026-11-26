@@ -693,6 +693,34 @@ def section_middle(ctx: Ctx) -> None:
     ctx.case(ctx.call(cpu, "payloadtop", k["PAY2_LO"] - 1) == 0,
              "the byte below the middle window answers a payload window")
 
+    # THE HEAP HAND-OVER (ABI 1.17): PayloadHeapWindow(a) picks the free piece
+    # of the window holding `a`; RunAt puts it in x1/x2 with the key in x3.
+    key = 0x3150414548464D50
+    syms = {n: ctx.sym.get(n) for n in ("global_ggoheaplo", "global_ggoheaphi", "global_ggoheapkey")}
+    if ctx.case(None not in syms.values(), "the heap hand-over globals are not in the .sym"):
+        def handed(addr):
+            got = ctx.call(cpu, "payloadheapwindow", addr)
+            return got, (peek64(cpu, syms["global_ggoheaplo"]),
+                         peek64(cpu, syms["global_ggoheaphi"]),
+                         peek64(cpu, syms["global_ggoheapkey"]))
+        for addr, want, why in (
+                (k["PAY2_LO"] + 0x01000000, (1, (k["PAY2_LO"], top + 1, key)),
+                 "a BSS in the middle window gets that window"),
+                (p0 + 0x100000, (1, (p0, k["PAY0_HI"] + 1, key)),
+                 "a BSS in the low window gets the low window"),
+                (k["PAY1_LO"], (1, (k["PAY1_LO"], ctx.edges["PAY1_HI"] + 1, key)),
+                 "a BSS in the high window gets the high window"),
+                (k["MON_VK_HEAP_LO"], (0, (0, 0, 0)), "the Vulkan heap is no window: nothing handed over"),
+                (0x07F80000, (0, (0, 0, 0)), "the stack corridor is no window: nothing handed over")):
+            got = handed(addr)
+            ctx.case(got == want, "PayloadHeapWindow($%X) gave %r, wanted %r - %s"
+                     % (addr, got, want, why))
+        # A device tree inside the middle window is cut out of the hand-over.
+        ctx.call(cpu, "hwmapbuild", 0x3B400000, 0x2EFF0000, 0x2EFFFFFF)
+        got = handed(0x2F100000)
+        ctx.case(got == (1, (0x2F000000, top + 1, key)),
+                 "PayloadHeapWindow above the device tree gave %r" % (got,))
+
 
 # =====================================================================
 #  ParseDotted and PayloadTop

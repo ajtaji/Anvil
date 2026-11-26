@@ -185,7 +185,8 @@ ABI_MAJOR = 1
 # IP layers had merged.  Neither moved an existing slot.  1.6 filled TLS (80..83, 87) and 1.7 the
 # file-handle group's directory-by-path slots (196, 197): minor bumps, nothing moved.
 # 1.8/1.9 filled graphics/input38/39;1.10 fills entropy175/176.
-ABI_MINOR = 16
+# 1.17 moved no slot either: x1..x3 at entry became the heap window.
+ABI_MINOR = 17
 SLOT_COUNT = 216
 HDR_BYTES = 16
 MAGIC = 0x53564E41              # 'ANVS'

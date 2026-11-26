@@ -139,8 +139,15 @@
 ; Existing 200-entry shape and every prior signature remain unchanged.
 ; 1.15 - appended slots200..207: cooperative IPv4/IPv6 datagram sockets.
 ; Every previous slot and signature is unchanged.
-#SVC_ABI_MINOR   = 16
+#SVC_ABI_MINOR   = 17
 ; 1.16 - appended cell-text group208..215, NativeText dispatcher at208.
 ; Every previous slot/signature remains unchanged; unbound returns ENOSYS.
+; 1.17 - 2026-11-26. THE HEAP WINDOW AT ENTRY. x1..x3 were promised zero;
+; now x1 = the first byte and x2 = one past the last of a window of normal
+; RAM the payload may use as its heap, and x3 = $3150414548464D50 ("PMFHEAP1")
+; says so; x3 = 0 (and x1 = x2 = 0) when the monitor hands over none. The
+; window is the free piece of the payload window holding the payload's BSS
+; (Anvil/Core/memrange.pbi PayloadHeapWindow). x4..x7 are still zero. No
+; slot moves; a payload built before ignores x1..x3.
 #SVC_SLOT_COUNT  = 216         ; Native text group appended at 1.16.
                                ; The boot code sizes its check by it.

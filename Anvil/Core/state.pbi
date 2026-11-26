@@ -158,6 +158,16 @@ EndProcedure
 
 Global gGoAddr.i               ; entry selected for a validated payload
 Global gGoRc.i                 ; full-width result returned to the monitor
+; THE HEAP WINDOW HANDED TO A PAYLOAD (ABI 1.17, 2026-11-26): the free piece
+; of the payload window that holds the payload's variables, as first byte
+; and one past the last; key #PAY_HEAP_KEY when they are meant, 0 when not.
+; gGoHeapAt is the address the window is chosen by (the container's BSS),
+; set by the loader before it enters; 0 means "the entry address".
+Global gGoHeapLo.i
+Global gGoHeapHi.i
+Global gGoHeapKey.i
+Global gGoHeapAt.i
+#PAY_HEAP_KEY = $3150414548464D50   ; the bytes "PMFHEAP1" in memory order
 
 ; Saved machine context and entry-register staging belong to the selected
 ; CPU backend. Shared state does not define a stack register or an ISA ABI.

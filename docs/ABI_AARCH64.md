@@ -13,8 +13,13 @@ met the EL3 entry requirement. There is no approved privilege downshift here.
 At payload entry:
 
 - `x0` holds the service-table address when the validated container requested
-  services, and zero otherwise. `x1` through `x7` are zero. Other volatile
-  registers have no initial-value guarantee.
+  services, and zero otherwise. Since ABI 1.17, `x1` and `x2` are the first
+  byte and one past the last byte of a heap window and `x3` is
+  `$3150414548464D50` (the bytes "PMFHEAP1") when the monitor hands one over,
+  and all three are zero when it does not. The window is the free part of
+  the payload window holding the payload's BSS; the payload's own image,
+  BSS and stack may lie inside it. `x4` through `x7` are zero. Other
+  volatile registers have no initial-value guarantee.
 - The compiled payload startup selects the validated payload stack, including
   for a payload built with `--entry-returns`. The AArch64 placement contract
   requires 16-byte alignment and the backend's declared initial stack extent.
