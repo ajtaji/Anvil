@@ -13,7 +13,7 @@ from neon_vk_particle_prepare_split_build import check_container, replace_once
 
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_OUT = "runs/neon-particle-dynamic-desk-20261003"
-CORE = ROOT / "RaspberryPi4/Examples/Diagnostics/vulkanNeonParticleMatchedProfileCore.pi4"
+CORE = ROOT / "RaspberryPi4/Examples/Diagnostics/vulkanNeonParticleMatchedProfileCore.pbi"
 SOURCE_FILES = (
     ROOT / "RaspberryPi4/Lib/neon.pi4",
     ROOT / "Anvil/Graphics/Vulkan/vk_v3d_backend.pi4",

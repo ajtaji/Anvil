@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-CORE = HERE / "vulkanNeonParticleMatchedProfileCore.pi4"
+CORE = HERE / "vulkanNeonParticleMatchedProfileCore.pbi"
 
 
 class MatchedProfileGate(unittest.TestCase):
@@ -17,7 +17,7 @@ class MatchedProfileGate(unittest.TestCase):
         for name, mode in (("Cpu", 0), ("Csd", 1)):
             text = (HERE / f"vulkanNeonParticleMatched{name}Profile.pi4").read_text()
             self.assertIn(f"#NMP_GPU = {mode}", text)
-            self.assertIn('XIncludeFile "RaspberryPi4/Examples/Diagnostics/vulkanNeonParticleMatchedProfileCore.pi4"', text)
+            self.assertIn('XIncludeFile "RaspberryPi4/Examples/Diagnostics/vulkanNeonParticleMatchedProfileCore.pbi"', text)
 
     def test_same_capacity_workload_and_frame_loop(self) -> None:
         source = self.core

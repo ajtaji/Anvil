@@ -15,7 +15,7 @@ OUT = ROOT / "runs/neon-particle-end-split-desk-20261003"
 CHROME = ROOT / "Anvil/Graphics/Vulkan/neon_vk_chrome.pi4"
 PARTICLES = ROOT / "Anvil/Graphics/Vulkan/neon_vk_particles.pi4"
 BACKEND = ROOT / "Anvil/Graphics/Vulkan/vk_v3d_backend.pi4"
-CORE = ROOT / "RaspberryPi4/Examples/Diagnostics/vulkanNeonParticleMatchedProfileCore.pi4"
+CORE = ROOT / "RaspberryPi4/Examples/Diagnostics/vulkanNeonParticleMatchedProfileCore.pbi"
 CSD = ROOT / "Anvil/Graphics/Vulkan/neon_vk_particle_csd.pi4"
 
 
