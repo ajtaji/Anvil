@@ -24,6 +24,13 @@ Procedure.i TickHz()
   ProcedureReturn rock_timer_frequency
 EndProcedure
 
+; The HAL's microsecond clock (Anvil/Hal/hal.pbi HwMicros), which
+; Anvil/Storage/hwfile.pbi hands the exFAT profiler since 2026-10-30.
+Procedure.i HwMicros()
+  If rock_timer_frequency < 1000000 : ProcedureReturn 0 : EndIf
+  ProcedureReturn RockTimerTicks() / (rock_timer_frequency / 1000000)
+EndProcedure
+
 Procedure.i RockTimerInit()
   Protected first.i
   Protected second.i
