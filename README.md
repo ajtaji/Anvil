@@ -240,8 +240,8 @@ python tools/build.py all
 ```
 
 Outputs are written under the ignored `build/` directory. The wrapper pins
-`PMF_ROOT` to this checkout and stages the external compiler with this
-repository's board profile in a temporary directory. Missing includes
+`PMF_ROOT` to this checkout and runs the external compiler where it is
+installed; the board profiles are read from this checkout. Missing includes
 therefore fail instead of being borrowed from another installation.
 
 Target entries are
