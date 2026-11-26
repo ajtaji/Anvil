@@ -87,7 +87,7 @@ def check_source() -> int:
     scene = SCENE.read_text(encoding="utf-8")
     required = (
         'XIncludeFile "RaspberryPi4/Board/vulkan_dma.pi4"',
-        'XIncludeFile "Anvil/Graphics/Vulkan/neon_vk_chrome.pi4"',
+        'XIncludeFile "Anvil/Graphics/Vulkan/neon_vk_chrome.pbi"',
         'XIncludeFile "RaspberryPi4/Examples/Diagnostics/vulkanNeonWidgetAcceptanceScene.pbi"',
         "vkCreateInstance(@ici, 0, @inst)",
         "vkEnumeratePhysicalDevices(inst, @count, @phys)",

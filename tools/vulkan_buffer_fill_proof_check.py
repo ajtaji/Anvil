@@ -8,7 +8,7 @@ import struct
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "RaspberryPi4/Examples/Diagnostics/vulkanBufferFillProof.pi4"
-BACKEND = ROOT / "Anvil/Graphics/Vulkan/vk_v3d_backend.pi4"
+BACKEND = ROOT / "RaspberryPi4/Lib/Vulkan/vk_v3d_backend.pi4"
 DMA = ROOT / "RaspberryPi4/Board/vulkan_dma.pi4"
 MAGIC, TAIL = 0x46424B56, 0x564B4246
 
