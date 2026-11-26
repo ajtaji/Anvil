@@ -30,7 +30,7 @@ UTC = dt.timezone.utc
 
 def build(compiler: Path, work: Path) -> Path:
     staged = work / compiler.name
-    shutil.copy2(compiler, staged)
+    staged = compiler  # in place: the compiler finds its own libraries beside itself
     if (ROOT / "Boards").is_dir():
         shutil.copytree(ROOT / "Boards", work / "Boards")
     image = work / "wallclock_gate.img"

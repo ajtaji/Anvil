@@ -41,7 +41,7 @@ def symbols(path: Path) -> tuple[int, int]:
 
 def build(compiler: Path, work: Path) -> Path:
     staged = work / compiler.name
-    shutil.copy2(compiler, staged)
+    staged = compiler  # in place: the compiler finds its own libraries beside itself
     shutil.copytree(ROOT / "Boards", work / "Boards")
     image = work / "exfat_gate.img"
     env = os.environ.copy()

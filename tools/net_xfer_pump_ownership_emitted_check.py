@@ -298,7 +298,7 @@ def execute(a64, image: Path) -> tuple[int, int]:
 def build(compiler: Path, work: Path, text: str, stem: str) -> Path:
     staged = work / compiler.name
     if not staged.exists():
-        shutil.copy2(compiler, staged)
+        staged = compiler  # in place: the compiler finds its own libraries beside itself
     boards = ROOT / "Boards"
     if boards.is_dir() and not (work / "Boards").exists():
         shutil.copytree(boards, work / "Boards")

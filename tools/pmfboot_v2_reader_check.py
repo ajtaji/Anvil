@@ -422,7 +422,7 @@ def main() -> int:
     with tempfile.TemporaryDirectory(prefix="pmfboot-v2-reader-") as folder:
         work = Path(folder)
         compiler = work / Path(args.compiler).name
-        shutil.copy2(Path(args.compiler).resolve(), compiler)
+        compiler = Path(args.compiler).resolve()  # in place: the compiler finds its own libraries beside itself
         shutil.copytree(ROOT / "Boards", work / "Boards")
         source = work / "pmfboot_v2_reader.pi4"
         image = work / "pmfboot_v2_reader.img"

@@ -238,7 +238,7 @@ EndProcedure
 
 def build(compiler: Path, work: Path, probe: Path) -> Path:
     staged = work / compiler.name
-    shutil.copy2(compiler, staged)
+    staged = compiler  # in place: the compiler finds its own libraries beside itself
     if (ROOT / "Boards").is_dir():
         shutil.copytree(ROOT / "Boards", work / "Boards", dirs_exist_ok=True)
     image = work / "cyw43_key_clear_gate.img"

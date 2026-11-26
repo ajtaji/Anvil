@@ -13,7 +13,7 @@ def proc(s,n):
  return m.group(0)
 def run(a64,compiler,text,stem):
  with tempfile.TemporaryDirectory(prefix='anvil-touch-visual-') as td:
-  d=Path(td); exe=d/compiler.name; shutil.copy2(compiler,exe); src=d/'gate.pi4'; src.write_text(text,encoding='utf-8'); img=d/(stem+'.img'); env=os.environ.copy(); env['PMF_ROOT']=str(ROOT)
+  d=Path(td); exe=compiler; src=d/'gate.pi4'; src.write_text(text,encoding='utf-8'); img=d/(stem+'.img'); env=os.environ.copy(); env['PMF_ROOT']=str(ROOT)
   r=subprocess.run([str(exe), "--compile",str(src),'-t','pi4','--load-addr',hex(emitted.LOAD),'--stack-addr',hex(emitted.STACK),'--entry-returns','-o',str(img),'-s'],cwd=ROOT,env=env,text=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
   if r.returncode or 'pmfc: OK' not in r.stdout: raise SystemExit('touch visual gate: compile failed\n'+r.stdout)
   return emitted.execute(a64,img)

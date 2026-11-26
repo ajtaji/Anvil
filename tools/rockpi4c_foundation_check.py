@@ -109,7 +109,7 @@ def compiler_contract(compiler: Path, output_path: Path | None = None) -> None:
         output = output_path.resolve() if output_path else temp / "foundation.img"
         output.parent.mkdir(parents=True, exist_ok=True)
         staged_compiler = temp / compiler.name
-        shutil.copy2(compiler, staged_compiler)
+        staged_compiler = compiler  # in place: the compiler finds its own libraries beside itself
         shutil.copytree(ROOT / "Boards", temp / "Boards")
         command = [
             str(staged_compiler), "--compile", "RockPi4C/Board/board.rockpi4c",

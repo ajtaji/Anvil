@@ -297,7 +297,7 @@ def source_checks(read) -> int:
 
 def build(compiler: Path, work: Path, mutation: str = "") -> Path:
     staged = work / compiler.name
-    shutil.copy2(compiler, staged)
+    staged = compiler  # in place: the compiler finds its own libraries beside itself
     boards = ROOT / "Boards"
     if boards.is_dir():
         shutil.copytree(boards, work / "Boards")

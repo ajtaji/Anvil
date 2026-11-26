@@ -134,7 +134,7 @@ def fixture(bodies: str) -> str:
 def build(compiler: Path, work: Path, text: str, stem: str) -> Path:
     staged = work / compiler.name
     if not staged.exists():
-        shutil.copy2(compiler, staged)
+        staged = compiler  # in place: the compiler finds its own libraries beside itself
     if (ROOT / "Boards").is_dir() and not (work / "Boards").exists():
         shutil.copytree(ROOT / "Boards", work / "Boards")
     src = work / f"{stem}.pi4"

@@ -410,7 +410,7 @@ def build(compiler: Path) -> None:
     with tempfile.TemporaryDirectory(prefix="anvil-module-compiler-") as name:
         stage = Path(name)
         staged = stage / compiler.name
-        shutil.copy2(compiler, staged)
+        staged = compiler  # in place: the compiler finds its own libraries beside itself
         shutil.copytree(ROOT / "Boards", stage / "Boards")
         env = os.environ.copy()
         env["PMF_ROOT"] = str(ROOT)

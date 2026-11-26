@@ -31,7 +31,7 @@ def main():
     out=out.replace('; @@GLOBALS@@',gl).replace('; @@HELPERS@@',helpers).replace('; @@STATUS@@',status)
     with tempfile.TemporaryDirectory(prefix='anvil-rxready-status-') as td:
         image=emitted.build(compiler,Path(td),mutation='') if False else None
-        src=Path(td)/'gate.pi4'; src.write_text(out,encoding='utf-8'); staged=Path(td)/compiler.name; shutil.copy2(compiler,staged)
+        src=Path(td)/'gate.pi4'; src.write_text(out,encoding='utf-8'); staged=compiler
         import subprocess
         img=Path(td)/'gate.img'; env=os.environ.copy(); env['PMF_ROOT']=str(ROOT)
         r=subprocess.run([str(staged), "--compile",str(src),'-t','pi4','--load-addr',hex(emitted.LOAD),'--stack-addr',hex(emitted.STACK),'--entry-returns','-o',str(img),'-s'],cwd=ROOT,env=env,text=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT)

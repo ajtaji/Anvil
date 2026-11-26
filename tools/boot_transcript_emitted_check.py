@@ -18,7 +18,7 @@ def fixture(core: str) -> str:
 
 def build(compiler: Path, work: Path, text: str, stem: str) -> Path:
     staged = work / compiler.name
-    if not staged.exists(): shutil.copy2(compiler, staged)
+    if not staged.exists(): staged = compiler  # in place: the compiler finds its own libraries beside itself
     if (ROOT / "Boards").is_dir() and not (work / "Boards").exists(): shutil.copytree(ROOT / "Boards", work / "Boards")
     src = work / f"{stem}.pi4"; src.write_text(text, encoding="utf-8", newline="\n")
     image = work / f"{stem}.img"

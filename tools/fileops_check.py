@@ -553,7 +553,7 @@ def build(compiler: Path, source_root: Path, program: str, work: Path) -> tuple:
     src = work / "fileops_gate.pi4"
     src.write_bytes(program.encode("utf-8"))
     staged = work / compiler.name
-    shutil.copy2(compiler, staged)
+    staged = compiler  # in place: the compiler finds its own libraries beside itself
     if not (work / "Boards").exists():
         shutil.copytree(source_root / "Boards", work / "Boards")
     image = work / "fileops_gate.img"

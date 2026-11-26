@@ -296,7 +296,7 @@ MUTANTS = (
 def build(compiler: Path, work: Path, source: Path, stem: str) -> Path:
     staged = work / compiler.name
     if not staged.exists():
-        shutil.copy2(compiler, staged)
+        staged = compiler  # in place: the compiler finds its own libraries beside itself
     if (ROOT / "Boards").is_dir():
         shutil.copytree(ROOT / "Boards", work / "Boards", dirs_exist_ok=True)
     image = work / f"{stem}.img"
