@@ -36,7 +36,12 @@ XIncludeFile "Anvil/Graphics/Vulkan/neon_vk_target_info.pbi"
 #NEON_VK_CHROME_MAX_VERTEX_QUADS = ((#NEON_MAX_VERTS * 32 + #NEON_MAX_TVERTS * 24 + #NEON_MAX_DRAWS * 16) + 143) / 144
 ; A path may use the entire native flat input budget. Emitted GPU storage
 ; remains independently bounded, including line/outline expansion.
-#NEON_VK_CHROME_MAX_PATH_POINTS = #NEON_MAX_VERTS
+; A program whose paths are shorter may set it before including this file:
+; nvcPathX/Y and nvcSavedPathX/Y take 32 bytes per point between them
+; (8 MB at 262144 points).
+CompilerIf Not Defined(NEON_VK_CHROME_MAX_PATH_POINTS, #PB_Constant)
+  #NEON_VK_CHROME_MAX_PATH_POINTS = #NEON_MAX_VERTS
+CompilerEndIf
 #NEON_VK_CHROME_WAIT_NS        = 2000000000
 #NEON_VK_CHROME_F_ONE          = $3F800000
 #NVC_SPRITE_Q8_LIMIT           = 1500000
