@@ -50,7 +50,8 @@ def fixture(cache: str) -> str:
              "MMU_PERIPH_BASE", "MMU_PCIE_SLOT_LO", "MMU_PCIE_SLOT_HI",
              "MMU_ERR_NULL", "MMU_ERR_ALIGN", "MMU_ERR_LOW", "MMU_NC_MAX",
              "MMU_TCR_EL2", "MMU_MAIR_EL2")
-    fb = ("MON_FB_LO", "MON_FB_HI", "MON_FB_SCAN", "MON_FB_DRAW", "MON_FB_BYTES")
+    fb = ("MON_FB_LO", "MON_FB_HI", "MON_FB_SCAN", "MON_FB_DRAW", "MON_FB_BYTES",
+          "MON_VK_HEAP_LO", "MON_VK_HEAP_HI", "MON_LOWDMA_LO", "MON_LOWDMA_HI")
     procedures = ("MmuClearNc", "MmuAddNc", "mmu_BlockNc", "MmuBuildTables")
     return ("EnableExplicit\n" + "\n".join(constant(mmu, n) for n in names) +
             "\n" + "\n".join(constant(memmap, n) for n in fb) + "\n" +
