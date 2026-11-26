@@ -368,19 +368,22 @@ def build(compiler: str, target: str) -> None:
 
 
 def staged_compiler(compiler: str, directory: Path) -> str:
-    """Stage the executable with this repository's board profiles.
+    """The compiler to run: the one named, IN PLACE.
 
-    The current compiler resolves Boards/*.board relative to its executable,
-    outside the otherwise-pinned PMF_ROOT search. A temporary staging folder
-    makes that dependency explicit without checking a compiler binary in.
+    This used to copy the executable and this repository's Boards folder
+    into a temporary folder, because the compiler of the time read
+    Boards/*.board beside its executable even with PMF_ROOT pinned. It no
+    longer does: with PMF_ROOT pinned the board files come from the pinned
+    root (this repository, or the snapshot a gate pins), and the libraries
+    the compiler adds by itself (the string library and the others) are
+    found BESIDE THE COMPILER, in its own installation. A lone copy of the
+    executable has no installation beside it, so every program that uses a
+    string stopped with "could not FIND .../Shared/Text/text.pmi".
+    Run it where it is installed and pin PMF_ROOT; `directory` is unused and
+    kept only so the callers' signature stays.
     """
-    source = Path(compiler).resolve()
-    staged = directory / source.name
-    shutil.copy2(source, staged)
-    board_source = ROOT / "Boards"
-    if board_source.is_dir():
-        shutil.copytree(board_source, directory / "Boards")
-    return str(staged)
+    del directory
+    return str(Path(compiler).resolve())
 
 
 def main() -> int:
