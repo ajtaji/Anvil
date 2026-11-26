@@ -1152,6 +1152,20 @@ CompilerEndIf
 BssAddress   $0D000000
 StackAddress $8000000
 
+; THE MONITOR'S OWN HEAP, STATED (2026-11-26). A program that uses strings
+; is given a heap by the compiler: 32 MiB of its variables by default from
+; 2026-11-13, and, with the compiler's heap change of 2026-11-26, the free
+; memory above its BSS - which for this monitor would run from $0D000000
+; over the Vulkan heap at $10000000 (memmap.pi4, region 8). With 32 MiB the
+; variables already ran to $1170318F, across that heap. So the size is the
+; monitor's own, derived from the image: the linked monitor contains NO
+; allocator (no AllocateMemory, no growable-text routine; the listing's
+; only memory-library routines are pm_mem_copy and pm_mem_zero) and no
+; instruction refers to pm_mem_arena. Its peak use is 0 bytes. 1 MiB is
+; kept so a later allocation has room and, if it outgrows it, fails with
+; the library's own refusal instead of reaching another owner.
+#MEMORY_HEAP_BYTES = 1048576
+
 ; ======================================================================
 ;  THE BUILD NUMBER (forum 586: `version` could not tell one build from
 ;  another)
