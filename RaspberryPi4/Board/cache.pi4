@@ -247,7 +247,13 @@ Procedure CacheMapNc()
   ; render target line by line twice (2.15 ms each, measured), for coherency that Non-Cacheable gives by
   ; construction. CacheDmaPolicy declares both to the V3D and DMA libraries, which then skip those walks.
   ; The arena literal is #V3DCON_ARENA / #AVC_ARENA_BASE (both $0A000000, 16 MiB), included after this file.
-  MmuAddNc($0C000000, $0D000000)                  ; #MON_VK_HEAP_LO .. _HI (memmap.pi4)
+  ; The Vulkan heap and the low DMA area by their memmap.pi4 constants. Until
+  ; 2026-11-26 this line was the literal $0C000000..$0CFFFFFF, the BCM2712's
+  ; heap band, while the BCM2711's heap was at $10000000 and mapped
+  ; Write-Back; it is the low DMA area now (the mailbox buffer), and stays
+  ; Non-Cacheable for that.
+  MmuAddNc(#MON_VK_HEAP_LO, #MON_VK_HEAP_HI + 1)
+  MmuAddNc(#MON_LOWDMA_LO, #MON_LOWDMA_HI + 1)
   MmuAddNc($0A000000, $0B000000)
   CompilerEndIf
 EndProcedure
@@ -271,7 +277,7 @@ Procedure CacheDmaPolicy()
   V3dClearUncached()
   V3dSetCacheOff(Bool(gCacheOn = 0 And gCacheRetired <> 0))
   If gCacheOn <> 0                                 ; mapped Non-Cacheable by CacheMapNc: no line to clean
-    V3dDeclareUncached($0C000000, $0D000000)
+    V3dDeclareUncached(#MON_VK_HEAP_LO, #MON_VK_HEAP_HI + 1)
     V3dDeclareUncached($0A000000, $0B000000)
   EndIf
   CompilerEndIf
@@ -285,7 +291,7 @@ Procedure CacheDmaPolicy()
     DmaAddUncached(gCacheDspLo, gCacheDspHi)
   EndIf
   CompilerIf #PMF_CHIP <> 2712
-  DmaAddUncached($0C000000, $0D000000)
+  DmaAddUncached(#MON_VK_HEAP_LO, #MON_VK_HEAP_HI + 1)
   DmaAddUncached($0A000000, $0B000000)
   CompilerEndIf
 EndProcedure

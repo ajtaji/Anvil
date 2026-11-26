@@ -206,26 +206,38 @@
 ;                         THE ETHERNET RECEIVE REGION under THE NETWORK.
 ;   $08200000..$0BFFFFFF  named DSI framebuffer, module arena, V3D arena
 ;                         and screenshot reservations (see memmap.pi4)
-;   $10000000..$13FFFFFF  Pi 4 monitor Vulkan device-memory heap
-;   $0C000000..$0CFFFFFF  Pi 5 reserved Vulkan heap (backend unqualified)
-;   $0D000000..$0DFFFFFF  #MON_DATA_LO..#MON_DATA_HI - 16 MiB monitor BSS
-;                         reservation, checked against the linker map.
-;                         It follows the Vulkan heap and is protected by
-;                         HitsMonitor().
-;   $0E000000..$3B2FFFFF  free, but DELIBERATELY NOT OFFERED - see below
+;   $0C000000..$0CFFFFFF  #MON_LOWDMA_* - the low DMA area: the mailbox's
+;                         message buffer, Non-Cacheable (the Pi 5's
+;                         Vulkan heap band; empty on the Pi 4 before
+;                         2026-11-26)
+;   $0D000000..           #MON_DATA_LO - monitor BSS, its linked extent
+;                         rounded to a megabyte, at least 16 MiB and never
+;                         past #MON_DATA_CEIL $17FFFFFF (a64_anvil_check).
+;                         74.5 MiB on 2026-11-26, the compiler's 32 MiB heap
+;                         included. Protected by HitsMonitor().
+;   $18000000..$1BFFFFFF  #MON_VK_HEAP_* - the monitor's Vulkan heap, 64 MiB
+;                         (at $10000000 until 2026-11-26, where the variables
+;                         had grown across it)
+;   $1C000000..           #PAY2_LO - the MIDDLE payload window, to the top
+;                         of the ARM's share of the first gigabyte as the
+;                         firmware states it (at most $3B2FFFFF), split
+;                         around the firmware's device tree when it lies
+;                         inside. Built by HwMapProbe at boot; see THE
+;                         MIDDLE WINDOW in memmap.pi4.
 ;   $3B03C000..$3B2FFFFF  U-Boot relocated, its heap, its stack, and the
 ;                         code the three parked cores are spinning in.
-;                         HISTORICAL, and left in the map on purpose:
+;                         HISTORICAL (it is inside the middle window now):
 ;                         U-Boot is no longer on the stick (safety.pi4:
 ;                         362-365), so nothing of it is up there now and
 ;                         the parked cores are in the FIRMWARE's spin
 ;                         table at $00000000..$00000FFF instead
 ;                         (smp.pi4:361-364 names the four release
-;                         words). The line stays because the band is
-;                         still not offered and because a range that
+;                         words). The line stays because a range that
 ;                         silently disappears from a map gets re-used by
 ;                         somebody who never knew it was claimed.
-;   $3B300000..$3FFFFFFF  not DRAM - the hole between the two banks
+;   $3B300000..$3FFFFFFF  not the ARM's - the VideoCore's share of the
+;                         first gigabyte (config.txt gpu_mem), which
+;                         bdinfo reports as the gap between the banks
 ;   $40000000..$FBFFFFFF  #PAY1_LO..#PAY1_HI  HIGH window, 3 GiB
 ;   $FC000000..$FFFFFFFF  VideoCore and the peripheral aperture
 ;
@@ -3244,6 +3256,10 @@ Procedure Main()
     PrintN("!! the ARM clock could not be raised - running at the firmware's")
     PrintN("   boot speed. Everything here still works, just slower. 'c' shows it.")
   EndIf
+
+  ; The middle payload window and the firmware device tree's pages
+  ; (memmap.pi4, THE MIDDLE WINDOW): asked once, before anything can load.
+  HwMapProbe(HwFirmwareDtb())
 
   ; TimerInit() does two things and only the second is worth calling
   ; for: it caches CNTFRQ_EL0, which Micros()/millis() would do lazily

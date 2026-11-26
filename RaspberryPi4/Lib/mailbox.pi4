@@ -601,6 +601,7 @@ CompilerEndIf
 
 ; ---- the tags (see THE TAGS above for the two sources) ---------------
 #MBX_TAG_BOARD_REVISION = $00010002
+#MBX_TAG_ARM_MEMORY     = $00010005   ; base, size of the ARM's share of the first GiB
 #MBX_TAG_GET_CLOCK      = $00030002
 #MBX_TAG_SET_CLOCK      = $00038002
 #MBX_TAG_MAX_CLOCK      = $00030004
@@ -993,7 +994,23 @@ CompilerEndIf
 #MBX_MODE_SINGLE = 1
 #MBX_MODE_LIST   = 2
 
+;
+; WHERE THE MESSAGE BUFFER IS - BCM2711, 2026-11-26. The VideoCore can name
+; only the first gigabyte, and a buffer in this program's variables is in
+; the first gigabyte only while the program's BSS is. So on the BCM2711 the
+; buffer is the first page of Anvil's low DMA area, #MBX_LOW_PAGE - the
+; same address in the monitor and in every payload, below $40000000 by
+; construction, mapped Non-Cacheable by the monitor's tables
+; (RaspberryPi4/Board/memmap.pi4 #MON_LOWDMA_MBX, which must equal it).
+; Sharing one page is safe for the same reason sharing mbxBuf inside one
+; program always was: every caller builds, sends and reads one message
+; before it returns, and a payload's own calls and the monitor services it
+; calls never interleave. The other chips keep the buffer in BSS.
+CompilerIf #PMF_CHIP = 2711
+#MBX_LOW_PAGE = $0C000000
+CompilerElse
 Global Dim mbxBuf.l[#MBX_BUF_WORDS]
+CompilerEndIf
 
 Global mbxBufAddr.i            ; 64-byte-aligned ARM address inside mbxBuf
 Global mbxBusAddr.i            ; the same buffer, named for the VideoCore
@@ -1154,7 +1171,11 @@ Procedure.i MailboxInit()
   ; -64 is a full-width 64-bit mask, which is why it is written as -64
   ; and not as a hex literal that would be 32 bits wide and would clear
   ; the top half of the address as well as the low six bits.
+  CompilerIf #PMF_CHIP = 2711
+  mbxBufAddr = #MBX_LOW_PAGE
+  CompilerElse
   mbxBufAddr = (@mbxBuf[0] + (#MBX_CACHE_LINE - 1)) & (-64)
+  CompilerEndIf
 
   ; The dma-ranges alias is 0x40000000 long. Above that there is no name
   ; for this buffer that the VideoCore would understand, and forming one

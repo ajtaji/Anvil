@@ -575,6 +575,7 @@ def section_layout(ctx: Ctx) -> None:
         ("V3D arena", "V3DCON_ARENA", None),
         ("screenshot capture", "MON_SHOT_LO", "MON_SHOT_HI"),
         ("Vulkan heap", "MON_VK_HEAP_LO", "MON_VK_HEAP_HI"),
+        ("low DMA area", "MON_LOWDMA_LO", "MON_LOWDMA_HI"),
         ("high payload window", e["PAY1_LO"], e["PAY1_HI"]),
     )
     v3d_text = read("RaspberryPi4/Board/v3d_console.pi4")
@@ -594,6 +595,103 @@ def section_layout(ctx: Ctx) -> None:
     ctx.case(not (lo <= e["MON_HI"] and hi - 1 >= e["MON_LO"]),
              "BSS $%08X..$%08X is inside the monitor's code window "
              "$%08X..$%08X" % (lo, hi - 1, e["MON_LO"], e["MON_HI"]))
+
+
+# =====================================================================
+#  THE MIDDLE WINDOW, THE LOW DMA AREA AND THE MONITOR'S DATA CEILING
+# =====================================================================
+#  2026-11-26. RaspberryPi4/Board/memmap.pi4 offers the first gigabyte
+#  above the Vulkan heap as payload windows 2 and 3, built by HwMapBuild
+#  from two facts the board asks for at boot (the ARM's share of the first
+#  gigabyte and the firmware device tree's pages). HwMapBuild is pure, so
+#  it is EXECUTED here on the built image with the facts supplied; the
+#  probe that asks the firmware is not, because it needs one.
+def section_middle(ctx: Ctx) -> None:
+    text = MAP.read_text(encoding="utf-8", errors="replace")
+    k = {n: const(text, n) for n in (
+        "MON_DATA_LO", "MON_DATA_CEIL", "MON_VK_HEAP_LO", "MON_VK_HEAP_HI",
+        "MON_LOWDMA_LO", "MON_LOWDMA_HI", "MON_LOWDMA_MBX", "PAY2_LO",
+        "PAY2_HI_MAX", "PAY0_HI", "PAY1_LO", "PAY_STACK_HI", "MON_GRAIN",
+        "MON_REGION_LOWDMA", "MON_REGION_FWDTB", "MON_REGION_VK_HEAP")}
+    mbx = const(read("RaspberryPi4/Lib/mailbox.pi4"), "MBX_LOW_PAGE")
+    ctx.case(mbx == k["MON_LOWDMA_MBX"],
+             "mailbox.pi4 #MBX_LOW_PAGE $%08X is not memmap.pi4 "
+             "#MON_LOWDMA_MBX $%08X" % (mbx, k["MON_LOWDMA_MBX"]))
+    ctx.case(k["MON_LOWDMA_LO"] <= k["MON_LOWDMA_MBX"] and
+             k["MON_LOWDMA_MBX"] + 4096 <= k["MON_LOWDMA_HI"] + 1 and
+             k["MON_LOWDMA_HI"] < 0x40000000,
+             "the mailbox page is not inside the low DMA area below 1 GiB")
+    # The order of the owners above the low window, and the ceiling.
+    order = (("low DMA area", k["MON_LOWDMA_LO"], k["MON_LOWDMA_HI"]),
+             ("monitor variables", k["MON_DATA_LO"], k["MON_DATA_CEIL"]),
+             ("Vulkan heap", k["MON_VK_HEAP_LO"], k["MON_VK_HEAP_HI"]),
+             ("middle window", k["PAY2_LO"], k["PAY2_HI_MAX"]))
+    for (an, alo, ahi), (bn, blo, bhi) in zip(order, order[1:]):
+        ctx.case(alo <= ahi < blo <= bhi,
+                 "the %s $%08X..$%08X does not lie wholly below the %s "
+                 "$%08X..$%08X" % (an, alo, ahi, bn, blo, bhi))
+    ctx.case(k["PAY2_HI_MAX"] < k["PAY1_LO"], "the middle window reaches the high one")
+    end = ctx.sym.get("__noclear_end__", ctx.sym.get("__bss_end__"))
+    ctx.case(end is not None and end - 1 <= k["MON_DATA_CEIL"],
+             "the monitor's variables end at $%08X, past #MON_DATA_CEIL $%08X "
+             "- they would run into the Vulkan heap at $%08X"
+             % ((end or 1) - 1, k["MON_DATA_CEIL"], k["MON_VK_HEAP_LO"]))
+    cpu = ctx.cpu()
+    ctx.case(ctx.call(cpu, "hwpaywindows") == 2,
+             "HwPayWindows() is not 2 before the board has asked its facts")
+    for i, lo, hi in ((k["MON_REGION_LOWDMA"], k["MON_LOWDMA_LO"], k["MON_LOWDMA_HI"]),
+                      (k["MON_REGION_VK_HEAP"], k["MON_VK_HEAP_LO"], k["MON_VK_HEAP_HI"])):
+        ctx.case(ctx.call(cpu, "hwmonregionlo", i) == lo and
+                 ctx.call(cpu, "hwmonregionhi", i) == hi,
+                 "monitor region %d is not $%08X..$%08X" % (i, lo, hi))
+    ctx.case(ctx.call(cpu, "hwmonregions") == 11, "HwMonRegions() is not 11")
+    top = k["PAY2_HI_MAX"]
+    dtb = k["MON_REGION_FWDTB"]
+    p0 = ctx.edges["PAY0_LO"]
+    cases = (
+        # (armTop, dtbLo, dtbHi, windows wanted [(lo, hi)...], dtb region, why)
+        (0, 1, 0, [], None, "no ARM memory answer: no middle window"),
+        (0x3B400000, 1, 0, [(k["PAY2_LO"], top)], None,
+         "the default 76 MiB GPU split, capped at the measured $3B2FFFFF"),
+        (0x30000000, 1, 0, [(k["PAY2_LO"], 0x2FFFFFFF)], None,
+         "a larger gpu_mem: the window follows the firmware's answer"),
+        (0x3B400000, 0x2EFF0000, 0x2EFFFFFF,
+         [(k["PAY2_LO"], 0x2EEFFFFF), (0x2F000000, top)], (0x2EFF0000, 0x2EFFFFFF),
+         "a device tree inside the window splits it at whole megabytes"),
+        (0x3B400000, k["PAY2_LO"], k["PAY2_LO"] + 0xFFFF,
+         [(k["PAY2_LO"] + 0x100000, top)], (k["PAY2_LO"], k["PAY2_LO"] + 0xFFFF),
+         "a device tree at the window's foot leaves one window above it"),
+        (0x3B400000, p0, p0 + 0xFFFF, [(k["PAY2_LO"], top)], None,
+         "a device tree in the low window is left as before, not reserved"),
+        (k["PAY2_LO"] + 0x80000, 1, 0, [], None,
+         "an ARM share that ends below the window builds none"),
+    )
+    for arm, dlo, dhi, want, region, why in cases:
+        n = ctx.call(cpu, "hwmapbuild", arm, dlo, dhi)
+        got = [(ctx.call(cpu, "hwpaylo", i), ctx.call(cpu, "hwpayhi", i))
+               for i in range(2, n)]
+        ctx.case(n == 2 + len(want) and got == want,
+                 "HwMapBuild($%X, $%X, $%X) gave %d windows %s, wanted %s - %s"
+                 % (arm, dlo, dhi, n, ["$%X..$%X" % w for w in got],
+                    ["$%X..$%X" % w for w in want], why))
+        rlo = ctx.call(cpu, "hwmonregionlo", dtb)
+        rhi = ctx.call(cpu, "hwmonregionhi", dtb)
+        if region is None:
+            ctx.case(rlo > rhi, "the device-tree region is $%X..$%X and should "
+                     "be empty - %s" % (rlo, rhi, why))
+        else:
+            ctx.case((rlo, rhi) == region, "the device-tree region is $%X..$%X, "
+                     "wanted $%X..$%X - %s" % (rlo, rhi, region[0], region[1], why))
+        for lo, hi in want:
+            ctx.case(ctx.call(cpu, "payloadtop", lo + 0x1000) == hi,
+                     "PayloadTop inside $%X..$%X does not answer its top - %s"
+                     % (lo, hi, why))
+    # The windows of the last ordinary case are left built for the next line.
+    ctx.call(cpu, "hwmapbuild", 0x3B400000, 1, 0)
+    ctx.case(ctx.call(cpu, "payloadtop", k["MON_VK_HEAP_HI"]) == 0,
+             "the Vulkan heap's last byte answers a payload window")
+    ctx.case(ctx.call(cpu, "payloadtop", k["PAY2_LO"] - 1) == 0,
+             "the byte below the middle window answers a payload window")
 
 
 # =====================================================================
@@ -3316,7 +3414,7 @@ def run_sections() -> int:
     for what in attribution_self_test():
         ctx.case(False, what)
     ctx.edges = window_edges(ctx)
-    for section in (section_layout, section_parse, section_address,
+    for section in (section_layout, section_middle, section_parse, section_address,
                     section_i2c, section_info, section_build_number,
                     section_identity, section_width, section_netrecv,
                     section_sendceiling,

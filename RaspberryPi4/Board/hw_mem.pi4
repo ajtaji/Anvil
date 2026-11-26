@@ -251,3 +251,58 @@ Procedure PutMemBytes(b.i)
     Print(" MB")
   EndIf
 EndProcedure
+
+; ----------------------------------------------------------------------
+;  HwMapProbe(dtb) - ASK THE TWO FACTS THE MIDDLE WINDOW IS MADE OF.
+;
+;  IT LIVES HERE AND NOT IN memmap.pi4 because it talks to the firmware:
+;  memmap.pi4 is included before the mailbox library in fixtures that
+;  build it alone, and it keeps only the arithmetic (HwMapBuild).
+;
+;  Called once by Main, early, with the device-tree pointer the firmware
+;  handed over (HwFirmwareDtb). It asks the firmware for the ARM's share of
+;  the first gigabyte, reads the device tree's size from its own header,
+;  and builds windows 2 and 3. Anything it cannot establish leaves the
+;  middle window out rather than guessing it: no answer from the mailbox,
+;  an answer below #PAY2_LO, or a share that does not start at 0.
+;
+;  The device tree's pages are kept from its first page to the 64 KiB
+;  boundary after its last byte (the Pi 5's measured region is bounded the
+;  same way); a pointer whose header does not carry the FDT magic is not a
+;  device tree and reserves nothing.
+; ----------------------------------------------------------------------
+Procedure.i MapBe32(p.i)
+  ProcedureReturn (PeekA(p) << 24) | (PeekA(p + 1) << 16) | (PeekA(p + 2) << 8) | PeekA(p + 3)
+EndProcedure
+
+Procedure HwMapProbe(dtb.i)
+  Define base.i, size.i, top.i, total.i, lo.i, hi.i
+  gMapProbed = 1
+  CompilerIf #PMF_CHIP <> 2712
+  lo = 1 : hi = 0 : top = 0
+  ; The device tree's pages, from its own header.
+  If dtb > 0 And dtb < #PAY1_LO
+    If MapBe32(dtb) = $D00DFEED
+      total = MapBe32(dtb + 4)
+      If total > 0 And total <= $00100000
+        lo = (dtb / 4096) * 4096
+        hi = ((dtb + total + $FFFF) / $10000) * $10000 - 1
+      EndIf
+    EndIf
+  EndIf
+  ; The ARM's share of the first gigabyte, from the firmware.
+  If MailboxReady() = 0
+    MailboxInit()
+  EndIf
+  If MailboxReady() <> 0
+    If MailboxBegin(#MBX_TAG_ARM_MEMORY, 0, 8) <> 0
+      If MailboxSend() <> 0
+        base = MailboxWord(0) & $FFFFFFFF
+        size = MailboxWord(1) & $FFFFFFFF
+        If base = 0 And size > 0 : top = size : EndIf
+      EndIf
+    EndIf
+  EndIf
+  HwMapBuild(top, lo, hi)
+  CompilerEndIf
+EndProcedure

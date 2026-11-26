@@ -331,6 +331,26 @@ CompilerEndIf
 #MON_DATA_HI    = $0DFFFFFF
 
 ; ----------------------------------------------------------------------
+;  THE BAND THE MONITOR'S VARIABLES MAY GROW INTO - BCM2711, 2026-11-26.
+;
+;  The linked extent is what the monitor reserves (HwMonDataHi), and it
+;  has no fixed top. What it must never do is reach the next owner. On
+;  2026-11-26 it had: the compiler's heap (pm_mem_arena, 32 MiB, NoClear,
+;  laid out after the zeroed variables since 2026-11-13) took the extent
+;  from $0D000000 to $1170318F, while the Vulkan heap was at $10000000.
+;  The two overlapped by 23 MiB and nothing refused it.
+;
+;  So the band has a ceiling, the next owner starts above it, and
+;  tools/a64/a64_anvil_check.py fails a build whose variables cross it:
+;  $0D000000..$17FFFFFF, 176 MiB, of which this monitor used 74.5 MiB on
+;  the day it was written. The Vulkan heap moved to $18000000.
+; ----------------------------------------------------------------------
+CompilerIf #PMF_CHIP = 2712
+CompilerElse
+#MON_DATA_CEIL  = $17FFFFFF
+CompilerEndIf
+
+; ----------------------------------------------------------------------
 ;  THE PAYLOAD WINDOWS. The LOW window's bottom edge is computed - see
 ;  HwPayLo() below. The other three edges are measured facts about this
 ;  board's DRAM and stay constants:
@@ -373,6 +393,63 @@ CompilerEndIf
 ; before any bytes are placed.
 #PAY_STACK_LO = $07F00000
 #PAY_STACK_HI = $080FFFFF
+
+; ----------------------------------------------------------------------
+;  THE MIDDLE WINDOW - BCM2711, NEW 2026-11-26.
+;
+;  WHY. The low window is 111 MiB at most, and the high one is above the
+;  first gigabyte, where the legacy DMA engines, the HVS and the VideoCore
+;  mailbox cannot see (dma.pi4 #DMA_LIMIT, mailbox.pi4 #MBX_DMA_LIMIT). A
+;  payload that uses this board's own graphics libraries keeps buffers the
+;  DMA engine reads in its variables, so its BSS must be below $40000000 -
+;  and its variables alone were 34 MB on this date. Meanwhile most of the
+;  first gigabyte was claimed by nobody: everything from the Vulkan heap to
+;  the top of the ARM's share was "free, but deliberately not offered".
+;
+;  WHAT IS REALLY THERE, from $1C000000 up to the top of the ARM's memory
+;  in the first gigabyte:
+;    * the ARM's share ends where the VideoCore's begins. config.txt's
+;      gpu_mem decides it, so it is ASKED (mailbox tag $00010005, "get ARM
+;      memory", once, by HwMapProbe) and never typed. bdinfo measured the
+;      share's end at $3B2FFFFF on the bench card, which sets no gpu_mem;
+;      #PAY2_HI_MAX caps the answer at that figure.
+;    * the firmware's device tree. The firmware chooses its address and
+;      hands it over in x0 (hw_boot.pi4); `boot` gives it to the kernel it
+;      starts, so it is kept. HwMapProbe reads its header's totalsize and it
+;      becomes a monitor region (#MON_REGION_FWDTB). When it lies inside the
+;      window it splits the window in two at whole megabytes, so a payload
+;      is never told a window it cannot use from end to end.
+;    * nothing else. Everything this monitor reserves is below $1C000000.
+;
+;  CACHE AND DMA. The window is Write-Back in this monitor's tables (the
+;  low gigabyte is Write-Back except CacheMapNc's list), and it is not in
+;  the DMA or V3D no-walk lists, so a DMA that reads it is cleaned first.
+;  A payload that installs its own tables decides for itself, as before.
+;
+;  BEFORE HwMapProbe HAS RUN there is no middle window: HwPayWindows()
+;  answers 2. So a model that never boots (the gates' interpreter) sees
+;  the two windows it always saw.
+;
+;  THE OLD WINDOWS DID NOT MOVE. #PAY0_HI, #PAY1_*, the stack corridor and
+;  the computed low edge are exactly as they were, so every payload built
+;  for the old map still loads.
+; ----------------------------------------------------------------------
+CompilerIf #PMF_CHIP = 2712
+CompilerElse
+#PAY2_LO     = $1C000000
+#PAY2_HI_MAX = $3B2FFFFF
+#MON_REGION_LOWDMA = 9
+#MON_REGION_FWDTB  = 10
+CompilerEndIf
+
+; What HwMapProbe found. 0 until it has run.
+Global gMapProbed.i
+Global gMapArmTop.i            ; one past the ARM's last byte in the first GiB
+Global gMapDtbLo.i             ; the firmware DTB's pages; hi <= lo for none
+Global gMapDtbHi.i
+Global gMapMidN.i              ; middle windows built: 0, 1 or 2 (zero = none)
+Global Dim gMapMidLo.i[2]
+Global Dim gMapMidHi.i[2]
 
 
 ; ----------------------------------------------------------------------
@@ -699,20 +776,44 @@ CompilerEndIf
 ; monitor BSS and below payload bank 1. The earlier 16 MiB window could not
 ; create an 800x600 canvas alongside the resident console's own resources.
 ; Other board maps retain their existing allocation until their GPU is proved.
-; _HI is written out in each branch, not computed: tools/a64/a64_anvil_check.py
-; reads these constants literally and could not read the expression, so it
-; stopped before its first case - including the one that checks the monitor's
-; variables against this heap.
+;
+; BCM2711: $18000000, above the ceiling of the monitor's variables
+; (#MON_DATA_CEIL). It was at $10000000 from 2026-10-29 to 2026-11-26, and
+; the monitor's variables grew across it (see THE BAND THE MONITOR'S
+; VARIABLES MAY GROW INTO). cache.pi4 maps it Non-Cacheable through these
+; constants; it used to map the BCM2712's $0C000000 instead.
 CompilerIf #PMF_CHIP = 2711
-#MON_VK_HEAP_LO      = $10000000
+#MON_VK_HEAP_LO      = $18000000
 #MON_VK_HEAP_BYTES   = $04000000
-#MON_VK_HEAP_HI      = $13FFFFFF
+#MON_VK_HEAP_HI      = $1BFFFFFF
 CompilerElse
 #MON_VK_HEAP_LO      = $0C000000
 #MON_VK_HEAP_BYTES   = $01000000
 #MON_VK_HEAP_HI      = $0CFFFFFF
 CompilerEndIf
 #MON_REGION_VK_HEAP  = 8
+
+; ----------------------------------------------------------------------
+;  THE LOW DMA AREA - BCM2711, NEW 2026-11-26.
+;
+;  $0C000000..$0CFFFFFF is the band the Pi 5 uses for its Vulkan heap; on
+;  the Pi 4 it has held nothing since that heap moved up on 2026-10-29,
+;  and cache.pi4 has mapped it Non-Cacheable all along. It becomes the
+;  place a buffer goes when the VideoCore or a 30-bit DMA engine must reach
+;  it whatever the program's variables are: the first page is the property
+;  mailbox's message buffer (mailbox.pi4 #MBX_LOW_PAGE, which must equal
+;  #MON_LOWDMA_MBX - tools/a64/a64_anvil_check.py checks it). A buffer in
+;  BSS is reachable only while BSS is below $40000000; this one always is.
+;
+;  The rest of the area is reserved and unassigned. It is a monitor region
+;  (#MON_REGION_LOWDMA), so `w`, `fill`, `copy` and every load refuse it.
+; ----------------------------------------------------------------------
+CompilerIf #PMF_CHIP = 2712
+CompilerElse
+#MON_LOWDMA_LO  = $0C000000
+#MON_LOWDMA_HI  = $0CFFFFFF
+#MON_LOWDMA_MBX = $0C000000
+CompilerEndIf
 
 ; The header's words. LOGICAL width and height are what the picture is
 ; STREAMED as - the console's own coordinates, the same numbers `p` puts
@@ -1167,7 +1268,7 @@ Procedure.i HwMonRegions()
   CompilerIf #PMF_CHIP = 2712
   ProcedureReturn 13
   CompilerElse
-  ProcedureReturn 9
+  ProcedureReturn 11
   CompilerEndIf
 EndProcedure
 
@@ -1177,6 +1278,12 @@ Procedure.i HwMonRegionLo(i.i)
   If i = #MON_REGION_DTB : ProcedureReturn #MON_FWDTB_LO : EndIf
   If i = #MON_REGION_FWFB : ProcedureReturn #MON_FWFB_LO : EndIf
   If i = #MON_REGION_STACK : ProcedureReturn #MON_STACK_LO : EndIf
+  CompilerElse
+  If i = #MON_REGION_LOWDMA : ProcedureReturn #MON_LOWDMA_LO : EndIf
+  If i = #MON_REGION_FWDTB
+    If gMapDtbHi <= gMapDtbLo : ProcedureReturn 1 : EndIf
+    ProcedureReturn gMapDtbLo
+  EndIf
   CompilerEndIf
   Select i
     Case 0 : ProcedureReturn HwMonLo()
@@ -1202,6 +1309,12 @@ Procedure.i HwMonRegionHi(i.i)
   If i = #MON_REGION_DTB : ProcedureReturn #MON_FWDTB_HI : EndIf
   If i = #MON_REGION_FWFB : ProcedureReturn #MON_FWFB_HI : EndIf
   If i = #MON_REGION_STACK : ProcedureReturn #MON_STACK_HI : EndIf
+  CompilerElse
+  If i = #MON_REGION_LOWDMA : ProcedureReturn #MON_LOWDMA_HI : EndIf
+  If i = #MON_REGION_FWDTB
+    If gMapDtbHi <= gMapDtbLo : ProcedureReturn 0 : EndIf
+    ProcedureReturn gMapDtbHi
+  EndIf
   CompilerEndIf
   Select i
     Case 0 : ProcedureReturn HwMonHi()
@@ -1234,6 +1347,18 @@ Procedure HwMonRegionSay(i.i)
     ProcedureReturn
   ElseIf i = #MON_REGION_STACK
     Print("this monitor's own stack")
+    ProcedureReturn
+  EndIf
+  CompilerElse
+  If i = #MON_REGION_LOWDMA
+    Print("the low DMA area (the mailbox buffer)")
+    ProcedureReturn
+  ElseIf i = #MON_REGION_FWDTB
+    If gMapDtbHi <= gMapDtbLo
+      Print("the firmware device tree (none found)")
+    Else
+      Print("the firmware device tree, where the firmware put it")
+    EndIf
     ProcedureReturn
   EndIf
   CompilerEndIf
@@ -1287,8 +1412,11 @@ EndProcedure
 ;  arithmetic: an image of any size produces a window that starts above
 ;  it. That is the ruling of 2026-09-08 written as code.
 ; ======================================================================
+; Windows 0 and 1 are the low and high windows, whose numbers never
+; change; 2 and 3 are the middle window, present once HwMapProbe has run
+; (one window, or two when the firmware's device tree lies inside it).
 Procedure.i HwPayWindows()
-  ProcedureReturn 2
+  ProcedureReturn 2 + gMapMidN
 EndProcedure
 
 Procedure.i HwPayLo(i.i)
@@ -1296,6 +1424,7 @@ Procedure.i HwPayLo(i.i)
     Case 0 : ProcedureReturn MonGrainUp(#MON_LO + HwMonBytes())
     Case 1 : ProcedureReturn #PAY1_LO
   EndSelect
+  If i >= 2 And i < 2 + gMapMidN : ProcedureReturn gMapMidLo[i - 2] : EndIf
   ProcedureReturn 1
 EndProcedure
 
@@ -1304,8 +1433,59 @@ Procedure.i HwPayHi(i.i)
     Case 0 : ProcedureReturn #PAY0_HI
     Case 1 : ProcedureReturn #PAY1_HI
   EndSelect
+  If i >= 2 And i < 2 + gMapMidN : ProcedureReturn gMapMidHi[i - 2] : EndIf
   ProcedureReturn 0
 EndProcedure
+
+; HwMapBuild(armTop, dtbLo, dtbHi) - the arithmetic, and nothing else, so
+; tools/a64/a64_anvil_check.py can execute it with no firmware: the windows
+; and the device-tree region from the two facts. armTop 0 means "not known"
+; and builds no middle window; dtbLo > dtbHi means no device tree. Answers
+; HwPayWindows().
+Procedure.i HwMapBuild(armTop.i, dtbLo.i, dtbHi.i)
+  CompilerIf #PMF_CHIP = 2712
+  ProcedureReturn 2
+  CompilerElse
+  Define top.i, lo.i, hi.i, cutLo.i, cutHi.i
+  gMapMidN = 0
+  gMapDtbLo = 1 : gMapDtbHi = 0
+  gMapArmTop = 0
+  ; The device tree is reserved only where no payload built for the old
+  ; map could already be - outside the low window, its stack corridor and
+  ; the high window - so a payload that loaded before still loads.
+  If dtbLo <= dtbHi And dtbLo > 0 And dtbHi < #PAY1_LO
+    If dtbLo > #PAY_STACK_HI Or dtbHi < HwPayLo(0)
+      gMapDtbLo = dtbLo : gMapDtbHi = dtbHi
+    EndIf
+  EndIf
+  If armTop <= 0 : ProcedureReturn 2 + gMapMidN : EndIf
+  top = armTop
+  If top > #PAY2_HI_MAX + 1 : top = #PAY2_HI_MAX + 1 : EndIf
+  top = (top / #MON_GRAIN) * #MON_GRAIN
+  gMapArmTop = top
+  If top <= #PAY2_LO + #MON_GRAIN : ProcedureReturn 2 + gMapMidN : EndIf
+  lo = #PAY2_LO
+  hi = top - 1
+  If gMapDtbHi > gMapDtbLo And gMapDtbLo <= hi And gMapDtbHi >= lo
+    cutLo = (gMapDtbLo / #MON_GRAIN) * #MON_GRAIN
+    cutHi = MonGrainUp(gMapDtbHi + 1)
+    If cutLo > lo
+      gMapMidLo[gMapMidN] = lo : gMapMidHi[gMapMidN] = cutLo - 1
+      gMapMidN = gMapMidN + 1
+    EndIf
+    If cutHi <= hi
+      gMapMidLo[gMapMidN] = cutHi : gMapMidHi[gMapMidN] = hi
+      gMapMidN = gMapMidN + 1
+    EndIf
+  Else
+    gMapMidLo[gMapMidN] = lo : gMapMidHi[gMapMidN] = hi
+    gMapMidN = gMapMidN + 1
+  EndIf
+  ProcedureReturn 2 + gMapMidN
+  CompilerEndIf
+EndProcedure
+
+
 
 ; Does the PMF initial stack area belong to memory a payload may use?
 ; The only exception to the regular payload windows is the dedicated

@@ -286,13 +286,17 @@ Procedure PutMonitorMap()
   PrintN(" bytes, measured from the image itself")
   n = HwMonRegions()
   For i = 0 To n - 1
-    Print("  reserved        ")
-    PutAddr(HwMonRegionLo(i))
-    Print(" to ")
-    PutAddr(HwMonRegionHi(i))
-    Print("   ")
-    HwMonRegionSay(i)
-    PrintNl()
+    ; An empty region (lo above hi) reserves nothing and is not printed:
+    ; the Pi 4's device-tree region when the firmware handed over none.
+    If HwMonRegionLo(i) <= HwMonRegionHi(i)
+      Print("  reserved        ")
+      PutAddr(HwMonRegionLo(i))
+      Print(" to ")
+      PutAddr(HwMonRegionHi(i))
+      Print("   ")
+      HwMonRegionSay(i)
+      PrintNl()
+    EndIf
   Next
   Print("  its stack top   ")
   PutAddr(HwMonStack())
