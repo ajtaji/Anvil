@@ -125,10 +125,24 @@ def header_flags(source: pathlib.Path) -> list[str]:
     return flags
 
 
+def header_target(source: pathlib.Path) -> str:
+    """pi5 when the opening comment documents a -t pi5 build, else pi4.
+
+    The Pi 5 programs in this directory share the Pi 4 libraries and the
+    .pi4 suffix, but their headers say they build with -t pi5 (#PMF_CHIP
+    2712); built as pi4 they are refused, correctly, by the BCM2712-only
+    code they include.
+    """
+    lines = source.read_text(encoding="utf-8", errors="replace").splitlines()
+    head = "\n".join(line for line in lines[:HEADER_LINES]
+                     if line.lstrip().startswith(";"))
+    return "pi5" if re.search(r"-t\s+pi5\b", head) else "pi4"
+
+
 def target_for(source: pathlib.Path) -> tuple[str, list[str]]:
     if source.suffix == ".unoq":
         return "unoq", list(Q_FLAGS)
-    return "pi4", header_flags(source)
+    return header_target(source), header_flags(source)
 
 
 def sources(include_q: bool) -> list[pathlib.Path]:
