@@ -699,14 +699,19 @@ CompilerEndIf
 ; monitor BSS and below payload bank 1. The earlier 16 MiB window could not
 ; create an 800x600 canvas alongside the resident console's own resources.
 ; Other board maps retain their existing allocation until their GPU is proved.
+; _HI is written out in each branch, not computed: tools/a64/a64_anvil_check.py
+; reads these constants literally and could not read the expression, so it
+; stopped before its first case - including the one that checks the monitor's
+; variables against this heap.
 CompilerIf #PMF_CHIP = 2711
 #MON_VK_HEAP_LO      = $10000000
 #MON_VK_HEAP_BYTES   = $04000000
+#MON_VK_HEAP_HI      = $13FFFFFF
 CompilerElse
 #MON_VK_HEAP_LO      = $0C000000
 #MON_VK_HEAP_BYTES   = $01000000
+#MON_VK_HEAP_HI      = $0CFFFFFF
 CompilerEndIf
-#MON_VK_HEAP_HI      = #MON_VK_HEAP_LO + #MON_VK_HEAP_BYTES - 1
 #MON_REGION_VK_HEAP  = 8
 
 ; The header's words. LOGICAL width and height are what the picture is
