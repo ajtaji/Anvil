@@ -18,18 +18,19 @@ XIncludeFile "RaspberryPi4/Lib/v3d.pi4"
 XIncludeFile "RaspberryPi4/Lib/neon.pi4"
 XIncludeFile "Anvil/Graphics/Vulkan/vk_api.pbi"
 XIncludeFile "Anvil/Graphics/Vulkan/vk_spirv_fixtures.pbi"
-XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_shader.pi4"
+XIncludeFile "RaspberryPi4/Lib/Vulkan/vk_v3d_shader.pi4"
 XIncludeFile "RaspberryPi4/Board/vulkan_dma.pi4"
-XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_backend.pi4"
-XIncludeFile "Anvil/Graphics/Vulkan/neon_vk_chrome.pi4"
-XIncludeFile "Anvil/Graphics/Vulkan/neon_vk_port.pi4"
-XIncludeFile "Anvil/Graphics/Vulkan/neon_vk_sprite_port.pi4"
+XIncludeFile "RaspberryPi4/Lib/Vulkan/vk_v3d_backend.pi4"
+XIncludeFile "Anvil/Graphics/Vulkan/neon_vk_chrome.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/neon_vk_prepared_lifecycle.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/neon_vk_port.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/neon_vk_sprite_port.pbi"
 ; The file loader uses the HwFile seam; this proof exercises memory only.
 Procedure.i HwFileOpen(*path) : ProcedureReturn 0 : EndProcedure
 Procedure.i HwFileSize() : ProcedureReturn 0 : EndProcedure
 Procedure.i HwFileReadAt(offset.i, *target, count.i) : ProcedureReturn -1 : EndProcedure
 Procedure HwFileClose() : EndProcedure
-XIncludeFile "Anvil/Graphics/Vulkan/neon_vk_sprite_asset.pi4"
+XIncludeFile "Anvil/Graphics/Vulkan/neon_vk_sprite_asset.pbi"
 
 #NBP_MAGIC = $42504E56
 #NBP_TAIL = $564E5042
@@ -266,10 +267,10 @@ Procedure.i Main()
   rc = NeonVkPortSpriteLoadMemory(@nbpSprite, 1, @nbpBmp[0], 70, @nbpPixels[0], 16, $0000FF00, @nbpMask[0], 4)
   nbpReport[4] = rc
   If rc <> 0 : ProcedureReturn nbpFinish(10) : EndIf
-  nbpReport[6] = nvpAssetU32(@nbpPixels[0])
-  nbpReport[7] = nvpAssetU32(@nbpPixels[4])
-  nbpReport[8] = nvpAssetU32(@nbpPixels[8])
-  nbpReport[9] = nvpAssetU32(@nbpPixels[12])
+  nbpReport[6] = (PeekL(@nbpPixels[0]) & $FFFFFFFF)
+  nbpReport[7] = (PeekL(@nbpPixels[4]) & $FFFFFFFF)
+  nbpReport[8] = (PeekL(@nbpPixels[8]) & $FFFFFFFF)
+  nbpReport[9] = (PeekL(@nbpPixels[12]) & $FFFFFFFF)
   nbpReport[26] = nbpMask[0] | (nbpMask[1] << 8) | (nbpMask[2] << 16) | (nbpMask[3] << 24)
   nbpReport[27] = nbpSprite\width : nbpReport[28] = nbpSprite\height
   nbpReport[29] = nbpSprite\generation
