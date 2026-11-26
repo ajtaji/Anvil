@@ -12,10 +12,42 @@ Procedure.i HwVkDmaWindowContains(base.i, windowBytes.i, dst.i, bytes.i)
   ProcedureReturn 1
 EndProcedure
 
+; A SOURCE THE ENGINE CANNOT SEE IS COPIED BY THE CPU (2026-11-26). The
+; legacy engines are thirty-bit (dma.pi4 #DMA_LIMIT): a buffer at or above
+; $40000000 - an update-buffer payload in a program's own variables, when
+; that program's BSS is in the high window - is refused by DmaCopy. The
+; destination is always inside the Vulkan window, which is below the
+; limit, so the copy is done by the CPU and the destination is then
+; maintained exactly as a DMA's would be: the result is the same bytes in
+; the same place, seen the same way by the GPU. A source the engine can
+; see still goes to the engine, as before.
+Procedure.i HwVkCpuCopy(base.i, windowBytes.i, source.i, destination.i, bytes.i)
+  Define at.i
+  If HwVkDmaWindowContains(base, windowBytes, destination, bytes) = 0 Or source <= 0
+    ProcedureReturn 0
+  EndIf
+  at = 0
+  If ((source | destination) & 7) = 0
+    While at + 8 <= bytes
+      PokeI(destination + at, PeekI(source + at))
+      at = at + 8
+    Wend
+  EndIf
+  While at < bytes
+    PokeA(destination + at, PeekA(source + at))
+    at = at + 1
+  Wend
+  DmaCacheRange(destination, bytes)
+  ProcedureReturn 1
+EndProcedure
+
 Procedure.i HwVkDmaCopy(base.i, windowBytes.i, source.i, destination.i, bytes.i)
   Define oldBase.i, oldBytes.i, copied.i, restored.i
   If HwVkDmaWindowContains(base, windowBytes, destination, bytes) = 0 Or DmaReady() = 0
     ProcedureReturn 0
+  EndIf
+  If DmaAddrOk(source, bytes) = 0
+    ProcedureReturn HwVkCpuCopy(base, windowBytes, source, destination, bytes)
   EndIf
   oldBase = dma_bounds : oldBytes = dma_boundsN
   If DmaSetBounds(base, windowBytes) = 0 : ProcedureReturn 0 : EndIf
@@ -40,6 +72,14 @@ Procedure.i HwVkDmaCopyRows(base.i, windowBytes.i, source.i, sourcePitch.i, dest
   destinationSpan = (rows - 1) * destinationPitch + rowBytes
   If sourceSpan < rowBytes Or destinationSpan < rowBytes Or HwVkDmaWindowContains(base, windowBytes, destination, destinationSpan) = 0
     ProcedureReturn 0
+  EndIf
+  If DmaAddrOk(source, sourceSpan) = 0
+    For row = 0 To rows - 1
+      If HwVkCpuCopy(base, windowBytes, source + row * sourcePitch, destination + row * destinationPitch, rowBytes) = 0
+        ProcedureReturn 0
+      EndIf
+    Next
+    ProcedureReturn 1
   EndIf
   If rows = 1 Or rowBytes > #DMA_MAX_ROW_BYTES Or rows > #DMA_MAX_ROWS Or sourcePitch - rowBytes > #DMA_STRIDE_MAX Or destinationPitch - rowBytes > #DMA_STRIDE_MAX Or (destination < source + sourceSpan And source < destination + destinationSpan)
     For row = 0 To rows - 1
